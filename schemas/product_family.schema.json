@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Amazon Product Family Protocol v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "product_type", "category_id", "source", "family", "product_specific"],
+  "properties": {
+    "protocol_version": { "const": "3.0" },
+    "product_type": { "type": "string", "minLength": 1 },
+    "category_id": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "seed_asin", "fetched_at", "raw_dir", "raw_dirs", "policy_version", "child_fetch_errors", "expected_child_count"],
+      "properties": {
+        "type": { "const": "apify" },
+        "seed_asin": { "type": "string", "pattern": "^[A-Z0-9]{10}$" },
+        "fetched_at": { "type": "string", "minLength": 1 },
+        "policy_version": { "const": "product-family-v3-resolved-facts-v10-child-scoped" },
+        "raw_dir": { "type": "string", "minLength": 1 },
+        "raw_dirs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["apify"],
+          "properties": { "apify": { "type": "string", "minLength": 1 } }
+        },
+        "child_fetch_errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["asin", "error"],
+            "properties": {
+              "asin": { "type": "string", "pattern": "^[A-Z0-9]{10}$" },
+              "error": { "type": "string" }
+            }
+          }
+        },
+        "expected_child_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "family": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parent_asin", "brand", "sku_prefix", "marketplace", "variation_theme", "variation_dimensions", "children"],
+      "properties": {
+        "parent_asin": { "type": "string", "pattern": "^[A-Z0-9]{10}$" },
+        "brand": { "type": "string", "minLength": 1 },
+        "sku_prefix": { "type": "string", "minLength": 1 },
+        "marketplace": { "type": "string", "minLength": 1 },
+        "variation_theme": { "type": "string", "minLength": 1 },
+        "variation_dimensions": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["asin", "variation_values", "title", "bullets", "description", "specs", "sold_unit_count", "sold_unit_count_source", "package_quantity", "package_quantity_source", "reference_images", "risk_flags", "product_specific", "status"],
+            "properties": {
+              "asin": { "type": "string", "pattern": "^[A-Z0-9]{10}$" },
+              "variation_values": { "type": "object" },
+              "title": { "type": "string", "minLength": 1 },
+              "bullets": { "type": "array", "items": { "type": "string" } },
+              "review_summary": { "type": ["string", "object", "array", "null"] },
+              "description": { "type": "string" },
+              "specs": { "type": "object" },
+              "normalized_facts": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "variation": { "type": "object" },
+                  "color": { "type": "string" },
+                  "size": { "type": "string" },
+                  "physical_dimensions": { "type": "string" },
+                  "style": { "type": "string" },
+                  "package": { "type": "string" },
+                  "list_price": { "type": "string" },
+                  "currency": { "type": "string" },
+                  "sold_unit_count": { "type": "integer", "minimum": 1 },
+                  "sold_unit_count_status": { "const": "conflicted" },
+                  "sold_unit_count_candidates": {
+                    "type": "array",
+                    "minItems": 2,
+                    "uniqueItems": true,
+                    "items": { "type": "integer", "minimum": 1 }
+                  },
+                  "package_quantity": { "type": "integer", "minimum": 1 },
+                  "spec_measurements": { "type": "array", "items": { "type": "string" } },
+                  "spec_measurement_records": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["field", "text"],
+                      "properties": {
+                        "field": { "type": "string", "minLength": 1 },
+                        "text": { "type": "string", "minLength": 1 }
+                      }
+                    }
+                  },
+                  "resolved_facts": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "object",
+                      "required": ["value", "status", "candidates", "evidence"],
+                      "properties": {
+                        "value": { "type": ["string", "integer"] },
+                        "status": { "enum": ["confirmed", "conflicted", "unconfirmed"] },
+                        "candidates": { "type": "array", "items": { "type": ["string", "integer"] } },
+                        "evidence": { "type": "array", "items": { "type": "object" } }
+                      }
+                    }
+                  },
+                  "evidence": { "type": "object" }
+                }
+              },
+              "offer": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "list_price": { "type": "string" },
+                  "currency": { "type": "string" },
+                  "source": { "type": "string" }
+                }
+              },
+              "sold_unit_count": { "type": "integer", "minimum": 1 },
+              "sold_unit_count_source": { "enum": ["apify_explicit_pack_count", "variation_pack_count", "amazon_single_unit_listing_policy"] },
+              "sold_unit_count_status": { "const": "conflicted" },
+              "sold_unit_count_candidates": {
+                "type": "array",
+                "minItems": 2,
+                "uniqueItems": true,
+                "items": { "type": "integer", "minimum": 1 }
+              },
+              "package_quantity": { "type": "integer", "minimum": 1 },
+              "package_quantity_source": { "enum": ["apify_explicit_package_quantity", "amazon_single_package_policy"] },
+              "reference_images": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["url", "source"],
+                  "properties": {
+                    "url": { "type": "string", "minLength": 1 },
+                    "source": { "const": "apify" }
+                  }
+                }
+              },
+              "risk_flags": { "type": "array", "items": { "type": "string" } },
+              "product_specific": { "type": "object", "minProperties": 1 },
+              "status": { "const": "ok" }
+            }
+          }
+        }
+      }
+    },
+    "product_specific": { "type": "object", "minProperties": 1 }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job_state.schema.json",
+  "title": "JobStateV7",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "job_id", "status", "stage", "stages", "tasks", "task_history", "artifacts", "errors", "invalidated_errors", "warnings", "updated_at"],
+  "properties": {
+    "schema_version": {"const": 7},
+    "job_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["pending", "running", "awaiting_review", "partial_success", "failed", "success"]},
+    "status_reason": {"type": "string"},
+    "stage": {"type": "string"},
+    "stages": {"type": "object", "additionalProperties": {"type": "object"}},
+    "tasks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_task_id", "owner_stage", "status", "input_revision_id", "attempts", "updated_at"],
+        "properties": {
+          "logical_task_id": {"type": "string", "minLength": 1},
+          "owner_stage": {"type": "string", "minLength": 1},
+          "status": {"enum": ["pending", "running", "retryable", "blocked", "review", "success"]},
+          "input_revision_id": {"type": "string", "minLength": 64, "maxLength": 64},
+          "attempt_id": {"type": "string"},
+          "attempts": {"type": "integer", "minimum": 0},
+          "error": {"type": "string"},
+          "failure_owner": {"type": "string"},
+          "transport_attempt": {"type": "integer", "minimum": 0},
+          "provider_attempts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+          "candidate_revision": {"type": "integer", "minimum": 0, "maximum": 99},
+          "candidate_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+          "execution_revision": {"type": "string", "minLength": 64, "maxLength": 64},
+          "updated_at": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "task_history": {"type": "array", "items": {"type": "object"}},
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {"type": "string"},
+          {
+            "type": "object",
+            "required": ["kind", "path", "sha256"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {"type": "string", "minLength": 1},
+              "path": {"type": "string", "minLength": 1},
+              "sha256": {"type": "string", "minLength": 64, "maxLength": 64}
+            }
+          }
+        ]
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["error_id", "stage", "logical_task_id", "input_revision_id", "message", "at"]
+      }
+    },
+    "resolved_errors": {"type": "array", "items": {"type": "object"}},
+    "invalidated_errors": {"type": "array", "items": {"type": "object"}},
+    "warnings": {"type": "array", "items": {"type": "object"}},
+    "updated_at": {"type": "string", "minLength": 1}
+  }
+}
