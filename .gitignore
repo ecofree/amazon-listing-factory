@@ -17,6 +17,7 @@ Fianl_templates/
 Final_templates/
 amazon_listing_factory_test_runs/
 amazon_listing_factory_test_logs/
+test_runs/
 .locked_delete_me/
 .codex_tmp_quality_sheet.jpg
 .claude/
