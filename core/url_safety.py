@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 from urllib.parse import urljoin, urlparse
 
@@ -34,7 +35,13 @@ def assert_public_http_url(url: str) -> None:
         assert_public_ip(address, hostname=host, allow_proxy_fake=literal_ip is None)
 
 
-def assert_public_ip(address: str, *, hostname: str = "", allow_proxy_fake: bool = True) -> None:
+def assert_public_ip(
+    address: str,
+    *,
+    hostname: str = "",
+    allow_proxy_fake: bool = True,
+    allow_configured_proxy_peer: bool = False,
+) -> None:
     """Reject a private peer after the HTTP stack has connected.
 
     URL validation alone is vulnerable to DNS rebinding between resolution and
@@ -48,6 +55,8 @@ def assert_public_ip(address: str, *, hostname: str = "", allow_proxy_fake: bool
     except ValueError as exc:
         raise UrlResolutionError(f"HTTP peer address is invalid: {address}") from exc
     if allow_proxy_fake and (ip in _PROXY_FAKE_IP_NETWORK or ip in _PROXY_FAKE_IP_NETWORK_V6):
+        return
+    if allow_configured_proxy_peer and ip in _configured_proxy_addresses():
         return
     if (
         ip.is_private
@@ -73,10 +82,34 @@ def assert_response_peer_public(response: object, *, hostname: str = "") -> None
         try:
             peer = sock.getpeername()
             address = peer[0] if isinstance(peer, tuple) else peer
-            assert_public_ip(str(address), hostname=hostname)
+            assert_public_ip(
+                str(address),
+                hostname=hostname,
+                allow_configured_proxy_peer=True,
+            )
             return
         except OSError:
             continue
+
+
+def _configured_proxy_addresses() -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Return explicitly configured proxy peers, not arbitrary local hosts."""
+    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        value = str(os.environ.get(key) or "").strip()
+        if not value:
+            continue
+        try:
+            host = urlparse(value).hostname or ""
+            literal = _literal_ip(host)
+            if literal is not None:
+                addresses.add(literal)
+                continue
+            for address in _resolved_addresses(host):
+                addresses.add(ipaddress.ip_address(address))
+        except (OSError, ValueError):
+            continue
+    return addresses
 
 
 def request_public_url(
