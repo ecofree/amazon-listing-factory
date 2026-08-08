@@ -1,0 +1,145 @@
+category_id: bathroom_cabinet
+display_name: Bathroom Cabinet
+product_type: BATHROOM_CABINET
+archetype: storage
+lifecycle: production_ready
+amazon_category: Home & Kitchen > Bath > Bathroom Furniture > Bathroom Cabinets
+browse_node_id: ""
+
+template:
+  engine: template_field_plan
+  path_env: AMAZON_BATHROOM_CABINET_TEMPLATE
+  default_path: templates/CABINET.xlsm
+
+variation_themes:
+  - COLOR
+  - SIZE
+  - COLOR/SIZE
+  - STYLE_NAME
+
+variation_dimensions:
+  - color
+  - size
+  - style
+
+extractors:
+  product_specific_fields:
+    material:
+      - Material
+      - Material Type
+      - Top Material Type
+      - Frame Material Type
+      - Frame Material
+      - Wood Type
+    color:
+      - Color
+      - Colour
+      - Finish Color
+    finish_type:
+      - Finish Type
+      - Finish Types
+      - Finish
+    mounting_type:
+      - Mounting Type
+      - Installation Type
+    dimensions:
+      - Product Dimensions
+      - Item Dimensions
+      - Item Dimensions L x W x H
+    number_of_doors:
+      - Number of Doors
+      - Door Count
+    number_of_drawers:
+      - Number of Drawers
+      - Drawer Count
+    number_of_shelves:
+      - Number of Shelves
+      - Shelf Count
+    load_capacity:
+      - Maximum Weight Recommendation
+      - Weight Capacity
+      - Weight Capacity Maximum
+      - Load Capacity
+    item_weight:
+      - Item Weight
+      - Product Weight
+    room_type:
+      - Room Type
+      - Recommended Uses For Product
+competitor_keywords:
+  - bathroom cabinet
+  - over toilet storage
+  - floor cabinet
+  - wall cabinet
+  - bathroom storage cabinet
+
+category_match:
+  require_positive_match: true
+  positive_keywords:
+    - bathroom cabinet
+    - bathroom storage cabinet
+    - over toilet storage
+    - over-the-toilet
+    - bathroom floor storage cabinet
+    - floor storage cabinet
+    - bathroom floor cabinet
+    - floor cabinet
+    - storage cabinet
+    - storage cupboard
+    - wall cabinet
+    - linen cabinet
+    - freestanding cabinet
+  negative_keywords:
+    - medicine cabinet
+    - mirrored cabinet
+    - bathroom mirror cabinet
+    - mirror cabinet
+    - recessed medicine cabinet
+    - wall mounted medicine cabinet
+    - wall-mounted medicine cabinet
+    - bed frame
+    - platform bed
+    - bunk bed
+    - loft bed
+    - artificial tree
+    - artificial plant
+    - faux tree
+    - fake plant
+    - wisteria
+
+model_preferences:
+  text_copy:
+    model: deepseek-v4-flash
+
+required_role_policy:
+  counts:
+    main: 1
+    scene: 1
+    size: 1
+    func: 1
+
+image_generation:
+  main_image_policy: white_background
+  template_image_role_order: [main, scene, func, size]
+  structure_invariants:
+    - cabinet carcass and top geometry
+    - doors, hinges, and handles
+    - drawers and drawer fronts when present
+    - shelves and interior compartments
+    - legs, base, and mounting form
+  allowed_internal_props:
+    - neatly arranged toiletries inside open shelves or compartments
+    - folded towels inside visible storage
+  replaceable_staging:
+    - loose toiletries, towels, flowers, baskets, wall decor, floor decor, and room surfaces not attached to the cabinet
+  forbidden_additions: []
+  role_specific_rules:
+    main:
+      - Use a white external canvas while allowing reasonable contents inside the cabinet
+    scene:
+      - Show storage use without hiding doors, drawers, handles, or cabinet proportions
+      - Scene props must remain visibly separate from the product and must not imply included accessories
+    size:
+      - Preserve confirmed cabinet dimensions and dimension endpoints
+    func:
+      - Show only source-supported doors, drawers, shelves, mounting, or storage features

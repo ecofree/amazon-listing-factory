@@ -1,0 +1,29 @@
+archetype: storage
+
+extractors:
+  product_specific_fields:
+    material:
+      - Material
+      - Frame Material
+    dimensions:
+      - Product Dimensions
+      - Dimensions
+    item_weight:
+      - Item Weight
+    mounting_type:
+      - Mounting Type
+      - Installation Type
+    number_of_shelves:
+      - Number of Shelves
+      - Shelves
+    number_of_doors:
+      - Number of Doors
+      - Doors
+    number_of_drawers:
+      - Number of Drawers
+      - Drawers
+    finish_type:
+      - Finish Type
+      - Finish
+    shape:
+      - Shape

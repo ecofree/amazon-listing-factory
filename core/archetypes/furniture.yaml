@@ -1,0 +1,19 @@
+archetype: furniture
+
+extractors:
+  product_specific_fields:
+    material:
+      - Material
+      - Frame Material
+      - Top Material Type
+    dimensions:
+      - Product Dimensions
+      - Dimensions
+    item_weight:
+      - Item Weight
+    weight_capacity:
+      - Maximum Weight Recommendation
+      - Load Capacity
+    finish_type:
+      - Finish Type
+      - Finish

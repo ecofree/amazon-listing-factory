@@ -1,0 +1,118 @@
+{
+  "source": "generic_offline_mock",
+  "generated_at": "2026-06-08T15:04:24.467980+00:00",
+  "marketplace": "US",
+  "marketplace_id": "ATVPDKIKX0DER",
+  "productType": "BED_FRAME",
+  "displayName": "Bed Frame",
+  "requirements": "LISTING",
+  "required": [
+    "item_name",
+    "brand",
+    "manufacturer",
+    "bullet_point",
+    "product_description",
+    "item_type_keyword",
+    "main_product_image_locator",
+    "condition_type",
+    "country_of_origin"
+  ],
+  "attributes": {
+    "item_name": {
+      "type": "string",
+      "group": "offer",
+      "required": true
+    },
+    "brand": {
+      "type": "string",
+      "group": "identity",
+      "required": true
+    },
+    "manufacturer": {
+      "type": "string",
+      "group": "identity",
+      "required": true
+    },
+    "bullet_point": {
+      "type": "array",
+      "group": "offer",
+      "required": true
+    },
+    "product_description": {
+      "type": "string",
+      "group": "offer",
+      "required": true
+    },
+    "generic_keyword": {
+      "type": "array",
+      "group": "offer"
+    },
+    "item_type_keyword": {
+      "type": "string",
+      "group": "discovery",
+      "required": true
+    },
+    "main_product_image_locator": {
+      "type": "string",
+      "group": "images",
+      "required": true
+    },
+    "other_product_image_locator_1": {
+      "type": "string",
+      "group": "images"
+    },
+    "color": {
+      "type": "string",
+      "group": "variation"
+    },
+    "size": {
+      "type": "string",
+      "group": "variation"
+    },
+    "material": {
+      "type": "string",
+      "group": "product_details"
+    },
+    "item_length_width_height": {
+      "type": "dimension",
+      "group": "product_details"
+    },
+    "item_weight": {
+      "type": "weight",
+      "group": "product_details"
+    },
+    "condition_type": {
+      "type": "enum",
+      "group": "offer",
+      "required": true,
+      "enum": [
+        "new_new"
+      ]
+    },
+    "country_of_origin": {
+      "type": "enum",
+      "group": "compliance",
+      "required": true
+    }
+  },
+  "propertyGroups": {
+    "identity": {
+      "title": "Identity"
+    },
+    "offer": {
+      "title": "Offer"
+    },
+    "images": {
+      "title": "Images"
+    },
+    "variation": {
+      "title": "Variation"
+    },
+    "product_details": {
+      "title": "Product Details"
+    },
+    "compliance": {
+      "title": "Compliance"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+archetype: default
+
+variation_themes:
+  - COLOR
+  - SIZE
+  - COLOR/SIZE
+  - STYLE_NAME
+
+variation_dimensions:
+  - color
+  - size
+  - style
+
+model_preferences:
+  text_copy:
+    model: deepseek-v4-flash
+
+extractors:
+  product_specific_fields:
+    material:
+      - Material
+      - Material Type
+    color:
+      - Color
+      - Color Name
+    dimensions:
+      - Product Dimensions
+      - Dimensions
+    item_weight:
+      - Item Weight
+      - Product Weight

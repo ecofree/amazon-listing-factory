@@ -1,0 +1,149 @@
+category_id: medicine_cabinet
+display_name: Medicine Cabinet
+product_type: MEDICINE_CABINET
+archetype: storage
+lifecycle: production_ready
+amazon_category: Home & Kitchen > Bath > Bathroom Furniture > Medicine Cabinets
+browse_node_id: ""
+
+template:
+  engine: template_field_plan
+  path_env: AMAZON_MEDICINE_CABINET_TEMPLATE
+  default_path: templates/Medcine_CABINET.xlsm
+
+variation_themes:
+  - COLOR
+  - SIZE
+  - COLOR/SIZE
+  - STYLE_NAME
+
+variation_dimensions:
+  - color
+  - size
+  - style
+
+extractors:
+  product_specific_fields:
+    material:
+      - Material
+      - Material Type
+      - Top Material Type
+      - Frame Material Type
+      - Frame Material
+    color:
+      - Color
+      - Colour
+      - Finish Color
+    finish_type:
+      - Finish Type
+      - Finish Types
+      - Finish
+    mounting_type:
+      - Mounting Type
+      - Installation Type
+    dimensions:
+      - Product Dimensions
+      - Item Dimensions
+      - Item Dimensions L x W x H
+    shape:
+      - Shape
+    frame_material:
+      - Frame Material
+      - Frame Material Type
+    number_of_doors:
+      - Number of Doors
+      - Door Count
+    number_of_shelves:
+      - Number of Shelves
+      - Shelf Count
+    door_orientation:
+      - Door Orientation
+      - Door Swing
+    item_weight:
+      - Item Weight
+      - Product Weight
+    load_capacity:
+      - Maximum Weight Recommendation
+      - Weight Capacity
+      - Weight Capacity Maximum
+      - Load Capacity
+    room_type:
+      - Room Type
+      - Recommended Uses For Product
+competitor_keywords:
+  - medicine cabinet
+  - mirrored cabinet
+  - bathroom mirror cabinet
+  - recessed medicine cabinet
+  - wall mounted medicine cabinet
+
+category_match:
+  require_positive_match: true
+  priority_keywords:
+    - medicine cabinet
+    - bathroom medicine cabinet
+    - wall mounted medicine cabinet
+    - wall-mounted medicine cabinet
+  positive_keywords:
+    - medicine cabinet
+    - mirrored cabinet
+    - bathroom mirror cabinet
+    - mirror cabinet
+    - recessed medicine cabinet
+    - wall mounted medicine cabinet
+    - wall-mounted medicine cabinet
+  negative_keywords:
+    - bathroom storage cabinet
+    - over toilet storage
+    - over-the-toilet
+    - floor cabinet
+    - linen cabinet
+    - freestanding cabinet
+    - bed frame
+    - platform bed
+    - bunk bed
+    - loft bed
+    - artificial tree
+    - artificial plant
+    - faux tree
+    - fake plant
+    - wisteria
+
+model_preferences:
+  text_copy:
+    model: deepseek-v4-flash
+
+required_role_policy:
+  counts:
+    main: 1
+    scene: 1
+    size: 1
+    func: 1
+
+image_generation:
+  main_image_policy: white_background
+  template_image_role_order: [main, scene, func, size]
+  structure_invariants:
+    - cabinet frame and the exact source-visible door or panel faces
+    - doors, hinges, and opening orientation
+    - shelves and interior compartments
+    - mounting form and visible hardware
+    - lights or electrical features only when present
+  allowed_internal_props:
+    - small toiletries inside open shelves or compartments
+  replaceable_staging:
+    - loose toiletries, towels, flowers, containers, wall decor, countertop props, and room surfaces not attached to the cabinet
+  forbidden_additions:
+    - part: lights
+      unless_source_visible: true
+    - part: electrical controls
+      unless_source_visible: true
+  role_specific_rules:
+    main:
+      - Use a white external canvas and preserve the source-visible frame, door or panel face, hinge, and shelf geometry
+    scene:
+      - Show vanity use without changing the source-visible door or panel face and opening orientation
+    size:
+      - Preserve confirmed cabinet dimensions and any source-visible face dimensions
+    func:
+      - Show only source-supported face, shelf, door, mounting, or lighting features

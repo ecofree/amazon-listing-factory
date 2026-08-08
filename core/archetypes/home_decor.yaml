@@ -1,0 +1,24 @@
+archetype: home_decor
+
+extractors:
+  product_specific_fields:
+    material:
+      - Material
+      - Product Material
+    dimensions:
+      - Product Dimensions
+      - Dimensions
+    height:
+      - Tree Height
+      - Height
+      - Product Height
+    pot_material:
+      - Pot Material
+      - Planter Material
+    plant_or_animal_product_type:
+      - Plant or Animal Product Type
+      - Tree Type
+      - Plant Type
+    color:
+      - Color
+      - Color Name

@@ -1,0 +1,33 @@
+# Local credentials and machine configuration
+config.local.env
+*.local.env
+.env
+.env.*
+
+# Runtime data and paid/generated artifacts
+jobs/
+images/
+outputs/
+reports/
+tmp/
+temp/
+Fianl_pics/
+Final_pics/
+Fianl_templates/
+Final_templates/
+amazon_listing_factory_test_runs/
+amazon_listing_factory_test_logs/
+.locked_delete_me/
+.codex_tmp_quality_sheet.jpg
+.claude/
+__pycache__/
+*.pyc
+
+# Local tooling/cache state
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+*.log
+logs/
+data/*.sqlite

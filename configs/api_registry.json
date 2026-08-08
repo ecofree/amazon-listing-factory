@@ -1,0 +1,300 @@
+{
+  "providers": [
+    {
+      "name": "holdai_gemini_31_flash_lite_vision_qa",
+      "family": "gemini",
+      "scope": "vision_qa",
+      "protocol": "openai",
+      "base_url": "https://api.holdai.top/v1",
+      "key_env": "HOLDAI_API_KEY",
+      "model": "gemini-3.1-flash-lite",
+      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "priority": 110,
+      "enabled": true
+    },
+    {
+      "name": "jiugx_gemini_31_flash_lite_vision_qa",
+      "family": "gemini",
+      "scope": "vision_qa",
+      "protocol": "openai",
+      "base_url": "https://jiugx.com/v1",
+      "key_env": "JIUGX_API_KEY",
+      "model": "gemini-3.1-flash-lite",
+      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "priority": 105,
+      "enabled": false
+    },
+    {
+      "name": "yunwu_gemini_31_flash_lite_vision_qa",
+      "family": "gemini",
+      "scope": "vision_qa",
+      "protocol": "openai",
+      "base_url": "https://yunwu.ai/v1",
+      "key_env": "YUNWU_API_KEY",
+      "model": "gemini-3.1-flash-lite",
+      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "priority": 100,
+      "enabled": false
+    },
+    {
+      "name": "zivv_gemini_35_flash_high_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "google_gemini",
+      "base_url": "https://zivv.pro/v1beta",
+      "key_env": "ZIVV_API_KEY",
+      "auth_mode": "header",
+      "model": "gemini-3.5-flash-high",
+      "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
+      "priority": 122,
+      "enabled": false
+    },
+    {
+      "name": "ccsub_gemini_35_flash_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://www.ccsub.net/api/v1",
+      "base_url_env": "CCSUB_BASE_URL",
+      "key_env": "CCSUB_API_KEY",
+      "model": "gemini-3.5-flash",
+      "capabilities": ["vision_input", "json_output", "visual_planning"],
+      "priority": 130,
+      "enabled": true
+    },
+    {
+      "name": "krill_gemini_35_flash_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://api.krill-ai.com/v1",
+      "key_env": "KRILL_VISUAL_PLANNING_API_KEY",
+      "model": "gemini-3.5-flash",
+      "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
+      "priority": 126,
+      "enabled": true
+    },
+    {
+      "name": "quqiai_gemini_35_flash_high_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "QUQIAI_API_KEY",
+      "model": "gemini-3.5-flash-high",
+      "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
+      "priority": 115,
+      "enabled": false
+    },
+    {
+      "name": "yunwu_gemini_35_flash_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://yunwu.ai/v1",
+      "key_env": "YUNWU_API_KEY",
+      "model": "gemini-3.5-flash",
+      "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
+      "priority": 112,
+      "enabled": true
+    },
+    {
+      "name": "cavoti_gpt_56_sol_visual_planning",
+      "family": "openai_vision",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://subrouter.ai/v1",
+      "key_env": "CAVOTI_GPT56_API_KEY",
+      "model": "gpt-5.6-sol",
+      "capabilities": ["vision_input", "json_output", "visual_planning"],
+      "priority": 90,
+      "enabled": true
+    },
+    {
+      "name": "krill_gpt_image_2",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://api.krill-ai.com/v1",
+      "key_env": "KRILL_AI_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 200,
+      "enabled": true
+    },
+    {
+      "name": "aicost_gpt_image_2",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "AICOST_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 150,
+      "enabled": true
+    },
+    {
+      "name": "qc_yc_fixed",
+      "display": "qc-yc-fixed",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "QC_YC_FIXED_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 160,
+      "enabled": true
+    },
+    {
+      "name": "cxk_fixed",
+      "display": "cxk-fixed",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "CXK_FIXED_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 155,
+      "enabled": true
+    },
+    {
+      "name": "highwayapi_gpt_image_2",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "highwayapi",
+      "url": "https://api.highwayapi.ai/v3/gpt-image-2-edit",
+      "key_env": "HIGHWAY_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "highwayapi_gpt_image_2_edit",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "size": "1024x1024",
+        "quality": "low",
+        "background": "auto",
+        "output_format": "png"
+      },
+      "capabilities": ["image_edit", "reference_image", "protected_mask", "square_output"],
+      "priority": 102,
+      "enabled": true
+    },
+    {
+      "name": "highwayapi_gpt_image_2_light",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "highwayapi",
+      "url": "https://api.highwayapi.ai/v3/gpt-image-2-light-edit",
+      "key_env": "HIGHWAY_API_KEY",
+      "model": "gpt-image-2-light",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "highwayapi_gpt_image_2_light_edit",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "size": "auto",
+        "quality": "low",
+        "image_field": "images"
+      },
+      "capabilities": ["image_edit", "reference_image", "square_output"],
+      "priority": 102,
+      "enabled": false
+    },
+    {
+      "name": "dragoncode",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "async_image_generation",
+      "url": "https://dragoncode.codes/gpt-image/v1/images/generations",
+      "key_env": "DRAGONCODE_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "dragoncode_async_images_generations",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "async_size": "1:1",
+        "resolution": "1k",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "square_output"],
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "name": "apimart",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "async_image_generation",
+      "url": "https://api.apimart.ai/v1/images/generations",
+      "key_env": "APIMART_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "apimart_async_images_generations",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "async_size": "1:1",
+        "resolution": "1k",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "square_output"],
+      "priority": 99,
+      "enabled": true
+    },
+    {
+      "name": "holdai_chat_image",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_chat_completions_image",
+      "url": "https://api.holdai.top/v1/chat/completions",
+      "key_env": "HOLDAI_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "chat_completions",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "square_output"],
+      "priority": 98,
+      "enabled": true
+    }
+  ]
+}

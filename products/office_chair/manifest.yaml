@@ -1,0 +1,5 @@
+category_id: office_chair
+display_name: Office Chair
+product_type: OFFICE_CHAIR
+lifecycle: unsupported
+unsupported_reason: Production is disabled until a current Amazon template and a real acceptance ASIN are provided.

@@ -1,0 +1,131 @@
+category_id: artificial_tree
+display_name: Artificial Tree
+product_type: ARTIFICIAL_TREE
+archetype: home_decor
+lifecycle: production_ready
+amazon_category: Home & Kitchen > Home Decor > Artificial Plants & Flowers > Artificial Trees
+browse_node_id: ""
+
+template:
+  engine: template_field_plan
+  path_env: AMAZON_ARTIFICIAL_TREE_TEMPLATE
+  default_path: templates/ARTIFICIAL_TREE.xlsm
+
+variation_themes:
+  - COLOR
+  - SIZE
+  - COLOR/SIZE
+  - STYLE_NAME
+
+variation_dimensions:
+  - color
+  - size
+  - style
+
+extractors:
+  product_specific_fields:
+    tree_type:
+      - Plant or Animal Product Type
+      - Plant Type
+      - Tree Type
+      - Style
+    material:
+      - Material
+      - Leaf Material
+      - Trunk Material
+    color:
+      - Color
+      - Colour
+    height:
+      - Height
+      - Item Height
+      - Tree Height
+    dimensions:
+      - Product Dimensions
+      - Item Dimensions
+      - Item Dimensions L x W x H
+    pot_material:
+      - Pot Material
+      - Planter Material
+    base_type:
+      - Base Type
+      - Pot Type
+      - Planter Type
+    item_weight:
+      - Item Weight
+      - Product Weight
+    indoor_outdoor:
+      - Indoor/Outdoor Usage
+      - Recommended Uses For Product
+competitor_keywords:
+  - artificial tree
+  - faux tree
+  - fake plant
+  - artificial olive tree
+  - artificial ficus tree
+
+category_match:
+  require_positive_match: true
+  positive_keywords:
+    - artificial tree
+    - artificial plant
+    - faux tree
+    - faux plant
+    - fake tree
+    - fake plant
+    - artificial olive tree
+    - artificial ficus tree
+    - wisteria
+    - topiary
+    - ficus
+    - olive tree
+    - palm tree
+    - snake plant
+    - boxwood
+    - potted plant
+  negative_keywords:
+    - bed frame
+    - platform bed
+    - bunk bed
+    - loft bed
+    - headboard
+    - bathroom cabinet
+    - medicine cabinet
+    - mirrored cabinet
+
+model_preferences:
+  text_copy:
+    model: deepseek-v4-flash
+
+required_role_policy:
+  counts:
+    main: 1
+    scene: 1
+    size: 1
+    func: 1
+
+image_generation:
+  main_image_policy: white_background
+  template_image_role_order: [main, scene, func, size]
+  structure_invariants:
+    - trunk and stem count
+    - branch and leaf density and placement
+    - exact source-visible base, pot, stand, stake, or spike type
+    - trunk-to-support connection and source-visible support geometry
+  allowed_internal_props: []
+  replaceable_staging:
+    - room or landscape background, furniture, wall decor, and loose decorative props not attached to the tree
+  forbidden_additions:
+    - {part: decorative planter, unless_source_visible: true}
+    - {part: flower pot, unless_source_visible: true}
+    - {part: plant pot, unless_source_visible: true}
+    - {part: container base, unless_source_visible: true}
+  role_specific_rules:
+    main:
+      - Preserve branch density, trunk count, and the exact source-visible support type
+    scene:
+      - Place the tree naturally without replacing, covering, or reinterpreting its source-visible support
+    size:
+      - Preserve confirmed height and width dimensions
+    func:
+      - Show only source-supported branch, material, or installation features

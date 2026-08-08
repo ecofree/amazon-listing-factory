@@ -1,0 +1,202 @@
+{
+  "endpoints": [
+    {
+      "name": "example_holdai_gemini_31_flash_lite_vision_qa",
+      "family": "gemini",
+      "scope": "vision_qa",
+      "protocol": "openai",
+      "base_url": "https://api.holdai.top/v1",
+      "key_env": "HOLDAI_API_KEY",
+      "model": "gemini-3.1-flash-lite",
+      "smoke_required": true,
+      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "priority": 110,
+      "enabled": false
+    },
+    {
+      "name": "example_jiugx_gemini_31_flash_lite_vision_qa",
+      "family": "gemini",
+      "scope": "vision_qa",
+      "protocol": "openai",
+      "base_url": "https://jiugx.com/v1",
+      "key_env": "JIUGX_API_KEY",
+      "model": "gemini-3.1-flash-lite",
+      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "priority": 105,
+      "enabled": false
+    },
+    {
+      "name": "example_yunwu_gemini_31_flash_lite_vision_qa",
+      "family": "gemini",
+      "scope": "vision_qa",
+      "protocol": "openai",
+      "base_url": "https://yunwu.ai/v1",
+      "key_env": "YUNWU_API_KEY",
+      "model": "gemini-3.1-flash-lite",
+      "smoke_required": true,
+      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "priority": 100,
+      "enabled": false
+    },
+    {
+      "name": "example_zivv_gemini_35_flash_high_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "google_gemini",
+      "base_url": "https://zivv.pro/v1beta",
+      "key_env": "ZIVV_API_KEY",
+      "auth_mode": "header",
+      "model": "gemini-3.5-flash-high",
+      "smoke_required": true,
+      "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
+      "priority": 122,
+      "enabled": true
+    },
+    {
+      "name": "example_ccsub_gemini_35_flash_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://www.ccsub.net/api/v1",
+      "base_url_env": "CCSUB_BASE_URL",
+      "key_env": "CCSUB_API_KEY",
+      "model": "gemini-3.5-flash",
+      "smoke_required": true,
+      "capabilities": ["vision_input", "json_output", "visual_planning"],
+      "priority": 130,
+      "enabled": true
+    },
+    {
+      "name": "example_cavoti_gpt_56_sol_visual_planning",
+      "family": "openai_vision",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "CAVOTI_GPT56_API_KEY",
+      "model": "gpt-5.6-sol",
+      "capabilities": ["vision_input", "json_output", "visual_planning"],
+      "priority": 150,
+      "enabled": true
+    },
+    {
+      "name": "example_provider_000_gpt_56_sol_visual_planning",
+      "family": "openai_vision",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "PROVIDER_000_GPT56_API_KEY",
+      "model": "gpt-5.6-sol",
+      "capabilities": ["vision_input", "json_output", "visual_planning"],
+      "priority": 145,
+      "enabled": true
+    }
+  ],
+  "providers": [
+    {
+      "name": "krill_gpt_image_2",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://api.krill-ai.com/v1",
+      "key_env": "KRILL_AI_API_KEY",
+      "model": "gpt-image-2",
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "protected_mask", "square_output"],
+      "priority": 80,
+      "enabled": true
+    },
+    {
+      "name": "qc_yc_fixed",
+      "display": "qc-yc-fixed",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "QC_YC_FIXED_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 85,
+      "enabled": true
+    },
+    {
+      "name": "cxk_fixed",
+      "display": "cxk-fixed",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "CXK_FIXED_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 84,
+      "enabled": true
+    },
+    {
+      "name": "example_stableai_gpt_56_sol_visual_planning",
+      "family": "openai_vision",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "STABLEAI_GPT56_API_KEY",
+      "model": "gpt-5.6-sol",
+      "capabilities": ["vision_input", "json_output", "visual_planning"],
+      "priority": 148,
+      "enabled": true
+    },
+    {
+      "name": "example_lz_token_gpt_56_sol_visual_planning",
+      "family": "openai_vision",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "LZ_TOKEN_GPT56_API_KEY",
+      "model": "gpt-5.6-sol",
+      "capabilities": ["vision_input", "json_output", "visual_planning"],
+      "priority": 147,
+      "enabled": true
+    },
+    {
+      "name": "cavoti_gpt_image_2",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://cavoti.com/v1",
+      "key_env": "CAVOTI_API_KEY",
+      "model": "gpt-image-2",
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "low"
+      },
+      "capabilities": ["image_edit", "reference_image", "protected_mask", "square_output"],
+      "priority": 90,
+      "enabled": true
+    }
+  ]
+}

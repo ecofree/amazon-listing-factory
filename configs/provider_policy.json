@@ -1,0 +1,18 @@
+{
+  "image_generation": {
+    "forbidden_providers": [],
+    "forbidden_image_providers": [],
+    "max_parallel_provider_jobs": 2,
+    "require_true_image_to_image": true,
+    "forbid_local_final_compositing": true
+  },
+  "vision_analysis": {
+    "provider": "gemini",
+    "default_model": "gemini-3.5-flash",
+    "role": "composition_scene_soft_furnishing_lighting_and_visual_qa"
+  },
+  "copy_polish": {
+    "provider": "deepseek",
+    "role": "objective_title_bullets_description_polish"
+  }
+}

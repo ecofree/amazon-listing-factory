@@ -1,0 +1,136 @@
+category_id: bed_frame
+display_name: Bed Frame
+product_type: BED_FRAME
+archetype: furniture
+lifecycle: production_ready
+amazon_category: Furniture > Bedroom Furniture > Beds, Frames & Bases
+browse_node_id: "3734891"
+
+template:
+  engine: template_field_plan
+  path_env: AMAZON_BED_FRAME_TEMPLATE
+  default_path: templates/BED_FRAME.xlsm
+
+variation_themes:
+  - COLOR/SIZE
+  - COLOR
+  - SIZE
+
+variation_dimensions:
+  - color
+  - size
+
+extractors:
+  product_specific_fields:
+    style:
+      - Style
+      - Style Name
+    size:
+      - Size
+    special_feature:
+      - Special Feature
+      - Special Features
+      - Additional Features
+    color:
+      - Color
+      - Colour
+    material:
+      - Material
+      - Material Type
+    frame_material:
+      - Frame Material
+      - Frame Material Type
+    item_weight:
+      - Item Weight
+      - Product Weight
+    clearance:
+      - Ground To Item Distance
+      - Under Bed Clearance
+      - Clearance
+    max_weight:
+      - Maximum Weight Recommendation
+      - Weight Capacity
+      - Maximum Weight Capacity
+      - Weight Capacity Maximum
+    model_number:
+      - Model Number
+      - Item model number
+      - Model
+    dimensions:
+      - Item Dimensions L x W x H
+      - Product Dimensions
+      - Item Dimensions
+      - Dimensions
+  aliases:
+    weight_capacity: max_weight
+    weight_capacity_unit: max_weight_unit
+competitor_keywords:
+  - bed frame
+  - platform bed
+  - bed with headboard
+  - bunk bed
+  - loft bed
+
+category_match:
+  require_positive_match: true
+  positive_keywords:
+    - bed frame
+    - platform bed
+    - bunk bed
+    - loft bed
+    - daybed
+    - headboard
+    - footboard
+    - bed with headboard
+    - mattress foundation
+    - slat
+    - guardrail
+  negative_keywords:
+    - artificial tree
+    - artificial plant
+    - faux tree
+    - faux plant
+    - fake plant
+    - wisteria
+    - topiary
+    - ficus
+    - olive tree
+    - palm tree
+    - snake plant
+    - bathroom cabinet
+    - medicine cabinet
+    - mirrored cabinet
+
+model_preferences:
+  text_copy:
+    model: deepseek-v4-flash
+
+required_role_policy:
+  counts:
+    main: 1
+    scene: 1
+    size: 1
+    func: 1
+
+image_generation:
+  main_image_policy: product_first_lifestyle
+  template_image_role_order: [main, scene, func, size]
+  structure_invariants:
+    - headboard and footboard geometry
+    - side rails, slats, platform, and center supports
+    - legs and under-bed clearance
+    - guardrails, ladder, or stairs when present
+    - trundle, drawers, or shelves when present
+  allowed_internal_props: []
+  replaceable_staging:
+    - mattress, bedding, pillows, rugs, wall decor, toys, and loose room props not sold with the frame
+  forbidden_additions: []
+  role_specific_rules:
+    main:
+      - Keep the complete bed frame clearly recognizable in a restrained lifestyle room
+    scene:
+      - Show room scale and intended audience with a materially different camera relationship from main
+    size:
+      - Preserve confirmed frame dimensions and dimension endpoints
+    func:
+      - Show only source-supported storage, support, clearance, or safety features
