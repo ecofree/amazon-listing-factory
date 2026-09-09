@@ -14,6 +14,13 @@ from core.template_runtime import template_job_with_defaults
 
 class TemplateFieldPlanContractsTests(unittest.TestCase):
     def test_unknown_template_data_start_row_fails_closed(self) -> None:
+        from core.template_field_plan import _conditional_activation
+        args = dict(values={}, fields={}, labels={}, aliases={})
+        for value, active in (("No", False), ("Yes", True), (False, False), (True, True), ("", None), (None, None)):
+            with self.subTest(battery=value):
+                self.assertIs(active, _conditional_activation("num_batteries#1.value", row_context={"contains_battery": value}, **args)[0])
+        self.assertIsNone(_conditional_activation("dangerous_goods#1.value", row_context={}, **args)[0])
+        self.assertIs(False, _conditional_activation("dangerous_goods#1.value", row_context={"dangerous_goods": "Not Applicable"}, **args)[0])
         workbook = Workbook()
         sheet = workbook.active
         sheet.cell(7, 1).value = "unknown row content"

@@ -125,11 +125,34 @@ image_generation:
   replaceable_staging:
     - mattress, bedding, pillows, rugs, wall decor, toys, and loose room props not sold with the frame
   forbidden_additions: []
+  visual_context:
+    primary_setting: modern US children's bedroom
+    buyer: parents and caregivers
+    user: child using a transition or Montessori bed
+    required_cues:
+      - child-scale reading, storage, or play element
+      - restrained wooden toys or picture books
+      - soft washable textiles and open circulation around the low bed
+    allowed_alternates:
+      - shared sibling bedroom
+      - quiet child reading and sleep corner
+    avoid:
+      - adult primary-bedroom or hotel-bedroom styling
+      - generic neutral room with no child-scale cues
+      - nursery-only baby props, cartoon clutter, or toy-store color blocking
+  role_visual_direction:
+    main:
+      - Keep a product-first lifestyle main image in a bright contemporary US children's bedroom; never convert it to a white-background catalog image.
+    scene:
+      - Create a different lifestyle moment through child-focused activities and loose staging, retaining the scene reference's product perspective.
+    func:
+      - Use a photo-led editorial feature composition with the bed frame as the hero and the title in genuine open image space; use sparse annotations, not stacked cards or dashboard grids.
+      - Keep the source-visible bed-frame feature and framing unchanged; redesign only non-product staging and presentation text around it.
   role_specific_rules:
     main:
       - Keep the complete bed frame clearly recognizable in a restrained lifestyle room
     scene:
-      - Show room scale and intended audience with a materially different camera relationship from main
+      - Show room scale and intended audience through child-scale staging within the scene reference's product perspective
     size:
       - Preserve confirmed frame dimensions and dimension endpoints
     func:

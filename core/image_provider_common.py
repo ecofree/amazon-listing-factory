@@ -79,7 +79,10 @@ _DEFAULT_PROVIDER_TIMEOUT_SECONDS = {
 _DEFAULT_PROVIDER_TIMEOUT_FALLBACK_SECONDS = 420
 _MAX_PROVIDER_TIMEOUT_SECONDS = 480
 _DEFAULT_PROVIDER_CONCURRENCY = 1
-_DEFAULT_VISION_PROVIDER_CONCURRENCY = 3
+# Visual planning holds several decoded/reference-image representations at
+# once. One lease per physical planning endpoint keeps independent jobs from
+# multiplying that peak while different endpoints can still run in parallel.
+_DEFAULT_VISION_PROVIDER_CONCURRENCY = 1
 _PROVIDER_SEMAPHORES: dict[tuple[str, int], threading.BoundedSemaphore] = {}
 _PROVIDER_SEMAPHORES_LOCK = threading.Lock()
 
@@ -359,6 +362,12 @@ _TRANSPORT_ERROR_MARKERS = (
 
 
 def provider_concurrency_limit(provider_name: str) -> int:
+    if provider_name == "host_image_memory":
+        total, available = _system_memory_bytes()
+        if total <= 0:
+            return 1
+        reserve = max(4 * 1024**3, int(total * 0.20))
+        return max(0, min(8, (available - reserve) // (1536 * 1024**2)))
     suffix = provider_env_suffix(provider_name)
     specific = os.environ.get(f"AMAZON_FACTORY_PROVIDER_CONCURRENCY_{suffix}")
     is_vision = str(provider_name or "").casefold().startswith("vision_")
@@ -371,7 +380,7 @@ def provider_concurrency_limit(provider_name: str) -> int:
     try:
         return min(32, max(0, int(value)))
     except ValueError:
-        return 0
+        return default
 
 
 @contextmanager
@@ -385,6 +394,8 @@ def provider_concurrency_slot(provider_name: str, *, deadline: float | None = No
     semaphore is invisible to other processes.
     """
     limit = provider_concurrency_limit(provider_name)
+    if provider_name == "host_image_memory" and limit == 0:
+        raise ProviderQueueUnavailable(provider_name, "Insufficient available memory for an image execution lease")
     if limit <= 0:
         yield
         return
@@ -424,6 +435,34 @@ def _provider_semaphore(provider_name: str, limit: int) -> threading.BoundedSema
             semaphore = threading.BoundedSemaphore(limit)
             _PROVIDER_SEMAPHORES[key] = semaphore
         return semaphore
+
+
+def _system_memory_bytes() -> tuple[int, int]:
+    """Return host memory for both local worker sizing and shared execution leases."""
+    if os.name == "nt":
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong), ("memory_load", ctypes.c_ulong),
+                ("total", ctypes.c_ulonglong), ("available", ctypes.c_ulonglong),
+                ("total_page", ctypes.c_ulonglong), ("available_page", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatus()
+        status.length = ctypes.sizeof(_MemoryStatus)
+        try:
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.total), int(status.available)
+        except (AttributeError, OSError):
+            pass
+    try:
+        page = int(os.sysconf("SC_PAGE_SIZE"))
+        return int(os.sysconf("SC_PHYS_PAGES")) * page, int(os.sysconf("SC_AVPHYS_PAGES")) * page
+    except (AttributeError, OSError, ValueError):
+        return 0, 0
 
 
 def _provider_slot_directory(provider_name: str) -> Path:

@@ -244,7 +244,7 @@ def _validate_manifest_binding(job_path: Path, manifest: dict[str, Any], task: d
         "source_sha256": _generation_reference_sha(task),
     }
     if any(str(manifest.get(key) or "") != value for key, value in expected.items()):
-        raise CandidateStateError("CandidateManifest does not match ImageTaskV8")
+        raise CandidateStateError("CandidateManifest does not match ImageTaskV9")
     sha = str(manifest.get("candidate_sha256") or "")
     if len(sha) != 64 or not str(manifest.get("candidate_path") or ""):
         raise CandidateStateError("CandidateManifest has no committed candidate identity")

@@ -67,6 +67,26 @@ class RootCauseRemediationTests(unittest.TestCase):
             assert_public_http_url("https://[fdfe:dcba:9876::106]/image.jpg")
 
     def test_dns_resolution_failure_is_retryable(self) -> None:
+        from core.source_fetch.apify_client import ApifyClient
+        from core.asset_manager import _download_once
+        from core.vision_gemini_client import gemini_stream_generate
+        from core.vision_errors import VisionQAError
+        from core.copy_writer import CopyWriterConfig, CopyWriterError, _post_chat_completion
+        from core.publish import _put_file_with_retries, PublishError
+        with patch("urllib.request.urlopen") as http, patch("requests.put") as upload:
+            with self.assertRaises(TimeoutError):
+                ApifyClient(tokens="test", actor_id="test", deadline_monotonic=0)._json_request("https://example.test")
+            with self.assertRaises(TimeoutError):
+                _download_once("https://example.test", Path("unused"), deadline_monotonic=0)
+            with self.assertRaises(VisionQAError):
+                gemini_stream_generate("test", [], deadline_monotonic=0)
+            with self.assertRaises(CopyWriterError) as error:
+                _post_chat_completion(CopyWriterConfig(True, "test", "https://example.test", "test", 30, deadline_monotonic=0), {})
+            self.assertTrue(error.exception.retryable)
+            with self.assertRaises(PublishError):
+                _put_file_with_retries("https://example.test", headers={}, image_path=Path("unused"), deadline_monotonic=0)
+            http.assert_not_called()
+            upload.assert_not_called()
         with patch("core.url_safety._resolved_addresses", return_value=set()):
             with self.assertRaises(UrlResolutionError):
                 assert_public_http_url("https://images.example.com/image.jpg")
@@ -82,9 +102,32 @@ class RootCauseRemediationTests(unittest.TestCase):
             self.assertEqual("SUCCEEDED", client._wait_for_run("run", token="token")["status"])
 
     def test_download_authority_invalidates_policy_and_unsafe_paths(self) -> None:
+        from core.final_source_intents import _classification_workers
+        self.assertEqual(1, _classification_workers(1, 12))
+        self.assertEqual(2, _classification_workers(0, 12))
+        self.assertEqual(3, _classification_workers(8, 12))
         from core.asset_manager import _download_input_revision, read_download_manifest
+        from core.asset_manager import download_artifacts_current, _inventory_fingerprint
         from core.status import input_revision_id
         self.assertNotEqual(input_revision_id({"url": "https://m.media-amazon.com/image.jpg", "validation_policy": "image-validation-v2-aspect-aware"}), _download_input_revision("https://m.media-amazon.com/image.jpg"))
+        inventory = [{"child": "B1", "index": index, "url": f"https://example.com/{index}.jpg"} for index in range(2)]
+        rows = [{**item, "input_revision_id": _download_input_revision(item["url"]),
+                 "status": "ok" if item["index"] == 0 else "failed", "retryable": True,
+                 "error": "temporary network failure" if item["index"] else ""} for item in inventory]
+        artifact = {"rows": rows, "inventory_fingerprint": _inventory_fingerprint(inventory)}
+        with (
+            patch("core.asset_manager.read_download_manifest", return_value=artifact),
+            patch("core.asset_manager._expected_inventory", return_value=inventory),
+            patch("core.asset_manager._download_row_reusable", return_value=True) as reusable,
+        ):
+            self.assertEqual((True, []), download_artifacts_current("unused"))
+            self.assertEqual("failed", rows[1]["status"])
+            self.assertTrue(rows[1]["retryable"])
+            reusable.return_value = False
+            self.assertFalse(download_artifacts_current("unused")[0])
+            reusable.return_value = True
+            rows[1]["error"] = ""
+            self.assertFalse(download_artifacts_current("unused")[0])
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             job = root / "job"

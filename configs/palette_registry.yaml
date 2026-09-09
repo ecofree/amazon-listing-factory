@@ -1,0 +1,194 @@
+schema_version: palette-registry-v2
+
+curation_policy:
+  production_network_access: false
+  selection_owner: program_dynamic_color_engine
+  execution_owner: gemini_visual_planning
+  quality_gate: diagnostic_only
+  note: "External color and market references are curated offline. Production uses local color math and these bounded style rules; it never calls a color or market website while generating a job. Final product color remains source fact and is never replaced by a staging color."
+
+reference_sources:
+  color:
+    - id: adobe_color_wheel
+      name: Adobe Color
+      url: "https://color.adobe.com/create/color-wheel"
+      use: offline harmony, contrast, and color-blind review reference
+    - id: benjamin_moore_trends
+      name: Benjamin Moore Color Trends
+      url: "https://www.benjaminmoore.com/en-us/color-overview/color-trends"
+      use: offline US residential undertone and seasonal reference
+    - id: sherwin_williams_trends
+      name: Sherwin-Williams Color Trends
+      url: "https://www.sherwin-williams.com/en-us/color/color-family/color-of-the-year"
+      use: offline residential material and neutral-balance reference
+  market:
+    - id: amazon_us_bedroom_sample_v1
+      name: Amazon US bedroom competitor sample
+      url: "https://www.amazon.com/s?k=white+bed+frame+bedroom"
+      use: product-led room density, textile layering, and shopping contrast
+      status: curated_offline_summary
+    - id: houzz_us_emerging_trends_2026
+      name: Houzz US emerging summer trends 2026
+      url: "https://blog.houzz.com/2026-u-s-houzz-emerging-summer-trends-report/"
+      use: warm neutrals, chocolate, rust, sage, and tactile residential balance
+      status: curated_offline_summary
+
+selection_policy:
+  version: dynamic-palette-selection-v6-residential-harmony
+  candidate_count: 15
+  max_competing_hues: 3
+  accent_max_area_ratio: 0.08
+  graphic_accent_max_area_ratio: 0.05
+  warm_textile_hue_range_deg: [24, 48]
+  staging_textile_hue_range_deg: [24, 48]
+  # Curated offline US-home hue families. The child seed selects one family
+  # coherently for textile layers; it is not a fixed route per product color.
+  staging_textile_hue_options: ["24-48", "82-142", "190-225"]
+  staging_floor_hue_range_deg: [24, 48]
+  staging_floor_saturation: [0.06, 0.18]
+  wood_textile_saturation: [0.10, 0.26]
+  wood_textile_lightness: [0.54, 0.72]
+  accent_harmony_modes:
+    analogous:
+      hue_offset_deg: [-28, 28]
+      saturation: [0.10, 0.28]
+      lightness: [0.44, 0.62]
+    mineral_neutral:
+      hue_offset_deg: [-8, 18]
+      saturation: [0.06, 0.16]
+      lightness: [0.46, 0.64]
+    softened_complement:
+      hue_offset_deg: [148, 205]
+      saturation: [0.10, 0.26]
+      lightness: [0.44, 0.60]
+  category_harmony_preferences:
+    bed_frame: [analogous, mineral_neutral, softened_complement]
+    medicine_cabinet: [mineral_neutral, analogous, softened_complement]
+    bathroom_cabinet: [mineral_neutral, analogous, softened_complement]
+    artificial_tree: [analogous, mineral_neutral, softened_complement]
+  residential_guardrails:
+    avoid_hue_range: [245, 360]
+    avoid_hue_roles: [room_primary, textile_primary, floor, accent]
+    avoid_hue_saturation_min: 0.12
+  max_room_saturation: 0.20
+  max_textile_saturation: 0.30
+  max_accent_saturation: 0.34
+  weights:
+    product_background_separation: 0.22
+    textile_separation: 0.16
+    hue_balance: 0.13
+    market_fit: 0.13
+    variation_diversity: 0.05
+    graphic_readability: 0.10
+    exposure_fit: 0.14
+    harmony_fit: 0.14
+    reference_fit: 0.12
+  reference_priors:
+    default:
+      preferred_profile_ids: [warm_material, mineral_contrast, soft_architectural, playful_refined]
+      role_hue_ranges:
+        room_primary: ["18-52", "55-155", "175-245"]
+        textile_primary: ["18-52", "55-155", "175-245"]
+        accent: ["18-52", "55-155", "175-245"]
+      saturation_limits:
+        room_primary: 0.22
+        textile_primary: 0.36
+        accent: 0.42
+    bed_frame:
+      preferred_profile_ids: [warm_material, mineral_contrast, soft_architectural, playful_refined]
+      role_hue_ranges:
+        room_primary: ["18-52", "55-155", "175-245"]
+        textile_primary: ["18-52", "82-142", "190-225"]
+        accent: ["18-52", "55-155", "175-245"]
+      saturation_limits:
+        room_primary: 0.20
+        textile_primary: 0.34
+        accent: 0.40
+  market_cues:
+    # These are curated US-home cues, not style_profile IDs. Profiles can share cues.
+    bed_frame: [calm_layered_residential, warm_material, soft_contemporary, tailored_coastal]
+    default: [calm_layered_residential, warm_material, soft_contemporary, tailored_coastal]
+role_rules:
+  product_identity:
+    source_authority: ProductFamily
+    recolor_forbidden: true
+    registry_hex_forbidden: true
+  wall:
+    lightness: [0.82, 0.95]
+    saturation: [0.03, 0.16]
+  wall_secondary:
+    lightness: [0.84, 0.95]
+    saturation: [0.03, 0.14]
+  textile_primary:
+    lightness: [0.50, 0.76]
+    saturation: [0.08, 0.30]
+  textile_secondary:
+    lightness: [0.68, 0.94]
+    saturation: [0.04, 0.24]
+  accent:
+    lightness: [0.46, 0.68]
+    saturation: [0.10, 0.30]
+  floor:
+    lightness: [0.48, 0.72]
+    saturation: [0.04, 0.16]
+  graphic:
+    ink_lightness: 0.18
+    surface_lightness: 0.94
+    line_lightness: 0.56
+    min_text_contrast: 4.5
+    accent_max_area_ratio: 0.05
+    accent_saturation_max: 0.32
+
+semantic_roles:
+  staging_primary: [textile_primary]
+  staging_secondary: [textile_secondary]
+  props: [accent, textile_secondary]
+  primary_graphics: [graphic_ink]
+  secondary_graphics: [graphic_line]
+
+style_profiles:
+  - profile_id: warm_material
+    market_fit: [warm_material, calm_layered_residential]
+    seed_hue_deg: 28
+    product_hue_weight: 0.42
+    wall_hue_offset_deg: 0
+    textile_hue_offset_deg: 0
+    secondary_hue_offset_deg: 12
+    floor_hue_offset_deg: 4
+    saturation_scale: 0.82
+  - profile_id: mineral_contrast
+    market_fit: [tailored_coastal, calm_layered_residential]
+    seed_hue_deg: 204
+    product_hue_weight: 0.48
+    wall_hue_offset_deg: 188
+    textile_hue_offset_deg: 0
+    secondary_hue_offset_deg: 10
+    floor_hue_offset_deg: 4
+    saturation_scale: 0.90
+  - profile_id: editorial_accent
+    market_fit: [soft_contemporary, calm_layered_residential]
+    seed_hue_deg: 334
+    product_hue_weight: 0.30
+    wall_hue_offset_deg: 332
+    textile_hue_offset_deg: 0
+    secondary_hue_offset_deg: 12
+    floor_hue_offset_deg: 4
+    saturation_scale: 0.88
+  - profile_id: soft_architectural
+    market_fit: [warm_material, soft_contemporary]
+    seed_hue_deg: 76
+    product_hue_weight: 0.36
+    wall_hue_offset_deg: 76
+    textile_hue_offset_deg: 0
+    secondary_hue_offset_deg: 10
+    floor_hue_offset_deg: 4
+    saturation_scale: 0.76
+  - profile_id: playful_refined
+    market_fit: [tailored_coastal, soft_contemporary]
+    seed_hue_deg: 252
+    product_hue_weight: 0.28
+    wall_hue_offset_deg: 252
+    textile_hue_offset_deg: 0
+    secondary_hue_offset_deg: 12
+    floor_hue_offset_deg: 4
+    saturation_scale: 0.94

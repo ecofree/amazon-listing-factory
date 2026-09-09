@@ -9,11 +9,12 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import Any
 
 from .title_quality import listing_title_quality_issues
+from .text_evidence import extract_measurements
 
 
 class CopyWriterError(RuntimeError):
@@ -34,6 +35,7 @@ class CopyWriterConfig:
     max_tokens: int = 5000
     json_mode: bool = True
     temperature: float = 0.15
+    deadline_monotonic: float | None = None
 
 
 COPY_CACHE_MAX_ENTRIES = 256
@@ -208,8 +210,9 @@ def rewrite_listing_copy(
     source_bullets: list[str],
     source_description: str,
     product_specific: dict[str, Any],
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
-    config = load_copy_writer_config(env)
+    config = replace(load_copy_writer_config(env), deadline_monotonic=deadline_monotonic)
     if not config.enabled:
         raise CopyWriterError("Copy AI is disabled")
     if not config.api_key:
@@ -1014,7 +1017,11 @@ def _repair_item_highlights_only_with_ai(
         repair_payload["response_format"] = {"type": "json_object"}
     repaired_body = _post_chat_completion(config, repair_payload)
     repaired = _copy_response_content_object(repaired_body)
-    highlights = repaired.get("item_highlights") if set(repaired) == {"item_highlights"} else None
+    # The repair contract asks for one key, but some compatible endpoints
+    # return the complete copy object. The highlights field is still read
+    # under the same source/fact validation below; accepting that harmless
+    # envelope avoids turning a formatting variation into a child blocker.
+    highlights = repaired.get("item_highlights") if isinstance(repaired, dict) else None
     if not isinstance(highlights, list) or not all(isinstance(item, str) for item in highlights):
         raise CopyWriterError(
             "Copy Item Highlight repair did not return an item_highlights string array",
@@ -1315,8 +1322,13 @@ def _post_chat_completion(config: CopyWriterConfig, payload: dict[str, Any]) -> 
             },
             method="POST",
         )
+        timeout = config.timeout
+        if config.deadline_monotonic is not None:
+            timeout = min(timeout, config.deadline_monotonic - time.monotonic())
+            if timeout <= 0:
+                raise CopyWriterError("Copy execution deadline exhausted before request", retryable=True)
         try:
-            with urllib.request.urlopen(request, timeout=config.timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             last_exc = exc
@@ -1349,6 +1361,8 @@ def _copy_max_tokens(config: CopyWriterConfig) -> int:
 def _sleep_before_copy_retry(attempt: int, config: CopyWriterConfig) -> None:
     base = max(0.0, float(config.retry_base_seconds or 0.0))
     delay = min(30.0, base * (2 ** max(0, attempt - 1)))
+    if config.deadline_monotonic is not None and time.monotonic() + delay >= config.deadline_monotonic:
+        raise CopyWriterError("Copy execution deadline exhausted before retry", retryable=True)
     if delay > 0:
         time.sleep(delay)
 
@@ -1644,6 +1658,27 @@ def _validate_copy_compliance(
     )
     if capacity_claim and not capacity_fact:
         violations.append("unsupported weight capacity")
+    if capacity_claim and capacity_fact:
+        capacity_terms = r"(?:weight[_ ]capacity|load[_ ]capacity|maximum[_ ]weight|max[_ ]weight|capacity of|supports up to|holds up to|up to)"
+        def capacity_values(value: Any, context: str = "") -> list[float]:
+            if isinstance(value, dict):
+                return [number for key, item in value.items()
+                        for number in capacity_values(item, context + " " + str(key))]
+            if isinstance(value, list):
+                return [number for item in value for number in capacity_values(item, context)]
+            content = str(value)
+            if re.search(capacity_terms, context, re.I):
+                return [float(row["canonical_value"]) for row in extract_measurements(content)
+                        if row["kind"] == "weight_g"]
+            return [float(row["canonical_value"])
+                    for match in re.finditer(capacity_terms + r"[^;\n]{0,65}", content, re.I)
+                    for row in extract_measurements(match.group()) if row["kind"] == "weight_g"]
+
+        known_capacities = capacity_values(product_specific)
+        claimed_capacities = capacity_values(text)
+        if known_capacities and any(not any(abs(value - known) <= max(1.0, known * 0.005)
+                       for known in known_capacities) for value in claimed_capacities):
+            violations.append("weight capacity value contradicts product facts")
     if re.search(r"\bergonomic\b", text, re.I) and not re.search(r"\b(?:ergonomic|ansi|bifma)\b", fact_text, re.I):
         violations.append("unsupported ergonomic")
     if re.search(r"\brust[- ]?proof\b", text, re.I) and "rust" not in fact_text:

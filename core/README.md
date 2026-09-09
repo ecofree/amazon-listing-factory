@@ -5,7 +5,7 @@ immutable, fingerprinted artifacts in one direction:
 
 ```text
 ProductFamilyV3 -> CopyV1 -> DownloadManifestV2 -> FinalSourceIntentV1
--> VisualDesignKitV10 -> ImageTaskV8 -> ImagePromptV2 -> generated pixels
+-> VisualDesignKitV10 -> ImageTaskV9 -> ImagePromptV2 -> generated pixels
 -> QAEvidenceV4 -> HumanReviewV4 -> ReleaseManifestV5 -> publish -> template
 ```
 

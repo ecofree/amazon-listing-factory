@@ -137,9 +137,10 @@ class ModelRouterTests(unittest.TestCase):
             "key_env": "PLANNER_KEY", "model": "gpt-5.6-sol",
             "protocol": "openai", "capabilities": ["vision_input", "json_output"],
         }
+        fallback = {**client, "name": "planner-fallback", "base_url": "https://planner-fallback.example/v1"}
         good = json.dumps({"choices": [{"message": {"content": "good"}}]})
         with (
-            patch("core.vision_gemini_client.gemini_clients", return_value=[client]),
+            patch("core.vision_gemini_client.gemini_clients", return_value=[client, fallback]),
             patch(
                 "core.vision_gemini_client._post_vision_request",
                 side_effect=[ProviderQueueUnavailable("planner", "busy"), good],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import argparse
 import time
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 from core import production, status
 from core.io import utc_now, write_json
+from core.progress_trace import record_progress
 
 
 def _job(path: Path) -> None:
@@ -79,6 +81,33 @@ class StatusRevisionContractTests(unittest.TestCase):
             write_json(status.status_path(job), data)
             self.assertEqual("awaiting_review", status.finish_run_state(job, "awaiting_review"))
             self.assertEqual("awaiting_review", status.load_status(job)["status"])
+            from scripts.factory import cmd_status
+            with status.job_run_lock(job), patch("core.status.mark_interrupted_running") as repair:
+                with self.assertRaises(status.JobLockError):
+                    cmd_status(argparse.Namespace(job=str(job), repair_running=True))
+                repair.assert_not_called()
+
+        for mode, expected in (("draft", ["qa", "template"]), ("submit_ready", ["qa"])):
+            with self.subTest(template_mode=mode), tempfile.TemporaryDirectory() as tmp:
+                job = Path(tmp)
+                _job(job)
+                write_json(job / "job.json", {})
+                request = production.JobRunRequest(job_dir=job, plugin=object(), template_mode=mode)
+                release = {"status": "awaiting_review", "rows": []}
+                with (
+                    patch("core.job.load_job"),
+                    patch.object(production, "load_env"),
+                    patch.object(production, "_assert_plugin_supported"),
+                    patch.object(production, "_stage_input_revision", return_value="a" * 64),
+                    patch.object(production, "_stage_artifact", return_value=("fixture", job / "job.json")),
+                    patch.object(production, "_run_stage", return_value={}) as run,
+                    patch.object(production, "build_release_manifest", return_value=release),
+                    patch.object(production, "_release_if_available", return_value=release),
+                    patch.object(production, "_finish", side_effect=lambda request, **kwargs: kwargs),
+                ):
+                    result = production.run_job(request, stages=["qa", "publish", "template"])
+                self.assertEqual(expected, [call.args[0] for call in run.call_args_list])
+                self.assertEqual("awaiting_review", result["status"])
 
     def test_new_revision_success_resolves_older_errors_for_same_logical_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,6 +156,10 @@ class StatusRevisionContractTests(unittest.TestCase):
                 },
             }
             write_json(status.status_path(job), data)
+            record_progress(job, "stage_started", stage="generate")
+            record_progress(job, "stage_finished", stage="generate", seconds=12.5)
+            record_progress(job, "image_provider_transport_attempt_started")
+            record_progress(job, "generate_candidate_committed")
             plugin = type("Plugin", (), {"category_id": "test"})()
             request = production.JobRunRequest(job_dir=job, plugin=plugin)
             summary = production._write_summary(
@@ -150,6 +183,10 @@ class StatusRevisionContractTests(unittest.TestCase):
             self.assertEqual(1, summary["candidate_count"])
             self.assertEqual("incomplete", summary["planned_image_completion_status"])
             self.assertEqual(1, summary["planned_image_unresolved_count"])
+            self.assertEqual({"generate": 1}, summary["stage_attempt_counts"])
+            self.assertEqual({"generate": 12.5}, summary["cumulative_stage_seconds"])
+            self.assertEqual(1, summary["provider_request_count"])
+            self.assertEqual(1, summary["candidate_commit_count"])
             review_summary = production._write_summary(
                 request,
                 status="awaiting_review",

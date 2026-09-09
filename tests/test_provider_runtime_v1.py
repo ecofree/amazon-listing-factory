@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import tempfile
 import time
+import threading
+import subprocess
+import sys
 import unittest
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from PIL import Image
 
 from core import image_provider_routing as routing
 from core.image_provider_common import (
@@ -26,7 +31,13 @@ from core.model_call_health import (
 )
 from core.io import write_json
 from core.candidate_state import CandidateStateError
-from core.image_generation import _execute, _generation_failure_status, run_image_revision
+from core.image_generation import (
+    _dispatch_generation_batch,
+    _effective_generation_workers,
+    _execute,
+    _generation_failure_status,
+    run_image_revision,
+)
 from core.image_generation_executor import generate_one
 from tests.current_image_contract_fixture import current_image_task, current_prompt_artifact
 
@@ -60,7 +71,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual("krill_gpt_image_2", assigned["child_provider_backup"])
         self.assertTrue(assigned["child_provider_lock"])
 
-    def test_pool_locks_equal_health_roles_and_avoids_low_quality_primary(self) -> None:
+    def test_pool_keeps_all_roles_on_one_child_provider(self) -> None:
         tasks = [
             {"child": "B1", "job_dir": "job", "category_id": "bed_frame", "role": role, "providers": ["a", "b", "c"]}
             for role in ("main", "scene", "func")
@@ -68,6 +79,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         with (
             patch.object(routing, "_order_by_health", side_effect=lambda _task, providers: providers),
             patch.object(routing, "_provider_scores", return_value={"a": 0.0, "b": 0.0, "c": 0.0}),
+            patch.object(routing, "image_provider_physical_identity", return_value={"model": "gpt-image-2"}),
         ):
             assigned = routing.assign_provider_pool(tasks)
         self.assertEqual(["a", "a", "a"], [row["child_provider_primary"] for row in assigned])
@@ -75,9 +87,10 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         with (
             patch.object(routing, "_order_by_health", side_effect=lambda _task, providers: providers),
             patch.object(routing, "_provider_scores", return_value={"a": 0.0, "b": 0.0, "c": -2.0}),
+            patch.object(routing, "image_provider_physical_identity", return_value={"model": "gpt-image-2"}),
         ):
             assigned = routing.assign_provider_pool(tasks)
-        self.assertEqual(["a", "a", "a"], [row["child_provider_primary"] for row in assigned])
+            self.assertEqual(["a", "a", "a"], [row["child_provider_primary"] for row in assigned])
 
         infographic_tasks = [
             {
@@ -94,12 +107,87 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             ),
         ):
             assigned = routing.assign_provider_pool(infographic_tasks)
-        self.assertTrue(all(
-            row["child_provider_primary"] == "aicost_gpt_image_2"
-            for row in assigned
-        ))
+        self.assertTrue(all(row["child_provider_primary"] == "aicost_gpt_image_2" for row in assigned))
         self.assertEqual(1, len({row["child_provider_primary"] for row in assigned}))
+        self.assertTrue(all(row["child_provider_lock"] for row in assigned))
+        self.assertTrue(all(row["child_provider_role_lane"] == "unified" for row in assigned))
         self.assertTrue(all("dragoncode_gpt_image_2" in row["child_provider_reserve"] for row in assigned))
+
+    def test_auto_generation_admits_three_child_lanes_across_three_providers(self) -> None:
+        from core import image_provider_common as common
+        with patch.object(common, "_system_memory_bytes", return_value=(8 * 1024**3, 4 * 1024**3)):
+            with self.assertRaises(ProviderQueueUnavailable):
+                with common.provider_concurrency_slot("host_image_memory", deadline=time.monotonic() + .1):
+                    self.fail("low memory must not admit generation")
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(common, "_system_memory_bytes", return_value=(8 * 1024**3, 6 * 1024**3)),
+            patch.object(common, "_provider_slot_directory", return_value=Path(tmp)),
+        ):
+            code = (
+                "import sys,time; from pathlib import Path; from core import image_provider_common as c; "
+                "c._system_memory_bytes=lambda:(8*1024**3,6*1024**3); "
+                "c._provider_slot_directory=lambda name:Path(sys.argv[1]); "
+                "slot=c.provider_concurrency_slot('host_image_memory',deadline=time.monotonic()+.1); "
+                "slot.__enter__(); slot.__exit__(None,None,None)"
+            )
+            with common.provider_concurrency_slot("host_image_memory", deadline=time.monotonic() + 1):
+                child = subprocess.run([sys.executable, "-c", code, tmp], capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(0, child.returncode)
+                self.assertIn("ProviderQueueUnavailable", child.stderr)
+            child = subprocess.run([sys.executable, "-c", code, tmp], capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, child.returncode, child.stderr[-500:])
+        tasks = [
+            {
+                "child": f"B{i}",
+                "child_provider_lane": f"lane-{i}",
+                "child_provider_primary": provider,
+                "providers": [provider, "backup"],
+                "role": "main",
+            }
+            for i, provider in enumerate(("a", "b", "c"), start=1)
+        ]
+        with (
+            patch("core.image_generation._effective_generation_workers", return_value=3),
+            patch("core.image_generation.provider_concurrency_limit", return_value=1),
+        ):
+            selected, deferred = _dispatch_generation_batch(tasks, requested_workers=0)
+        self.assertEqual(3, len(selected))
+        self.assertEqual([], deferred)
+        self.assertEqual({"B1", "B2", "B3"}, {row["child"] for row in selected})
+        self.assertEqual({"a", "b", "c"}, {row["child_provider_primary"] for row in selected})
+
+        refilled = threading.Event()
+        overlap = []
+        work = [{"child": child, "role": role, "providers": [provider]}
+                for child, role, provider in [("slow", "main", "a"), ("fast", "main", "b"), ("fast", "scene", "b")]]
+        def generate(task, **_kwargs):
+            if task["child"] == "slow":
+                overlap.append(refilled.wait(2))
+            elif task["role"] == "scene":
+                refilled.set()
+            return task
+        with (
+            patch("core.image_generation._effective_generation_workers", return_value=2),
+            patch("core.image_generation.provider_concurrency_limit", return_value=1),
+            patch("core.image_generation.generate_one", side_effect=generate),
+        ):
+            completed, failures = _execute(work, plugin=_Plugin(), workers=2)
+        self.assertEqual([True], overlap, "free provider must refill before the slow sibling finishes")
+        self.assertEqual(3, len(completed))
+        self.assertEqual([], failures)
+
+        tasks = [
+            {"child": f"B{i}", "child_provider_primary": provider, "providers": [provider]}
+            for i, provider in enumerate(("a", "b", "c"), start=1)
+        ]
+        with (
+            patch("core.image_generation._system_memory_bytes", return_value=(32 * 1024**3, 12 * 1024**3)),
+            patch("core.image_generation._cpu_worker_cap", return_value=8),
+            patch("core.image_generation._policy_parallel_cap", return_value=4),
+            patch("core.image_generation.provider_concurrency_limit", return_value=1),
+        ):
+            self.assertEqual(3, _effective_generation_workers(tasks, requested_workers=0))
 
         providers = [
             "highwayapi_gpt_image_2", "apimart", "qc_yc_fixed", "cxk_fixed",
@@ -116,8 +204,32 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             ordered[:5],
         )
         self.assertEqual(["krill_gpt_image_2", "dragoncode"], ordered[5:])
+        tasks = [
+            {
+                "child": f"B{i}",
+                "child_provider_lane_key": f"bed_frame:job:B{i}",
+                "job_dir": "job",
+                "category_id": "bed_frame",
+                "role": "scene",
+                "providers": ["aicost_gpt_image_2", "qc_yc_fixed", "cxk_fixed", "lz_token_gpt_image_2"],
+            }
+            for i in range(8)
+        ]
+        with (
+            patch.object(routing, "_order_by_health", side_effect=lambda _task, providers: providers),
+            patch.object(
+                routing,
+                "_provider_scores",
+                side_effect=lambda _task, providers: {
+                    name: float(len(providers) - index) for index, name in enumerate(providers)
+                },
+            ),
+        ):
+            assigned = routing.assign_provider_pool(tasks)
+        self.assertGreater(len({row["child_provider_primary"] for row in assigned}), 1)
+        self.assertTrue(all(row["providers"][:1] for row in assigned))
 
-    def test_busy_primary_requeues_without_spending_backup(self) -> None:
+    def test_busy_primary_uses_assigned_backup_before_batch_requeue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "candidate.png"
             source = Path(tmp) / "source.png"
@@ -130,7 +242,89 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             }
             with (
                 patch("core.image_generation_executor.generation_reference_primary_path", return_value=source),
-                patch("core.image_generation_executor.generation_reference_image_inputs", return_value=[{"bytes": b"image"}]),
+                patch(
+                    "core.image_generation_executor.generation_reference_sources",
+                    return_value=[{"kind": "editable_reference", "path": source}],
+                ),
+                patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
+                patch("core.image_generation_executor.load_provider_policy", return_value={}),
+                patch("core.image_generation_executor.provider_run_circuit_open", return_value=False),
+                patch("core.image_generation_executor.provider_runtime_circuit_key", side_effect=lambda name: f"provider:{name}"),
+                patch("core.image_generation_executor.assert_provider_allowed"),
+                 patch(
+                     "core.image_generation_executor.generate_with_provider_retries",
+                     side_effect=[ProviderQueueUnavailable("a", "local lane busy"), b"pixels"],
+                 ) as generate,
+                 patch(
+                     "core.image_generation_executor.commit_candidate_output",
+                     side_effect=lambda _job, _task, data: output.write_bytes(data),
+                 ),
+                 patch("core.image_generation_executor._finalize_candidate_bytes", return_value=b"pixels"),
+                 patch("core.image_generation_executor._record_generation_progress"),
+                 patch("core.image_generation_executor._record_provider_event_audit_only"),
+             ):
+                 result = generate_one(task, plugin=_Plugin())
+        self.assertEqual(2, generate.call_count)
+        self.assertEqual("a", generate.call_args_list[0].kwargs["provider_name"])
+        self.assertEqual("b", generate.call_args_list[1].kwargs["provider_name"])
+        self.assertEqual("b", result["provider"])
+
+    def test_protected_reference_mask_is_passed_to_mask_capable_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            source = job / "source.png"
+            mask = job / "mask.png"
+            output = job / "candidate.png"
+            Image.new("RGB", (32, 32), "white").save(source)
+            Image.new("RGBA", (32, 32), (255, 255, 255, 128)).save(mask)
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            mask_sha = hashlib.sha256(mask.read_bytes()).hexdigest()
+            task = {
+                "job_dir": str(job), "output_path": str(output), "prompt": "prompt",
+                "providers": ["unsupported", "a"], "child_provider_reserve": [],
+                "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "func",
+                "logical_task_id": "generate:B1:func", "provider_attempts": {},
+                "generation_references": [{
+                    "kind": "editable_reference", "path": "source.png", "sha256": source_sha,
+                    "protected_mask": {"path": "mask.png", "sha256": mask_sha},
+                }],
+            }
+            with (
+                patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
+                patch("core.image_generation_executor.load_provider_policy", return_value={}),
+                patch("core.image_generation_executor.provider_run_circuit_open", return_value=False),
+                patch("core.image_generation_executor.provider_runtime_circuit_key", return_value="provider:a"),
+                patch("core.image_generation_executor.assert_provider_allowed"),
+                patch("core.image_generation_executor.image_provider_supports_mask", side_effect=lambda name: name == "a"),
+                patch("core.image_generation_executor.generate_with_provider_retries", return_value=b"pixels") as generate,
+                patch("core.image_generation_executor.commit_candidate_output", side_effect=lambda _job, _task, data: output.write_bytes(data)),
+                patch("core.image_generation_executor._finalize_candidate_bytes", return_value=b"pixels"),
+                patch("core.image_generation_executor._record_generation_progress"),
+                patch("core.image_generation_executor._record_provider_event_audit_only"),
+            ):
+                generate_one(task, plugin=_Plugin())
+        self.assertIsNotNone(generate.call_args.kwargs["mask_bytes"])
+        self.assertEqual("a", generate.call_args.kwargs["provider_name"])
+        self.assertEqual(1, generate.call_count)
+        self.assertEqual(mask_sha, hashlib.sha256(generate.call_args.kwargs["mask_bytes"]).hexdigest())
+
+    def test_assigned_reserve_is_reached_after_two_content_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "candidate.png"
+            source = Path(tmp) / "source.png"
+            source.write_bytes(b"source")
+            task = {
+                "job_dir": tmp, "output_path": str(output), "prompt": "prompt",
+                "providers": ["a", "b"], "child_provider_reserve": ["c"],
+                "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "scene",
+                "logical_task_id": "generate:B1:scene", "provider_attempts": {},
+            }
+            with (
+                patch("core.image_generation_executor.generation_reference_primary_path", return_value=source),
+                patch(
+                    "core.image_generation_executor.generation_reference_sources",
+                    return_value=[{"kind": "editable_reference", "path": source}],
+                ),
                 patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
                 patch("core.image_generation_executor.load_provider_policy", return_value={}),
                 patch("core.image_generation_executor.provider_run_circuit_open", return_value=False),
@@ -138,14 +332,23 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor.assert_provider_allowed"),
                 patch(
                     "core.image_generation_executor.generate_with_provider_retries",
-                    side_effect=ProviderQueueUnavailable("a", "local lane busy"),
+                    side_effect=[
+                        ProviderContentError("a", "solid output"),
+                        ProviderContentError("b", "solid output"),
+                        b"pixels",
+                    ],
                 ) as generate,
+                patch(
+                    "core.image_generation_executor.commit_candidate_output",
+                    side_effect=lambda _job, _task, data: output.write_bytes(data),
+                ),
+                patch("core.image_generation_executor._finalize_candidate_bytes", return_value=b"pixels"),
                 patch("core.image_generation_executor._record_generation_progress"),
+                patch("core.image_generation_executor._record_provider_event_audit_only"),
             ):
-                with self.assertRaises(ProviderQueueUnavailable):
-                    generate_one(task, plugin=_Plugin())
-        self.assertEqual(1, generate.call_count)
-        self.assertEqual("a", generate.call_args_list[0].kwargs["provider_name"])
+                result = generate_one(task, plugin=_Plugin())
+        self.assertEqual(["a", "b", "c"], [call.kwargs["provider_name"] for call in generate.call_args_list])
+        self.assertEqual("c", result["provider"])
 
     def test_moderation_rejection_does_not_poison_physical_provider_circuit(self) -> None:
         error = ImageGenerationError(
@@ -272,7 +475,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         error = ProviderConfigurationError("bad", "401")
         with patch.object(routing, "_generate_with_provider_deadline", side_effect=error):
             with self.assertRaises(ProviderConfigurationError):
-                routing.generate_with_provider_retries(provider_name="bad", image_inputs=[b"x"], prompt="x")
+                routing.generate_with_provider_retries(provider_name="bad", image_input_paths=[], prompt="x")
         self.assertTrue(provider_run_circuit_open(routing.provider_runtime_circuit_key("bad")))
         self.assertEqual("retryable", _generation_failure_status(error))
         reset_provider_run_circuits()
@@ -290,7 +493,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             patch.object(routing, "_generate_with_provider_deadline") as request,
         ):
             with self.assertRaisesRegex(ProviderConfigurationError, "waited for a concurrency slot"):
-                routing.generate_with_provider_retries(provider_name="bad", image_inputs=[b"x"], prompt="x")
+                routing.generate_with_provider_retries(provider_name="bad", image_input_paths=[], prompt="x")
         request.assert_not_called()
 
     def test_configuration_cooldown_expires_when_credential_revision_changes(self) -> None:
@@ -360,6 +563,19 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 self.assertFalse(model_provider_cooldown_active(scope="image_generation", provider="p", model="image"))
 
     def test_timeout_ends_provider_attempts_and_opens_run_circuit(self) -> None:
+        with patch.object(routing, "_generate_with_provider_deadline") as transport:
+            with self.assertRaisesRegex(ImageGenerationError, "budget exhausted"):
+                routing.generate_with_provider_retries(provider_name="budget-test", image_input_paths=[], prompt="x", total_timeout_seconds=0)
+            transport.assert_not_called()
+            self.assertFalse(provider_run_circuit_open(routing.provider_runtime_circuit_key("budget-test")))
+        with (
+            patch.object(routing.time, "monotonic", return_value=100.0),
+            patch.object(routing, "provider_concurrency_slot") as slot,
+            patch.object(routing, "_generate_with_provider_deadline", return_value=b"image") as transport,
+        ):
+            routing.generate_with_provider_retries(provider_name="budget-test", image_input_paths=[], prompt="x", total_timeout_seconds=5)
+            self.assertLessEqual(transport.call_args.kwargs["timeout_seconds"], 5)
+            self.assertLessEqual(slot.call_args.kwargs["deadline"], 105)
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp) / "job"
             output = job / "images" / "generated" / "candidate.png"
@@ -388,7 +604,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 slot.return_value.__enter__.return_value = None
                 with self.assertRaises(ProviderTransportError):
                     routing.generate_with_provider_retries(
-                        provider_name="p", image_inputs=[b"x"], prompt="x",
+                        provider_name="p", image_input_paths=[], prompt="x",
                         total_timeout_seconds=30, attempt_observer=observe,
                     )
             self.assertEqual(["started", "timeout_failure", "started", "timeout_failure"], statuses)
@@ -439,6 +655,13 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual([], completed)
         self.assertEqual(1, len(failures))
         self.assertEqual("retryable", failures[0]["task_status"])
+        with patch("core.image_generation.generate_one", return_value=task):
+            with self.assertRaisesRegex(OSError, "state write"):
+                _execute([task], plugin=_Plugin(), workers=1,
+                         on_success=lambda _task: (_ for _ in ()).throw(OSError("state write")))
+        from core.image_provider_common import provider_concurrency_limit
+        with patch.dict("os.environ", {"AMAZON_FACTORY_IMAGEGEN_PROVIDER_CONCURRENCY": "invalid"}):
+            self.assertGreater(provider_concurrency_limit("test_unconfigured_provider"), 0)
 
     def test_batch_requeues_capacity_without_failing_logical_task(self) -> None:
         task = {"logical_task_id": "generate:B1:scene", "child": "B1", "role": "scene", "providers": ["p"]}

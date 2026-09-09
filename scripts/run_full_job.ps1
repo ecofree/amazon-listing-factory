@@ -39,7 +39,7 @@ param(
     [string]$ProductIdType = "",
     [string]$ProductId = "",
     [string]$Marketplace = "US",
-    [int]$Workers = 4,
+    [int]$Workers = 0,
     [switch]$Upload,
     [switch]$WriteExcel,
     [switch]$PlanOnly

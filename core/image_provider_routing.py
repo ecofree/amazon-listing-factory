@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import threading
+import tempfile
 import time
 import calendar
 from pathlib import Path
@@ -19,6 +20,7 @@ from .api_registry import (
     image_provider_physical_identity,
 )
 from .image_provider_common import (
+    ImageGenerationError,
     ProviderConfigurationError,
     ProviderContentError,
     ProviderQueueUnavailable,
@@ -27,6 +29,7 @@ from .image_provider_common import (
     is_transient_imagegen_error,
     normalize_provider_error,
     provider_attempts,
+    provider_concurrency_limit,
     provider_concurrency_slot,
     provider_failure_class,
     provider_failure_code,
@@ -56,8 +59,6 @@ _CURRENT_IMAGE_PROVIDERS = (
     "aicost_gpt_image_2",
     "qc_yc_fixed",
     "cxk_fixed",
-    # The primary pool is tried across different tasks. APImart and Krill
-    # remain sequential reserves after the primary pool is exhausted.
 )
 _ROLE_PREFERENCE = {
     "scene": _CURRENT_IMAGE_PROVIDERS,
@@ -142,6 +143,7 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         child_lane = str(task.get("child_provider_lane_key") or task.get("child") or "default")
         child_rows.setdefault(child_lane, []).append((index, task, ordered))
     result: list[dict[str, Any] | None] = [None] * len(tasks)
+    assigned_load: dict[str, int] = {}
     for child_lane, rows in child_rows.items():
         # First select from the candidates common to the complete child.  In
         # normal production all roles share the same filtered registry list;
@@ -160,17 +162,25 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if name in scores:
                     score_totals[name] += float(scores[name])
                 first_position.setdefault(name, ordered.index(name) if name in ordered else len(ordered))
-        family_primary = max(
+        candidates = sorted(candidates, key=lambda name: (first_position.get(name, 999), name))
+        family_primary = min(
             candidates,
-            key=lambda name: (score_totals.get(name, 0.0), -first_position.get(name, 999)),
+            key=lambda name: (
+                assigned_load.get(name, 0) / max(1, provider_concurrency_limit(name)),
+                first_position.get(name, 999),
+                -score_totals.get(name, 0.0),
+                name,
+            ),
             default="",
         )
-        selected_primaries = [
-            family_primary if family_primary in ordered else (ordered[0] if ordered else "")
-            for _index, _task, ordered in rows
-        ]
-        family_provider_locked = bool(family_primary) and len(set(selected_primaries)) <= 1
+        if family_primary:
+            assigned_load[family_primary] = assigned_load.get(family_primary, 0) + 1
+        lane_pool = [family_primary, *[name for name in candidates if name != family_primary]]
+        lane_pool = list(dict.fromkeys(name for name in lane_pool if name))
         for index, task, ordered in rows:
+            # A child is one visual system. Keep every role on the same
+            # physical provider so exposure, geometry, typography, and model
+            # interpretation do not drift between photo and graphic roles.
             primary = family_primary if family_primary in ordered else (ordered[0] if ordered else "")
             backup = next((name for name in ordered if name != primary), "")
             eligible = [name for name in (primary, backup) if name]
@@ -182,13 +192,14 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "child_provider_primary": primary,
                 "child_provider_backup": backup,
                 "child_provider_lane": child_lane,
-                "child_provider_lock": family_provider_locked,
+                "child_provider_lock": True,
+                "child_provider_role_lane": "unified",
             }
     return [row for row in result if row is not None]
 
 
 def generate_with_provider_retries(
-    *, provider_name: str, image_inputs: list[bytes], prompt: str,
+    *, provider_name: str, image_input_paths: list[str], prompt: str,
     mask_bytes: bytes | None = None, attempt_observer: Any | None = None,
     total_timeout_seconds: float | None = None, request_id: str = "",
 ) -> bytes:
@@ -197,10 +208,12 @@ def generate_with_provider_retries(
     if provider_run_circuit_open(circuit):
         raise ProviderConfigurationError(provider_name, "Provider circuit is open for this run")
     try:
-        total = float(total_timeout_seconds or os.environ.get("AMAZON_FACTORY_IMAGEGEN_ROLE_DEADLINE_SECONDS") or "480")
+        total = float(total_timeout_seconds if total_timeout_seconds is not None else os.environ.get("AMAZON_FACTORY_IMAGEGEN_ROLE_DEADLINE_SECONDS") or "480")
     except ValueError:
         total = 480.0
-    run_deadline = time.monotonic() + max(30.0, total)
+    run_deadline = time.monotonic() + max(0.0, total)
+    if total <= 1:
+        raise ImageGenerationError("Image request budget exhausted before provider admission")
     last: Exception | None = None
     for attempt in range(1, provider_attempts(provider_name) + 1):
         attempt_started_at: float | None = None
@@ -233,7 +246,7 @@ def generate_with_provider_retries(
                 # concurrently and caused avoidable 429/EOF failures.
                 data = _generate_with_provider_deadline(
                     provider_name=provider_name,
-                    image_inputs=image_inputs,
+                    image_input_paths=image_input_paths,
                     prompt=prompt,
                     mask_bytes=mask_bytes,
                     timeout_seconds=attempt_timeout,
@@ -286,7 +299,7 @@ def generate_with_provider_retries(
 
 
 def _generate_with_provider_deadline(
-    *, provider_name: str, image_inputs: list[bytes], prompt: str,
+    *, provider_name: str, image_input_paths: list[str], prompt: str,
     mask_bytes: bytes | None = None, timeout_seconds: float | None = None,
     request_id: str = "",
 ) -> bytes:
@@ -296,14 +309,16 @@ def _generate_with_provider_deadline(
     timeout = max(1.0, float(timeout_seconds or provider_timeout_seconds(provider_name)))
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue(maxsize=1)
+    with tempfile.NamedTemporaryFile(prefix="amazon_factory_image_", suffix=".bin", delete=False) as handle:
+        result_path = Path(handle.name)
     process = context.Process(
         target=_provider_worker,
-        args=(provider_name, image_inputs, prompt, mask_bytes, request_id, result_queue),
+        args=(provider_name, image_input_paths, prompt, mask_bytes, request_id, str(result_path), result_queue),
         daemon=True,
     )
     deadline = time.monotonic() + timeout
-    process.start()
     try:
+        process.start()
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -319,6 +334,22 @@ def _generate_with_provider_deadline(
                     break
                 except queue.Empty as exc:
                     raise ProviderTransportError(provider_name, f"Provider subprocess exited without a result (exit_code={process.exitcode})") from exc
+        if result.get("ok") is True:
+            if not result_path.is_file():
+                raise ProviderTransportError(provider_name, "Provider subprocess returned no result file")
+            return result_path.read_bytes()
+        code = str(result.get("failure_code") or "")
+        message = str(result.get("message") or "Provider subprocess failed")
+        if code == "local_contract_mismatch":
+            raise ProviderConfigurationError(provider_name, message)
+        if code == "provider_transport_failure":
+            raise ProviderTransportError(
+                provider_name,
+                message,
+                status=str(result.get("status") or "transport_failure"),
+                ambiguous=bool(result.get("ambiguous")),
+            )
+        raise ProviderContentError(provider_name, message)
     finally:
         if process.is_alive():
             process.terminate()
@@ -328,31 +359,26 @@ def _generate_with_provider_deadline(
             process.join(timeout=1)
         result_queue.cancel_join_thread()
         result_queue.close()
-    if result.get("ok") is True:
-        return bytes(result["data"])
-    code = str(result.get("failure_code") or "")
-    message = str(result.get("message") or "Provider subprocess failed")
-    if code == "local_contract_mismatch":
-        raise ProviderConfigurationError(provider_name, message)
-    if code == "provider_transport_failure":
-        raise ProviderTransportError(
-            provider_name,
-            message,
-            status=str(result.get("status") or "transport_failure"),
-            ambiguous=bool(result.get("ambiguous")),
-        )
-    raise ProviderContentError(provider_name, message)
+        try:
+            result_path.unlink()
+        except OSError:
+            pass
 
 
 def _provider_worker(
-    provider: str, images: list[bytes], prompt: str, mask: bytes | None,
-    request_id: str, output: Any,
+    provider: str, image_input_paths: list[str], prompt: str, mask: bytes | None,
+    request_id: str, result_path: str, output: Any,
 ) -> None:
+    partial_path = Path(f"{result_path}.partial")
     try:
-        output.put({"ok": True, "data": generate_with_registry_image_provider(
+        images = [Path(path).read_bytes() for path in image_input_paths]
+        data = generate_with_registry_image_provider(
             provider_name=provider, image_inputs=images, prompt=prompt, mask_bytes=mask,
             request_id=request_id,
-        )})
+        )
+        partial_path.write_bytes(data)
+        os.replace(partial_path, result_path)
+        output.put({"ok": True})
     except Exception as exc:
         output.put({
             "ok": False,
@@ -361,6 +387,11 @@ def _provider_worker(
             "message": f"{type(exc).__name__}: {exc}",
             "ambiguous": bool(getattr(exc, "ambiguous", False)),
         })
+    finally:
+        try:
+            partial_path.unlink()
+        except OSError:
+            pass
 
 
 def project_provider_success_ledger_path(job_path: Path) -> Path:
@@ -483,7 +514,7 @@ def record_provider_quality_score(
         and str(row.get("role") or "") == str(role)
     ), None)
     if not isinstance(task, dict):
-        raise ValueError(f"No current ImageTaskV8 for provider quality score: {child}/{role}")
+        raise ValueError(f"No current ImageTaskV9 for provider quality score: {child}/{role}")
     candidate = current_candidate(job, task, required=True)
     try:
         output = resolve_job_owned_path(job, str(candidate.get("output_path") or candidate.get("candidate_path") or ""))

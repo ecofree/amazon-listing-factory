@@ -37,17 +37,17 @@
       "enabled": false
     },
     {
-      "name": "zivv_gemini_35_flash_high_visual_planning",
+      "name": "zivv_gemini_37_flash_tiered_visual_planning",
       "family": "gemini",
       "scope": "visual_planning",
       "protocol": "google_gemini",
       "base_url": "https://zivv.pro/v1beta",
       "key_env": "ZIVV_API_KEY",
       "auth_mode": "header",
-      "model": "gemini-3.5-flash-high",
+      "model": "gemini-3.7-flash-tiered",
       "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
-      "priority": 122,
-      "enabled": false
+      "priority": 150,
+      "enabled": true
     },
     {
       "name": "ccsub_gemini_35_flash_visual_planning",
@@ -60,7 +60,7 @@
       "model": "gemini-3.5-flash",
       "capabilities": ["vision_input", "json_output", "visual_planning"],
       "priority": 130,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "krill_gemini_35_flash_visual_planning",
@@ -69,9 +69,21 @@
       "protocol": "openai",
       "base_url": "https://api.krill-ai.com/v1",
       "key_env": "KRILL_VISUAL_PLANNING_API_KEY",
-      "model": "gemini-3.5-flash",
+      "model": "gemini-3.6-flash",
       "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
       "priority": 126,
+      "enabled": true
+    },
+    {
+      "name": "nuwa_gemini_37_flash_visual_planning",
+      "family": "gemini",
+      "scope": "visual_planning",
+      "protocol": "openai",
+      "base_url": "https://api.nuwaflux.com/v1",
+      "key_env": "NUWA_API_KEY",
+      "model": "gemini-3.7-flash",
+      "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
+      "priority": 135,
       "enabled": true
     },
     {
@@ -92,23 +104,11 @@
       "family": "gemini",
       "scope": "visual_planning",
       "protocol": "openai",
-      "base_url": "https://yunwu.ai/v1",
+      "base_url": "https://api.openlux.ai/v1",
       "key_env": "YUNWU_API_KEY",
-      "model": "gemini-3.5-flash",
+      "model": "gemini-3.7-flash",
       "capabilities": ["vision_input", "json_output", "visual_planning", "source_observation"],
       "priority": 112,
-      "enabled": true
-    },
-    {
-      "name": "cavoti_gpt_56_sol_visual_planning",
-      "family": "openai_vision",
-      "scope": "visual_planning",
-      "protocol": "openai",
-      "base_url": "https://subrouter.ai/v1",
-      "key_env": "CAVOTI_GPT56_API_KEY",
-      "model": "gpt-5.6-sol",
-      "capabilities": ["vision_input", "json_output", "visual_planning"],
-      "priority": 90,
       "enabled": true
     },
     {
@@ -124,11 +124,11 @@
         "image_endpoint": "images_edits",
         "request_size": "1024x1024",
         "output_contract": "square",
-        "quality": "low"
+        "quality": "high"
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 200,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "aicost_gpt_image_2",
@@ -144,11 +144,32 @@
         "image_endpoint": "images_edits",
         "request_size": "1024x1024",
         "output_contract": "square",
-        "quality": "low"
+        "quality": "high"
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 150,
       "enabled": true
+    },
+    {
+      "name": "lz_token_gpt_image_2",
+      "display": "LzToken",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "LZ_TOKEN_GPT_IMAGE_2_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 149,
+      "enabled": false
     },
     {
       "name": "qc_yc_fixed",
@@ -165,11 +186,32 @@
         "image_endpoint": "images_edits",
         "request_size": "1024x1024",
         "output_contract": "square",
-        "quality": "low"
+        "quality": "high"
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 160,
       "enabled": true
+    },
+    {
+      "name": "laoliu-fixed",
+      "display": "laoliu-fixed",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "LAOLIU_FIXED_API_KEY",
+      "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 158,
+      "enabled": false
     },
     {
       "name": "cxk_fixed",
@@ -186,7 +228,7 @@
         "image_endpoint": "images_edits",
         "request_size": "1024x1024",
         "output_contract": "square",
-        "quality": "low"
+        "quality": "high"
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 155,
@@ -212,7 +254,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "protected_mask", "square_output"],
       "priority": 102,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "highwayapi_gpt_image_2_light",
@@ -254,7 +296,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "square_output"],
       "priority": 100,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "apimart",
@@ -275,7 +317,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "square_output"],
       "priority": 99,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "holdai_chat_image",
@@ -294,7 +336,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "square_output"],
       "priority": 98,
-      "enabled": true
+      "enabled": false
     }
   ]
 }

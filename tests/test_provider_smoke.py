@@ -8,12 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core import provider_smoke
-from core.image_provider_common import ImageGenerationError
 from core.image_provider_transport import (
     ImageEditRequest,
     _decode_image_response,
     _openai_images_edit_multipart_body,
-    generate_with_registry_image_provider,
 )
 
 
@@ -164,111 +162,6 @@ class ProviderSmokeTests(unittest.TestCase):
             data = _decode_image_response(json.dumps(payload))
         self.assertEqual(b"image-bytes", data)
         download.assert_called_once_with("https://example.test/generated.png")
-
-    def test_async_image_generation_polls_task_and_downloads_result(self) -> None:
-        entry = {
-            "name": "apimart",
-            "family": "image_generation",
-            "scope": "image_generation",
-            "api_type": "async_image_generation",
-            "url": "https://api.apimart.ai/v1/images/generations",
-            "api_key": "test-key",
-            "model": "gpt-image-2",
-            "prompt_max_chars": 8000,
-            "protocol_profile": {"request_size": "1024x1024", "output_contract": "square", "async_size": "1:1", "resolution": "1k"},
-            "capabilities": ["image_edit", "reference_image", "square_output"],
-        }
-        registry = {"providers": [entry]}
-        calls: dict[str, object] = {}
-        post_calls = {"count": 0}
-        get_calls = {"count": 0}
-
-        def fake_post(url: str, payload: dict, *, headers: dict, timeout: int, provider_name: str) -> str:
-            post_calls["count"] += 1
-            calls["submit_url"] = url
-            calls["payload"] = payload
-            calls["idempotency_key"] = headers.get("Idempotency-Key")
-            self.assertEqual("https://api.apimart.ai/v1/images/generations", url)
-            self.assertEqual("1:1", payload["size"])
-            self.assertEqual("1k", payload["resolution"])
-            self.assertTrue(payload["image_urls"][0].startswith("data:image/"))
-            if post_calls["count"] == 1:
-                raise ImageGenerationError("apimart request failed: unexpected_eof")
-            return json.dumps({"code": 200, "data": [{"status": "submitted", "task_id": "task_1"}]})
-
-        def fake_get(url: str, *, headers: dict, timeout: int, provider_name: str) -> str:
-            get_calls["count"] += 1
-            calls["status_url"] = url
-            self.assertEqual("https://api.apimart.ai/v1/tasks/task_1", url)
-            if get_calls["count"] == 1:
-                raise ImageGenerationError("apimart request failed: remote end closed connection")
-            return json.dumps(
-                {
-                    "code": 200,
-                    "data": {
-                        "status": "completed",
-                        "progress": 100,
-                        "result": {"images": [{"url": ["https://example.test/result.png"]}]},
-                    },
-                }
-            )
-
-        with (
-            patch.dict("os.environ", {"AMAZON_FACTORY_API_REGISTRY": json.dumps(registry)}, clear=False),
-            patch("core.image_provider_transport._post_json", side_effect=fake_post),
-            patch("core.image_provider_transport._get_text", side_effect=fake_get),
-            patch("core.image_provider_transport._download_image_bytes", return_value=b"async-image") as download,
-        ):
-            data = generate_with_registry_image_provider(
-                provider_name="apimart",
-                image_inputs=[b"\x89PNG\r\n\x1a\npayload"],
-                prompt="edit image",
-                request_id="generate:B1:scene:0",
-            )
-
-        self.assertEqual(b"async-image", data)
-        self.assertTrue(calls["idempotency_key"])
-        self.assertEqual(2, post_calls["count"])
-        self.assertEqual(2, get_calls["count"])
-        download.assert_called_once_with("https://example.test/result.png")
-
-    def test_highwayapi_json_edit_can_send_mask_and_decode_url(self) -> None:
-        entry = {
-            "name": "highwayapi_gpt_image_2",
-            "family": "image_generation",
-            "scope": "image_generation",
-            "api_type": "highwayapi",
-            "url": "https://api.highwayapi.ai/v3/gpt-image-2-edit",
-            "api_key": "test-key",
-            "model": "gpt-image-2",
-            "prompt_max_chars": 8000,
-            "protocol_profile": {"request_size": "1024x1024", "output_contract": "square", "size": "1024x1024"},
-            "capabilities": ["image_edit", "reference_image", "protected_mask", "square_output"],
-        }
-        registry = {"providers": [entry]}
-
-        def fake_post(url: str, payload: dict, *, headers: dict, timeout: int, provider_name: str) -> str:
-            self.assertEqual("https://api.highwayapi.ai/v3/gpt-image-2-edit", url)
-            self.assertIn("image", payload)
-            self.assertIn("mask", payload)
-            self.assertEqual("1024x1024", payload["size"])
-            self.assertEqual("low", payload["quality"])
-            return json.dumps({"images": ["https://example.test/highway.png"]})
-
-        with (
-            patch.dict("os.environ", {"AMAZON_FACTORY_API_REGISTRY": json.dumps(registry)}, clear=False),
-            patch("core.image_provider_transport._post_json", side_effect=fake_post),
-            patch("core.image_provider_transport._download_image_bytes", return_value=b"highway-image") as download,
-        ):
-            data = generate_with_registry_image_provider(
-                provider_name="highwayapi_gpt_image_2",
-                image_inputs=[b"\x89PNG\r\n\x1a\npayload"],
-                mask_bytes=b"\x89PNG\r\n\x1a\nmask",
-                prompt="edit image",
-            )
-
-        self.assertEqual(b"highway-image", data)
-        download.assert_called_once_with("https://example.test/highway.png")
 
 if __name__ == "__main__":
     unittest.main()

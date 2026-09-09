@@ -13,6 +13,7 @@ from core.image_tasks import (
     IMAGE_TASK_POLICY_VERSION,
     IMAGE_TASK_SCHEMA_VERSION,
     _task_fingerprint,
+    _edit_contract,
     validate_image_task,
 )
 
@@ -56,7 +57,6 @@ def current_image_task(
         "category_image_policy": {},
         "formation_status": "blocked" if blocked_reason else "ready",
         "formation_reason": blocked_reason,
-        "formation_retryable": bool(retryable),
         "source_path": "" if blocked_reason else "images/source.png",
         "source_sha256": "" if blocked_reason else source_sha256,
     }
@@ -92,18 +92,19 @@ def current_image_task(
             if family == "size"
             else {"mode": "none", "render_text": [], "measurement_groups": []}
         )
+        references = [
+            {
+                "kind": "editable_reference",
+                "path": "images/func-source.png" if family == "func" else "images/source.png",
+                "sha256": source_sha256,
+            }
+        ]
         base.update({
             "family_design_id": "family-design",
             "family_art_direction": current_art_direction(),
             "source_intent_revision_id": "source-intent-revision",
             "source_index": 0,
-            "generation_references": [
-                {
-                    "kind": "editable_reference",
-                    "path": "images/source.png",
-                    "sha256": source_sha256,
-                }
-            ],
+            "generation_references": references,
             "generation_reference_sha256": source_sha256,
             "reference_mode": f"{family}_source_edit",
             "product_facts": {
@@ -151,18 +152,11 @@ def current_image_task(
             "image_direction": (
                 "Keep the exact product as the dominant visual subject under the shared family direction."
                 if family in {"main", "scene"}
-                else ""
+                else "Use an editorial asymmetric feature composition with restrained callouts and generous product space under the shared child system."
+                if family == "func"
+                else "Use a spacious technical hierarchy with aligned measurements and the shared child typography, line, and badge system."
             ),
-            "edit_contract": {
-                "create": f"Create one square Amazon US {family} image.",
-                "reference_authority": "The attached image is the sole sold-product authority.",
-                "preserve": ["complete sold product, visible state, color, and proportions"],
-                "replace": ["non-sold staging and source presentation styling"],
-                "forbid": [
-                    "Do not invent product parts, facts, logos, watermarks, or readable text"
-                ],
-                "reference_completeness": "complete_product_view",
-            },
+            "edit_contract": _edit_contract(family, measurement, base["category_image_policy"], {}, product_type=category_id),
             "execution_profile": (
                 "reference_infographic_design"
                 if family == "func"

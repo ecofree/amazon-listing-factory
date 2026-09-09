@@ -446,7 +446,7 @@ def source_inventory_coverage(
                 "source_intent_revision_id": revision,
                 "image_task_roles": [str(task.get("role") or "") for task in matches],
                 "status": "image_task_missing" if not matches else "image_task_ambiguous",
-                "blocking_reason": "final source intent must map to exactly one ImageTaskV8 row",
+                "blocking_reason": "final source intent must map to exactly one ImageTaskV9 row",
             })
             continue
         coverage_rows.append({

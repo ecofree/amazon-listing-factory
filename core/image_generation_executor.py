@@ -15,6 +15,7 @@ from .image_provider_common import (
     provider_failure_code,
     provider_failure_status,
     provider_timeout_seconds,
+    provider_concurrency_slot,
 )
 from .image_provider_routing import (
     generate_with_provider_retries,
@@ -26,9 +27,11 @@ from .model_call_health import open_provider_run_circuit, provider_run_circuit_o
 from .image_provider_transport import assert_imagegen_prompt_preflight
 from .image_task_inputs import EXECUTION_PROFILES
 from .image_reference_context import (
-    generation_reference_image_inputs,
+    generation_reference_mask_bytes,
     generation_reference_primary_path,
+    generation_reference_sources,
 )
+from .api_registry import image_provider_supports_mask
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .provider_policy import assert_provider_allowed, load_provider_policy
@@ -36,14 +39,26 @@ from .progress_trace import record_progress
 
 
 def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
+    deadlines = [float(task[key]) for key in ("deadline_monotonic", "role_deadline_monotonic") if task.get(key) is not None]
+    deadline = min([time.monotonic() + 5.0, *deadlines])
+    if time.monotonic() >= deadline:
+        raise ImageGenerationError("Image execution deadline exhausted before memory admission")
+    with provider_concurrency_slot("host_image_memory", deadline=deadline):
+        return _generate_admitted(task, plugin=plugin)
+
+
+def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
     source_path = generation_reference_primary_path(task, plugin=plugin)
     output_path = resolve_job_owned_path(str(task.get("job_dir") or ""), str(task.get("output_path") or ""))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = str(task["prompt"])
-    # Provider assignment selects one family primary and one sequential backup.
-    # Do not append the reserve list here: different providers are intended to
-    # share different image tasks, not regenerate the same image.
-    providers = list(task.get("providers", []))[:2]
+    # Provider assignment locks a child to one ordered family lane.  The
+    # reserve entries are the same lane's sequential fallbacks; omitting them
+    # made a configured third provider unreachable after two content failures.
+    providers = list(dict.fromkeys([
+        *(str(name) for name in task.get("providers", []) if str(name).strip()),
+        *(str(name) for name in task.get("child_provider_reserve", []) if str(name).strip()),
+    ]))
     imagegen_mode = os.environ.get("AMAZON_FACTORY_IMAGEGEN_MODE", "").strip().lower()
     if imagegen_mode in {"copy", "mock"}:
         if _production_imagegen_task(task):
@@ -60,8 +75,22 @@ def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, An
         raise ImageGenerationError(f"No allowed image providers configured for {plugin.category_id}")
     if output_path.exists():
         raise CandidateStateError(f"Immutable candidate output already exists without a current manifest: {output_path}")
-    reference_inputs = generation_reference_image_inputs(task, plugin=plugin)
-    image_inputs = [row["bytes"] for row in reference_inputs]
+    reference_sources = generation_reference_sources(task, plugin=plugin)
+    image_input_paths = [str(row["path"]) for row in reference_sources]
+    has_protected_mask = any(
+        isinstance(row, dict) and isinstance(row.get("protected_mask"), dict)
+        for row in reference_sources
+    )
+    protected_mask_bytes = (
+        generation_reference_mask_bytes(task, plugin=plugin)
+        if has_protected_mask
+        else None
+    )
+    if protected_mask_bytes is not None:
+        mask_providers = [provider for provider in providers if image_provider_supports_mask(provider)]
+        if not mask_providers:
+            raise ProviderConfigurationError(providers[0], "No assigned provider supports the supplied protected mask")
+        providers = mask_providers
     execution_profile = str(task.get("execution_profile") or "")
     if execution_profile not in EXECUTION_PROFILES:
         raise ImageGenerationError(f"Unsupported generated-image execution profile: {execution_profile}")
@@ -86,26 +115,31 @@ def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, An
     # A role has one bounded production budget, not the sum of every provider's
     # maximum timeout.  The primary may use the full 420-second slow-provider
     # window, but at least two minutes remain for a configured fallback.
-    default_role_budget = min(600.0, max(120.0, sum(float(provider_timeout_seconds(name)) for name in providers[:2])))
+    default_role_budget = min(600.0, max(120.0, sum(float(provider_timeout_seconds(name)) for name in providers)))
     try:
         role_budget_seconds = max(60.0, float(os.environ.get("AMAZON_FACTORY_IMAGEGEN_ROLE_DEADLINE_SECONDS") or default_role_budget))
     except ValueError:
         role_budget_seconds = default_role_budget
-    role_deadline = time.monotonic() + role_budget_seconds
+    role_deadline = task.setdefault("role_deadline_monotonic", time.monotonic() + role_budget_seconds)
+    if task.get("deadline_monotonic") is not None:
+        role_deadline = min(role_deadline, float(task["deadline_monotonic"]))
+    if time.monotonic() >= role_deadline:
+        raise ImageGenerationError("Image execution deadline exhausted before provider request")
     for provider_index, provider in enumerate(providers):
         if provider_run_circuit_open(provider_runtime_circuit_key(provider)):
             circuit_skipped_providers.append(provider)
             _record_generation_progress(task, "image_provider_attempt_skipped_circuit_open", provider)
             continue
+        if role_deadline - time.monotonic() <= 1:
+            raise ImageGenerationError("Image execution deadline exhausted before fallback request")
         provider_started = time.monotonic()
         try:
             remaining = role_deadline - time.monotonic()
-            if remaining < 30:
-                raise ProviderTransportError(provider, "Image role deadline exhausted before provider attempt", status="timeout_failure")
             remaining_provider_count = max(1, len(providers) - provider_index)
             fallback_reserve = 120.0 * max(0, remaining_provider_count - 1)
             provider_budget = min(
                 float(provider_timeout_seconds(provider)),
+                remaining,
                 max(30.0, remaining - fallback_reserve),
             )
             assert_provider_allowed(provider, global_policy)
@@ -150,9 +184,9 @@ def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, An
 
             data = generate_with_provider_retries(
                 provider_name=provider,
-                image_inputs=image_inputs,
+                image_input_paths=image_input_paths,
                 prompt=prompt,
-                mask_bytes=None,
+                mask_bytes=protected_mask_bytes,
                 attempt_observer=observe_transport_attempt,
                 total_timeout_seconds=provider_budget,
                 request_id=(
@@ -203,11 +237,29 @@ def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, An
                     status="queue_unavailable",
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                # A local capacity miss says nothing about provider health and
-                # must return the same role to the batch scheduler. Switching
-                # providers here turned a temporary slot shortage into a
-                # false provider failure and unnecessarily spent the reserve.
-                raise
+                # Capacity is not provider health, but it is still a valid
+                # reason to use this task's already-assigned backup. Holding
+                # the task on the same saturated provider made independent
+                # jobs wait until the batch stall budget expired even when a
+                # configured reserve was idle.
+                attempted_failures.append({
+                    "provider": provider,
+                    "failure_class": failure_class,
+                    "failure_code": provider_failure_code(exc),
+                    "status": provider_failure_status(exc),
+                    "duration_seconds": round(time.monotonic() - provider_started, 3),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                _record_provider_event_audit_only(
+                    output_path=output_path,
+                    provider=provider,
+                    task=task,
+                    status=provider_failure_status(exc),
+                    error=f"{type(exc).__name__}: {exc}",
+                    failure_class=failure_class,
+                    duration_seconds=time.monotonic() - provider_started,
+                )
+                continue
             attempted_failures.append({
                 "provider": provider,
                 "failure_class": failure_class,
@@ -306,6 +358,14 @@ def _finalize_candidate_bytes(data: bytes) -> bytes:
 
     try:
         with Image.open(io.BytesIO(data)) as opened:
+            # Candidate commit owns the single publication-size conversion.
+            # Keep an already normalized PNG compressed bytestring intact so a
+            # large provider response is not decoded and re-encoded twice.
+            if opened.format == "PNG" and opened.mode == "RGB":
+                width, height = opened.size
+                if min(width, height) <= 0 or width != height:
+                    raise ImageGenerationError("Generated image has an invalid canvas")
+                return bytes(data)
             if opened.mode in {"RGBA", "LA"} or (opened.mode == "P" and "transparency" in opened.info):
                 rgba = opened.convert("RGBA")
                 background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))

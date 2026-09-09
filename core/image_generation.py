@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +15,10 @@ from .api_registry import (
 from .candidate_state import CandidateStateError, current_candidate
 from .image_generation_executor import generate_one
 from .image_provider_common import (
+    _system_memory_bytes,
     ProviderQueueUnavailable,
     provider_attempts,
+    provider_concurrency_limit,
     provider_failure_class,
     provider_timeout_seconds,
 )
@@ -39,6 +41,7 @@ from .io import file_sha256, load_env, write_bytes_atomic, write_json
 from .job import load_job
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
+from .provider_policy import load_provider_policy
 from .progress_trace import record_progress
 from .run_scope import scoped_child_set
 from .status import (
@@ -56,10 +59,11 @@ def run_image_generation(
     job_dir: str | Path,
     plugin: ProductPlugin,
     config_path: str = "",
-    workers: int = 2,
+    workers: int = 0,
     limit: int = 0,
     production: bool = False,
     attempt_id: str = "",
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     job_path = Path(job_dir).resolve()
     _load_generation_env(config_path, str(load_job(job_path).get("config_path") or ""))
@@ -258,6 +262,8 @@ def run_image_generation(
         if attempt_id:
             record_task_failures(job_path, owner_stage="generate", attempt_id=attempt_id, failures=[failure])
 
+    for task in runtime:
+        task["deadline_monotonic"] = deadline_monotonic
     completed, execution_failures = _execute(
         assign_provider_pool(runtime),
         plugin=plugin,
@@ -523,26 +529,22 @@ def _execute(
     pending = list(tasks)
     capacity_requeues: dict[str, int] = {}
     last_batch_progress_at = time.monotonic()
-    while pending:
-        current, pending = pending, []
-        capacity_misses = 0
-        capacity_errors: dict[str, ProviderQueueUnavailable] = {}
-        round_made_progress = False
-        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(current)))) as pool:
-            futures = {pool.submit(generate_one, task, plugin=plugin): task for task in current}
-            for future in as_completed(futures):
-                task = futures[future]
+    capacity_errors: dict[str, ProviderQueueUnavailable] = {}
+    with ThreadPoolExecutor(max_workers=_effective_generation_workers(tasks, workers)) as pool:
+        futures: dict[Any, dict[str, Any]] = {}
+        while pending or futures:
+            current, pending = _dispatch_generation_batch(pending, workers, active=list(futures.values()))
+            futures.update({pool.submit(generate_one, task, plugin=plugin): task for task in current})
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            round_made_progress = False
+            for future in done:
+                task = futures.pop(future)
                 try:
                     completed_task = future.result()
-                    completed.append(completed_task)
-                    round_made_progress = True
-                    if on_success is not None:
-                        on_success(completed_task)
                 except Exception as exc:
                     task_id = str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}")
                     if isinstance(exc, ProviderQueueUnavailable):
                         capacity_requeues[task_id] = capacity_requeues.get(task_id, 0) + 1
-                        capacity_misses += 1
                         capacity_errors[task_id] = exc
                         pending.append(task)
                         if task.get("job_dir") and (
@@ -569,10 +571,18 @@ def _execute(
                     failures.append(failure)
                     if on_failure is not None:
                         on_failure(failure)
-        if pending and capacity_misses:
+                else:
+                    if on_success is not None:
+                        on_success(completed_task)
+                    completed.append(completed_task)
+                    round_made_progress = True
             if round_made_progress:
                 last_batch_progress_at = time.monotonic()
-            elif time.monotonic() - last_batch_progress_at >= _capacity_stall_budget_seconds():
+                capacity_errors.clear()
+            if pending and not futures and all(
+                str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}") in capacity_errors
+                for task in pending
+            ) and time.monotonic() - last_batch_progress_at >= _capacity_stall_budget_seconds():
                 stalled, pending = pending, []
                 for task in stalled:
                     task_id = str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}")
@@ -596,12 +606,119 @@ def _execute(
                     if on_failure is not None:
                         on_failure(failure)
                 continue
-            # Capacity is scheduling state. Any terminal sibling result resets
-            # the shared stall window, so long-running provider waves cannot
-            # expire later role tasks before a slot becomes free.
-            time.sleep(0.25)
+            if pending and capacity_errors and not round_made_progress:
+                time.sleep(0.25)
     completed.sort(key=lambda row: (row["child"], row["role"]))
     return completed, failures
+
+
+def _dispatch_generation_batch(
+    pending: list[dict[str, Any]], requested_workers: int,
+    *, active: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fill free worker lanes; provider file leases remain cross-process authority."""
+    if not pending:
+        return [], []
+    active = active or []
+    cap = max(0, _effective_generation_workers(pending + active, requested_workers) - len(active))
+    selected: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    used: dict[str, int] = {}
+    used_lanes: set[str] = {
+        str(task.get("child_provider_lane") or task.get("child_provider_lane_key") or task.get("child") or "default")
+        for task in active
+    }
+    for task in active:
+        primary = _task_primary_provider(task)
+        used[primary] = used.get(primary, 0) + 1
+    for task in pending:
+        primary = _task_primary_provider(task)
+        lane = str(task.get("child_provider_lane") or task.get("child_provider_lane_key") or task.get("child") or "default")
+        if lane in used_lanes:
+            deferred.append(task)
+            continue
+        limit = provider_concurrency_limit(primary) if primary else 0
+        if primary and limit > 0 and used.get(primary, 0) >= limit:
+            deferred.append(task)
+            continue
+        if len(selected) >= cap:
+            deferred.append(task)
+            continue
+        selected.append(task)
+        used_lanes.add(lane)
+        if primary:
+            used[primary] = used.get(primary, 0) + 1
+    return selected, deferred
+
+
+def _task_primary_provider(task: dict[str, Any]) -> str:
+    return str(
+        task.get("child_provider_primary")
+        or ((task.get("providers") or [""])[0] if isinstance(task.get("providers"), list) else "")
+        or ""
+    ).strip()
+
+
+def _effective_generation_workers(
+    tasks: list[dict[str, Any]], requested_workers: int,
+) -> int:
+    task_count = max(1, len(tasks))
+    requested = int(requested_workers or 0)
+    requested_cap = requested if requested > 0 else task_count
+    policy_cap = _policy_parallel_cap()
+    provider_cap = 0
+    for provider in {_task_primary_provider(task) for task in tasks} - {""}:
+        limit = provider_concurrency_limit(provider)
+        provider_cap += limit if limit > 0 else task_count
+    provider_cap = provider_cap or 1
+    return max(1, min(
+        task_count,
+        requested_cap,
+        policy_cap,
+        provider_cap,
+        _memory_worker_cap(tasks),
+        _cpu_worker_cap(),
+    ))
+
+
+def _policy_parallel_cap() -> int:
+    try:
+        policy = load_provider_policy().get("image_generation") or {}
+        value = int(policy.get("max_parallel_provider_jobs") or 0)
+        return max(1, min(32, value)) if value > 0 else 1
+    except (OSError, TypeError, ValueError):
+        return 1
+
+
+def _cpu_worker_cap() -> int:
+    logical = int(os.cpu_count() or 1)
+    return max(1, min(8, logical // 4 or 1))
+
+
+def _memory_worker_cap(tasks: list[dict[str, Any]] | None = None) -> int:
+    total, available = _system_memory_bytes()
+    if total <= 0 or available <= 0:
+        return 1
+    reserve = max(4 * 1024**3, int(total * 0.20))
+    # A generation task keeps one compressed reference and one response in
+    # memory. Use the live machine budget plus a bounded reference-size uplift;
+    # the former 6% of total RAM estimate unnecessarily capped this machine at
+    # two workers despite three independent provider slots.
+    largest_reference = 0
+    for task in tasks or []:
+        for row in task.get("generation_references") or []:
+            path = row.get("path") if isinstance(row, dict) else row
+            try:
+                largest_reference = max(largest_reference, Path(str(path)).stat().st_size)
+            except (OSError, TypeError, ValueError):
+                continue
+    estimated_task_peak = max(768 * 1024**2, min(1536 * 1024**2, int(total * 0.04)))
+    estimated_task_peak = max(
+        estimated_task_peak,
+        min(1536 * 1024**2, largest_reference * 8 + 512 * 1024**2),
+    )
+    usable = max(0, available - reserve)
+    return max(1, min(8, usable // estimated_task_peak or 1))
 
 
 def _capacity_stall_budget_seconds() -> float:
@@ -675,6 +792,10 @@ def _generation_execution_revision(providers: list[str]) -> str:
     registry = {entry.name: entry for entry in image_provider_entries()}
     material: dict[str, Any] = {
         "prompt_contract": PROMPT_CONTRACT_VERSION,
+        # Reference cardinality is part of the executable generation contract.
+        # A task that was blocked under the old single-reference runtime must
+        # be eligible for recovery after the current func dual-reference fix.
+        "generation_reference_contract": "one_role_source_edit-v1",
         "execution_profiles": sorted(EXECUTION_PROFILES),
         "url_safety_policy": URL_SAFETY_POLICY_VERSION,
         "providers": [],
@@ -729,6 +850,11 @@ def _runtime_generation_references(job_path: Path, task: dict[str, Any]) -> list
         if not path.is_file() or len(expected_sha) != 64 or file_sha256(path) != expected_sha:
             raise RuntimeError(f"Image task generation reference is missing or changed: {task.get('child')}/{task.get('role')}")
         runtime.append({**row, "path": str(path)})
-    if len(runtime) != 1 or runtime[0]["sha256"] != str(task.get("generation_reference_sha256") or ""):
+    editable = [row for row in runtime if row.get("kind") == "editable_reference"]
+    if (
+        len(editable) != 1
+        or len(editable) != len(runtime)
+        or editable[0]["sha256"] != str(task.get("generation_reference_sha256") or "")
+    ):
         raise RuntimeError(f"Image task generation reference contract is invalid: {task.get('child')}/{task.get('role')}")
     return runtime

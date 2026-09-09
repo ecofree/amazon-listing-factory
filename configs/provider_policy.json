@@ -1,8 +1,8 @@
 {
   "image_generation": {
-    "forbidden_providers": [],
-    "forbidden_image_providers": [],
-    "max_parallel_provider_jobs": 2,
+    "allowed_providers": ["aicost_gpt_image_2", "qc_yc_fixed", "cxk_fixed"],
+    "forbidden_image_providers": ["lz_token_gpt_image_2"],
+    "max_parallel_provider_jobs": 4,
     "require_true_image_to_image": true,
     "forbid_local_final_compositing": true
   },

@@ -518,23 +518,31 @@ def _conditional_activation(
         active = bool(row_context.get("package_level"))
         return active, "package_level_present" if active else "not_a_package_hierarchy"
     if any(token in name for token in ("battery[", "num_batteries", "lithium_battery", "lithium_ion", "lithium_metal")):
-        active = bool(row_context.get("contains_battery"))
-        return active, "battery_present" if active else "battery_not_present"
+        flags = {str(row_context.get(key)).strip().casefold() for key in ("contains_battery", "batteries_required")}
+        if flags & {"true", "yes", "1"}:
+            return True, "battery_present"
+        if flags & {"false", "no", "0"}:
+            return False, "battery_not_present"
+        return None, "battery_presence_unknown"
     if any(token in name for token in ("hazmat", "ghs[", "safety_data_sheet", "dangerous_goods")):
         dangerous = str(row_context.get("dangerous_goods") or "").strip().casefold()
-        active = bool(dangerous and dangerous not in {"not applicable", "not_applicable", "none", "no"})
+        if not dangerous or dangerous in {"unknown", "not specified"}:
+            return None, "dangerous_goods_unknown"
+        active = dangerous not in {"not applicable", "not_applicable", "none", "no"}
         return active, "dangerous_goods_present" if active else "dangerous_goods_not_applicable"
     value = str(values.get(field) or "").strip()
     if value:
         return True, "value_supplied"
+    hardware_color_fields = set(fields_for_alias(fields, labels, aliases, "hardware_color"))
     color_fields = {
         *fields_for_alias(fields, labels, aliases, "color"),
         *fields_for_alias(fields, labels, aliases, "color_map"),
-        *fields_for_alias(fields, labels, aliases, "hardware_color"),
     }
     size_fields = set(fields_for_alias(fields, labels, aliases, "size"))
-    if row_type == "Parent" and field in color_fields | size_fields:
+    if row_type == "Parent" and field in color_fields | hardware_color_fields | size_fields:
         return False, "parent_row"
+    if field in hardware_color_fields:
+        return False, "hardware_color_not_supplied"
     if "COLOR" in theme and row_type == "Child" and field in color_fields:
         return True, "color_variation"
     if "SIZE" in theme and row_type == "Child" and field in size_fields:

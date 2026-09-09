@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -12,13 +13,15 @@ from core.image_upscale import ImageUpscaleError, upscale_for_publication
 from core.io import file_sha256
 from core.price import normalize_price_value
 from core.publish import PublishError, _publish_candidate_row
+from core.vision_gemini_client import gemini_stream_generate
 
 
 class UnattendedProductionContractTests(unittest.TestCase):
     def test_publication_sizing_is_exactly_1600_square(self) -> None:
         source = io.BytesIO()
         Image.new("RGB", (1024, 1024), "white").save(source, format="PNG")
-        output = upscale_for_publication(source.getvalue())
+        with patch.dict(os.environ, {"AMAZON_FACTORY_UPSCALE_BACKEND": "pillow"}):
+            output = upscale_for_publication(source.getvalue())
         with Image.open(io.BytesIO(output)) as image:
             self.assertEqual((1600, 1600), image.size)
 
@@ -67,12 +70,38 @@ class UnattendedProductionContractTests(unittest.TestCase):
         ):
             result = generate_with_provider_retries(
                 provider_name="test-provider",
-                image_inputs=[],
+                image_input_paths=[],
                 prompt="prompt",
                 total_timeout_seconds=30,
             )
         self.assertEqual(b"ok", result)
         self.assertEqual(["enter", "transport", "exit"], events)
+
+    def test_openai_vision_path_does_not_eagerly_encode_native_parts(self) -> None:
+        client = {
+            "name": "planner-openai",
+            "family": "gemini",
+            "scope": "visual_planning",
+            "protocol": "openai",
+            "base_url": "https://planner.example/v1",
+            "api_key": "secret",
+            "key_env": "PLANNER_KEY",
+            "model": "gemini-3.7-flash",
+        }
+        response = '{"choices":[{"message":{"content":"good"}}]}'
+        with (
+            patch("core.vision_gemini_client.gemini_clients", return_value=[client]),
+            patch("core.vision_gemini_client._openai_chat_payload", return_value={}),
+            patch("core.vision_gemini_client._post_vision_request", return_value=response),
+            patch("core.vision_gemini_client._image_part", side_effect=AssertionError("native parts were eager")),
+        ):
+            result = gemini_stream_generate(
+                "prompt", [Path("missing-reference.png")], client_scope="visual_planning",
+                attempts=1, total_timeout_seconds=10,
+                response_validator=lambda text: text == "good",
+                request_id="lazy-vision-parts-test",
+            )
+        self.assertEqual("good", result)
 
 
 if __name__ == "__main__":

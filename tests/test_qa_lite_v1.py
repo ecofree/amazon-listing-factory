@@ -123,12 +123,11 @@ class QaLiteV1Tests(unittest.TestCase):
         self.assertEqual("human_review_and_provider_ledger", evidence["quality_authority"])
         self.assertFalse(any("brand" in key or "quality_score" in key for key in evidence))
 
-    def test_func_mojibake_is_hard_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.object(image_qa, "ocr_evidence_for_image", return_value={"available": True, "lines": [{"text": "Durable�Shelf", "confidence": 0.99}]}):
             text, _ = image_qa._ocr_gates(Path(tmp), _task("func_01"), Path(tmp) / "candidate.png")
         self.assertEqual("fail", text["status"])
 
-    def test_func_only_allows_immutable_render_contract_text(self) -> None:
+    def test_func_contract_text_and_unverified_prop_text_do_not_auto_fail(self) -> None:
         task = _task("func_01")
         task["renderable_text_contract"]["strings"] = ["Smooth Self-Closing Hinges", "Adjustable Shelf"]
         with tempfile.TemporaryDirectory() as tmp, patch.object(image_qa, "ocr_evidence_for_image", return_value={"available": True, "lines": [{"text": "Smooth", "confidence": 0.99}, {"text": "Self-ClosingHinges", "confidence": 0.99}]}):
@@ -157,19 +156,19 @@ class QaLiteV1Tests(unittest.TestCase):
         self.assertEqual("pass", text["status"])
         with tempfile.TemporaryDirectory() as tmp, patch.object(image_qa, "ocr_evidence_for_image", return_value={"available": True, "lines": [{"text": "Wall mounting system", "confidence": 0.99}]}), patch.object(image_qa, "_source_ocr_lines", return_value=["Wall Mounting System"]):
             text, _ = image_qa._ocr_gates(Path(tmp), task, Path(tmp) / "candidate.png")
-        self.assertEqual("fail", text["status"])
+        self.assertEqual("pass", text["status"])
         with tempfile.TemporaryDirectory() as tmp, patch.object(image_qa, "ocr_evidence_for_image", return_value={"available": True, "lines": [{"text": "LORIOT", "confidence": 0.99}]}):
             text, _ = image_qa._ocr_gates(Path(tmp), _task("func_01"), Path(tmp) / "candidate.png")
-        self.assertEqual("fail", text["status"])
+        self.assertEqual("pass", text["status"])
         with tempfile.TemporaryDirectory() as tmp, patch.object(image_qa, "ocr_evidence_for_image", return_value={"available": True, "lines": [{"text": "lnterior", "confidence": 0.99}]}), patch.object(image_qa, "_source_ocr_lines", return_value=["Interior"]):
             text, _ = image_qa._ocr_gates(Path(tmp), _task("func_01"), Path(tmp) / "candidate.png")
-        self.assertEqual("fail", text["status"])
+        self.assertEqual("pass", text["status"])
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             image_qa, "ocr_evidence_for_image",
             return_value={"available": True, "lines": [{"text": "Goodnight", "confidence": 0.79}]},
         ):
             text, _ = image_qa._ocr_gates(Path(tmp), task, Path(tmp) / "candidate.png")
-        self.assertEqual("fail", text["status"])
+        self.assertEqual("pass", text["status"])
 
     def test_source_size_ocr_difference_requires_review_not_rejection(self) -> None:
         with (
@@ -183,7 +182,6 @@ class QaLiteV1Tests(unittest.TestCase):
         self.assertTrue(dimension["warning"])
         self.assertIn("OCR cannot overrule", dimension["evidence"])
 
-    def test_source_size_explicit_zero_measurement_is_hard_fail(self) -> None:
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.object(image_qa, "ocr_evidence_for_image", return_value={"available": True, "lines": [{"text": "0 lbs", "confidence": 0.99}]}),

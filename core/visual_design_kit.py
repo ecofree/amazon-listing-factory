@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .final_source_intents import PLANNING_SOURCE_ROLES, selected_task_source_intents
-from .io import file_sha256, load_env, read_jsonl, temporary_environ, write_jsonl
+from .io import (
+    file_sha256,
+    load_env,
+    parse_json_object_response,
+    read_jsonl,
+    temporary_environ,
+    write_jsonl,
+)
 from .job import load_job
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
@@ -21,8 +28,13 @@ from .run_scope import read_run_scope
 from .status import input_revision_id, logical_task_id
 from .text_evidence import clean_evidence_text, has_bad_encoding
 from .image_task_inputs import visual_product_color, visual_variation_values
+from .palette_registry import (
+    palette_registry_policy_version,
+    select_palette_route,
+)
 from .vision_gemini_client import gemini_scope_identity, gemini_stream_generate
 from .visual_design_references import planning_reference_paths
+from .visual_context import planner_visual_context_instruction
 from .visual_design_kit_compiler import (
     VisualDesignKitCompileError,
     cleaned_source_claims,
@@ -30,7 +42,10 @@ from .visual_design_kit_compiler import (
     validate_compiled_visual_design_kit,
 )
 VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v10"
-VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-family-art-direction-v21-complete-source-briefs"
+VISUAL_DESIGN_KIT_POLICY_VERSION = (
+    "gemini-family-art-direction-v39-planner-visual-authority-"
+    f"{palette_registry_policy_version()}-func-design-gemini-v1-numeric-component-bound-v1"
+)
 VISUAL_DESIGN_KIT_ARTIFACT = "visual_design_kits_v10.jsonl"
 
 _ROW_FIELDS = {"schema_version", "policy_version", "category_id", "child", "source_reference", "source_sha256", "source_references", "child_facts_revision_id", "input_revision_id", "family_design_id", "visual_design_kit_id", "family_art_direction", "source_briefs", "planner"}
@@ -42,7 +57,15 @@ class VisualDesignKitError(RuntimeError):
     pass
 
 
-def build_visual_design_kits(*, job_dir: str | Path, plugin: ProductPlugin, config_path: str = "", workers: int = 4) -> dict[str, Any]:
+def build_visual_design_kits(
+    *,
+    job_dir: str | Path,
+    plugin: ProductPlugin,
+    config_path: str = "",
+    workers: int = 4,
+    attempt_id: str = "",
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
     """Build one immutable visual-design row per selected child."""
     job = Path(job_dir).resolve()
     family = read_product_family(job)
@@ -75,7 +98,9 @@ def build_visual_design_kits(*, job_dir: str | Path, plugin: ProductPlugin, conf
         prompt = visual_design_kit_prompt(plugin, compact_product_facts(child), policy, source_manifest)
         revision, child_facts_revision = _kit_input_revision(child=child, policy=policy, sources=sources, planner_prompt=prompt)
         cached = previous.get(asin)
-        if cached and cached.get("input_revision_id") == revision and _planner_trace_current(job, cached):
+        if cached and visual_design_kit_row_current(
+            job, plugin, asin, cached, child_row=child, sources=sources, policy=policy,
+        ):
             record_progress(job, "visual_design_kit_cache_hit", child=asin, input_revision=revision)
             return asin, cached, []
 
@@ -132,6 +157,7 @@ def build_visual_design_kits(*, job_dir: str | Path, plugin: ProductPlugin, conf
                 status=attempt["status"],
                 elapsed_ms=attempt["elapsed_ms"],
                 error=attempt["error"],
+                attempt_id=attempt_id,
             )
             if event.get("status") == "validation_failure" and event.get("response_text"):
                 index = sum(row["status"] == "validation_failure" for row in attempts)
@@ -146,12 +172,16 @@ def build_visual_design_kits(*, job_dir: str | Path, plugin: ProductPlugin, conf
                 prompt,
                 source_paths,
                 client_scope="visual_planning",
-                timeout_seconds=90,
+                timeout_seconds=75,
                 attempts=1,
-                total_timeout_seconds=240,
-                # Allow the complete configured planning pool to be tried once;
-                # GPT-5.6-sol must remain reachable when every Gemini route fails.
-                max_physical_requests=max(3, len(gemini_scope_identity("visual_planning"))),
+                # A slow planner must yield to the configured reserves in a
+                # bounded interval; a successful ZIVV response in the live
+                # canary completed well below this ceiling.
+                total_timeout_seconds=150,
+                deadline_monotonic=deadline_monotonic,
+                # Allow each configured provider one request plus one schema repair
+                # on the provider that returns a structurally invalid response.
+                max_physical_requests=max(4, len(gemini_scope_identity("visual_planning")) + 1),
                 response_validator=validate_response,
                 attempt_observer=observe,
                 request_id=f"visual-design-kit-v10:{asin}:{revision}",
@@ -165,6 +195,11 @@ def build_visual_design_kits(*, job_dir: str | Path, plugin: ProductPlugin, conf
                 category_id=plugin.category_id,
             )
             validate_visual_design_kit(
+                planned,
+                source_manifest=source_manifest,
+                category_id=plugin.category_id,
+            )
+            validate_compiled_visual_design_kit(
                 planned,
                 source_manifest=source_manifest,
                 category_id=plugin.category_id,
@@ -214,7 +249,15 @@ def build_visual_design_kits(*, job_dir: str | Path, plugin: ProductPlugin, conf
             record_progress(job, "visual_design_kit_failed", child=asin, input_revision=revision, error=f"{type(exc).__name__}: {exc}"[:1000])
             return asin, None, [_failure(asin, f"{type(exc).__name__}: {exc}", revision=revision)]
 
-    max_workers = max(1, min(int(workers or 1), len(children) or 1, 4))
+    configured_workers = str(os.environ.get("AMAZON_FACTORY_VISUAL_PLANNER_WORKERS") or "2").strip().casefold()
+    if configured_workers in {"", "auto", "default"}:
+        planner_workers = 2
+    else:
+        try:
+            planner_workers = max(1, min(4, int(configured_workers)))
+        except ValueError:
+            planner_workers = 2
+    max_workers = max(1, min(int(workers or planner_workers), planner_workers, len(children) or 1))
     with temporary_environ(env), ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(build_one, child): str(child.get("asin") or "")
@@ -232,10 +275,16 @@ def build_visual_design_kits(*, job_dir: str | Path, plugin: ProductPlugin, conf
                     error=f"{type(exc).__name__}: {exc}"[:1000],
                 )
             if payload is not None:
+                # Keep the family artifact untouched until every selected child
+                # has reached a terminal result.  Writing after each future
+                # used to replace a complete family with a partial file when
+                # the process was interrupted between children.
                 result[asin] = payload
-                write_jsonl(job / "reports" / VISUAL_DESIGN_KIT_ARTIFACT, [result[key] for key in sorted(result)])
             failures.extend(child_failures)
 
+    # A single atomic commit is the only point at which a rebuilt family
+    # becomes visible.  Successful siblings remain usable when another child
+    # fails, while an interrupted run cannot destroy the previous artifact.
     write_jsonl(job / "reports" / VISUAL_DESIGN_KIT_ARTIFACT, [result[key] for key in sorted(result)])
     return {
         "schema_version": VISUAL_DESIGN_KIT_SCHEMA_VERSION,
@@ -313,10 +362,14 @@ def visual_design_kit_row_current(
         prompt = visual_design_kit_prompt(
             plugin, compact_product_facts(child_row), policy, source_manifest,
         )
-        expected, _ = _kit_input_revision(
+        expected_revision, expected_child_facts = _kit_input_revision(
             child=child_row, policy=policy, sources=sources, planner_prompt=prompt,
         )
-        return str(row.get("input_revision_id") or "") == expected
+        if row.get("source_references") != source_manifest:
+            return False
+        if row.get("child_facts_revision_id") != expected_child_facts:
+            return False
+        return row.get("input_revision_id") == expected_revision
     except Exception:
         return False
 
@@ -347,6 +400,9 @@ def compact_product_facts(child: dict[str, Any]) -> dict[str, Any]:
         and _bounded_input_text(value, 120)
     ]
     return {
+        "palette_route_key": _bounded_input_text(
+            child.get("asin") or child.get("sku") or child.get("title"), 120,
+        ),
         "title": _bounded_input_text(child.get("title"), 180),
         "variation": _bounded_dict(visual_variation_values(child), 6),
         "color": _bounded_input_text(visual_product_color(child), 100),
@@ -422,7 +478,7 @@ def _planner_product_identity(facts: dict[str, Any]) -> dict[str, Any]:
     identity = {
         key: value
         for key, value in facts.items()
-        if key != "features" and value not in (None, "", [], {})
+        if key not in {"features", "palette_route_key"} and value not in (None, "", [], {})
     }
     variation = identity.get("variation")
     if isinstance(variation, dict):
@@ -442,6 +498,29 @@ def _planner_product_identity(facts: dict[str, Any]) -> dict[str, Any]:
             identity.pop("variation", None)
     return identity
 
+
+def _palette_planning_reference(plugin: ProductPlugin, facts: dict[str, Any]) -> dict[str, Any] | None:
+    """Return one computed color aid without making it executable design state."""
+    if not str(facts.get("color") or "").strip():
+        return None
+    route = select_palette_route(
+        category_id=str(getattr(plugin, "category_id", "") or ""),
+        product_color=facts.get("color"),
+        route_key=facts.get("palette_route_key") or facts.get("title"),
+        size=facts.get("size"),
+        variation=facts.get("variation"),
+    )
+    basis = route.get("selection_basis") if isinstance(route.get("selection_basis"), dict) else {}
+    return {
+        "authority": "advisory_color_analysis_only",
+        "product_color": str(facts.get("color") or "").strip(),
+        "computed_starting_palette": route.get("recipe") or {},
+        "computed_harmony_mode": str(route.get("harmony_mode") or ""),
+        "computed_style_profile": str(route.get("profile_id") or ""),
+        "spatial_limits": basis.get("spatial_limits") or {},
+        "quality_metrics": route.get("metrics") or {},
+    }
+
 def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], policy: dict[str, Any], source_manifest: list[dict[str, Any]]) -> str:
     expected_briefs = [
         _brief_schema_for_source(row)
@@ -450,13 +529,13 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
     ]
     response_schema = {
         "family_art_direction": {
-            "audience_and_market": "specific US buyer, room context, price-positioning impression, and emotional goal",
-            "palette_direction": "product-derived color relationships for rooms, textiles, props, text, and restrained accents",
-            "photography_direction": "light behavior, realism, material response, depth, and photographic mood",
-            "environment_and_staging": "US-home environment, replaceable props, styling density, and what must feel newly designed",
-            "typography_direction": "one coherent typographic character and hierarchy plus one physical text-ink color shared by every title and label, without naming pixel sizes or layout coordinates",
-            "graphic_direction": "one coherent information-graphic character with line/marker color tied to the shared text ink, one family-wide header treatment choice, and physical rules for text, lines, icons, and supporting surfaces",
-            "cohesion_rule": "short non-color shared-execution rule; no palette",
+            "audience_and_market": "US buyer, room context, price position, and emotional goal",
+            "palette_direction": "final child palette selected by Gemini: room surfaces, textiles or soft furnishings, small accents, and infographic colors",
+            "photography_direction": "light, exposure, shadows, white balance, material response, depth, and mood; no coordinates",
+            "environment_and_staging": "US-home setting, replaceable props, styling density, and redesign intent",
+            "typography_direction": "one child-wide title, label, unit, and numeric hierarchy for func and size",
+            "graphic_direction": "one child-wide badge, icon, leader, arrow, panel, spacing, and accent system for func and size",
+            "cohesion_rule": "cross-role rule respecting role contracts and product facts",
             "negative_visuals": ["2-6 product-specific visual outcomes to avoid"],
         },
         "source_briefs": expected_briefs,
@@ -468,16 +547,26 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
         for claim in source.get("product_claims") or []
         if isinstance(claim, dict) and claim.get("evidence_id") and claim.get("text")
     }
+    palette_reference = _palette_planning_reference(plugin, facts)
+    palette_aid = (
+        "COLOR ANALYSIS AID (NOT DESIGN AUTHORITY)\n"
+        + json.dumps(palette_reference, ensure_ascii=False)
+        + "\nTreat this as one computed starting point, not an assigned palette. Assess and revise it for the attached product color, category, audience, and current US-home aesthetic. Your palette_direction is the sole final child palette.\n\n"
+        if palette_reference
+        else ""
+    )
+    # Keep planner context useful but bounded; the same context is projected
+    # again into role prompts, so repeating the full policy here adds noise.
+    visual_context_guardrail = planner_visual_context_instruction(policy, max_chars=420)
     return (
-        "Return one JSON object only. You are the senior US-market art director for one Amazon child image family. "
-        "The program owns product facts, structure, color identity, quantity, visible state, and measurements. You own one coherent aesthetic; GPT-Image owns exact composition.\n\n"
-        "FAMILY ART DIRECTION\n"
-        "Inspect the main reference first and separate sold-product surfaces from staging. Product colour means only the visible sold structure, finish, and material; never infer it from bedding, pillows, blankets, towels, plants, flowers, rugs, wall paint, furniture, props, banners, or other decoration. Build a new family palette from the sold product's hue, lightness, material response, finish, construction character, target buyer, and US room context. Source staging colours are redesign evidence, not palette instructions. Choose physical color relationships and explain their material, contrast, and intended area; do not default to a house palette or force every category into the same hue family. Keep the product readable with bright natural exposure, open midtones, soft diffuse daylight, light-reflective surfaces, and readable contact shadows; never crush blacks, vignette, or alter product color or saturation. Typography_direction must state type character, weight contrast, case, spacing rhythm, and one physical text-ink color for every title and label. The title and all labels must share that one family ink color; do not color-code labels by feature or role. Graphic_direction must state physical text/line/surface behavior, including line/marker color and its relationship to the text ink, favoring direct type and feature-anchored lines over cards, badges, stickers, or icon rails. Choose one family header treatment and keep its presence, geometry, and color consistent across roles. Keep photography and infographics coherent through palette, light, type, and negative space. Cohesion_rule adds no palette. Use physical colors, materials, light behavior, type behavior, and line behavior; abstract style words are not decisions unless tied to physical choices. Do not decide facts, measurements, copy, coordinates, or fixed geometry. Negative_visuals must be safe across all roles.\n\n"
-        "SOURCE BRIEFS\n"
-        "Return exactly one brief for every non-main source_id. Every brief states the shopper question. A scene brief also states an authentic use moment and which non-sold staging to restyle while preserving the presence, coverage, placement, and relationship of state-bearing staging and the source-visible product, viewpoint, occlusion, and state; preserve staging presence and function only, not its source hue, palette, or decorative styling. Loose decor may be restyled or substituted without attaching it to the product. Never command visible mattress, bedding, doors, drawers, mirrors, supports, or other state-bearing items to disappear or be reconstructed; do not command any sold part to open, close, turn, move, change count, or reveal hidden structure. Func and size do not return image_direction; the program owns their source-edit contract. Never repeat or override the newly derived family palette, type, graphics, or layout.\n"
-        "For func, return one specific 2-6 word shopping-story title and 3-6 distinct 2-6 word labels when evidence supports them. Bind each to a listed source evidence_id or an ID from the global Trusted product fact evidence. Use only cleaned evidence concepts, never raw OCR fragments. The title and labels must answer what the buyer can do or gain from this image; a generic category, material, safety, design, or hardware noun phrase is not acceptable as final copy. If a label cannot be rewritten into a concrete evidence-bound buyer outcome, omit that label rather than blocking the child. Do not prescribe coordinates, a fixed card grid, or a repeated left/right template; GPT-Image chooses the composition.\n"
-        "For size, describe only the presentation treatment for the complete source diagram. Preserve every number, unit, line direction, endpoint, measured part, and relationship. Never simplify, invent text, or add filler modules.\n\n"
-        "Family-wide execution: the returned Typography Direction text-ink color and Graphic Direction header treatment are shared across every role; choose them once and do not vary, recolor, add, or remove them per source image.\n\n"
+        "Return one JSON object for one Amazon child image family. The program owns only product facts, visible state, measurements, and process boundaries. You are the sole visual designer: select the final child palette, lighting, staging, typography, badges, icons, lines, panels, spacing, and role-specific composition. The image model executes your validated design.\n\n"
+        "Keep each source product's geometry, finish, quantity, camera relationship, and demonstrated feature state. For beds retain the source-visible mattress and bed-in-use state in lifestyle main and scene. Source rooms, props, people or reflections, graphics, typography, banners, badges, colors, and layout are evidence or anti-patterns, never design authority. Build a bright, people-free, product-led US-market system and keep it coherent across this child.\n\n"
+        + palette_aid
+        + (visual_context_guardrail + "\n\n" if visual_context_guardrail else "")
+        + "SOURCE BRIEFS\n"
+         "Return one brief for every non-main source_id. Every brief supplies a positive image_direction that applies the same child system with a role-appropriate composition. Scene redesigns the US-home setting and loose staging. Func redesigns the complete infographic presentation while preserving source-supported feature evidence. Size redesigns visual hierarchy around the unchanged measurement diagram. Do not create a second palette or component system per image.\n"
+        "For func, return one 2-6 word evidence-bound title and up to 2 labels. Prefer the source's specific mechanism or relationship over generic material/support wording; retain counts and qualifiers, omit unsupported labels, and bind each string to its evidence IDs.\n\n"
+        "Category direction controls audience and non-product composition, not product geometry. Func must preserve the feature evidence but must not inherit source graphic framing. Size must preserve values, measured objects, endpoints, and label-to-line relationships but may redesign typography, spacing, icons, and graphic color.\n\n"
         f"Category: {plugin.category_id}\n"
         f"Product type: {plugin.display_name}\n"
         f"Product identity: {json.dumps(_planner_product_identity(facts), ensure_ascii=False)}\n"
@@ -562,14 +651,16 @@ def _kit_input_revision(*, child: dict[str, Any], policy: dict[str, Any], source
     policy_id = str(policy.get("policy_id") or "")
     if not policy_id:
         raise VisualDesignKitError("compiled image policy has no policy_id")
+    # The actual planner input is part of the visual authority.  If its
+    # wording changes, reusing the previous kit would make production ignore
+    # the new design direction while appearing current.
+    planner_prompt_sha256 = hashlib.sha256(planner_prompt.encode("utf-8")).hexdigest()
     revision = input_revision_id({
-        "schema_version": VISUAL_DESIGN_KIT_SCHEMA_VERSION,
-        "policy_version": VISUAL_DESIGN_KIT_POLICY_VERSION,
         "child_facts_revision_id": child_facts_revision,
         "child_material": _material_facts(child),
         "complete_image_policy_id": policy_id,
+        "planner_prompt_sha256": planner_prompt_sha256,
         "ordered_final_source_intent_revisions": [str(row.get("input_revision_id") or "") for row in sources],
-        "planner_prompt_sha256": hashlib.sha256(planner_prompt.encode("utf-8")).hexdigest(),
     })
     return revision, child_facts_revision
 
@@ -651,8 +742,8 @@ def _validate_source_manifest(rows: Any) -> None:
                 if claim["source_sha256"] != row["source_sha256"] or not str(claim["evidence_id"]):
                     raise VisualDesignKitError(f"source_references[{index}] has unbound func evidence")
                 claim_ids.add(str(claim["evidence_id"]))
-            if not claim_ids or len(claim_ids) != len(row["claims"]):
-                raise VisualDesignKitError(f"source_references[{index}] needs unique func evidence")
+            if len(claim_ids) != len(row["claims"]):
+                raise VisualDesignKitError(f"source_references[{index}] has duplicate func evidence IDs")
             for claim in row["product_claims"]:
                 if (
                     not isinstance(claim, dict)
@@ -685,10 +776,10 @@ def _planner_source_view(row: dict[str, Any]) -> dict[str, Any]:
     }
     if row["role"] == "func":
         claims: list[dict[str, Any]] = []
-        for claim in cleaned_source_claims(row)[:6]:
+        for claim in cleaned_source_claims(row):
             claims.append({
                 "evidence_id": claim["evidence_id"],
-                "text": _bounded_input_text(claim["text"], 140),
+                "text": claim["text"],
             })
         view["source_supported_claims"] = claims
     return view
@@ -700,13 +791,16 @@ def _brief_schema_for_source(source: dict[str, Any]) -> dict[str, Any]:
         "source_id": source["source_id"],
         "shopping_purpose": "specific purpose for this source image",
     }
-    if role == "scene":
-        common["image_direction"] = "authentic use moment and non-product staging to redesign"
-    elif role == "func":
+    common["image_direction"] = {
+        "scene": "role-specific US-home composition and non-product staging under the child visual system",
+        "func": "complete infographic composition, hierarchy, and component treatment under the child visual system",
+        "size": "measurement-diagram hierarchy and graphic treatment under the child visual system",
+    }[role]
+    if role == "func":
         common.update({
             "func_story": {
                 "title": {"evidence_ids": ["listed evidence_id"], "text": "specific 2-6 word shopping-story title"},
-                "labels": [{"evidence_ids": ["listed evidence_id"], "text": "2-6 word supporting label"}],
+                "labels": [{"evidence_ids": ["listed evidence_id"], "text": "2-6 word factual supporting label; at most 2 labels"}],
             },
         })
     return common
@@ -718,6 +812,7 @@ def _planner_policy_view(policy: dict[str, Any]) -> dict[str, Any]:
         for key in (
             "main_image_policy", "allowed_internal_props",
             "replaceable_staging",
+            "role_visual_direction",
         )
         if policy.get(key) not in (None, "", [], {})
     }
@@ -735,20 +830,10 @@ def _validate_text(value: Any, label: str, *, minimum: int = 1, maximum: int) ->
 
 
 def _parse_response(text: str) -> dict[str, Any]:
-    raw = str(text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start < 0 or end <= start:
-            raise
-        data = json.loads(raw[start:end + 1])
-    if not isinstance(data, dict):
-        raise VisualDesignKitError("VisualDesignKit planner response is not an object")
-    return data
+        return parse_json_object_response(text, label="VisualDesignKit planner response")
+    except ValueError as exc:
+        raise VisualDesignKitError(str(exc)) from exc
 
 
 def _read_previous(job: Path, category_id: str) -> dict[str, dict[str, Any]]:
@@ -763,10 +848,10 @@ def _read_previous(job: Path, category_id: str) -> dict[str, dict[str, Any]]:
     for row in rows:
         try:
             validate_visual_design_kit_row(row, category_id)
-            if not _planner_trace_current(job, row):
-                continue
             result[str(row["child"])] = row
         except Exception:
+            # A policy or source change invalidates the complete row.  It must
+            # never become input to a new planner run.
             continue
     return result
 

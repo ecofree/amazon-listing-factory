@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,23 @@ def planning_reference_paths(
 def _write_labelled_reference(source: Path, output: Path, source_id: str, role: str) -> None:
     from PIL import Image, ImageDraw, ImageFont
 
-    with Image.open(source) as opened:
-        image = opened.convert("RGB")
-        image.thumbnail((1280, 1280))
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with Image.open(source) as opened:
+                # Force decoding while the file handle is open. A transient
+                # decoder/read failure must not abort an otherwise valid child
+                # reference set on the first read.
+                opened.load()
+                image = opened.convert("RGB")
+                image.thumbnail((1280, 1280))
+            break
+        except (OSError, ValueError) as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(0.15)
+    else:
+        raise last_error or OSError(f"Could not read visual planning source: {source}")
     bar = max(56, image.height // 20)
     canvas = Image.new("RGB", (image.width, image.height + bar), "white")
     canvas.paste(image, (0, bar))

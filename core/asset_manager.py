@@ -43,6 +43,7 @@ def download_reference_images(
     max_images: int = 0,
     force: bool = False,
     workers: int = 0,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     job_path = Path(job_dir).resolve()
     inventory = _expected_inventory(job_path, max_images=max_images)
@@ -93,6 +94,7 @@ def download_reference_images(
                 Path("images") / "source_objects" / object_name,
                 force,
                 job_path=job_path,
+                deadline_monotonic=deadline_monotonic,
             )
             source_sha = file_sha256(raw)
             return [
@@ -183,6 +185,7 @@ def read_download_manifest(job_dir: str | Path) -> dict[str, Any]:
 
 
 def download_artifacts_current(job_dir: str | Path, *, max_issues: int = 20) -> tuple[bool, list[str]]:
+    """Validate inventory provenance, not whether every download succeeded."""
     job_path = Path(job_dir).resolve()
     try:
         artifact = read_download_manifest(job_path)
@@ -208,10 +211,8 @@ def download_artifacts_current(job_dir: str | Path, *, max_issues: int = 20) -> 
                 issues.append(f"{label}: successful row has a missing, invalid, or changed image")
         elif row.get("status") != "failed":
             issues.append(f"{label}: invalid status {row.get('status')!r}")
-        elif bool(row.get("retryable")):
-            issues.append(f"{label}: retryable download is still pending")
         elif not str(row.get("error") or "").strip():
-            issues.append(f"{label}: terminal failure has no recorded error")
+            issues.append(f"{label}: failure has no recorded error")
         if len(issues) >= max_issues:
             break
     return not issues, issues
@@ -368,7 +369,7 @@ def _dedupe_urls(values: Iterable[Any]) -> list[str]:
     return result
 
 
-def _download(url: str, out_no_ext: Path, force: bool, *, job_path: Path) -> Path:
+def _download(url: str, out_no_ext: Path, force: bool, *, job_path: Path, deadline_monotonic: float | None = None) -> Path:
     out_no_ext = resolve_job_owned_path(job_path, out_no_ext)
     if not force:
         for existing in _existing_download_candidates(out_no_ext):
@@ -383,16 +384,22 @@ def _download(url: str, out_no_ext: Path, force: bool, *, job_path: Path) -> Pat
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return _download_once(url, out_no_ext)
+            return _download_once(url, out_no_ext, deadline_monotonic=deadline_monotonic)
         except Exception as exc:
             last_error = exc
             if attempt >= attempts or not _download_error_retryable(exc):
                 raise
-            time.sleep(_download_retry_delay(attempt))
+            delay = _download_retry_delay(attempt)
+            if deadline_monotonic is not None and time.monotonic() + delay >= deadline_monotonic:
+                raise TimeoutError("Download execution deadline exhausted") from exc
+            time.sleep(delay)
     raise last_error or RuntimeError(f"Download failed: {url}")
 
 
-def _download_once(url: str, out_no_ext: Path) -> Path:
+def _download_once(url: str, out_no_ext: Path, *, deadline_monotonic: float | None = None) -> Path:
+    timeout = min(90.0, deadline_monotonic - time.monotonic()) if deadline_monotonic is not None else 90.0
+    if timeout <= 0:
+        raise TimeoutError("Download execution deadline exhausted before request")
     assert_public_http_url(url)
     request = urllib.request.Request(
         url,
@@ -401,7 +408,7 @@ def _download_once(url: str, out_no_ext: Path) -> Path:
             "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         },
     )
-    with urllib.request.build_opener(_PublicRedirectHandler()).open(request, timeout=90) as response:
+    with urllib.request.build_opener(_PublicRedirectHandler()).open(request, timeout=timeout) as response:
         # Re-check the connected peer to close the DNS-rebinding gap between
         # assert_public_http_url() and urllib's actual socket connection.
         assert_response_peer_public(response, hostname=urlparse(url).hostname or "")
@@ -413,6 +420,8 @@ def _download_once(url: str, out_no_ext: Path) -> Path:
         chunks: list[bytes] = []
         total = 0
         while True:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("Download execution deadline exhausted during response")
             chunk = response.read(min(1024 * 1024, maximum - total + 1))
             if not chunk:
                 break

@@ -120,6 +120,21 @@ image_generation:
     - {part: flower pot, unless_source_visible: true}
     - {part: plant pot, unless_source_visible: true}
     - {part: container base, unless_source_visible: true}
+  visual_context:
+    primary_setting: real US front entry, porch, garden, or bright sunroom
+    buyer: homeowners and renters styling an everyday residential space
+    user: household member placing and maintaining decorative greenery
+    required_cues:
+      - believable floor, porch, or garden scale
+      - natural light and an installation relationship that matches the source
+      - restrained surrounding decor that keeps the tree as the hero
+    allowed_alternates:
+      - entryway beside a door or console
+      - bright living area only when the source supports indoor placement
+    avoid:
+      - random bedroom decor or a generic studio void
+      - invented planter or support hardware not visible in the source
+      - clutter that hides the trunk, branches, or base
   role_specific_rules:
     main:
       - Preserve branch density, trunk count, and the exact source-visible support type

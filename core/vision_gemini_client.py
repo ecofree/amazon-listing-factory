@@ -47,6 +47,7 @@ def gemini_stream_generate(
     request_id: str = "",
     preferred_client_name: str = "",
     max_physical_requests: int = 0,
+    deadline_monotonic: float | None = None,
 ) -> str:
     effective_scope = gemini_client_effective_scope(client_scope)
     max_models = 0
@@ -59,6 +60,10 @@ def gemini_stream_generate(
         max_models = _env_int("AMAZON_FACTORY_VISUAL_PLANNER_MAX_MODELS", 0, 0, 12)
     attempts = max(1, min(4, int(attempts)))
     deadline = time.monotonic() + max(1, int(total_timeout_seconds)) if total_timeout_seconds > 0 else None
+    if deadline_monotonic is not None:
+        deadline = min(deadline, deadline_monotonic) if deadline is not None else deadline_monotonic
+        if time.monotonic() >= deadline:
+            raise VisionQAError("Gemini execution deadline exhausted before request")
     attempt_history: list[dict[str, Any]] = []
     external_attempt_observer = attempt_observer
 
@@ -85,8 +90,11 @@ def gemini_stream_generate(
                 "Missing vision model endpoint config. Add the required scope provider to configs/api_registry.json."
             ),
         )
-    parts: list[dict[str, Any]] = [{"text": prompt}]
-    parts.extend(_image_part(path) for path in image_paths)
+    # Build native-Gemini parts only inside the native protocol branch.  The
+    # OpenAI-compatible branches encode the same references independently;
+    # eager construction here doubled the base64 image payload retained by
+    # every concurrent job and was the main avoidable memory peak in canaries.
+    parts: list[dict[str, Any]] | None = None
     last_exc: Exception | None = None
     last_status = ""
     last_provider = ""
@@ -268,7 +276,7 @@ def gemini_stream_generate(
                             _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text)
                             if terminal or attempt >= max(1, attempts):
                                 break
-                            if effective_scope == "visual_planning" and status != "queue_unavailable":
+                            if effective_scope == "visual_planning":
                                 break
                             _deadline_sleep((2 * attempt) + random.uniform(0, 0.5), deadline)
             continue
@@ -330,10 +338,13 @@ def gemini_stream_generate(
                             _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text)
                             if terminal or attempt >= max(1, attempts):
                                 break
-                            if effective_scope == "visual_planning" and status != "queue_unavailable":
+                            if effective_scope == "visual_planning":
                                 break
                             _deadline_sleep((2 * attempt) + random.uniform(0, 0.5), deadline)
             continue
+        if parts is None:
+            parts = [{"text": prompt}]
+            parts.extend(_image_part(path) for path in image_paths)
         payload = _gemini_native_payload(parts, client)
         auth_modes = [str(client["auth_mode"])] if client.get("auth_mode") else _gemini_auth_modes(base_url)
         for candidate_model in candidates:
@@ -398,7 +409,7 @@ def gemini_stream_generate(
                             _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text)
                             if terminal or attempt >= max(1, attempts):
                                 break
-                            if effective_scope == "visual_planning" and status != "queue_unavailable":
+                            if effective_scope == "visual_planning":
                                 break
                             _deadline_sleep((2 * attempt) + random.uniform(0, 0.5), deadline)
     last_attempt = attempt_history[-1] if attempt_history else {}

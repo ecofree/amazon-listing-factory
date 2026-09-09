@@ -36,7 +36,7 @@ from .template_runtime import child_sku, load_template_env, normalize_template_m
 COPY_SCHEMA_VERSION = "copy-v1"
 COPY_ARTIFACT = "copy_v1.json"
 COPY_GROUP_POLICY_VERSION = "copy-group-v5-retryable-ai-output"
-COPY_VALIDATION_POLICY_VERSION = "copy-validation-v8-retryable-ai-output"
+COPY_VALIDATION_POLICY_VERSION = "copy-validation-v9-capacity-values"
 PARENT_COPY_KEY = "__parent__"
 COPY_IGNORED_FACT_KEYS = {"fabric_type"}
 
@@ -53,6 +53,7 @@ def run_copy_polish(
     limit: int = 0,
     mode: str = "",
     retry_blocked: bool = False,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     job_path = Path(job_dir)
     job = load_job(job_path)
@@ -143,6 +144,7 @@ def run_copy_polish(
                     fingerprint=group_fingerprint,
                     row_type="Child",
                     expected_request_fingerprint=model_request_fingerprint,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 _write_fragment(job_path, group_fingerprint, fragment)
             except (CopyWriterError, CopyPolishError) as exc:
@@ -199,6 +201,7 @@ def run_copy_polish(
                     facts=parent_facts, fingerprint=parent_fingerprint,
                     row_type="Parent",
                     expected_request_fingerprint=parent_model_fingerprint,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 _write_fragment(job_path, parent_fingerprint, parent_fragment)
             except (CopyWriterError, CopyPolishError) as exc:
@@ -364,7 +367,7 @@ def _validate_artifact_provenance(data: dict[str, Any]) -> None:
         for group in data.get("groups") or [] if isinstance(group, dict)
     }
     for key, row in rows.items():
-        _validate_copy_row(row)
+        _validate_copy_row(row, row_type="parent" if key == PARENT_COPY_KEY else "child")
         expected = (
             str(data.get("parent_model_request_fingerprint") or "")
             if key == PARENT_COPY_KEY
@@ -497,6 +500,7 @@ def _rewrite_group(
     fingerprint: str,
     row_type: str,
     expected_request_fingerprint: str,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     source_copy = _source_copy(source)
     result = rewrite_listing_copy(
@@ -508,6 +512,7 @@ def _rewrite_group(
         source_bullets=list(source_copy["item_highlights"]),
         source_description=source_copy["description"],
         product_specific=facts,
+        deadline_monotonic=deadline_monotonic,
     )
     config = load_copy_writer_config(env)
     if str(result.get("_request_fingerprint") or "") != expected_request_fingerprint:

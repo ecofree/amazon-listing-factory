@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -18,11 +19,11 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .vision_gemini_client import gemini_stream_generate
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v1"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v1.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v11-explicit-review-task"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v12-bound-phrases-and-measurements"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
 SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size"})
-_VISUAL_RECOVERY_POLICY_VERSION = "final-source-intent-visual-recovery-v3-ambiguous-product-view"
+_VISUAL_RECOVERY_POLICY_VERSION = "final-source-intent-visual-recovery-v4-authored-evidence"
 PLANNING_SOURCE_ROLES = frozenset({"main", "scene", "func", "size"})
 _DIMENSION_WORD = re.compile(r"\b(size|dimensions?|width|height|depth|length|overall|tall|wide|inch(?:es)?|cm|mm|ft|feet)\b", re.I)
 _DIRECTION_WORD = re.compile(r"\b(width|height|depth|length|overall|tall|wide)\b", re.I)
@@ -32,7 +33,8 @@ _SCENE_WORD = re.compile(r"\b(living room|office|bedroom|bathroom|kitchen|laundr
 _NOISE_TEXT = re.compile(r"^[^A-Za-z0-9]*$|^[A-Za-z]{1,2}$|^\d{1,3}$")
 class FinalSourceIntentError(RuntimeError):
     pass
-def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, workers: int = 0, limit: int = 0) -> dict[str, Any]:
+def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, workers: int = 0, limit: int = 0,
+                               deadline_monotonic: float | None = None) -> dict[str, Any]:
     """Build one immutable, final role decision for every scoped downloaded source."""
     job = Path(job_dir).resolve()
     ensure_run_scope(job_dir=job, limit=limit)
@@ -50,7 +52,7 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
     source_reviews = _current_source_intent_reviews(job, downloads)
     family = read_product_family(job)
     children = {str(row["asin"]): row for row in family["family"]["children"]}
-    evidence_by_sha = _collect_evidence_by_sha(job, downloads, workers=max(1, int(workers or 1)))
+    evidence_by_sha = _collect_evidence_by_sha(job, downloads, workers=_classification_workers(workers, len(downloads)), deadline_monotonic=deadline_monotonic)
     prepared_by_child: dict[str, list[dict[str, Any]]] = {}
     for download in downloads:
         try:
@@ -298,15 +300,15 @@ def final_source_intents_current(job_dir: str | Path, plugin: ProductPlugin,
     except Exception as exc:
         return False, [f"{type(exc).__name__}: {exc}"]
 def _collect_evidence_by_sha(job: Path, downloads: list[dict[str, Any]], *,
-                             workers: int) -> dict[str, dict[str, Any]]:
+                             workers: int, deadline_monotonic: float | None = None) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in downloads:
         sha = str(row.get("source_sha256") or "")
         grouped.setdefault(sha, []).append(row)
     evidence: dict[str, dict[str, Any]] = {}
-    max_workers = max(1, min(int(workers or 1), len(grouped) or 1, 8))
+    max_workers = max(1, min(int(workers or 1), len(grouped) or 1, 3))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_evidence_for_sha, job, sha, rows): sha for sha, rows in grouped.items()}
+        futures = {pool.submit(_evidence_for_sha, job, sha, rows, deadline_monotonic=deadline_monotonic): sha for sha, rows in grouped.items()}
         for future in as_completed(futures):
             sha = futures[future]
             try:
@@ -314,7 +316,20 @@ def _collect_evidence_by_sha(job: Path, downloads: list[dict[str, Any]], *,
             except Exception as exc:
                 evidence[sha] = _empty_evidence(f"{type(exc).__name__}: {exc}")
     return evidence
-def _evidence_for_sha(job: Path, sha: str, downloads: list[dict[str, Any]]) -> dict[str, Any]:
+
+
+def _classification_workers(requested: int, source_count: int) -> int:
+    """Honor explicit serial execution; automatic observation concurrency is two."""
+    if source_count <= 1:
+        return 1
+    try:
+        requested_count = int(requested or 2)
+    except (TypeError, ValueError):
+        requested_count = 1
+    return max(1, min(requested_count, source_count, 3))
+def _evidence_for_sha(job: Path, sha: str, downloads: list[dict[str, Any]], *, deadline_monotonic: float | None = None) -> dict[str, Any]:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise FinalSourceIntentError("Classification execution deadline exhausted")
     source = _job_path(job, downloads[0].get("raw_path"))
     if source is None or not source.is_file() or file_sha256(source) != sha:
         raise FinalSourceIntentError(f"Downloaded source changed before classification: {downloads[0].get('raw_path')}")
@@ -331,7 +346,11 @@ def _evidence_for_sha(job: Path, sha: str, downloads: list[dict[str, Any]]) -> d
         }
     )
     trusted = _trusted_text_lines(ocr)
-    raw_measurements = extract_measurements(" ".join(trusted))
+    raw_measurements = [
+        {**value, "source_label": line, "source_occurrence": f"{line_index}:{index}"}
+        for line_index, line in enumerate(trusted)
+        for index, value in enumerate(extract_measurements(line))
+    ]
     measurements = _independent_measurements(raw_measurements)
     claims = _authored_claims(trusted)
     pixels = _pixel_evidence(source)
@@ -343,10 +362,10 @@ def _evidence_for_sha(job: Path, sha: str, downloads: list[dict[str, Any]]) -> d
         "text": " ".join(trusted),
         "pixel_evidence": pixels,
     }
-    visual = _visual_recovery(job, source, sha, downloads, base)
-    return {**base, "visual_evidence": visual}
+    visual = _visual_recovery(job, source, sha, downloads, base, deadline_monotonic=deadline_monotonic)
+    return {**base, "visual_evidence": visual, "claims": _authored_claims(trusted, visual=visual)}
 def _visual_recovery(job: Path, source: Path, sha: str, downloads: list[dict[str, Any]],
-                     evidence: dict[str, Any]) -> dict[str, Any]:
+                     evidence: dict[str, Any], *, deadline_monotonic: float | None = None) -> dict[str, Any]:
     if not _needs_visual_recovery(downloads, evidence):
         return {"status": "not_needed", "reason": "deterministic evidence is sufficient"}
     cache = resolve_job_owned_path(job, job / "reports" / "final_source_intent_visual_evidence" / f"{sha}_{_VISUAL_RECOVERY_POLICY_VERSION}.json")
@@ -375,6 +394,7 @@ def _visual_recovery(job: Path, source: Path, sha: str, downloads: list[dict[str
                 preferred_client_name=provider,
                 timeout_seconds=25,
                 total_timeout_seconds=35,
+                deadline_monotonic=deadline_monotonic,
                 response_validator=_visual_response_valid,
             )
             value = _normalize_visual_evidence(_parse_json_object(response))
@@ -425,12 +445,12 @@ def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
     measurements = _measurement_rows(evidence.get("measurements") or [], child)
     trusted_text = list(evidence.get("trusted_text") or [])
     visual = dict(evidence.get("visual_evidence") or {})
-    signals = _signals(source_index, evidence, measurements)
-    # A visual callout panel is only a role signal.  It is not permission to
-    # promote arbitrary OCR lines into semantic claims.  Claims must already
-    # have passed _authored_claims/_claim_concept before they enter the
-    # immutable FuncStoryContract.
-    claims = list(evidence.get("claims") or [])
+    # A matching child fact can corroborate OCR without a second observation
+    # request; a layout signal alone never authorizes arbitrary prop text.
+    claims = _authored_claims(trusted_text, visual=visual, product_text=_plain_text({
+        key: child.get(key) for key in ("title", "bullets", "specs", "product_specific")
+    }))
+    signals = _signals(source_index, {**evidence, "claims": claims}, measurements)
     return {
         "plugin": plugin,
         "download": download,
@@ -587,7 +607,7 @@ def _bound_claims(prepared: dict[str, Any]) -> list[dict[str, Any]]:
     for value in values:
         if not isinstance(value, dict):
             continue
-        text = _compact_text(value.get("text"), 180)
+        text = normalize_text(value.get("text"))
         if not text or has_bad_encoding(text):
             continue
         rows.append({
@@ -601,7 +621,7 @@ def _bound_claims(prepared: dict[str, Any]) -> list[dict[str, Any]]:
             "type": str(value.get("type") or "source_visible"),
             "confidence": str(value.get("confidence") or "source_visible"),
         })
-    return rows[:8]
+    return rows
 def _signals(source_index: int, evidence: dict[str, Any], measurements: list[dict[str, Any]]) -> dict[str, Any]:
     trusted = list(evidence.get("trusted_text") or [])
     text = " ".join(trusted)
@@ -673,32 +693,49 @@ def _measurement_rows(values: list[dict[str, Any]], child: dict[str, Any]) -> li
                 "text": str(value.get("text") or value.get("raw_text") or ""),
                 "raw_text": str(value.get("raw_text") or value.get("text") or ""),
                 "canonical_pair": pair,
+                "source_label": str(value.get("source_label") or value.get("raw_text") or ""),
+                "source_occurrence": str(value.get("source_occurrence") or ""),
+                "axis_hint": str(value.get("axis_hint") or ""),
                 "confidence": "confirmed" if pair and pair in spec_pairs else "source_visible",
             }
         )
     return rows
 def _independent_measurements(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for value in values:
         if not isinstance(value, dict):
             continue
-        key = str(value.get("canonical_pair") or "").strip().lower()
-        if not key:
-            key = normalize_text(value.get("text") or value.get("raw_text") or "").lower()
-        if key and key not in seen:
+        pair = str(value.get("canonical_pair") or "").strip().lower()
+        label = normalize_text(value.get("source_label") or value.get("raw_text") or value.get("text") or "").lower()
+        key = (pair, label, str(value.get("axis_hint") or ""), str(value.get("source_occurrence") or ""))
+        if (pair or label) and key not in seen:
             rows.append(dict(value))
             seen.add(key)
     return rows
-def _authored_claims(lines: list[str]) -> list[dict[str, Any]]:
+def _authored_claims(lines: list[str], *, visual: dict[str, Any] | None = None, product_text: str = "") -> list[dict[str, Any]]:
+    visual = visual or {}
+    authored = (
+        visual.get("role_guess") == "func" and visual.get("has_callouts_or_panels")
+        and float(visual.get("confidence") or 0) >= 0.8
+    )
+    observed = {normalize_text(value).casefold() for value in visual.get("evidence") or [] if isinstance(value, str)} if authored else set()
+    candidates = list(lines)
+    ocr_text = " ".join(normalize_text(line).casefold() for line in lines)
+    for phrase in visual.get("evidence") or [] if authored else []:
+        if isinstance(phrase, str) and normalize_text(phrase).casefold() in ocr_text:
+            candidates.append(phrase)
     rows: list[dict[str, Any]] = []
-    for line in lines:
+    product_words = " " + " ".join(re.findall(r"[a-z0-9]+", product_text.casefold())) + " "
+    for line in candidates:
         text = _claim_concept(line)
-        if not text or has_bad_encoding(text):
+        words = re.findall(r"[a-z0-9]+", text.casefold())
+        corroborated = len(words) >= 2 and (" " + " ".join(words) + " ") in product_words
+        if not text or not (_AUTHORED_FUNC_WORD.search(text) or normalize_text(line).casefold() in observed or corroborated):
             continue
-        if text not in {row["text"] for row in rows}:
+        if text.casefold() not in {row["text"].casefold() for row in rows}:
             rows.append({"text": text, "type": "visible_function_concept", "confidence": "source_visible"})
-    return rows[:8]
+    return rows
 
 
 def _claim_concept(value: Any) -> str:
@@ -707,12 +744,12 @@ def _claim_concept(value: Any) -> str:
         " ",
         normalize_text(value),
     )
-    if not text or has_bad_encoding(text) or not _AUTHORED_FUNC_WORD.search(text):
+    if not text or has_bad_encoding(text):
         return ""
     # This is source evidence, not buyer-facing render copy. Long, trustworthy
     # authored sentences stay bound to the source; the later FuncStory contract
     # alone owns the 2-6 word renderable rewrite.
-    return text[:180].rstrip(" ,;:")
+    return text.rstrip(" ,;:")
 
 
 def _spec_measurement_pairs(child: dict[str, Any]) -> set[str]:
@@ -895,10 +932,10 @@ def _trusted_text_lines(ocr: dict[str, Any]) -> list[str]:
     for line in lines:
         if not isinstance(line, dict) or float(line.get("confidence") or 0) < 0.68:
             continue
-        text = _clean_line(line.get("text"))[:240]
+        text = _clean_line(line.get("text"))
         if text and not _NOISE_TEXT.match(text) and text not in rows:
             rows.append(text)
-    return rows[:20]
+    return rows
 
 
 def _has_untrusted_raw_text(ocr: dict[str, Any], trusted_text: list[str]) -> bool:
@@ -962,7 +999,8 @@ def _visual_recovery_prompt() -> str:
         "\"has_callouts_or_panels\":false,\"visible_numbers_or_units\":[\"\"],\"layout_summary\":\"\","
         "\"confidence\":0.0,\"evidence\":[\"\"]}. Size requires multiple visible measurements plus lines, arrows, "
         "endpoints, or a clear measurement layout. Func uses authored callouts, panels, detail crops, or functional text. "
-        "Scene is an environment or alternate product view without authored information. Do not infer product facts or claims."
+        "Scene is an environment or alternate product view without authored information. For func, evidence must quote complete "
+        "authored product callouts verbatim, excluding text printed on loose props. Do not infer product facts or claims."
     )
 def _visual_response_valid(text: str) -> bool:
     value = _parse_json_object(text)

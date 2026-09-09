@@ -133,6 +133,21 @@ image_generation:
   replaceable_staging:
     - loose toiletries, towels, flowers, baskets, wall decor, floor decor, and room surfaces not attached to the cabinet
   forbidden_additions: []
+  visual_context:
+    primary_setting: modern US bathroom or powder room
+    buyer: homeowners and renters organizing daily storage
+    user: household members using bathroom storage
+    required_cues:
+      - towel and toiletry scale
+      - vanity-adjacent or bathroom architectural relationship
+      - clean surfaces with practical everyday organization
+    allowed_alternates:
+      - compact powder room
+      - transitional bathroom with restrained spa styling
+    avoid:
+      - bedroom or living-room staging
+      - wall-mounted treatment for a freestanding cabinet
+      - empty showroom styling with no believable storage use
   role_specific_rules:
     main:
       - Use a white external canvas while allowing reasonable contents inside the cabinet

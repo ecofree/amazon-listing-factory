@@ -53,6 +53,15 @@ def compiled_image_policy(plugin: Any) -> dict[str, Any]:
         "role_specific_rules": _role_rules(image_config.get("role_specific_rules")),
         "template_image_role_order": order,
     }
+    # These fields are executable visual context, not planner-owned decoration.
+    # Keep them in the same policy projection so manifest changes reach both the
+    # planner and every current ImageTask instead of remaining inert metadata.
+    visual_context = image_config.get("visual_context")
+    if isinstance(visual_context, dict):
+        policy["visual_context"] = visual_context
+    role_visual_direction = image_config.get("role_visual_direction")
+    if isinstance(role_visual_direction, dict):
+        policy["role_visual_direction"] = role_visual_direction
     policy["policy_id"] = hashlib.sha256(json.dumps(policy, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     return policy
 

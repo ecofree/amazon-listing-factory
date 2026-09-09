@@ -398,10 +398,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if bool(getattr(args, "repair_running", False)):
         from core.status import mark_interrupted_running
 
-        mark_interrupted_running(
-            job_path,
-            reason="Operator explicitly repaired stale running state from status command",
-        )
+        with job_run_lock(job_path):
+            mark_interrupted_running(
+                job_path,
+                reason="Operator explicitly repaired stale running state from status command",
+            )
     state = load_status(job_path)
     release_path = job_path / "reports" / "release_manifest_v5.json"
     release = read_json(release_path) if release_path.is_file() else {}
@@ -542,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--category", default="")
     p.add_argument("--config", default="")
     p.add_argument("--stages", default="", help="Comma-separated debug stages handled by the canonical production controller.")
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=0, help="Generation concurrency cap; 0 selects a hardware/provider-aware limit.")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--upload", action="store_true")
     p.add_argument("--write-excel", action="store_true", help="Write the XLSM artifact for debug template runs; enabled automatically for --stages template.")

@@ -165,6 +165,7 @@ def publish_approved_release(
     config_path: str = "",
     upload: bool = False,
     workers: int = 4,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, list[dict[str, str]]]:
     from .release_manifest import approved_release_rows, build_release_manifest
 
@@ -230,7 +231,10 @@ def publish_approved_release(
             })
     if upload and publish_rows:
         try:
-            _preflight_upload_endpoint(_env_any("R2_ENDPOINT", "R2_S3_ENDPOINT", required=True))
+            remaining = deadline_monotonic - time.monotonic() if deadline_monotonic is not None else 5.0
+            if remaining <= 0:
+                raise PublishError("Publish execution deadline exhausted before upload")
+            _preflight_upload_endpoint(_env_any("R2_ENDPOINT", "R2_S3_ENDPOINT", required=True), timeout=min(5.0, remaining))
         except PublishError as exc:
             _write_partial_publish_ledger(job_path, _merge_publish_rows(existing_rows, reusable_rows))
             preflight_failures = [
@@ -261,6 +265,7 @@ def publish_approved_release(
             persisted_rows=existing_rows,
             failures=failures,
             public_base_url=public_base_url,
+            deadline_monotonic=deadline_monotonic,
         )
     elif publish_rows:
         new_rows = [_local_row(row, job, job_id=job_path.name) for row in publish_rows]
@@ -483,6 +488,7 @@ def _upload_rows(
     persisted_rows: list[dict[str, str]] | None = None,
     failures: list[dict[str, str]] | None = None,
     public_base_url: str,
+    deadline_monotonic: float | None = None,
 ) -> list[dict[str, str]]:
     endpoint = _env_any("R2_ENDPOINT", "R2_S3_ENDPOINT", required=True)
     access_key_id = _env_any("R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID", required=True)
@@ -499,7 +505,7 @@ def _upload_rows(
                 raise PublishError(f"Generated image not found before upload: {image_path}")
             object_key = _build_key(prefix, row["parent"], row["child"], image_path, row["candidate_sha256"])
             public_url = _public_url(public_base_url, object_key)
-            future = executor.submit(_upload_one_s3, endpoint, access_key_id, secret_access_key, bucket, object_key, image_path, region)
+            future = executor.submit(_upload_one_s3, endpoint, access_key_id, secret_access_key, bucket, object_key, image_path, region, deadline_monotonic=deadline_monotonic)
             futures[future] = (row, image_path, object_key, public_url)
         for future in as_completed(futures):
             row, image_path, object_key, public_url = futures[future]
@@ -788,7 +794,7 @@ def _atomic_copy(source: Path, target: Path) -> Path:
                 pass
 
 
-def _upload_one_s3(endpoint: str, access_key_id: str, secret_access_key: str, bucket: str, object_key: str, image_path: Path, region: str) -> dict[str, int | str]:
+def _upload_one_s3(endpoint: str, access_key_id: str, secret_access_key: str, bucket: str, object_key: str, image_path: Path, region: str, *, deadline_monotonic: float | None = None) -> dict[str, int | str]:
     content_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
     payload_hash = _sha256_file(image_path)
     size = image_path.stat().st_size
@@ -812,7 +818,7 @@ def _upload_one_s3(endpoint: str, access_key_id: str, secret_access_key: str, bu
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
     }
-    response = _put_file_with_retries(url, headers=headers, image_path=image_path)
+    response = _put_file_with_retries(url, headers=headers, image_path=image_path, deadline_monotonic=deadline_monotonic)
     if not response.ok:
         hint = ""
         if _is_retryable_signature_error(response.status_code, response.text):
@@ -831,24 +837,33 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _put_file_with_retries(url: str, *, headers: dict[str, str], image_path: Path) -> requests.Response:
+def _put_file_with_retries(url: str, *, headers: dict[str, str], image_path: Path, deadline_monotonic: float | None = None) -> requests.Response:
     attempts = 3
     last: requests.Response | None = None
     for attempt in range(1, attempts + 1):
+        timeout = min(120.0, deadline_monotonic - time.monotonic()) if deadline_monotonic is not None else 120.0
+        if timeout <= 0:
+            raise PublishError("Publish execution deadline exhausted before request")
         try:
             with image_path.open("rb") as f:
-                response = requests.put(url, headers=headers, data=f, timeout=120)
+                response = requests.put(url, headers=headers, data=f, timeout=timeout)
         except requests.RequestException as exc:
             if _is_socket_permission_error(exc):
                 raise PublishError(f"R2 upload blocked by local socket permissions: {exc}") from exc
             if attempt >= attempts:
                 raise PublishError(f"R2 upload failed after {attempts} attempts: {exc}") from exc
-            time.sleep(_retry_delay(attempt))
+            delay = _retry_delay(attempt)
+            if deadline_monotonic is not None and time.monotonic() + delay >= deadline_monotonic:
+                raise PublishError("Publish execution deadline exhausted before retry") from exc
+            time.sleep(delay)
             continue
         last = response
         if response.ok or not _retryable_status(response.status_code, response.text) or attempt >= attempts:
             return response
-        time.sleep(_retry_delay(attempt))
+        delay = _retry_delay(attempt)
+        if deadline_monotonic is not None and time.monotonic() + delay >= deadline_monotonic:
+            raise PublishError("Publish execution deadline exhausted before retry")
+        time.sleep(delay)
     return last if last is not None else requests.Response()
 
 

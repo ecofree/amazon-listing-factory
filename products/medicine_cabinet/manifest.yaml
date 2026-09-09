@@ -138,6 +138,21 @@ image_generation:
       unless_source_visible: true
     - part: electrical controls
       unless_source_visible: true
+  visual_context:
+    primary_setting: modern US bathroom vanity area
+    buyer: homeowners and renters organizing daily grooming storage
+    user: household members using a mirror and bathroom cabinet
+    required_cues:
+      - mirror, vanity, and grooming scale
+      - believable wall relationship for the source-visible cabinet
+      - restrained toiletries and clean counter organization
+    allowed_alternates:
+      - compact powder room vanity
+      - shared family bathroom with practical storage
+    avoid:
+      - freestanding floor-cabinet treatment
+      - bedroom, kitchen, or living-room staging
+      - decorative props that hide the mirror, doors, or storage state
   role_specific_rules:
     main:
       - Use a white external canvas and preserve the source-visible frame, door or panel face, hinge, and shelf geometry

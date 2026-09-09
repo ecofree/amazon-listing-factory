@@ -10,14 +10,15 @@ from .io import read_jsonl, write_bytes_atomic, write_jsonl
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .status import input_revision_id, logical_task_id
+from .text_evidence import extract_measurements, normalize_text
+from .visual_design_kit_compiler import _sanitize_role_image_direction
 
 
-PROMPT_CONTRACT_VERSION = "gemini-art-direction-projection-v33-single-authority"
-PROMPT_HARD_LIMIT_CHARS = 8000
+PROMPT_CONTRACT_VERSION = "gemini-art-direction-v65-planner-visual-authority"
 PROMPT_REVISION_RESERVE_CHARS = 700
-PROMPT_INITIAL_LIMIT_CHARS = PROMPT_HARD_LIMIT_CHARS - PROMPT_REVISION_RESERVE_CHARS
+PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v15-single-authority"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v50-planner-visual-authority"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -122,7 +123,7 @@ def image_branch_currentness(job_dir: str | Path, plugin: ProductPlugin) -> tupl
     # blocked rows for missing/stale child kits.  Requiring global kit
     # completeness here would make one failed child suppress ready siblings.
     for label, check in (
-        ("ImageTask", image_tasks_current),
+        ("ImageTask", lambda path, active_plugin: image_tasks_current(path, active_plugin, include_optional=True)),
         ("ImagePrompt", image_prompts_current),
     ):
         if not check(job_dir, plugin):
@@ -131,6 +132,7 @@ def image_branch_currentness(job_dir: str | Path, plugin: ProductPlugin) -> tupl
 
 
 def require_current_image_branch(job_dir: str | Path, plugin: ProductPlugin) -> None:
+    """Keep the existing generation entry point fail-closed on stale inputs."""
     current, reason = image_branch_currentness(job_dir, plugin)
     if not current:
         raise ImagePromptError(f"Image branch is not current: {reason}")
@@ -148,7 +150,7 @@ def prompt_for_task(prompt_artifact: dict[str, Any], task: dict[str, Any]) -> di
     row = matches[0]
     validate_image_prompt(row)
     if row["task_fingerprint"] != task.get("task_fingerprint"):
-        raise ImagePromptError("ImagePromptV2 does not match current ImageTaskV8")
+        raise ImagePromptError("ImagePromptV2 does not match current ImageTaskV9")
     if row["status"] != "ready":
         raise ImagePromptError(str(row.get("error") or "Image prompt formation is blocked"))
     return row
@@ -166,7 +168,16 @@ def validate_image_prompt(row: Any) -> None:
     )
     missing = [key for key in required if row.get(key) in (None, "", [], {})]
     if missing or row.get("policy_version") != IMAGE_PROMPT_POLICY_VERSION:
-        raise ImagePromptError(f"ImagePromptV2 is incomplete: {missing}")
+        mismatch = ""
+        if row.get("policy_version") != IMAGE_PROMPT_POLICY_VERSION:
+            mismatch = (
+                f" policy_version found={row.get('policy_version')!r} "
+                f"expected={IMAGE_PROMPT_POLICY_VERSION!r}; task_fingerprint={row.get('task_fingerprint')!r}"
+            )
+        raise ImagePromptError(
+            f"ImagePromptV2 is incomplete: missing={missing};{mismatch} "
+            "regenerate the current ImagePrompt artifact from the active ImageTask"
+        )
     if row["status"] not in {"ready", "blocked"}:
         raise ImagePromptError("ImagePromptV2 status is invalid")
     if row["status"] == "ready":
@@ -190,43 +201,54 @@ def compile_task_prompt(
     if not isinstance(art_direction, dict):
         raise ValueError("ImageTask has no family art direction")
     edit = task.get("edit_contract") if isinstance(task.get("edit_contract"), dict) else {}
+    main_policy = str((task.get("category_image_policy") or {}).get("main_image_policy") or "")
+    white_main = role == "main" and main_policy == "white_background"
     renderable = task_renderable_text(task)
     text_mode = str((task.get("renderable_text_contract") or {}).get("mode") or "none")
     if renderable:
-        text_rule = (
-            "Treat all readable text already visible in the editable reference as evidence only, not output content. "
-            "Erase or replace every source headline, paragraph, caption, instruction, badge, and label. Render only the "
-            "exact strings inside the renderable-text block; copy them verbatim without expanding, paraphrasing, or adding text."
-        )
+        if str(task.get("category_id") or "") == "bed_frame" and role == "func":
+            text_rule = (
+                "Render only the exact strings in the renderable-text block verbatim for the infographic. "
+                "Child-room picture books may use short generic titles only; do not show author names, publishers, "
+                "recognizable third-party brands, logos, trademarks, branded packaging, or product claims."
+            )
+        elif str(task.get("category_id") or "") in {"bathroom_cabinet", "medicine_cabinet"} and role == "func":
+            text_rule = (
+                "Source text is evidence only, not presentation authority. Render only the exact strings in the "
+                "renderable-text block verbatim. Use plain, unbranded, label-free bottles, books, towels, and containers; "
+                "remove all other readable prop text, logos, trademarks, and packaging copy."
+            )
+        else:
+            text_rule = (
+                "Source text is evidence only, not presentation authority. Erase source presentation text and text-bearing staging; "
+                "render only the exact strings in the renderable-text block verbatim and add nothing else."
+            )
     elif text_mode == "preserve_source_measurements":
         text_rule = (
-            "Only source-visible measurement facts are renderable. Preserve their exact values, units, measured-part labels, "
-            "and diagram relationships. Preserve factual load-capacity callouts and their source-visible icon/label relationship "
-            "even when they are drawn as a badge; only decorative, non-factual badges may be removed. Remove non-measurement "
-            "headings, field names, captions, and marketing copy."
+            "Only source-visible measurement facts are renderable; use the canonical display copy supplied for factual callouts with readable spacing. Remove decorative headings, "
+            "field names, captions, marketing copy, and non-factual modules."
         )
     else:
         text_rule = "Do not render any readable text."
+        if role == "main":
+            text_rule = "Main image: no readable text anywhere; erase or replace text-bearing staging, signs, labels, and decorative graphics."
     prompt = "\n\n".join((
         f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}",
-        text_rule,
-        "[CREATE]\n" + str(edit.get("create") or "").strip() + "\n" + _composition_responsibility(
-            role, reference_mode=str(task.get("reference_mode") or ""),
-        ),
-        "[REFERENCE AND PRODUCT BOUNDARY]\n" + _product_boundary(task, edit),
-        "[FAMILY ART DIRECTION]\n" + _family_art_direction(
+        "[ROLE]\n" + str(edit.get("create") or "").strip() + "\n"
+        + _visual_rendering_baseline(role)
+        + "\n" + _role_content(task, role, white_main=white_main),
+        "[REFERENCE]\n" + _product_boundary(task, edit),
+        "[STYLE]\n" + _family_art_direction(
             art_direction, role,
-            main_policy=str((task.get("category_image_policy") or {}).get("main_image_policy") or ""),
+            main_policy=main_policy,
+        ) + "\n" + _presentation_system(
+            art_direction,
+            role=role,
+            main_policy=main_policy,
         ),
-        "[THIS IMAGE]\n" + _role_content(task, role, edit),
-        "[FORBIDDEN]\n" + _join_items(edit.get("forbid")),
-        "[OUTPUT]\nRender only the strongest final composition. Square Amazon US listing image; photoreal sold product; no logo, watermark, malformed text, or unrequested readable copy. Maintain clear focal hierarchy and purposeful spacing. Product boundary and role purpose constrain the content; the family art direction remains authoritative for visual treatment.",
+        "[TEXT]\n" + text_rule + ("\n" + _render_text_block(renderable) if renderable else ""),
+        "[OUTPUT]\nReturn one square Amazon US image only. No commentary, watermark, or unapproved content.",
     )).strip()
-    if len(prompt) > PROMPT_INITIAL_LIMIT_CHARS:
-        raise ValueError(
-            f"Compiled image brief is {len(prompt)} characters; the immutable ImageTask must be reduced upstream "
-            f"to reserve {PROMPT_REVISION_RESERVE_CHARS} characters for an explicit revision"
-        )
     assert_prompt_contract(prompt, role=role, task=task)
     return prompt
 
@@ -236,17 +258,12 @@ def assert_prompt_contract(
     renderable_text: list[str] | None = None,
 ) -> None:
     required = (
-        f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}", "[CREATE]",
-        "[REFERENCE AND PRODUCT BOUNDARY]", "[FAMILY ART DIRECTION]",
-        "[THIS IMAGE]", "[FORBIDDEN]", "[OUTPUT]",
+        f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}", "[ROLE]", "[REFERENCE]",
+        "[STYLE]", "[TEXT]", "[OUTPUT]",
     )
     missing = [value for value in required if value not in prompt]
     if missing:
         raise ValueError(f"Compiled image brief is incomplete: {missing}")
-    if len(prompt) > PROMPT_HARD_LIMIT_CHARS:
-        raise ValueError(
-            f"Compiled image brief is {len(prompt)} characters; hard limit is {PROMPT_HARD_LIMIT_CHARS}"
-        )
     if task is None and renderable_text is None:
         return
     strings = list(renderable_text if renderable_text is not None else task_renderable_text(task or {}))
@@ -343,76 +360,65 @@ def _prompt_failure(task: dict[str, Any], error: str) -> dict[str, Any]:
 def _product_boundary(task: dict[str, Any], edit: dict[str, Any]) -> str:
     facts = task.get("product_facts") if isinstance(task.get("product_facts"), dict) else {}
     boundary = task.get("product_boundary") if isinstance(task.get("product_boundary"), dict) else {}
-    staging = "; ".join(str(value).strip() for value in boundary.get("replaceable_staging") or [] if str(value).strip())
+    authority = " ".join(str(edit.get("reference_authority") or "the role source").split()).strip()
+    identity = (
+        f"type={facts.get('product_type') or 'reference'}; color={facts.get('color') or 'reference'}; "
+        f"quantity={facts.get('sold_unit_count') or 'reference'}"
+    )
     rows = [
-        "Reference authority: " + str(edit.get("reference_authority") or "preserve from the editable reference").strip(),
-        (
-            f"Sold product: {facts.get('product_type') or 'preserve from reference'}; "
-            f"color: {facts.get('color') or 'preserve from reference'}; "
-            f"quantity: {facts.get('sold_unit_count') or 'preserve from reference'}."
-        ),
-        "Keep every source-visible sold part, attachment, surface, structural relationship, and current open/closed state unchanged.",
-        "Retain the presence, coverage, and functional relationship of state-bearing staging, while restyling only individual loose props; never remove a source-visible mattress, bedding, drawer contents, towel, or other item that establishes the sold product's current use or state" + (": " + staging if staging else "."),
-        "Reference completeness: " + str(edit.get("reference_completeness") or "partial_feature_view") + ". If this is partial_feature_view or scene_context_only, use it only for visible feature/state evidence and do not reconstruct hidden product regions; use confirmed product facts for identity.",
-        _line("Conditional source-visible structures", boundary.get("conditional_structure_lock")),
+        f"Reference authority: {authority} Identity: {identity}.",
+        _line("Preserve", edit.get("preserve")),
+        _line("Edit", edit.get("replace")),
+        _line("Category constraints", edit.get("forbid")),
+        "Source completeness: " + str(edit.get("reference_completeness") or "partial_feature_view") + "; use visible evidence only; do not infer hidden regions.",
+        _conditional_structure_line(boundary.get("conditional_structure_lock")),
         _line("Forbidden additions", boundary.get("forbidden_additions")),
     ]
     return "\n".join(row for row in rows if row)
 
 
-def _composition_responsibility(role: str, *, reference_mode: str = "") -> str:
+def _visual_rendering_baseline(role: str) -> str:
+    """Emit one role-appropriate exposure sentence."""
     if role == "size":
-        return (
-            "Edit the source measurement image without rebuilding or simplifying its measurement diagram. Preserve every source-visible "
-            "number, unit, line direction, endpoint, measured part, and relationship. Re-art-direct only the presentation under the "
-            "family art direction. Use the family Graphic Direction exactly; do not invent a role-specific banner or header. "
-            "Do not reduce the result to a generic plain-gray diagram or an empty measurement sheet."
-        )
+        return "Bright neutral technical presentation; crisp edges and readable contrast. No people."
     if role == "func":
-        if reference_mode == "func_main_identity_edit":
-            return (
-                "Use the editable main reference as the sole complete sold-product identity and structure authority. "
-                "The function source was used only to derive the frozen shopping story and feature evidence; do not "
-                "reconstruct a different tree, flower, branch, stem, or pot from that partial evidence. Choose one "
-                "clear function composition around the preserved main product inside the family art direction. "
-                "Do not copy any source infographic layout, banner, card geometry, icon arrangement, or background blocks."
-            )
-        return (
-            "Use the source function image only for its demonstrated product state, feature relationship, and shopping evidence; do not copy "
-            "its composition, crop, banner, card geometry, icon arrangement, typography, or background blocks. Let the image model choose "
-            "one clear composition and information hierarchy inside the family art direction. Use the family Graphic Direction exactly; do "
-            "not invent a role-specific banner or header. Keep the headline and supported labels large and readable, with no footnotes or "
-            "micro-copy. Redesign the non-product presentation rather than reproducing the source infographic template."
-        )
-    shared = (
-        "Choose the final composition yourself. Treat the family art direction as binding, and use the editable reference as product "
-        "and feature evidence rather than a layout template."
-    )
-    role_direction = {
-        "main": "The role contract is absolute: compose for immediate recognition and obey its white-canvas or lifestyle requirement even when the family direction describes a room.",
-        "scene": "Use the source scene only for product/state/use evidence; do not copy its composition, crop, banner, card geometry, icon arrangement, typography, or background blocks. The product boundary above already locks sold parts and state-bearing staging; redesign only individual loose props and their styling. Build a believable US-home spatial relationship that reveals scale and use, with bright natural daylight and light room surfaces, keeping the product as the visual anchor.",
-    }.get(role, "Compose one clear shopping story with the product as the visual anchor.")
-    return shared + " " + role_direction
+        return "Bright neutral infographic presentation; light canvas, readable contrast, natural product detail, no shadows behind text. No people."
+    return "Bright airy commercial exposure with neutral daylight, lifted midtones, soft shadows, and clear product separation. No people."
 
 
-def _role_content(task: dict[str, Any], role: str, edit: dict[str, Any]) -> str:
+def _role_content(
+    task: dict[str, Any], role: str, *, white_main: bool = False
+) -> str:
     purpose = str(task.get("role_purpose") or "").strip()
     rows = ["Shopping purpose: " + purpose]
-    image_direction = str(task.get("image_direction") or "").strip()
+    image_direction = "" if white_main else _compact_role_direction(_sanitize_role_image_direction(task.get("image_direction")))
     if image_direction:
+        # Keep the planner's role-level design language; it does not authorize a
+        # fixed layout or replace the product and evidence contracts.
         rows.append("Image direction: " + image_direction)
-    rows.append(_line("Redesign", edit.get("replace")))
-    strings = task_renderable_text(task)
-    if strings:
-        rows.extend(("Exact readable copy:", _render_text_block(strings)))
     if role == "size":
         rows.append(_measurement_content(task.get("measurement_authority")))
     elif role == "func":
-        rows.append(
-            "The shopping story is frozen: show only its source-visible relationship and do not invent a different function or state. "
-            "Image direction applies only to non-product presentation."
-        )
+        rows.append("Function: show only the source-supported feature relationship and state.")
     return "\n".join(row for row in rows if row)
+
+
+def _compact_role_direction(value: Any) -> str:
+    """Keep planner composition language while removing compiler-owned locks."""
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    text = text.replace(
+        "vary bedding, accent color, and material contrast",
+        "vary textile texture and material contrast within the child route",
+    )
+    for suffix in (
+        " Bedding/pillows=textile roles only; accent=props/decor only.",
+        " Bedding/pillows=textile roles only; accent=props/decor only",
+    ):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].rstrip(" .;:")
+    return text
 
 
 def _family_art_direction(
@@ -421,77 +427,122 @@ def _family_art_direction(
     *,
     main_policy: str = "",
 ) -> str:
-    white_main = role == "main" and main_policy == "white_background"
-    fields_by_role = {
-        "main": (
-            "audience_and_market", "palette_direction", "photography_direction",
-            "environment_and_staging",
-        ),
-        "scene": (
-            "audience_and_market", "palette_direction", "photography_direction",
-            "environment_and_staging",
-        ),
-        "func": (
-            "audience_and_market", "palette_direction", "photography_direction",
-            "typography_direction", "graphic_direction",
-        ),
-        "size": (
-            "palette_direction", "typography_direction", "graphic_direction",
-        ),
-    }
-    fields = ("photography_direction",) if white_main else fields_by_role.get(role, fields_by_role["func"])
-    rows = []
-    if white_main:
-        rows.append(
-            "The external canvas remains uniform pure white; inherit only the family lighting, product presentation, and permitted non-sold staging."
-        )
-    rows.extend(
-        f"{field.replace('_', ' ').title()}: {direction.get(field)}"
-        for field in fields
-        if str(direction.get(field) or "").strip()
-    )
-    if role in {"scene", "func", "size"}:
-        rows.append(
-            "Family visual rules are immutable: use the Typography Direction and Graphic Direction exactly, including the family text ink, line treatment, and header treatment; do not invent role-specific colors, fonts, banners, or modules."
-        )
-    if not white_main:
-        rows.append(_line("Negative visual outcomes", direction.get("negative_visuals")))
-    return "\n".join(row for row in rows if str(row).strip())
+    if role == "main" and main_policy == "white_background":
+        rows = [
+            "White-background main presentation: bright neutral studio exposure, soft grounding shadow, "
+            "clean edge separation, and no room or lifestyle staging."
+        ]
+    else:
+        audience = _compact_token_direction(direction.get("audience_and_market"))
+        staging = _compact_staging_direction(direction.get("environment_and_staging"))
+        photography = _compact_photography_direction(direction.get("photography_direction") or "")
+        cohesion = _compact_token_direction(direction.get("cohesion_rule"))
+        rows = [
+            "Market context: " + audience if audience else "",
+            "Staging intent: " + staging if staging and role in {"main", "scene"} else "",
+            "Photography intent: " + photography if photography else "",
+            "Child cohesion: " + cohesion if cohesion else "",
+        ]
+    negative = [
+        _compact_token_direction(value)
+        for value in direction.get("negative_visuals") or []
+        if _compact_token_direction(value)
+    ]
+    if negative:
+        rows.append("Avoid: " + "; ".join(negative) + ".")
+    return "\n".join(row for row in rows if row)
+
+
+def _compact_palette_direction(value: str, *, role: str) -> str:
+    """Project Gemini's final child palette without interpreting or replacing it."""
+    del role
+    text = _compact_token_direction(value)
+    return "Child palette: " + text + "." if text else ""
+
+
+def _compact_photography_direction(value: str) -> str:
+    """Keep Gemini's lighting and material-rendering intent compact."""
+    return _compact_staging_direction(value)
+
+
+def _compact_staging_direction(value: str) -> str:
+    """Project current planner staging without a retired program-prefix reader."""
+    return _sanitize_planner_direction(value)
+
+
+def _presentation_system(direction: dict[str, Any], *, role: str, main_policy: str = "") -> str:
+    """Emit Gemini's one child-wide palette and component system once."""
+    if role == "main" and main_policy == "white_background":
+        return "Do not apply room, floor, textile, staging, or child room palette tokens to this white-background main image."
+    palette = _compact_palette_direction(direction.get("palette_direction") or "", role=role)
+    if role in {"func", "size"}:
+        rows = [
+            palette,
+            "Typography system: " + _compact_token_direction(direction.get("typography_direction")),
+            "Graphic system: " + _compact_token_direction(direction.get("graphic_direction")),
+            "Apply environmental colors only to non-product content and graphic colors only to presentation graphics; do not recolor the sold product or add a room to a technical diagram.",
+        ]
+    else:
+        rows = [palette]
+        rows.append("Apply this palette to non-product surroundings and staging; keep the sold product finish unchanged.")
+    return "\n".join(row for row in rows if row)
+
+
+def _compact_token_direction(value: Any) -> str:
+    """Normalize one Gemini design field without changing its meaning."""
+    text = " ".join(str(value or "").split()).strip().rstrip(".")
+    if not text:
+        return ""
+    return text
+
+
+def _sanitize_planner_direction(value: Any) -> str:
+    return " ".join(_sanitize_role_image_direction(value).split()).strip(" .;:")
 
 
 def _measurement_content(value: Any) -> str:
     measurement = value if isinstance(value, dict) else {}
     if measurement.get("mode") == "source_image":
-        inventory = [
-            str(row.get("render_text") or "").strip()
-            for row in measurement.get("measurement_groups") or []
-            if isinstance(row, dict) and str(row.get("render_text") or "").strip()
-        ]
-        audit = (
-            " Source-observed measurement inventory that must remain present: "
-            + "; ".join(dict.fromkeys(inventory))
-            + ". This inventory is an audit aid, not permission to omit any other source-visible measurement."
-            if inventory else ""
+        candidates = list(measurement.get("source_visible_callouts") or [])
+        for row in measurement.get("measurement_groups") or []:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("render_text") or "").strip()
+            part = str(row.get("measured_part") or "").strip()
+            axis = str(row.get("axis") or "").strip()
+            if part and part != "source_visible":
+                text = part if extract_measurements(part) else f"{part}: {text}"
+            if axis and axis != "source_diagram" and not extract_measurements(part):
+                text = f"{axis}: {text}"
+            candidates.append(text)
+        candidates.extend(
+            row for row in measurement.get("source_visible_text_artifacts") or []
+            if isinstance(row, dict) and row.get("kind") in {"measurement", "callout"}
         )
+        inventory, seen = [], set()
+        for row in candidates:
+            text = normalize_text(row.get("display_text") or row.get("text")) if isinstance(row, dict) else normalize_text(row)
+            if not text or re.fullmatch(r"\d+(?:\.\d+)?", text):
+                continue  # Naked OCR numbers have no unit/object authority; keep them in evidence only.
+            values = extract_measurements(text)
+            context = text.casefold()
+            for item in values:
+                context = context.replace(str(item["raw_text"]).casefold(), " ")
+            context = " ".join(re.findall(r"[a-z]+", context))
+            key = (context, tuple(item["canonical_pair"] for item in values)) if values and context else (text.casefold(), ())
+            if key not in seen:
+                inventory.append(text)
+                seen.add(key)
         return (
-            "Preserve the complete visible measurement diagram: every measurement value, unit, measured-part label, line "
-            "direction, endpoint, label-line relationship, and the exact product instance each line measures. Non-measurement "
-            "headings, template field names, marketing captions, and decorative source copy are replaceable presentation; "
-            "remove them without adding a replacement heading. Factual load-capacity callouts (for example a confirmed lb/lbs "
-            "value) are not decorative badges: preserve the exact value and its source-visible icon/label relationship. Never move "
-            "one product's measurement line across a second unit."
-            + audit
+            "Measurement copy: Render canonical display copy with readable spacing at its existing source association, not as additional labels. "
+            "This inventory aids transcription; the source diagram remains authority for all relationships and unlisted facts."
+            + (" Source-observed facts: " + "; ".join(inventory) + "." if inventory else "")
         )
     groups = [
         f"{row.get('measured_part')} / {row.get('axis')}: {row.get('render_text')}"
         for row in measurement.get("measurement_groups") or [] if isinstance(row, dict)
     ]
     return "Confirmed measurement relationships: " + "; ".join(groups) + "."
-
-
-def _join_items(values: Any) -> str:
-    rows = values if isinstance(values, list) else [] if values in (None, "") else [values]
-    return "; ".join(" ".join(str(value or "").split()) for value in rows if str(value or "").strip())
 
 
 def _line(label: str, values: Any) -> str:
@@ -501,6 +552,29 @@ def _line(label: str, values: Any) -> str:
         for value in rows if str(value or "").strip()
     )
     return f"{label}: {text}." if text else ""
+
+
+def _conditional_structure_line(values: Any) -> str:
+    rows = values if isinstance(values, list) else [] if values in (None, "") else [values]
+    normalized = [
+        " ".join(str(value or "").split()).rstrip(" .;:")
+        for value in rows
+        if str(value or "").strip()
+    ]
+    normalized = list(dict.fromkeys(normalized))
+    prefix = "Preserve "
+    suffix = " exactly when visible in the editable reference; do not add it when absent"
+    items = [
+        value[len(prefix):-len(suffix)]
+        for value in normalized
+        if value.startswith(prefix) and value.endswith(suffix)
+    ]
+    if normalized and len(items) == len(normalized):
+        return (
+            "Conditional source-visible structures: preserve these structures exactly when visible in the editable reference "
+            "and do not add any when absent: " + "; ".join(items) + "."
+        )
+    return _line("Conditional source-visible structures", normalized)
 
 
 def _render_text_block(values: list[str]) -> str:

@@ -25,6 +25,28 @@ def read_json(path: str | Path) -> Any:
         raise ValueError(f"Could not read JSON file {json_path}: {type(exc).__name__}: {exc}") from exc
 
 
+def parse_json_object_response(text: str, *, label: str = "JSON response") -> dict[str, Any]:
+    """Parse one JSON object from a provider response without trusting prose."""
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    decoder = json.JSONDecoder()
+    start = raw.find("{")
+    if start < 0:
+        raise ValueError(f"{label} does not contain a JSON object")
+    try:
+        value, end = decoder.raw_decode(raw[start:])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    trailing = raw[start + end:].strip()
+    if trailing.startswith("{"):
+        raise ValueError(f"{label} contains more than one JSON object")
+    return value
+
+
 def write_json(path: str | Path, data: Any) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)

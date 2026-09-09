@@ -89,18 +89,17 @@ def upscale_for_publication_with_backend(
     try:
         target = max(PUBLIC_IMAGE_SIZE, int(target_size or PUBLIC_IMAGE_SIZE))
         with Image.open(BytesIO(data)) as source:
-            source.load()
             width, height = int(source.width), int(source.height)
             if width != height:
                 raise ImageUpscaleError(f"generated image must be square before sizing: {width}x{height}")
+            if (width, height) == (target, target) and source.format == "PNG" and source.mode == "RGB":
+                return bytes(data), UPSCALE_BACKEND
+            source.load()
             backend = _configured_backend()
             if backend in {"auto", "realesrgan", "real-esrgan"} and _realesrgan_executable().is_file():
                 try:
                     return _realesrgan_resize(bytes(data), target), REALESRGAN_MODEL
                 except ImageUpscaleError as exc:
-                    # Keep publication available, but make the quality
-                    # downgrade explicit in CandidateManifest instead of
-                    # silently presenting Pillow output as ESRGAN output.
                     fallback = f"{UPSCALE_BACKEND}:fallback_from_realesrgan:{type(exc).__name__}"
                     return _resize_lanczos(source, target), fallback
             return _resize_lanczos(source, target), UPSCALE_BACKEND

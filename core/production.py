@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -53,7 +54,7 @@ class JobRunRequest:
     job_dir: Path
     plugin: ProductPlugin
     config_path: str = ""
-    workers: int = 4
+    workers: int = 0
     limit: int = 0
     upload: bool = False
     write_excel: bool = False
@@ -62,6 +63,7 @@ class JobRunRequest:
     resume: bool = False
     dry_run: bool = False
     retry_copy: bool = False
+    deadline_monotonic: float | None = None
 
 
 def run_job(request: JobRunRequest, stages: Iterable[str] | None = None) -> dict[str, Any]:
@@ -111,15 +113,20 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
         job_deadline_seconds = max(60.0, float(os.environ.get("AMAZON_FACTORY_JOB_DEADLINE_SECONDS") or "7200"))
     except ValueError:
         job_deadline_seconds = 7200.0
+    request = replace(request, deadline_monotonic=min(
+        started + job_deadline_seconds,
+        request.deadline_monotonic if request.deadline_monotonic is not None else float("inf"),
+    ))
     timings: dict[str, float] = {}
     release: dict[str, Any] = {}
     submit_ready_template = request.production or str(request.template_mode or "").strip().lower() == "submit_ready"
+    draft_template_requested = "template" in selected and not submit_ready_template
     if request.resume and selected and (
         selected[0] == "publish" or (selected[0] == "template" and submit_ready_template)
     ):
         release = release or _release_if_available(request)
         terminal = _release_terminal_before_publish(release)
-        if terminal:
+        if terminal and not draft_template_requested:
             return _finish(request, status=terminal, timings=timings, started=started, release=release)
     begin_run(request.job_dir)
     current_stage = "run"
@@ -129,7 +136,7 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
     run_had_failures = False
     try:
         for stage in selected:
-            if time.monotonic() - started >= job_deadline_seconds:
+            if time.monotonic() >= request.deadline_monotonic:
                 raise ProductionPipelineError(f"Production job deadline exhausted after {job_deadline_seconds:.0f} seconds")
             current_stage = stage
             stage_started = time.monotonic()
@@ -143,6 +150,8 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
                 release = build_release_manifest(job_dir=request.job_dir, plugin=request.plugin)
                 terminal = _release_terminal_before_publish(release)
                 if terminal:
+                    if draft_template_requested:
+                        continue
                     return _finish(request, status=terminal, timings=timings, started=started, release=release)
             if stage == "template":
                 if submit_ready_template:
@@ -199,6 +208,16 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
                 })
             if task_status_recorded:
                 stage_successes = [row for row in successes if str(row.get("logical_task_id") or "") == logical_task_id(stage)]
+                if not failures and not stage_successes:
+                    # Generation/QA/publish record their child tasks inside the
+                    # stage implementation. The stage task still needs the
+                    # same terminal success record so an older interrupted
+                    # stage cannot remain the active blocker after recovery.
+                    stage_successes = [{
+                        "logical_task_id": logical_task_id(stage),
+                        "input_revision_id": stage_revision,
+                        "status": "success",
+                    }]
                 record_task_successes(request.job_dir, owner_stage=stage, attempt_id=attempt_id, tasks=stage_successes)
                 record_task_failures(request.job_dir, owner_stage=stage, attempt_id=attempt_id, failures=failures)
             else:
@@ -227,7 +246,7 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
             # Copy and image production are independent branches. Copy failures
             # remain task-level blockers and are enforced by submit-ready
             # template creation, but must not discard usable image work.
-            if stage == "qa":
+            if stage == "qa" and not draft_template_requested:
                 release = build_release_manifest(job_dir=request.job_dir, plugin=request.plugin)
                 approved = approved_release_rows(release)
                 if release.get("status") == "awaiting_review" and (
@@ -272,7 +291,41 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
             started=started,
             release=release,
         )
+    except KeyboardInterrupt:
+        # Ctrl+C is a normal operator interruption, not permission to leave
+        # job_state.json claiming that a stage is still running. Hard process
+        # termination is repaired on the next run by mark_interrupted_running;
+        # cooperative interruption is closed here immediately.
+        try:
+            record_progress(
+                request.job_dir,
+                "run_interrupted",
+                stage=current_stage,
+                attempt_id=attempt_id,
+                error="KeyboardInterrupt",
+            )
+            mark_interrupted_running(
+                request.job_dir,
+                reason="Production run interrupted by operator; current tasks are retryable",
+            )
+        except Exception:
+            # Preserve the operator interrupt even if status recovery itself
+            # cannot acquire the state file during shutdown.
+            pass
+        raise
     except Exception as exc:
+        try:
+            mark_interrupted_running(
+                request.job_dir,
+                reason=(
+                    f"Production stage {current_stage} stopped unexpectedly; "
+                    "unfinished tasks remain retryable"
+                ),
+            )
+        except Exception:
+            # Preserve the original failure if state recovery cannot acquire
+            # the lock during an abrupt resource failure.
+            pass
         record_progress(request.job_dir, "stage_failed", stage=current_stage, attempt_id=attempt_id, seconds=round(time.monotonic() - stage_started, 3), error=f"{type(exc).__name__}: {exc}")
         details = _error_details(exc)
         failure_statuses = [
@@ -321,7 +374,7 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
                 job_dir=job, limit=request.limit, production=request.production,
             )
             return {"reused": True, "output_path": str(job / "source" / "product_family_v3.json")}
-        result = fetch_family(job_dir=job, plugin=plugin, config_path=request.config_path, limit_children=0)
+        result = fetch_family(job_dir=job, plugin=plugin, config_path=request.config_path, limit_children=0, deadline_monotonic=request.deadline_monotonic)
         assert_family_matches_plugin(job, plugin)
         ensure_run_scope(
             job_dir=job, limit=request.limit, production=request.production,
@@ -337,11 +390,12 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
             limit=0,
             mode="submit_ready" if request.production else request.template_mode,
             retry_blocked=request.retry_copy,
+            deadline_monotonic=request.deadline_monotonic,
         )
     if stage == "download":
         from .asset_manager import download_reference_images
 
-        return download_reference_images(job_dir=job, plugin=plugin, workers=request.workers)
+        return download_reference_images(job_dir=job, plugin=plugin, workers=request.workers, deadline_monotonic=request.deadline_monotonic)
     if stage == "classify":
         from .final_source_intents import (
             build_final_source_intents,
@@ -358,7 +412,7 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
                     "failures": [],
                     "reused": True,
                 }
-        return build_final_source_intents(job_dir=job, plugin=plugin, workers=request.workers, limit=0)
+        return build_final_source_intents(job_dir=job, plugin=plugin, workers=request.workers, limit=0, deadline_monotonic=request.deadline_monotonic)
     if stage == "brief":
         from .image_prompt_compiler import (
             build_image_prompts,
@@ -388,9 +442,10 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
                 plugin=plugin,
                 config_path=request.config_path,
                 workers=request.workers,
+                deadline_monotonic=request.deadline_monotonic,
             )
         )
-        if image_tasks_current(job, plugin, limit=0):
+        if image_tasks_current(job, plugin, limit=0, include_optional=True):
             image_tasks = read_image_tasks(job, category_id=plugin.category_id)
             image_tasks["failures"] = _formation_failures(image_tasks.get("tasks") or [], owner="brief")
             image_tasks["reused"] = True
@@ -399,6 +454,7 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
                 job_dir=job,
                 plugin=plugin,
                 workers=request.workers,
+                include_optional=True,
             )
         if image_prompts_current(job, plugin):
             image_prompts = read_image_prompts(job, category_id=plugin.category_id)
@@ -478,12 +534,14 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
             limit=0,
             production=request.production,
             attempt_id=attempt_id,
+            deadline_monotonic=request.deadline_monotonic,
         )
     if stage == "qa":
         from .image_qa import run_image_qa
 
         return run_image_qa(
             job_dir=job,
+            deadline_monotonic=request.deadline_monotonic,
             plugin=plugin,
             config_path=request.config_path,
             workers=request.workers,
@@ -494,6 +552,7 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
 
         return publish_approved_release(
             job_dir=job,
+            deadline_monotonic=request.deadline_monotonic,
             plugin=plugin,
             config_path=request.config_path,
             upload=request.upload,
@@ -530,7 +589,10 @@ def _formation_failures(rows: Iterable[dict[str, Any]], *, owner: str) -> list[d
         failures.append({
             "task": task,
             "failure_owner": owner,
-            "task_status": "retryable" if row.get("formation_retryable") else "blocked",
+            # Formation is a current ImageTaskV9 contract result. Retryability
+            # belongs to the owning brief/planner attempt, not to a stale task
+            # field that can silently change generation semantics.
+            "task_status": "blocked",
             "error": str(row.get("formation_reason") or row.get("formation_reason_code") or "task formation blocked"),
         })
     return failures
@@ -891,8 +953,12 @@ def _finish(
     started: float,
     release: dict[str, Any],
 ) -> dict[str, Any]:
-    actual = finish_run_state(request.job_dir, status)
-    return _write_summary(request, status=actual, timings=timings, started=started, release=release)
+    summary = _write_summary(request, status=status, timings=timings, started=started, release=release)
+    actual = finish_run_state(request.job_dir, str(summary["workflow_status"]))
+    if actual != summary["workflow_status"]:
+        summary["workflow_status"] = actual
+        write_json(request.job_dir / "reports" / "production_summary_v3.json", summary)
+    return summary
 
 
 def _write_summary(
@@ -970,6 +1036,7 @@ def _write_summary(
         )
         else status
     )
+    cumulative = _cumulative_progress(request.job_dir)
     summary = {
         "schema_version": 3,
         "job_id": request.job_dir.name,
@@ -978,7 +1045,9 @@ def _write_summary(
         "workflow_status": workflow_status,
         "completed_through_stage": completed_through_stage,
         "duration_seconds": round(time.monotonic() - started, 3),
+        "invocation_duration_seconds": round(time.monotonic() - started, 3),
         "stage_times": timings,
+        **cumulative,
         "release_status": str(effective_release.get("status") or "not_run"),
         "planned_image_completion_status": image_completion_status,
         "planned_image_unresolved_count": missing_candidate_count,
@@ -994,6 +1063,42 @@ def _write_summary(
     }
     write_json(request.job_dir / "reports" / "production_summary_v3.json", summary)
     return summary
+
+
+def _cumulative_progress(job_dir: Path) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    stage_attempt_counts: dict[str, int] = {}
+    stage_seconds: dict[str, float] = {}
+    path = Path(job_dir) / "reports" / "progress_v1.jsonl"
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                event = str(row.get("event") or "")
+                counts[event] = counts.get(event, 0) + 1
+                stage = str(row.get("stage") or "")
+                if event == "stage_started" and stage:
+                    stage_attempt_counts[stage] = stage_attempt_counts.get(stage, 0) + 1
+                if event in {"stage_finished", "stage_failed"} and stage:
+                    try:
+                        stage_seconds[stage] = stage_seconds.get(stage, 0.0) + max(0.0, float(row.get("seconds") or 0.0))
+                    except (TypeError, ValueError):
+                        continue
+    except OSError:
+        pass
+    return {
+        "cumulative_stage_seconds": {name: round(value, 3) for name, value in stage_seconds.items()},
+        "stage_attempt_counts": stage_attempt_counts,
+        "provider_request_count": counts.get("image_provider_transport_attempt_started", 0),
+        "candidate_commit_count": counts.get("generate_candidate_committed", 0),
+        "candidate_reuse_count": counts.get("generate_candidate_reused", 0),
+        "candidate_revision_commit_count": counts.get("generate_revision_committed", 0),
+    }
 
 
 def _publish_mode(job_dir: Path, *, publish_ran: bool) -> str:

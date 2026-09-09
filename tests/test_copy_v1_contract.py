@@ -8,6 +8,7 @@ from core.copy_writer import (
     _parse_copy_response,
     _rewrite_listing_copy_with_openai,
 )
+from core.copy_polish import _validate_artifact_provenance
 
 
 def _body(payload: dict) -> str:
@@ -15,6 +16,32 @@ def _body(payload: dict) -> str:
 
 
 class CopyV1ContractTests(unittest.TestCase):
+    def test_parent_artifact_uses_optional_parent_highlight_contract(self) -> None:
+        row = {
+            "title": "Wall Mounted Medicine Cabinet",
+            "item_highlights": [
+                "Wall mounted design", "Adjustable shelf", "Two door storage",
+                "Engineered wood", "Easy assembly", "Bathroom organization",
+            ],
+            "bullets": ["A useful fact"] * 5,
+            "description": "A wall mounted cabinet for organized storage.",
+            "provider": "https://api.deepseek.com",
+            "model": "deepseek-chat",
+            "request_fingerprint": "parent-fingerprint",
+        }
+        row["bullets"] = [
+            "Wall mounted storage for compact rooms",
+            "Adjustable shelf supports varied item heights",
+            "Two doors keep everyday items organized",
+            "Engineered wood provides sturdy construction",
+            "Simple assembly supports quick setup",
+        ]
+        _validate_artifact_provenance({
+            "rows": {"__parent__": row},
+            "groups": [],
+            "parent_model_request_fingerprint": "parent-fingerprint",
+        })
+
     def test_multiple_item_highlights_and_brandless_size_first_title(self) -> None:
         payload = {
             "title": "24 Inch Wall Mount Medicine Cabinet with Mirror",
@@ -68,6 +95,11 @@ class CopyV1ContractTests(unittest.TestCase):
         }
         with self.assertRaises(CopyWriterError):
             _parse_copy_response(_body(payload), brand="safeplus")
+        payload["bullets"][0] = "Weight Capacity: Supports up to 900 lbs"
+        with self.assertRaisesRegex(CopyWriterError, "capacity value"):
+            _parse_copy_response(_body(payload), brand="safeplus", product_specific={"weight_capacity": "300 lbs", "shipping_weight": "900 lbs"})
+        payload["bullets"][0] = "Weight Capacity: Supports up to 300 lbs"
+        _parse_copy_response(_body(payload), brand="safeplus", product_specific={"weight_capacity": "300 lbs"})
 
     def test_model_repairs_all_reported_copy_errors_in_one_followup(self) -> None:
         invalid = {
@@ -177,6 +209,22 @@ class CopyV1ContractTests(unittest.TestCase):
         highlight_repair = json.loads(highlight_post.call_args_list[1].args[1]["messages"][1]["content"])
         self.assertEqual(3, len(highlight_repair["source_item_highlights"]))
         self.assertEqual(2, highlight_post.call_count)
+
+        with patch(
+            "core.copy_writer._post_chat_completion",
+            side_effect=[_body(highlight_only_invalid), _body(valid)],
+        ):
+            full_envelope = _rewrite_listing_copy_with_openai(
+                config=config,
+                category="medicine_cabinet",
+                brand="safeplus",
+                row_type="child",
+                source_title="Wall Mount Medicine Cabinet",
+                source_bullets=["Adjustable shelf storage", "Mirrored door", "Wall-mounted organization"],
+                source_description="",
+                product_specific={"mounting_type": "wall mount", "shelf": "adjustable"},
+            )
+        self.assertEqual(valid["item_highlights"], full_envelope["item_highlights"])
 
         over_budget = [
             "Adjustable Interior Shelf",

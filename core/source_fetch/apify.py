@@ -47,6 +47,7 @@ def fetch_family(
     config_path: str = "",
     limit_children: int = 0,
     refresh: bool = False,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     job_path = Path(job_dir)
     job = load_job(job_path)
@@ -59,6 +60,7 @@ def fetch_family(
         tokens=_apify_tokens_from_env(env, required=True),
         actor_id=env_any(env, "APIFY_ACTOR_ID", required=True),
         marketplace=job.get("marketplace") or env_any(env, "AMAZON_MARKETPLACE", default="US"),
+        deadline_monotonic=deadline_monotonic,
     )
     extractors = plugin.load_extractors()
     seed_asin = job["seed_asin"]

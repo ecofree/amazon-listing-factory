@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ _UNAUTHORIZED_TEXT_CONFIDENCE = 0.75
 def run_image_qa(
     *, job_dir: str | Path, plugin: ProductPlugin, config_path: str = "",
     workers: int = 2, limit: int = 0,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     job = Path(job_dir).resolve()
     for path in (config_path, str(load_job(job).get("config_path") or "")):
@@ -82,6 +84,8 @@ def run_image_qa(
         cached = existing.get((task["child"], task["role"]))
         if cached and evidence_is_current(cached, task, candidate, job_dir=job):
             return cached
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise TimeoutError("QA execution deadline exhausted before evaluation")
         return _evaluate(job, plugin, task, candidate)
 
     rows: list[dict[str, Any]] = []
@@ -237,16 +241,15 @@ def _ocr_gates(job: Path, task: dict[str, Any], output: Path) -> tuple[dict[str,
             and normalize_text(row.get("text"))
         ]
         unsupported = _unsupported_contract_lines(readable_lines, allowed)
-        definite = [line for line in unsupported if not _line_is_contract_fragment(line, allowed) and re.search(r"[A-Za-z]{4,}", line)]
-        if definite:
-            return _gate("unauthorized_text", "fail", f"high-confidence text is outside the immutable render contract: {definite}"), _gate("dimension_accuracy", "pass", "func dimensions are not a hard gate")
-        warnings = list(unsupported)
         evidence = (
-            f"OCR fragments are not conclusive enough to reject; human text review required: {unsupported}"
+            "ordinary prop text is allowed; human review must confirm it is not a third-party brand, logo, "
+            f"or branded package: {unsupported}"
             if unsupported else
             "all high-confidence OCR fragments match contracted text"
         )
-        return _gate("unauthorized_text", "pass", evidence, warning=bool(warnings)), _gate("dimension_accuracy", "pass", "func dimensions are not a hard gate")
+        return _gate("unauthorized_text", "pass", evidence, warning=bool(unsupported)), _gate(
+            "dimension_accuracy", "pass", "func dimensions are not a hard gate"
+        )
     return _size_ocr_gates(job, task, lines)
 
 

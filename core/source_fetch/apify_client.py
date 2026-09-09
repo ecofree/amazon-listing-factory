@@ -32,6 +32,7 @@ class ApifyClient:
     marketplace: str = "US"
     poll_seconds: int = 5
     timeout_seconds: int = 300
+    deadline_monotonic: float | None = None
     _token_index: int = field(default=0, init=False, repr=False)
     _token_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _token_cooldowns: dict[str, float] = field(default_factory=dict, init=False, repr=False)
@@ -57,6 +58,17 @@ class ApifyClient:
     def _mark_token_cooldown(self, token: str, *, seconds: float = 60.0) -> None:
         with self._token_lock:
             self._token_cooldowns[token] = time.time() + max(1.0, seconds)
+
+    def _request_timeout(self) -> float:
+        remaining = self.deadline_monotonic - time.monotonic() if self.deadline_monotonic is not None else 120.0
+        if remaining <= 0:
+            raise TimeoutError("Apify execution deadline exhausted")
+        return min(120.0, remaining)
+
+    def _sleep(self, seconds: float) -> None:
+        if self.deadline_monotonic is not None and time.monotonic() + seconds >= self.deadline_monotonic:
+            raise TimeoutError("Apify execution deadline exhausted before retry")
+        time.sleep(seconds)
 
     def product_url(self, asin: str) -> str:
         host = AMAZON_HOSTS.get((self.marketplace or "US").upper(), "www.amazon.com")
@@ -141,7 +153,7 @@ class ApifyClient:
                 headers["Content-Type"] = "application/json"
             request = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
-                with urllib.request.urlopen(request, timeout=120) as response:
+                with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
                     body = response.read().decode("utf-8", errors="replace")
                 return json.loads(body) if body else {}
             except urllib.error.HTTPError as exc:
@@ -156,7 +168,7 @@ class ApifyClient:
                     raise RuntimeError(f"Apify request blocked by local socket permissions: {exc.reason}") from exc
                 if attempt >= attempts:
                     raise
-            time.sleep(_request_retry_delay(attempt))
+            self._sleep(_request_retry_delay(attempt))
         if last_exc:
             raise last_exc
         return {}
@@ -179,16 +191,16 @@ class ApifyClient:
                     self._mark_token_cooldown(token, seconds=_retry_after_seconds(exc.headers.get("Retry-After")))
                     return exc.code, body
                 if exc.code in {500, 502, 503, 504} and attempt < 4:
-                    time.sleep(min(2.0, 0.25 * (attempt + 1)))
+                    self._sleep(min(2.0, 0.25 * (attempt + 1)))
                     continue
                 if exc.code != 402 or "actor-memory-limit-exceeded" not in body:
                     return exc.code, body
-                time.sleep(min(20 * (attempt + 1), 90))
+                self._sleep(min(20 * (attempt + 1), 90))
             except urllib.error.URLError as exc:
                 last_status = 599
                 last_body = str(exc.reason)
                 if attempt < 4:
-                    time.sleep(min(2.0, 0.25 * (attempt + 1)))
+                    self._sleep(min(2.0, 0.25 * (attempt + 1)))
                     continue
                 return last_status, last_body
         return last_status, last_body
@@ -196,19 +208,20 @@ class ApifyClient:
     def _wait_for_run(self, run_id: str, *, token: str) -> dict[str, Any]:
         deadline = time.time() + self.timeout_seconds
         while True:
+            self._request_timeout()
             try:
                 response = self._json_request(f"https://api.apify.com/v2/actor-runs/{run_id}", token=token)
             except urllib.error.HTTPError as exc:
                 if exc.code != 404 or time.time() >= deadline:
                     raise
-                time.sleep(self.poll_seconds)
+                self._sleep(self.poll_seconds)
                 continue
             run = response.get("data", {})
             if run.get("status") in {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}:
                 return run
             if time.time() >= deadline:
                 raise RuntimeError(f"Timed out waiting for Apify run {run_id}")
-            time.sleep(self.poll_seconds)
+            self._sleep(self.poll_seconds)
 
 
 def _retry_after_seconds(value: str | None) -> float:
