@@ -151,6 +151,48 @@
       "enabled": true
     },
     {
+      "name": "aicost_gpt_image_25_flare",
+      "display": "aicost-gpt-image-2.5-flare",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "AICOST_API_KEY",
+      "model": "gpt-image-2.5-flare",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 150,
+      "enabled": true
+    },
+    {
+      "name": "aicost_gpt_image_25_sunburst",
+      "display": "aicost-gpt-image-2.5-sunburst",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "AICOST_API_KEY",
+      "model": "gpt-image-2.5-sunburst",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 150,
+      "enabled": true
+    },
+    {
       "name": "lz_token_gpt_image_2",
       "display": "LzToken",
       "family": "image_generation",
@@ -223,6 +265,48 @@
       "base_url_env": "SUBROUTER_BASE_URL",
       "key_env": "CXK_FIXED_API_KEY",
       "model": "gpt-image-2",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 155,
+      "enabled": true
+    },
+    {
+      "name": "cxk_gpt_image_25",
+      "display": "cxk-gpt-image-2.5",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "CXK_FIXED_API_KEY",
+      "model": "gpt-image-2.5",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 155,
+      "enabled": true
+    },
+    {
+      "name": "cxk_gpt_image_25_flare",
+      "display": "cxk-gpt-image-2.5-flare",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "CXK_FIXED_API_KEY",
+      "model": "gpt-image-2.5-flare",
       "prompt_max_chars": 12000,
       "protocol_profile": {
         "image_endpoint": "images_edits",
