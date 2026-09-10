@@ -396,6 +396,11 @@ def source_inventory_coverage(
                 "blocking_reason": str(intent.get("error") or "source purpose classification failed"),
             })
             continue
+        if role == "excluded_wrong_variant":
+            coverage_rows.append({**base, "final_role": role, "source_intent_revision_id": revision,
+                                  "image_task_roles": [], "status": role, "blocking_reason": "",
+                                  "disposition_reason": intent.get("classification_reason")})
+            continue
         if role == "review_required":
             coverage_rows.append({
                 **base,
@@ -457,7 +462,7 @@ def source_inventory_coverage(
             "status": "covered",
             "blocking_reason": "",
         })
-    accounted_statuses = {"covered", "classified_not_selected"}
+    accounted_statuses = {"covered", "classified_not_selected", "excluded_wrong_variant"}
     issues = [row for row in coverage_rows if row["status"] not in accounted_statuses]
     return {
         "status": (
@@ -468,6 +473,7 @@ def source_inventory_coverage(
             else "unavailable"
         ),
         "source_count": len(coverage_rows),
+        "excluded_count": sum(row["status"] == "excluded_wrong_variant" for row in coverage_rows),
         "covered_count": len(coverage_rows) - len(issues),
         "unresolved_count": len(issues),
         "authority_errors": authority_errors,

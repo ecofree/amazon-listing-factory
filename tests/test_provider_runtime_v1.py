@@ -61,7 +61,11 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
     def test_assigned_tasks_share_one_child_lane_provider_and_a_reserve(self) -> None:
         with (
             patch.object(routing, "provider_order", return_value=["krill_gpt_image_2", "aicost_gpt_image_2", "apimart"]),
+            patch.object(routing, "image_provider_entries", return_value=[
+                SimpleNamespace(name=name, api_key="", bearer_token="", raw={"allowed_roles": ["scene"]})
+                for name in ("krill_gpt_image_2", "aicost_gpt_image_2", "apimart")]),
             patch.object(routing, "_global_provider_cooldown_active", return_value=False),
+            patch.object(routing, "_persistently_unhealthy_providers", return_value=set()),
         ):
             task = routing.apply_role_provider_policy({"role": "scene_01", "role_family": "scene", "job_dir": "job"}, _Plugin())
         self.assertEqual(3, len(task["providers"]))
@@ -75,8 +79,15 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual("krill_gpt_image_2", assigned["child_provider_primary"])
         self.assertEqual("aicost_gpt_image_2", assigned["child_provider_backup"])
         self.assertTrue(assigned["child_provider_lock"])
+        entries = [SimpleNamespace(name="flare", raw={}), SimpleNamespace(name="sunburst", raw={"role_priority": {"func": 1, "size": 1}})]
+        with patch.object(routing, "image_provider_entries", return_value=entries), patch.object(routing, "_provider_scores", return_value={"flare": 0.0, "sunburst": 0.0}):
+            self.assertEqual(["sunburst", "flare"], routing._order_by_health({"role": "func_02"}, ["flare", "sunburst"]))
+            self.assertEqual(["flare", "sunburst"], routing._order_by_health({"role": "main"}, ["flare", "sunburst"]))
+            self.assertEqual(["flare"], routing._order_by_health({"role": "func"}, ["flare"]))
+        with patch.object(routing, "image_provider_entries", return_value=entries), patch.object(routing, "_provider_scores", return_value={"flare": 0.0, "sunburst": -3.0}):
+            self.assertEqual(["flare", "sunburst"], routing._order_by_health({"role": "size"}, ["flare", "sunburst"]))
 
-    def test_pool_keeps_all_roles_on_one_child_provider(self) -> None:
+    def test_pool_keeps_each_role_group_on_one_child_provider(self) -> None:
         from core.api_registry import image_provider_resource_group
         entries = [SimpleNamespace(name=name, raw={"resource_group": "account-a"}) for name in ("model-a", "model-b")]
         with patch("core.api_registry.image_provider_entries", return_value=entries):
@@ -86,7 +97,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                     {"providers": ["model-a"]}, {"providers": ["model-b"]}], requested_workers=8))
         tasks = [
             {"child": "B1", "job_dir": "job", "category_id": "bed_frame", "role": role, "providers": ["a", "b", "c"]}
-            for role in ("main", "scene", "func")
+            for role in ("main", "scene", "scene_02")
         ]
         with (
             patch.object(routing, "_order_by_health", side_effect=lambda _task, providers: providers),
@@ -122,7 +133,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertTrue(all(row["child_provider_primary"] == "aicost_gpt_image_2" for row in assigned))
         self.assertEqual(1, len({row["child_provider_primary"] for row in assigned}))
         self.assertTrue(all(row["child_provider_lock"] for row in assigned))
-        self.assertTrue(all(row["child_provider_role_lane"] == "unified" for row in assigned))
+        self.assertTrue(all(row["child_provider_role_lane"] == "infographic" for row in assigned))
         self.assertTrue(all("dragoncode_gpt_image_2" in row["child_provider_reserve"] for row in assigned))
 
     def test_auto_generation_admits_three_child_lanes_across_three_providers(self) -> None:

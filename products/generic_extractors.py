@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from core.amazon_image_urls import same_amazon_image_exists
+from core.text_evidence import extract_measurements, numeric_signature
 
 
 FieldLabels = dict[str, tuple[str, ...]]
@@ -52,19 +53,20 @@ def parse_lwh(value: str) -> tuple[str, str, str] | None:
     )
     if not match:
         return None
+    quantities = extract_measurements(value)
+    if len(quantities) == 3 and all(numeric_signature(row['number']) == numeric_signature(match.group(i)) for i, row in enumerate(quantities, 1)):
+        return tuple(row['text'] for row in quantities)
     return match.group(1), match.group(2), match.group(3)
 
 
 def parse_quantity_unit(value: str) -> tuple[str, str] | None:
-    match = re.search(r"([0-9.]+)\s*(pounds|pound|lbs|lb|inches|inch|in|feet|foot|ft)\b", str(value or ""), re.I)
-    if not match:
+    rows = extract_measurements(value)
+    if len(rows) != 1:
         return None
-    unit = match.group(2).lower()
-    if unit in {"pounds", "pound", "lbs", "lb"}:
-        return match.group(1), "Pounds"
-    if unit in {"feet", "foot", "ft"}:
-        return match.group(1), "Feet"
-    return match.group(1), "Inches"
+    row = rows[0]
+    unit = {'lb': 'Pounds', 'ft': 'Feet', 'in': 'Inches', 'cm': 'Centimeters',
+            'mm': 'Millimeters', 'm': 'Meters', 'kg': 'Kilograms', 'g': 'Grams', 'oz': 'Ounces'}[row['unit']]
+    return row['number'], unit
 
 
 def parse_pack_count(value: str) -> str:

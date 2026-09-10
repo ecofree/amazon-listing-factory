@@ -127,10 +127,9 @@ def gemini_stream_generate(
         if not available:
             return False
         if max_physical_requests > 0 and physical_request_count >= max_physical_requests:
-            last_status = "request_budget_exhausted"
-            last_exc = VisionQAError(
-                f"Physical vision request budget exhausted ({max_physical_requests})"
-            )
+            if last_exc is None:
+                last_status = "request_budget_exhausted"
+                last_exc = VisionQAError(f"Physical vision request budget exhausted ({max_physical_requests})")
             return False
         physical_request_count += 1
         return True
@@ -242,12 +241,12 @@ def gemini_stream_generate(
                             )
                             if not validation_error:
                                 _record_vision_model_event(client, client_scope, candidate_model, protocol, "success")
-                                _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index)
+                                _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index, response_body=body)
                                 return text
                             last_exc = VisionQAError(validation_error)
                             last_status = "validation_failure"
                             _record_vision_model_event(client, client_scope, candidate_model, protocol, "validation_failure")
-                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error)
+                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error, response_body=body)
                             action = validation_failure_action(
                                 client,
                                 candidate_model,
@@ -304,12 +303,12 @@ def gemini_stream_generate(
                             )
                             if not validation_error:
                                 _record_vision_model_event(client, client_scope, candidate_model, protocol, "success")
-                                _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index)
+                                _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index, response_body=body)
                                 return text
                             last_exc = VisionQAError(validation_error)
                             last_status = "validation_failure"
                             _record_vision_model_event(client, client_scope, candidate_model, protocol, "validation_failure")
-                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error)
+                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error, response_body=body)
                             action = validation_failure_action(
                                 client,
                                 candidate_model,
@@ -373,12 +372,12 @@ def gemini_stream_generate(
                             )
                             if not validation_error:
                                 _record_vision_model_event(client, client_scope, candidate_model, protocol, "success")
-                                _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index)
+                                _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index, response_body=body)
                                 return text
                             last_exc = VisionQAError(validation_error)
                             last_status = "validation_failure"
                             _record_vision_model_event(client, client_scope, candidate_model, protocol, "validation_failure")
-                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error)
+                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error, response_body=body)
                             action = validation_failure_action(
                                 client,
                                 candidate_model,
@@ -577,6 +576,7 @@ def _emit_attempt(
     status: str,
     started: float,
     response_text: str = "",
+    response_body: str = "",
     response_candidates: list[dict[str, Any]] | None = None,
     selected_candidate_index: int | None = None,
     error: str = "",
@@ -592,6 +592,7 @@ def _emit_attempt(
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         "response_text": response_text or None,
         "response_char_count": len(response_text or ""),
+        "finish_reasons": _response_finish_reasons(response_body),
         "response_candidates": list(response_candidates or []),
         "selected_candidate_index": selected_candidate_index,
         "error": error or None,
@@ -603,6 +604,32 @@ def _emit_attempt(
     except Exception:
         pass
     return event
+
+
+def _response_finish_reasons(body: str) -> list[str]:
+    reasons: set[str] = set()
+    chunks = [line[5:].strip() for line in body.splitlines() if line.startswith("data:")]
+    for chunk in chunks or [body]:
+        try:
+            value = json.loads(chunk)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        rows = (value.get("candidates") or []) + (value.get("choices") or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            reason = row.get("finishReason") or row.get("finish_reason")
+            if reason:
+                reasons.add(str(reason))
+        response = value.get("response", value)
+        if isinstance(response, dict):
+            details = response.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else None
+            if reason:
+                reasons.add(str(reason))
+    return sorted(reasons)
 
 
 def _attempt_event_summary(event: dict[str, Any]) -> dict[str, Any]:
@@ -731,10 +758,14 @@ def _deadline_sleep(seconds: float, deadline: float | None) -> None:
 
 def _gemini_native_payload(parts: list[dict[str, Any]], client: dict[str, str]) -> dict[str, Any]:
     temperature = _float_or_default(client.get("temperature"), 0.2)
-    generation_config: dict[str, Any] = {"temperature": temperature}
+    generation_config: dict[str, Any] = {
+        "temperature": temperature, "maxOutputTokens": _client_token_limit(client),
+    }
     response_modalities = _response_modalities_from_value(client.get("response_modalities") or "TEXT")
     if response_modalities:
         generation_config["responseModalities"] = response_modalities
+    if response_modalities == ["TEXT"] and profile_from_client(client).response_format == "json":
+        generation_config["responseMimeType"] = "application/json"
     return {"contents": [{"role": "user", "parts": parts}], "generationConfig": generation_config}
 
 
@@ -1002,7 +1033,7 @@ def _parse_sse_text_candidates(body: str) -> list[str]:
             candidate_index = int(candidate.get("index", position))
             content = candidate.get("content") or {}
             for part in content.get("parts", []) or []:
-                if part.get("text"):
+                if part.get("text") and not part.get("thought"):
                     pieces_by_candidate.setdefault(candidate_index, []).append(str(part["text"]))
     return [
         text
@@ -1021,7 +1052,7 @@ def _parse_generate_content_candidates(body: str) -> list[str]:
         pieces: list[str] = []
         content = candidate.get("content") or {}
         for part in content.get("parts", []) or []:
-            if part.get("text"):
+            if part.get("text") and not part.get("thought"):
                 pieces.append(str(part["text"]))
         text = "".join(pieces).strip()
         if text:

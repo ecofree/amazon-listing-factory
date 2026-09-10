@@ -224,6 +224,12 @@ def validate_registry() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
             if not entry.model:
                 errors.append({"error": f"api_registry {label}: gemini entry requires explicit model"})
         elif entry.family == "image_generation":
+            roles = entry.raw.get("allowed_roles")
+            if not isinstance(roles, list) or not roles or any(role not in {"main", "scene", "func", "size"} for role in roles):
+                errors.append({"error": f"api_registry {label}: requires explicit allowed_roles (main, scene, func, size)"})
+            preference = entry.raw.get("role_priority", {})
+            if not isinstance(preference, dict) or any(key not in (roles if isinstance(roles, list) else []) or type(value) is not int for key, value in preference.items()):
+                errors.append({"error": f"api_registry {label}: role_priority must assign integers to allowed roles"})
             if not entry.url:
                 errors.append({"error": f"api_registry {label}: image_generation entry requires url"})
             if entry.api_type not in IMAGE_API_TYPES:

@@ -21,17 +21,22 @@ from core.image_tasks import (
 def current_art_direction() -> dict[str, Any]:
     return {
         "audience_and_market": "US homeowners seeking calm, practical bathroom storage with a residential rather than commercial impression.",
-        "palette_direction": "Use warm mineral neutrals around the soft-white cabinet, charcoal text, and one muted blue-gray accent so the product remains distinct.",
+        "palette_direction": {"wall": "#F4F2EE matte mineral paint", "floor": "#B9A88D oak", "towels": "#8A999E cotton"},
         "photography_direction": "Broad natural side light, soft contact shadows, truthful painted-wood response, and realistic residential depth.",
         "environment_and_staging": "Restrained US bathroom styling with newly selected towels and ceramic containers; do not copy source props.",
-        "typography_direction": "Confident contemporary sans-serif hierarchy with highly legible short headlines and labels.",
-        "graphic_direction": "Restrained technical lines and sparse icons integrated into the image without dashboard cards or sticker modules.",
+        "typography_direction": {"font_family": "Inter", "title_style": "Semibold sentence case", "body_style": "Regular with readable spacing", "numeric_style": "Tabular figures with unit spacing"},
+        "graphic_direction": {"text_color": "#303634", "line_color": "#637470", "icon_color": "#303634", "backing_color": "#F4F2EE", "backed_symbol_color": "#303634", "component_style": "Thin lines, sparse icons, local backing only where needed; no numeric icon duplication"},
         "cohesion_rule": "Repeat the same light behavior, typographic hierarchy, restrained line character, and negative-space rhythm across the family.",
         "negative_visuals": [
             "No dark solid advertising field behind the light cabinet.",
             "No floating UI cards, copied toiletries, unrelated saturated accents, or invented cabinet parts.",
         ],
     }
+
+
+def current_image_direction(*, environment: str = "designed_environment") -> dict[str, Any]:
+    return {"layout": [{"view_id": "view_01", "target_region": [0.1, 0.1, 0.9, 0.9]}],
+            "text_placement": [], "environment_mode": environment}
 
 
 def current_image_task(
@@ -131,7 +136,6 @@ def current_image_task(
                 "observed_product_colors": [
                     {"name": "soft white", "source": "ProductFamilyV3"}
                 ],
-                "conditional_structure_lock": [],
                 "forbidden_additions": [],
             },
             "measurement_authority": measurement,
@@ -140,24 +144,14 @@ def current_image_task(
                 "mode": (
                     "exact"
                     if family == "func"
-                    else "preserve_source_measurements"
+                    else "source_measurement_display"
                     if family == "size"
                     else "none"
                 ),
                 "strings": strings,
             },
-            "role_purpose": (
-                "Explain how the interior storage adapts to different items."
-                if family == "func"
-                else "Identify the sold product immediately."
-            ),
-            "image_direction": (
-                "Keep the exact product as the dominant visual subject under the shared family direction."
-                if family in {"main", "scene"}
-                else "Use an editorial asymmetric feature composition with restrained callouts and generous product space under the shared child system."
-                if family == "func"
-                else "Use a spacious technical hierarchy with aligned measurements and the shared child typography, line, and badge system."
-            ),
+            "image_direction": {**current_image_direction(), "layout": [
+                {"source_region": [0.0, 0.0, 1.0, 1.0], "target_region": [0.1, 0.1, 0.9, 0.9]}]},
             "edit_contract": _edit_contract(family, measurement, base["category_image_policy"], {}, product_type=category_id),
             "execution_profile": (
                 "reference_infographic_design"

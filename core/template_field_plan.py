@@ -10,7 +10,7 @@ from .copy_writer import (
     ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS,
 )
 
-_WEIGHT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(pounds?|lbs?|lb|kilograms?|kg|grams?|g|ounces?|oz)?\s*$", re.I)
+from .text_evidence import extract_measurements, us_measurement_text
 
 
 def item_highlights_text(copy: dict[str, Any]) -> str:
@@ -27,14 +27,11 @@ def item_highlights_text(copy: dict[str, Any]) -> str:
 
 
 def split_weight_recommendation(value: Any, unit: Any = "") -> tuple[str, str]:
-    raw_unit = _weight_unit(unit)
     text = str(value or "").strip()
-    match = _WEIGHT_RE.match(text)
-    if match:
-        parsed_unit = _weight_unit(match.group(2))
-        return _clean_number(match.group(1)), raw_unit or parsed_unit
-    number = _first_number(text)
-    return (number, raw_unit) if number and raw_unit else ("", raw_unit)
+    rows = extract_measurements(us_measurement_text(text if extract_measurements(text) else f'{text} {unit}', upper_bound=True))
+    if len(rows) == 1 and rows[0]['kind'] == 'weight_g':
+        return rows[0]['number'], _weight_unit(rows[0]['unit'])
+    return '', _weight_unit(unit)
 
 
 def country_of_origin_value(value: Any) -> str:
@@ -732,13 +729,3 @@ def _weight_unit(value: Any) -> str:
     if text in {"ounce", "ounces", "oz"}:
         return "Ounces"
     return str(value or "").strip()
-
-
-def _first_number(value: str) -> str:
-    match = re.search(r"\d+(?:\.\d+)?", value)
-    return _clean_number(match.group(0)) if match else ""
-
-
-def _clean_number(value: Any) -> str:
-    text = str(value or "").strip()
-    return text[:-2] if text.endswith(".0") else text

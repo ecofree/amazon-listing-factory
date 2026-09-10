@@ -84,6 +84,7 @@ def _registry_image_provider_specs() -> dict[str, ImageProviderSpec]:
 def generate_with_registry_image_provider(
     *, provider_name: str, image_inputs: list[bytes], prompt: str,
     mask_bytes: bytes | None = None, request_id: str = "", request_audit: dict[str, Any] | None = None,
+    request_observer: Any | None = None,
 ) -> bytes:
     if not image_inputs:
         raise ProviderConfigurationError(provider_name, "image provider requires at least one reference image")
@@ -107,6 +108,8 @@ def generate_with_registry_image_provider(
                         "sent_bytes": len(data), "transform": "unchanged" if original == hashlib.sha256(data).hexdigest() else "bounded_image_encoding"}
                        for original, data in zip(originals, image_inputs)],
         })
+    if request_observer is not None:
+        request_observer(dict(request_audit or {}))
     if spec and spec.api_type == "openai_images_edit":
         return _generate_with_openai_images_edit(
             provider_name=provider_name,

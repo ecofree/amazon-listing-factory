@@ -498,6 +498,7 @@ def _write_task(
         if key not in row and value not in (None, "", [], {}):
             row[key] = value
     tasks[logical_id] = row
+    validate_data(data, "job_state.schema.json", label="updated job state")
 
 
 def _append_active_error(

@@ -2,8 +2,8 @@ schema_version: palette-registry-v2
 
 curation_policy:
   production_network_access: false
-  selection_owner: program_dynamic_color_engine
-  execution_owner: gemini_visual_planning
+  selection_owner: gemini_visual_planning
+  execution_owner: image_model
   quality_gate: diagnostic_only
   note: "External color and market references are curated offline. Production uses local color math and these bounded style rules; it never calls a color or market website while generating a job. Final product color remains source fact and is never replaced by a staging color."
 

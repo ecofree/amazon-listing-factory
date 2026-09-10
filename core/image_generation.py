@@ -830,6 +830,7 @@ def _generation_execution_revision(providers: list[str]) -> str:
         # A task that was blocked under the old single-reference runtime must
         # be eligible for recovery after the current func dual-reference fix.
         "generation_reference_contract": "typed-reference-edit-base-v2",
+        "routing_contract": "role-model-pool-v1-bounded-fallback",
         "execution_profiles": sorted(EXECUTION_PROFILES),
         "url_safety_policy": URL_SAFETY_POLICY_VERSION,
         "providers": [],
@@ -842,6 +843,7 @@ def _generation_execution_revision(providers: list[str]) -> str:
             "identity": image_provider_physical_identity(name),
             "credential_revision": hashlib.sha256(str(getattr(entry, "api_key", "")).encode("utf-8")).hexdigest(),
             "prompt_max_chars": int(raw.get("prompt_max_chars") or 0),
+            "allowed_roles": raw.get("allowed_roles") or [],
             # The resolved protocol profile is part of currentness: endpoint,
             # request dimensions, quality/background and output contract all
             # affect provider behaviour even when the prompt is unchanged.

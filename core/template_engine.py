@@ -967,7 +967,7 @@ def compile_template_field_plan(
     for alias in ("length_unit", "width_unit", "height_unit", "item_depth_unit", "item_weight_unit"):
         base = alias.replace("_unit", "")
         if attributes.get(base):
-            semantic_values[alias] = attributes.get(alias) or _default_unit_for(base)
+            semantic_values[alias] = attributes.get(alias) or ""
     return compile_field_plan(
         fields=template.fields,
         labels=template.labels,
@@ -994,12 +994,6 @@ def compile_template_field_plan(
             "package_level": attributes.get("package_level") or attributes.get("package_contains_sku") or "",
         },
     )
-
-def _default_unit_for(base: str) -> str:
-    # Weight units are not safely inferable from a bare number. Dimensions use
-    # the US template's inch convention; a weight without an explicit unit is
-    # left for audit instead of being mislabeled as Pounds.
-    return "" if base == "item_weight" else "Inches"
 
 def _inventory_available_candidate(value: Any) -> str:
     text = str(value or "").strip().casefold()

@@ -1,15 +1,15 @@
 {
   "endpoints": [
     {
-      "name": "example_holdai_gemini_31_flash_lite_vision_qa",
+      "name": "example_nuwa_gemini_37_vision_qa",
       "family": "gemini",
       "scope": "vision_qa",
       "protocol": "openai",
-      "base_url": "https://api.holdai.top/v1",
-      "key_env": "HOLDAI_API_KEY",
-      "model": "gemini-3.1-flash-lite",
+      "base_url": "https://api.nuwaflux.com/v1",
+      "key_env": "NUWA_API_KEY",
+      "model": "gemini-3.7-flash",
       "smoke_required": true,
-      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "capabilities": ["vision_input", "json_output", "evidence_extraction"],
       "priority": 110,
       "enabled": false
     },
@@ -131,7 +131,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 85,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "cxk_fixed",

@@ -1,14 +1,5 @@
 {
   "image_generation": {
-    "allowed_providers": [
-      "aicost_gpt_image_2",
-      "aicost_gpt_image_25_flare",
-      "aicost_gpt_image_25_sunburst",
-      "qc_yc_fixed",
-      "cxk_fixed",
-      "cxk_gpt_image_25",
-      "cxk_gpt_image_25_flare"
-    ],
     "forbidden_image_providers": ["lz_token_gpt_image_2"],
     "max_parallel_provider_jobs": 4,
     "require_true_image_to_image": true,

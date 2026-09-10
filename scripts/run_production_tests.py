@@ -28,8 +28,11 @@ PRODUCTION_TEST_MODULES = (
     "tests.test_provider_smoke",
     "tests.test_template_field_plan_contracts",
     "tests.test_search_terms",
+    "tests.test_us_measurement_contract",
+    "tests.test_freeze_recovery",
+    "tests.test_visual_design_remediation",
 )
-MAX_CASES = 75
+MAX_CASES = 98
 MAX_SECONDS = 60.0
 
 

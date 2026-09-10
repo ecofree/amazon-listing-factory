@@ -21,15 +21,15 @@ from .product_family import read_product_family
 from .required_role_policy import compiled_image_policy, required_role_policy
 from .run_scope import read_run_scope
 from .status import input_revision_id, logical_task_id
-from .text_evidence import normalize_text
+from .text_evidence import normalize_text, us_measurement_text
 from .visual_design_kit import compact_product_claims, read_visual_design_kits, visual_design_kit_row_current
 
 
 IMAGE_TASK_SCHEMA_VERSION = "image-task-v10"
-IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v20-content-ownership"
+IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v24-observed-view-binding"
 IMAGE_TASK_ARTIFACT = "image_tasks_v10.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
-_TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "product_boundary", "measurement_authority", "func_story_contract", "renderable_text_contract", "role_purpose", "image_direction", "edit_contract", "execution_profile"}
+_TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "product_boundary", "measurement_authority", "func_story_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
 _TASK_BLOCKED_FIELDS = _TASK_BASE_FIELDS | {"formation_reason_code"}
 
 
@@ -177,7 +177,7 @@ def validate_image_task(row: Any) -> None:
             "family_design_id", "family_art_direction", "source_path", "source_sha256",
             "source_intent_revision_id", "generation_references", "product_boundary",
             "measurement_authority", "func_story_contract", "renderable_text_contract",
-            "role_purpose", "edit_contract", "execution_profile",
+            "edit_contract", "execution_profile",
         )
         if row.get("role_family") in {"main", "scene"}:
             needed += ("image_direction",)
@@ -192,7 +192,7 @@ def validate_image_task(row: Any) -> None:
         if references[0]["sha256"] != row["source_sha256"]:
             raise ImageTaskError("Initial task edit base disagrees with its role source")
         boundary = row["product_boundary"]
-        if set(boundary) != {"sold_product_parts", "replaceable_staging", "must_not_change", "product_color_material", "observed_product_colors", "conditional_structure_lock", "forbidden_additions", "observed_objects"}:
+        if set(boundary) != {"sold_product_parts", "replaceable_staging", "must_not_change", "product_color_material", "observed_product_colors", "forbidden_additions", "observed_objects"}:
             raise ImageTaskError("ImageTaskV10 product boundary is not canonical")
         if row["role_family"] == "func":
             expected = func_renderable_text_contract(row.get("func_story_contract") or {})
@@ -329,7 +329,9 @@ def _form_task(
         return _blocked(base, str(source_brief.get("error") or "source brief is pending"))
     try:
         measurement = _measurement_authority(family, child, source)
-        _source_reference(design_kit, source)
+        source_reference = _source_reference(design_kit, source)
+        view_regions = {row["view_id"]: row["region"] for row in source_reference["observation"]["physical_views"]}
+        image_direction = source_brief["image_direction"]
         story = (
             build_func_story_contract(
                 source,
@@ -370,8 +372,10 @@ def _form_task(
             "measurement_authority": measurement,
             "func_story_contract": story,
             "renderable_text_contract": renderable,
-            "role_purpose": source_brief["shopping_purpose"],
-            "image_direction": source_brief["image_direction"],
+            "image_direction": {**image_direction, "layout": [
+                {"source_region": view_regions[row["view_id"]], "target_region": row["target_region"]}
+                for row in image_direction["layout"]
+            ]},
             "edit_contract": _edit_contract(
                 family, measurement, image_policy, source_brief or {},
                 product_type=product_type,
@@ -479,17 +483,19 @@ def _measurement_authority(family: str, child: dict[str, Any], source: dict[str,
         measurements = [
             {
                 "id": f"source:{index}",
+                "source_id": f"source_{int(source.get('source_index') or 0):02d}",
+                "source_text": str(row.get("text") or "").strip(),
                 "measured_part": _canonical_source_callout(row.get("source_label")) or "source_visible",
                 "axis": str(row.get("axis_hint") or "source_diagram"),
                 "kind": "measurement",
                 "canonical_value": str(row.get("canonical_pair") or ""),
-                "render_text": str(row.get("text") or "").strip(),
+                "render_text": us_measurement_text(row.get("text"), upper_bound="capacity" in str(row.get("source_label") or "").lower()),
                 "confidence": str(row.get("confidence") or "source_visible"),
                 # A load-capacity callout is factual evidence even when it is
                 # drawn inside an icon/badge rather than on a dimension line.
-                "measurement_role": _measurement_role(str(row.get("text") or "")),
+                "measurement_role": _measurement_role(str(row.get("source_label") or row.get("text") or "")),
                 "presentation": "source_visible_capacity_callout"
-                if _measurement_role(str(row.get("text") or "")) == "load_capacity"
+                if _measurement_role(str(row.get("source_label") or row.get("text") or "")) == "load_capacity"
                 else "source_visible_measurement",
             }
             for index, row in enumerate(source.get("measurements") or [], 1)
@@ -505,7 +511,7 @@ def _measurement_authority(family: str, child: dict[str, Any], source: dict[str,
             "source_visible_text_artifacts": source_visible_text_artifacts,
             "source_visible_callouts": source_visible_callouts,
             "ocr_role": "definite_error_warning_only",
-            "relationship_policy": "Preserve each label, line, endpoint, measured part, and product-instance association exactly as shown.",
+            "relationship_policy": "Preserve physical quantities, measured parts, endpoints and product-instance associations; display the authorized US-unit labels.",
         }
     raise ImageTaskError("Size task requires one source image classified as size")
 
@@ -528,7 +534,14 @@ def _source_visible_factual_text(
         if str(row.get(key) or "").strip()
     }
     artifacts: list[dict[str, Any]] = []
-    callouts: list[str] = []
+    callouts = list(dict.fromkeys(
+        _canonical_source_callout(row.get("text"))
+        for row in (source.get("visual_evidence") or {}).get("text_observations") or []
+        if row.get("kind") == "measurement" or (
+            source.get("role") == "size" and row.get("kind") == "marketing"
+            and normalize_text(row.get("text")).casefold() in {"dimensions", "measurements", "size", "product size"}
+        )
+    ))
     for line in lines:
         if not isinstance(line, dict) or float(line.get("confidence") or 0) < 0.68:
             continue
@@ -536,7 +549,7 @@ def _source_visible_factual_text(
         box = line.get("box")
         if not text or not isinstance(box, list) or len(box) < 4:
             continue
-        normalized = " ".join(text.casefold().split())
+        normalized = _canonical_source_callout(text).casefold()
         is_numeric_fact = (
             normalized in measurement_texts
             or bool(re.search(r"\d", normalized) and re.search(r"(?:\"|\b(?:in|inch|inches|lb|lbs|pounds?)\b)", normalized))
@@ -575,14 +588,16 @@ def _canonical_source_callout(value: Any) -> str:
     text = re.sub(r"\s*:\s*", ": ", text)
     text = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", text)
     text = re.sub(r"(?<=[\"'])\s*(?=\()", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    return us_measurement_text(re.sub(r"\s+", " ", text).strip())
 
 
 def _measurement_role(text: str) -> str:
     """Classify source-visible numeric evidence without changing its value."""
     normalized = " ".join(text.casefold().replace("–", "-").split())
-    if re.search(r"\b(?:lb|lbs|pounds?)\b", normalized):
+    if re.search(r"\b(?:capacity|load|supports?|holds?)\b", normalized):
         return "load_capacity"
+    if re.search(r"\b(?:lb|lbs|pounds?|kg|kilograms?)\b", normalized):
+        return "weight" if re.search(r"\b(?:item|product|net|shipping|package)\s+weight\b", normalized) else "mass_callout"
     return "dimension"
 
 
@@ -598,14 +613,14 @@ def _edit_contract(
         "func": "Create one square Amazon US function image.",
         "size": "Create one square Amazon US size image.",
     }[family]
-    reference = "Edit attachment 1. Product evidence verifies structure and material; approved design references guide style only. Preserve the demonstrated product state and do not invent unseen parts."
+    reference = "Attachment 1 supplies physical product views, not a page design. Separate its real components from adjustment ghosts and graphic overlays."
     preserve = [
-        "Keep the protected source content unchanged: product geometry, proportions, finish, quantity, attached parts, camera relationship, and visible state; do not reconstruct the product",
+        "Preserve product geometry, proportions, finish, physical part count, attached parts, demonstrated state and the perspective within each view; retain occlusion and partial-view boundaries without reconstructing unseen surfaces",
     ]
     replace: list[str] = []
     if measurement.get("mode") == "source_image":
         preserve.extend([
-            "Every source measurement value, unit, measured object, line endpoint and label-to-line relationship; typography and line color are editable, geometry is not",
+            "Every physical quantity, measured object and both endpoints on that object; use authorized US-unit labels. Repositioning the intact diagram preserves these associations, not absolute canvas coordinates",
         ])
     if family == "func":
         preserve.append(
@@ -626,14 +641,14 @@ def _edit_contract(
         )
     elif family == "func":
         replace.append(
-            "Replace source-authored presentation graphics, including colored highlights drawn over the product, with the child graphic system. Recompose required evidence views without changing product pixels, geometry or feature relationships; overlays are not product surface markings"
+            "Design a new canvas hierarchy around intact source product/detail views: reposition and scale them without changing their internal perspective or visible extent. Replace source panel shapes, title bands, badges and drawn highlights using the child design; source graphics are not a layout template"
         )
         replace.append(
-            "Remove or replace source people, hands, faces, and reflected people as non-product presentation content; preserve the sold mirror glass and all product parts"
+            "Remove source people and reflected people as non-product staging; preserve all sold product surfaces and parts"
         )
     elif family == "size":
         replace.append(
-            "Replace source background, diagram typography, line and highlight colors with the child graphic system without moving measurement endpoints or changing product surfaces"
+            "Redesign the graphic canvas, typography and measurement styling with the child system; move or scale the intact diagram as a unit, keeping each endpoint attached to the same physical point"
         )
     if bed and family in {"main", "scene"} and policy.get("main_image_policy") != "white_background":
         preserve.append("Retain the complete source-visible mattress and bed-in-use state while restyling bedding")
@@ -678,7 +693,7 @@ _TASK_SEMANTIC_FIELDS = frozenset({
     "source_index", "source_path", "source_sha256", "generation_references",
     "edit_base_sha256", "reference_mode", "product_facts",
     "product_boundary", "measurement_authority", "func_story_contract",
-    "renderable_text_contract", "role_purpose", "image_direction",
+    "renderable_text_contract", "image_direction",
     "edit_contract", "execution_profile", "prompt_contract_version",
 })
 

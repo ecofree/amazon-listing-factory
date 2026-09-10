@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -12,34 +11,9 @@ from core.io import write_json
 from core.schema import SchemaValidationError, validate_data
 from core.source_fetch import apify
 from core.url_safety import UrlResolutionError, UnsafeUrlError, assert_public_http_url
-from core.visual_design_references import planning_reference_paths
 
 
 class RootCauseRemediationTests(unittest.TestCase):
-    def test_visual_design_reference_directories_are_safe_under_child_concurrency(self) -> None:
-        from PIL import Image
-
-        with tempfile.TemporaryDirectory() as tmp:
-            job = Path(tmp).resolve()
-            source = job / "images" / "source_objects" / "source.png"
-            source.parent.mkdir(parents=True)
-            Image.new("RGB", (32, 32), "white").save(source)
-            output_root = job / "reports" / "visual_design_references"
-            output_root.mkdir(parents=True)
-            sources = [
-                {"role": "main", "source_index": 0, "source_path": source.relative_to(job).as_posix()},
-                {"role": "scene", "source_index": 1, "source_path": source.relative_to(job).as_posix()},
-            ]
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                results = list(pool.map(
-                    lambda child: planning_reference_paths(
-                        job, child, sources, output_dir=output_root,
-                    ),
-                    ("B000000001", "B000000002", "B000000003", "B000000004"),
-                ))
-            self.assertTrue(all(len(paths) == 2 for paths in results))
-            self.assertTrue(all(path.is_file() for paths in results for path in paths))
-
     def test_apify_normalized_facts_match_product_family_schema(self) -> None:
         from products.generic_extractors import image_urls
         own = [f"https://m.media-amazon.com/images/I/own{i}._AC_SL1500_.jpg" for i in range(8)]

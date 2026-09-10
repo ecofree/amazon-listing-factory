@@ -4,8 +4,8 @@ import re
 from typing import Any
 
 from .visual_semantics import CLAIM_REVIEW_POLICY, claim_key
-from .image_reference_context import validate_supporting_sources
-from .text_evidence import has_bad_encoding
+from .image_reference_context import validate_supporting_sources, physical_views
+from .text_evidence import has_bad_encoding, us_measurement_text
 
 
 class VisualDesignKitCompileError(ValueError):
@@ -30,7 +30,7 @@ def cleaned_source_claims(source: dict[str, Any]) -> list[dict[str, str]]:
             not evidence_id
             or not text
             or has_bad_encoding(text)
-            or len(words) < 2
+            or not words
             or any(
                 len(word) == 1
                 and word.casefold() not in {"x", "a", "i"}
@@ -59,7 +59,27 @@ _ART_DIRECTION_FIELDS = {
 }
 # Gemini is the single visual authority. The compiler validates and binds its
 # design to immutable product evidence; it does not replace design fields.
-_PLANNER_ART_DIRECTION_FIELDS = _ART_DIRECTION_FIELDS
+DESIGN_FIELD_SCHEMAS = {
+    "typography_direction": {
+        "font_family": "one chosen font family, not alternatives",
+        "title_style": "weight, case and hierarchy relative to the product",
+        "body_style": "weight, spacing and line breaks for readable labels",
+        "numeric_style": "measurement legibility and spacing; no literal values",
+    },
+    "graphic_direction": {
+        "text_color": "one hex for headings and body copy",
+        "line_color": "one hex for leaders and measurement arrows",
+        "icon_color": "one hex for unbacked icon strokes",
+        "backing_color": "one hex for local backing when needed",
+        "backed_symbol_color": "one contrasting hex for symbols on backing",
+        "component_style": "chosen stroke, icon and label treatment; backing only where readability needs it, no duplicated value inside an icon",
+    },
+}
+IMAGE_DIRECTION_SCHEMA = {
+    "layout": [{"view_id": "one observed view_id for this source", "target_region": [0.1, 0.1, 0.9, 0.9]}],
+    "text_placement": [{"text_ref": "title|label:0|measurements", "target_region": [0.1, 0.02, 0.9, 0.1]}],
+    "environment_mode": "designed_environment|graphic_canvas|source_setting; graphic_canvas for isolated details/technical diagrams, source_setting only where physical context is evidence",
+}
 _BRIEF_BINDING_FIELDS = {
     "source_id",
     "source_intent_revision_id",
@@ -72,17 +92,10 @@ _BRIEF_ROLE_FIELDS = {
     "func": {"shopping_purpose", "image_direction", "func_story_contract", "claim_reviews"},
     "size": {"shopping_purpose", "image_direction", "measurement_authority", "invent_text"},
 }
-# Every brief must carry a positive per-image direction. Making it
-# optional let flash-class planners omit it silently, so func/size prompts
-# reached the image model with family art direction as their only design
-# input.  Absence is now a compile error; the planner repair loop reports the
-# missing field and gets one bounded chance to fix it.
-_BRIEF_OPTIONAL_FIELDS = {"main": set(), "scene": set(), "func": set(), "size": set()}
 # A complete art-direction field can legitimately be longer than a short
 # label.  Keep a bounded contract, but do not reject a coherent provider
 # response merely because it explains the physical design in detail.
 _ART_DIRECTION_FIELD_MAX = 2200
-_SOURCE_BRIEF_FIELD_MAX = 700
 _SHOPPING_PURPOSE_MAX = 320
 _MEASUREMENT_RE = re.compile(
     r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*"
@@ -101,7 +114,7 @@ _PRODUCT_PART_STATE_MUTATION_RE = re.compile(
 _RENDERABLE_COPY_INSTRUCTION_RE = re.compile(
     r"(?:^|[\r\n;])\s*(?:text|title|caption|slogan|headline|label|copy)\s*:\s*"
     r"|\b(?:render|write|print|spell|include|display|show|place)\s+(?:the\s+)?(?:following\s+)?"
-    r"(?:text|title|caption|slogan|headline|label|words|copy)\b"
+    r"(?:text|title|caption|slogan|headline|label|words|copy)\s*(?:[:=]|[\"\u201c])"
     r"|\b(?:set|name|call)\s+(?:the\s+)?(?:visible\s+)?"
     r"(?:text|title|caption|slogan|headline|label|copy)\s+(?:to|as|reading|saying)\b"
     r"|\b(?:text|title|caption|slogan|headline|label|copy)\b[^.\r\n]{0,48}"
@@ -173,7 +186,7 @@ def claim_review_requests(raw: Any, source_manifest: list[dict[str, Any]]) -> li
             except VisualDesignKitCompileError:
                 continue
             evidence = {key: available[key] for key in bound["evidence_ids"]}
-            if bound["text"] in evidence.values():
+            if bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
                 continue
             key = claim_key(bound["text"], evidence)
             requests[key] = {"key": key, "proposed_text": bound["text"], "evidence": evidence}
@@ -209,8 +222,14 @@ def _compile_art_direction(value: Any) -> dict[str, Any]:
             f"family_art_direction.{field}",
             _ART_DIRECTION_FIELD_MAX,
         )
-        for field in _PLANNER_ART_DIRECTION_FIELDS - {"negative_visuals"}
+        for field in _ART_DIRECTION_FIELDS - {"negative_visuals", "palette_direction", *DESIGN_FIELD_SCHEMAS}
     }
+    for field, schema in DESIGN_FIELD_SCHEMAS.items():
+        result[field] = _design_mapping(value.get(field), schema, field)
+    palette = value.get("palette_direction")
+    if not isinstance(palette, dict) or not palette:
+        raise VisualDesignKitCompileError("palette_direction needs object-to-color/material assignments")
+    result["palette_direction"] = _design_mapping(palette, palette, "palette_direction")
     negative = _text_list(value.get("negative_visuals"), maximum=6)
     if not 2 <= len(negative) <= 6:
         raise VisualDesignKitCompileError("family_art_direction needs 2-6 negative visuals")
@@ -234,7 +253,7 @@ def _compile_source_brief(
         "source_sha256": str(source["source_sha256"]),
         "role": role,
         "shopping_purpose": _source_brief_text(draft.get("shopping_purpose"), "shopping_purpose", _SHOPPING_PURPOSE_MAX, category_id=category_id),
-        "image_direction": _source_brief_text(draft.get("image_direction"), "image_direction", _SOURCE_BRIEF_FIELD_MAX, category_id=category_id),
+        "image_direction": _image_direction(draft.get("image_direction"), source),
     }
     if role == "func":
         result["func_story_contract"] = _compile_func_story(source, draft.get("func_story"), product_claims=product_claims, claim_reviews=claim_reviews)
@@ -244,7 +263,21 @@ def _compile_source_brief(
         result["claim_reviews"] = {key: value for key, value in claim_reviews.items() if key in used_keys}
     elif role == "size":
         result.update(measurement_authority="complete_source_measurement_diagram", invent_text=False)
+    # Placement is optional design metadata, not authority to invent copy.
+    # Project only existing copy references; an unused hint cannot block facts.
+    result["image_direction"] = {**result["image_direction"], "text_placement": [
+        row for row in result["image_direction"]["text_placement"] if row["text_ref"] in _text_refs(result, source)
+    ]}
     return result
+
+
+def _text_refs(brief: dict[str, Any], source: dict[str, Any]) -> set[str]:
+    story = brief.get("func_story_contract") or {}
+    refs = {"title"} if story.get("title") else set()
+    refs.update(f"label:{i}" for i, _ in enumerate(story.get("labels") or []))
+    if brief["role"] == "size" or source.get("measurements"):
+        refs.add("measurements")
+    return refs
 
 
 def _compile_func_story(
@@ -276,7 +309,7 @@ def _copy_binding(value: Any, available: dict[str, str]) -> dict[str, Any]:
         or len(text) > 240 or has_bad_encoding(text)
     ):
         raise VisualDesignKitCompileError("func story copy has invalid text or evidence scope")
-    return {"evidence_ids": list(ids), "text": text}
+    return {"evidence_ids": list(ids), "text": us_measurement_text(text)}
 
 
 def _bind_func_story_text(
@@ -285,7 +318,7 @@ def _bind_func_story_text(
 ) -> dict[str, Any]:
     bound = _copy_binding(value, available)
     evidence = {key: available[key] for key in bound["evidence_ids"]}
-    if bound["text"] in evidence.values():
+    if bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
         return bound
     key = claim_key(bound["text"], evidence)
     review = (claim_reviews or {}).get(key) or {}
@@ -297,7 +330,10 @@ def _bind_func_story_text(
 def _validate_art_direction(value: Any) -> None:
     if not isinstance(value, dict) or set(value) != _ART_DIRECTION_FIELDS:
         raise VisualDesignKitCompileError("family_art_direction fields do not match the V11 contract")
-    for field in _ART_DIRECTION_FIELDS - {"negative_visuals"}:
+    compiled = _compile_art_direction(value)
+    if compiled != value:
+        raise VisualDesignKitCompileError("art direction is not canonical")
+    for field in _ART_DIRECTION_FIELDS - {"negative_visuals", "palette_direction", *DESIGN_FIELD_SCHEMAS}:
         _valid_text(
             value[field],
             f"family_art_direction.{field}",
@@ -355,7 +391,7 @@ def _validate_briefs(
         if brief.get("status") != "ready":
             raise VisualDesignKitCompileError("source brief readiness is missing")
         required_fields = _BRIEF_BINDING_FIELDS | _BRIEF_ROLE_FIELDS[role] | {"status", "supporting_sources"}
-        allowed_fields = required_fields | _BRIEF_OPTIONAL_FIELDS[role]
+        allowed_fields = required_fields
         missing_fields = sorted(required_fields - set(brief))
         unknown_fields = sorted(set(brief) - allowed_fields)
         if missing_fields or unknown_fields or brief.get("role") != role:
@@ -376,11 +412,9 @@ def _validate_briefs(
             5,
             _SHOPPING_PURPOSE_MAX,
         )
-        _image_direction_text(
-            brief["image_direction"],
-            f"source_briefs[{index}].image_direction",
-            category_id=category_id,
-        )
+        direction = _image_direction(brief["image_direction"], source)
+        if any(row["text_ref"] not in _text_refs(brief, source) for row in direction["text_placement"]):
+            raise VisualDesignKitCompileError("text placement references absent role copy")
         if role == "func":
             _validate_func_brief(
                 brief, source, index, product_claims=product_claims,
@@ -507,25 +541,39 @@ def _source_brief_text(
     return text
 
 
-def _validate_scene_state_boundary(value: str, label: str, *, category_id: str) -> None:
-    if _product_state_mutation(value, category_id=category_id):
-        raise VisualDesignKitCompileError(
-            f"{label} tries to change a source-visible product state"
-        )
+def _design_mapping(value: Any, schema: dict[str, Any], label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != set(schema):
+        raise VisualDesignKitCompileError(f"{label} needs the current named design fields")
+    return {key: _required_text(item, f"{label}.{key}", _ART_DIRECTION_FIELD_MAX)
+            for key, item in value.items()}
 
 
-def _image_direction_text(value: Any, label: str, *, category_id: str) -> str:
-    """Validate required func/size visual guidance without treating layout language as copy.
-
-    Func/size directions may naturally mention titles, labels, or callouts as
-    visual objects.  Exact readable strings remain owned by FuncStoryContract
-    and MeasurementContract; rejecting ordinary words such as "show labels"
-    here would turn a quality hint into a new planner blocker.
-    """
-    _valid_text(value, label, 5, _SOURCE_BRIEF_FIELD_MAX)
-    text = str(value)
-    _validate_scene_state_boundary(text, label, category_id=category_id)
-    return text
+def _image_direction(value: Any, source: dict[str, Any]) -> dict[str, Any]:
+    """Bind canvas geometry, never execute factual prose from a design field."""
+    if not isinstance(value, dict) or set(value) != set(IMAGE_DIRECTION_SCHEMA):
+        raise VisualDesignKitCompileError("image_direction needs the current named design fields")
+    if value["environment_mode"] not in {"designed_environment", "graphic_canvas", "source_setting"}:
+        raise VisualDesignKitCompileError("image_direction has unknown environment_mode")
+    for field, fields in (("layout", {"view_id", "target_region"}), ("text_placement", {"text_ref", "target_region"})):
+        rows = value[field]
+        if not isinstance(rows, list) or (field == "layout" and not rows):
+            raise VisualDesignKitCompileError(f"{field} needs a region list")
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != fields:
+                raise VisualDesignKitCompileError(f"{field} has invalid region fields")
+            if field == "text_placement" and not isinstance(row["text_ref"], str):
+                raise VisualDesignKitCompileError("text_ref must name a role-copy entry")
+            if field == "layout" and not isinstance(row["view_id"], str):
+                raise VisualDesignKitCompileError("view_id must name observed physical evidence")
+            for key in fields - {"text_ref", "view_id"}:
+                box = row[key]
+                if not isinstance(box, list) or len(box) != 4 or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in box) or not (box[0] < box[2] and box[1] < box[3]):
+                    raise VisualDesignKitCompileError(f"{field}.{key} requires normalized left,top,right,bottom bounds")
+    known = {row["view_id"] for row in physical_views((source.get("observation") or {}).get("physical_views"))}
+    selected = [row["view_id"] for row in value["layout"]]
+    if not known or set(selected) != known or len(selected) != len(known):
+        raise VisualDesignKitCompileError("layout must bind every source physical view once, without hidden or duplicate views")
+    return value
 
 
 def _product_state_mutation(value: str, *, category_id: str = "") -> bool:

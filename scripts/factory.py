@@ -234,7 +234,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", "") or str(job.get("config_path") or "") or str(FACTORY_ROOT / "config.local.env")
     load_env(config_path, override=False)
     stages = [stage.strip() for stage in args.stages.split(",") if stage.strip()] if args.stages else None
-    write_excel = bool(args.write_excel or (not args.production and stages == ["template"]))
+    write_excel = bool(args.write_excel or (not args.production and (stages is None or "template" in stages)))
     request = JobRunRequest(
         job_dir=job_dir,
         plugin=plugin,
@@ -552,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=0, help="Generation concurrency cap; 0 selects a hardware/provider-aware limit.")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--upload", action="store_true")
-    p.add_argument("--write-excel", action="store_true", help="Write the XLSM artifact for debug template runs; enabled automatically for --stages template.")
+    p.add_argument("--write-excel", action="store_true", help="Write XLSM; enabled automatically whenever the selected stages include template.")
     p.add_argument("--resume", action="store_true", help="Resume from the current job_state.json stage state.")
     p.add_argument("--retry-copy", action="store_true", help="Explicitly retry terminal copy failures for the current input revision.")
     p.add_argument("--dry-run", action="store_true", help="Print the resolved stage plan without executing network calls.")
@@ -589,7 +589,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--job", required=True)
     p.add_argument("--child", required=True)
     p.add_argument("--source-index", required=True, type=int)
-    p.add_argument("--role", required=True, choices=["scene", "func", "size"])
+    p.add_argument("--role", required=True, choices=["scene", "func", "size", "excluded_wrong_variant"])
     p.add_argument("--reason", required=True)
     p.set_defaults(func=cmd_review_source)
 

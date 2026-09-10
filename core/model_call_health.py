@@ -176,7 +176,7 @@ def model_status_from_exception(exc: Exception, detail: str = "") -> str:
         return "rate_limit_failure"
     if "timeout" in text or "timed out" in text:
         return "timeout_failure"
-    if "500" in text or "502" in text or "503" in text or "504" in text or "connection" in text:
+    if isinstance(exc, (urllib.error.URLError, ConnectionError)) or "500" in text or "502" in text or "503" in text or "504" in text or "connection" in text:
         return "transport_failure"
     return "content_failure"
 

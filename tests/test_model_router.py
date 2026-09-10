@@ -130,7 +130,7 @@ class ModelRouterTests(unittest.TestCase):
                     request_id="physical-budget-test",
                 )
         self.assertEqual(2, request.call_count)
-        self.assertEqual("request_budget_exhausted", raised.exception.failure_kind)
+        self.assertEqual("validation_failure", raised.exception.failure_kind)
         self.assertEqual(2, raised.exception.metadata["physical_request_count"])
         client = {
             "name": "planner", "family": "openai_vision", "scope": "visual_planning",

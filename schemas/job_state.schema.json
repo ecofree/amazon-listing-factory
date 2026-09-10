@@ -32,6 +32,15 @@
           "candidate_revision": {"type": "integer", "minimum": 0, "maximum": 99},
           "candidate_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
           "execution_revision": {"type": "string", "minLength": 64, "maxLength": 64},
+          "request_outcome": {"enum": ["unknown"]},
+          "request_audit": {
+            "type": "object",
+            "required": ["request_id", "provider"],
+            "properties": {
+              "request_id": {"type": "string", "minLength": 1},
+              "provider": {"type": "string", "minLength": 1}
+            }
+          },
           "updated_at": {"type": "string", "minLength": 1}
         }
       }

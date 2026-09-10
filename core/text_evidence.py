@@ -4,6 +4,7 @@ import re
 import unicodedata
 from collections import Counter
 from fractions import Fraction
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
 from typing import Any
 
 _QUOTE_MAP = str.maketrans({
@@ -24,12 +25,12 @@ _QUOTE_MAP = str.maketrans({
     "\u2014": "-",
     "\u2212": "-",
 })
-_NUMBER_RE = r"\d+(?:\.\d+)?(?:/\d+)?"
+_NUMBER_RE = r"[+-]?(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)"
 _UNIT_RE = (
     r"feet|foot|ft|inches|inch|in|centimeters|centimeter|cm|millimeters|millimeter|mm|"
     r"meters|meter|m|lbs|lb|pounds|pound|kilograms|kilogram|kg|grams|gram|g|ounces|ounce|oz|[\"']"
 )
-_MEASURE_RE = re.compile(rf"\b({_NUMBER_RE})\s*-?\s*({_UNIT_RE})\b", re.I)
+_MEASURE_RE = re.compile(rf"(?<![\w./])({_NUMBER_RE})\s*-?\s*({_UNIT_RE})(?![A-Za-z])", re.I)
 _QUOTE_MEASURE_RE = re.compile(rf"\b({_NUMBER_RE})\s*([\"'])(?!\s*[,:\]\}}\n\r])", re.I)
 _DIMENSION_CHAIN_RE = re.compile(
     rf"\b({_NUMBER_RE}(?:\s*(?:x|\*)\s*{_NUMBER_RE}){{1,5}})\s*-?\s*({_UNIT_RE})\b",
@@ -199,11 +200,23 @@ def number_tokens(value: str) -> set[str]:
     return {_clean_number(match) for match in re.findall(_NUMBER_RE, normalize_text(value))}
 
 
+def numeric_signature(value: str) -> tuple[float, ...]:
+    return tuple(_number_value(m[0]) for m in re.finditer(rf"(?<![A-Za-z0-9]){_NUMBER_RE}", normalize_text(value)))
+
+
 def extract_measurements(value: Any) -> list[dict[str, Any]]:
     text = normalize_text(value)
     results: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     occupied: list[range] = []
+    for match in re.finditer(rf"(?<![\w./])({_NUMBER_RE})\s*(?:to|-)\s*({_NUMBER_RE})\s*({_UNIT_RE})(?![A-Za-z])", text, re.I):
+        for number in (match[1], match[2]):
+            _append_measurement(results, seen, number, _UNIT_ALIASES[match[3].casefold()], match[0], allow_duplicate=True)
+        occupied.append(range(match.start(), match.end()))
+    for match in re.finditer(rf"\b({_NUMBER_RE})\s*(?:ft|feet|foot|')\s*({_NUMBER_RE})\s*(?:inches|inch|in|\")", text, re.I):
+        inches = _number_value(match[1]) * 12 + _number_value(match[2])
+        _append_measurement(results, seen, str(inches), _UNIT_ALIASES['in'], match[0], allow_duplicate=True)
+        occupied.append(range(match.start(), match.end()))
     for match in _LABELLED_DIMENSION_CHAIN_RE.finditer(text):
         unit = _unit(match.group(2))
         if unit is None:
@@ -228,7 +241,8 @@ def extract_measurements(value: Any) -> list[dict[str, Any]]:
             continue
         unit = _unit(match.group(2))
         if unit is not None:
-            _append_measurement(results, seen, match.group(1), unit, match.group(0))
+            _append_measurement(results, seen, match.group(1), unit, match.group(0), allow_duplicate=True)
+            occupied.append(range(match.start(), match.end()))
     for match in _QUOTE_MEASURE_RE.finditer(text):
         if any(match.start() in span and match.end() - 1 in span for span in occupied):
             continue
@@ -236,6 +250,41 @@ def extract_measurements(value: Any) -> list[dict[str, Any]]:
         if unit is not None:
             _append_measurement(results, seen, match.group(1), unit, match.group(0))
     return results
+
+
+def us_measurement_text(value: Any, *, upper_bound: bool = False, length_unit: str = '') -> str:
+    """Convert explicit metric quantities only; preserve source wording and axes."""
+    text = normalize_text(value)
+    metric = r"centimeters?|cm|millimeters?|mm|meters?|m|kilograms?|kg|grams?|g"
+    if length_unit == 'in':
+        metric += r"|feet|foot|ft"
+    axis = r"(?:\s*(?:L|W|H|D|length|width|height|depth)\b)?"
+    pattern = re.compile(rf"(?<![\w./])({_NUMBER_RE}{axis}(?:\s*(?:[x*]|to|-)\s*{_NUMBER_RE}{axis})*)\s*({metric})(?![A-Za-z])", re.I)
+    bound = upper_bound or bool(re.search(r"\b(capacity|supports up to|holds up to|maximum load)\b", text, re.I))
+
+    def convert(match: re.Match[str]) -> str:
+        kind, factor, _ = _UNIT_ALIASES[match[2].casefold()]
+        target, divisor = ('in', Decimal('25.4')) if kind == 'length_mm' else ('lb', Decimal('453.59237'))
+        mode = ROUND_FLOOR if bound and kind == 'weight_g' else ROUND_HALF_UP
+        def number(m: re.Match[str]) -> str:
+            n = Decimal(str(_number_value(m[0]))) * Decimal(str(factor)) / divisor
+            places = Decimal('0.01')
+            while n and abs(n) < places:
+                places /= 10
+            return format(n.quantize(places, rounding=mode), 'f').rstrip('0').rstrip('.') if places < 1 else str(n)
+        return re.sub(rf"(?<![\d/]){_NUMBER_RE}", number, match[1]) + ' ' + target
+
+    return pattern.sub(convert, text)
+
+
+def measurement_values_match(source: str, candidate: str) -> bool:
+    """Allow exact physical equivalence or the single approved US display value."""
+    original, actual = extract_measurements(source), extract_measurements(candidate)
+    approved = extract_measurements(us_measurement_text(source))
+    if not original or len(original) != len(actual) or len(approved) != len(actual):
+        return False
+    return all(a['canonical_pair'] in {s['canonical_pair'], d['canonical_pair']}
+               for s, d, a in zip(original, approved, actual))
 
 
 def has_measurement_text(value: Any) -> bool:
@@ -300,7 +349,9 @@ def _append_measurement(
     kind, multiplier, display_unit = unit_info
     number = _clean_number(raw_number)
     numeric = _number_value(raw_number)
-    canonical_value = f"{numeric * multiplier:.3f}".rstrip("0").rstrip(".")
+    canonical_value = format(Decimal(str(numeric)) * Decimal(str(multiplier)), 'f')
+    if '.' in canonical_value:
+        canonical_value = canonical_value.rstrip('0').rstrip('.')
     key = (kind, canonical_value, number)
     if not allow_duplicate and key in seen:
         return
@@ -325,21 +376,21 @@ def _unit(value: str) -> tuple[str, float, str] | None:
 
 
 def _quote_unit(number: str, quote: str) -> tuple[str, float, str] | None:
-    normalized = normalize_text(quote)
-    if normalized == "'" and _number_value(number) > 12:
-        return _UNIT_ALIASES['"']
-    return _unit(normalized)
+    return _unit(normalize_text(quote))
 
 
 def _clean_number(value: str) -> str:
-    text = normalize_text(value)
+    text = normalize_text(value).replace(',', '')
     if "/" in text and "." not in text:
         return text.lstrip("0") or "0"
     return text.rstrip("0").rstrip(".") if "." in text else (text.lstrip("0") or "0")
 
 
 def _number_value(value: str) -> float:
-    text = normalize_text(value)
+    text = normalize_text(value).replace(',', '')
+    if re.fullmatch(r"\d+\s+\d+/\d+", text):
+        whole, fraction = text.split()
+        return float(int(whole) + Fraction(fraction))
     if "/" in text and "." not in text:
         return float(Fraction(text))
     return float(text)

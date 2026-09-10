@@ -1,14 +1,14 @@
 {
   "providers": [
     {
-      "name": "holdai_gemini_31_flash_lite_vision_qa",
+      "name": "nuwa_gemini_37_vision_qa",
       "family": "gemini",
       "scope": "vision_qa",
       "protocol": "openai",
-      "base_url": "https://api.holdai.top/v1",
-      "key_env": "HOLDAI_API_KEY",
-      "model": "gemini-3.1-flash-lite",
-      "capabilities": ["vision_input", "json_output", "low_cost_reasoning", "evidence_extraction"],
+      "base_url": "https://api.nuwaflux.com/v1",
+      "key_env": "NUWA_API_KEY",
+      "model": "gemini-3.7-flash",
+      "capabilities": ["vision_input", "json_output", "evidence_extraction"],
       "priority": 110,
       "enabled": true
     },
@@ -132,6 +132,7 @@
     },
     {
       "name": "aicost_gpt_image_2",
+      "allowed_roles": ["main", "scene"],
       "resource_group": "aicost_gpt_image_2",
       "family": "image_generation",
       "scope": "image_generation",
@@ -152,7 +153,30 @@
       "enabled": true
     },
     {
+      "name": "aicost_gpt_image_25",
+      "allowed_roles": ["main", "scene"],
+      "resource_group": "aicost_gpt_image_2",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "AICOST_API_KEY",
+      "model": "gpt-image-2.5",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 150,
+      "enabled": true
+    },
+    {
       "name": "aicost_gpt_image_25_flare",
+      "allowed_roles": ["main", "scene", "func", "size"],
       "resource_group": "aicost_gpt_image_2",
       "display": "aicost-gpt-image-2.5-flare",
       "family": "image_generation",
@@ -175,6 +199,8 @@
     },
     {
       "name": "aicost_gpt_image_25_sunburst",
+      "role_priority": {"func": 1, "size": 1},
+      "allowed_roles": ["func", "size"],
       "resource_group": "aicost_gpt_image_2",
       "display": "aicost-gpt-image-2.5-sunburst",
       "family": "image_generation",
@@ -235,7 +261,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 160,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "laoliu-fixed",
@@ -260,6 +286,7 @@
     },
     {
       "name": "cxk_fixed",
+      "allowed_roles": ["main", "scene"],
       "resource_group": "cxk_fixed",
       "display": "cxk-fixed",
       "family": "image_generation",
@@ -282,6 +309,7 @@
     },
     {
       "name": "cxk_gpt_image_25",
+      "allowed_roles": ["main", "scene"],
       "resource_group": "cxk_fixed",
       "display": "cxk-gpt-image-2.5",
       "family": "image_generation",
@@ -304,6 +332,7 @@
     },
     {
       "name": "cxk_gpt_image_25_flare",
+      "allowed_roles": ["main", "scene", "func", "size"],
       "resource_group": "cxk_fixed",
       "display": "cxk-gpt-image-2.5-flare",
       "family": "image_generation",

@@ -31,7 +31,7 @@ from .image_task_inputs import release_candidate_fingerprint
 from .image_tasks import read_image_tasks
 from .run_scope import scoped_child_set
 from .status import input_revision_id, logical_task_id
-from .text_evidence import extract_measurements, normalize_text
+from .text_evidence import extract_measurements, normalize_text, measurement_values_match, numeric_signature
 
 
 LOCAL_GATE_NAMES = ("image_integrity", "main_background", "unauthorized_text", "dimension_accuracy")
@@ -81,7 +81,9 @@ def run_image_qa(
 
     def evaluate(task: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
         cached = existing.get((task["child"], task["role"], candidate["candidate_sha256"]))
-        if cached and evidence_is_current(cached, task, candidate, job_dir=job):
+        if cached and evidence_is_current(cached, task, candidate, job_dir=job) and (
+            cached.get("candidate_observation") or cached["automatic_decision"] == "fail"
+        ):
             return cached
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             raise TimeoutError("QA execution deadline exhausted before evaluation")
@@ -114,9 +116,16 @@ def run_image_qa(
             "input_revision_id": input_revision_id({"evidence": row["evidence_fingerprint"], "qa_policy": row["qa_policy_id"]}),
             "child": row["child"], "role": row["role"], "status": "success",
         }
-        for row in rows
+        for row in rows if row.get('observation_status') != 'unavailable'
     ]
-    failures = candidate_failures + evaluation_failures
+    observation_failures = [{
+        'task': {'logical_task_id': logical_task_id('qa', child=row['child'], role=row['role']),
+                 'input_revision_id': input_revision_id({'evidence': row['evidence_fingerprint'], 'qa_policy': row['qa_policy_id']}),
+                 'child': row['child'], 'role': row['role']},
+        'failure_owner': 'qa', 'task_status': 'retryable', 'error_code': 'qa_observer_unavailable',
+        'error': next((g['evidence'] for g in row['gates'] if g['gate'] == 'product_fidelity'), 'QA observer unavailable'),
+    } for row in rows if row.get('observation_status') == 'unavailable']
+    failures = candidate_failures + evaluation_failures + observation_failures
     records.extend({
         "logical_task_id": item["task"]["logical_task_id"],
         "input_revision_id": item["task"]["input_revision_id"],
@@ -148,7 +157,7 @@ def _evaluate(job: Path, plugin: ProductPlugin, task: dict[str, Any], candidate:
     output = resolve_job_owned_path(job, str(candidate["candidate_path"]))
     gates = _local_gates(job, plugin, task, output)
     observation = {}
-    if not any(row["gate"] == "image_integrity" and row["status"] == "fail" for row in gates):
+    if not any(row["status"] == "fail" for row in gates):
         try:
             observation = observe_candidate(job, task, candidate, deadline_monotonic=deadline_monotonic)
             semantic = _semantic_gates(task, observation)
@@ -165,6 +174,7 @@ def _evaluate(job: Path, plugin: ProductPlugin, task: dict[str, Any], candidate:
         "qa_policy_id": qa_policy_id(task), "automatic_decision": decision,
         "decision_scope": "observed_hard_facts_only",
         "candidate_observation": observation,
+        "observation_status": "completed" if observation else "not_needed" if decision == "fail" else "unavailable",
         "quality_authority": "human_review_and_provider_ledger",
         "automatic_pass": decision == "pass", "failure_owner": "qa" if decision == "fail" else "",
         "provider": observation.get("provider") or {"provider": "unavailable", "model": "unavailable", "protocol": "unavailable"},
@@ -183,7 +193,10 @@ def _local_gates(job: Path, plugin: ProductPlugin, task: dict[str, Any], output:
         gates.append(_gate("image_integrity", "pass", "candidate decodes and has a non-solid production canvas"))
     except Exception as exc:
         gates.append(_gate("image_integrity", "fail", f"{type(exc).__name__}: {exc}"))
+        return gates
     gates.append(_main_background_gate(plugin, task, output))
+    if gates[-1]["status"] == "fail":
+        return gates
     text, dimensions = _ocr_gates(job, task, output)
     gates.extend((text, dimensions))
     return gates
@@ -227,8 +240,13 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
     unknown = [row["text"] for row in texts if row["kind"] in {"unknown", "brand", "product_label"} or row["confidence"] < 0.9]
     marketing = [row["text"] for row in texts if row["kind"] == "marketing" and row["confidence"] >= 0.9]
     has_diagram = (task.get("measurement_authority") or {}).get("mode") == "source_image"
-    unexpected = _unsupported_contract_lines(marketing if has_diagram else authored, allowed)
-    missing = _unsupported_contract_lines(allowed, authored)
+    factual_copy = (task.get("measurement_authority") or {}) if has_diagram else {}
+    permitted = allowed + list(factual_copy.get("render_text") or []) + list(factual_copy.get("source_visible_callouts") or [])
+    unexpected = _unsupported_contract_lines(marketing if has_diagram else authored, permitted)
+    observed_phrases = authored + [" ".join(authored[start:stop])
+                                  for start in range(len(authored))
+                                  for stop in range(start + 2, min(len(authored), start + 3) + 1)]
+    missing = _unsupported_contract_lines(allowed, observed_phrases)
     if unexpected:
         text_gate = _gate("unauthorized_text", "fail", f"Located unapproved authored copy: {unexpected}")
     elif unknown or observation["text_coverage"] != "complete" or missing:
@@ -237,13 +255,19 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
         text_gate = _gate("unauthorized_text", "pass", "Located approved copy matches; ordinary prop text is not an authored product claim")
 
     dimensions = observation["measurements"]
+    groups = {r['id']: r for r in (task.get('measurement_authority') or {}).get('measurement_groups', [])}
+    expected_ids = set(groups)
+    observed_ids = [r.get('measurement_id') for r in dimensions if r.get('measurement_id')]
+    unbound = bool(set(observed_ids) != expected_ids or len(observed_ids) != len(set(observed_ids)))
+    if expected_ids and any(not extract_measurements(row['candidate_text']) for row in dimensions):
+        unbound = True
     wrong = [row for row in dimensions if row["confidence"] >= 0.9 and (
         row["relationship"] == "different" or (
             _measurement_values([row["source_text"]]) and _measurement_values([row["candidate_text"]])
-            and _measurement_values([row["source_text"]]) != _measurement_values([row["candidate_text"]])))]
+            and not measurement_values_match(groups.get(row.get('measurement_id'), {}).get('render_text') or row["source_text"], row["candidate_text"])))]
     if wrong:
         dimension_gate = _gate("dimension_accuracy", "fail", f"Located measured-object/value/endpoint contradictions: {wrong}")
-    elif (has_diagram and (not dimensions or observation["measurement_coverage"] != "complete")) or observation["measurement_coverage"] == "partial" or any(row["confidence"] < 0.9 or row["relationship"] == "unknown" for row in dimensions):
+    elif unbound or (has_diagram and (not dimensions or observation["measurement_coverage"] != "complete")) or observation["measurement_coverage"] == "partial" or any(row["confidence"] < 0.9 or row["relationship"] == "unknown" for row in dimensions):
         dimension_gate = _gate("dimension_accuracy", "inconclusive", "Incomplete measured-object, value or endpoint observation")
     else:
         dimension_gate = _gate("dimension_accuracy", "pass", "Observed measurement relationships match" if dimensions else "No measurement diagram; func numeric claims remain checked as exact authored copy")
@@ -252,7 +276,12 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
     status = {"consistent": "pass", "contradiction": "fail", "unknown": "inconclusive"}[product["status"]]
     if product["confidence"] < 0.9:
         status = "inconclusive"
-    return [text_gate, dimension_gate, _gate("product_fidelity", status, str(product))]
+    gates = [text_gate, dimension_gate, _gate("product_fidelity", status, str(product))]
+    edit = observation.get('edit_comparison')
+    if edit:
+        edit_status = {'consistent': 'pass', 'contradiction': 'fail', 'unknown': 'inconclusive'}[edit['status']]
+        gates.append(_gate('edit_scope', edit_status if edit['confidence'] >= .9 else 'inconclusive', str(edit)))
+    return gates
 
 
 def _measurement_values(lines: Any) -> set[str]:
@@ -270,6 +299,8 @@ def _line_matches_any(line: str, allowed: list[str]) -> bool:
     if not tokens:
         return True
     for value in allowed:
+        if numeric_signature(line) != numeric_signature(value):
+            continue
         permitted = _ocr_match_tokens(value)
         if tokens == permitted or _compact_edit_distance_at_most_one(
             _ocr_compact(line), _ocr_compact(value)
@@ -289,15 +320,9 @@ def _unsupported_contract_lines(lines: list[str], allowed: list[str]) -> list[st
         index for index, line in enumerate(lines)
         if _line_matches_any(line, allowed)
     }
-    permitted = {_ocr_compact(value) for value in allowed if _ocr_compact(value)}
     for start in range(len(lines)):
         for stop in range(start + 2, min(len(lines), start + 3) + 1):
-            if any(
-                _compact_edit_distance_at_most_one(
-                    _ocr_compact(" ".join(lines[start:stop])), expected,
-                )
-                for expected in permitted
-            ):
+            if _line_matches_any(" ".join(lines[start:stop]), allowed):
                 supported.update(range(start, stop))
     return [line for index, line in enumerate(lines) if index not in supported]
 

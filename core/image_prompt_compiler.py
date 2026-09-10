@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from .image_reference_context import reference_prompt
 import re
 from pathlib import Path
@@ -15,11 +14,11 @@ from .status import input_revision_id, logical_task_id
 from .text_evidence import extract_measurements, normalize_text
 
 
-PROMPT_CONTRACT_VERSION = "gemini-art-direction-v67-content-ownership"
+PROMPT_CONTRACT_VERSION = "gemini-art-direction-v71-evidence-view-layout"
 PROMPT_REVISION_RESERVE_CHARS = 700
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v52-content-ownership"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v56-region-layout"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -204,14 +203,16 @@ def compile_task_prompt(
     edit = task.get("edit_contract") if isinstance(task.get("edit_contract"), dict) else {}
     main_policy = str((task.get("category_image_policy") or {}).get("main_image_policy") or "")
     white_main = role == "main" and main_policy == "white_background"
+    image_direction = task["image_direction"]
+    environment = role != "size" and not white_main and image_direction["environment_mode"] == "designed_environment"
     renderable = task_renderable_text(task)
     text_mode = str((task.get("renderable_text_contract") or {}).get("mode") or "none")
     if renderable:
         text_rule = "The renderable-text block is the complete authored copy, including inset captions. Render those strings once; composition prose and source marketing supply no additional display text."
         if task["measurement_authority"].get("mode") == "source_image":
             text_rule += " Retain the source measurement diagram under its separate factual measurement authority."
-    elif text_mode == "preserve_source_measurements":
-        text_rule = "Display the source measurement diagram's facts at their existing measured-object and endpoint associations with readable spacing; no extra feature cards or duplicate measurement labels from composition prose."
+    elif text_mode == "source_measurement_display":
+        text_rule = "Display authorized US labels with readable spacing at their measured-object associations; no extra feature cards or duplicate measurement labels on the same association. Equal values on different measured objects remain separate."
     else:
         text_rule = "No added marketing text, captions or decorative overlays."
     text_rule += (
@@ -227,10 +228,12 @@ def compile_task_prompt(
         "[STYLE]\n" + _family_art_direction(
             art_direction, role,
             main_policy=main_policy,
+            environment=environment,
         ) + "\n" + _presentation_system(
             art_direction,
             role=role,
             main_policy=main_policy,
+            environment=environment,
         ),
         "[TEXT]\n" + text_rule + ("\n" + _render_text_block(renderable) if renderable else ""),
         "[OUTPUT]\nReturn one square Amazon US image only. No commentary, watermark, or unapproved content.",
@@ -357,12 +360,11 @@ def _product_boundary(task: dict[str, Any], edit: dict[str, Any]) -> str:
         _line("Edit", edit.get("replace")),
         _line("Category constraints", edit.get("forbid")),
         "Source completeness: " + str(edit.get("reference_completeness") or "partial_feature_view") + "; use visible evidence only; do not infer hidden regions.",
-        _conditional_structure_line(boundary.get("conditional_structure_lock")),
         _line("Forbidden additions", boundary.get("forbidden_additions")),
-        "Observed objects: " + json.dumps([
-            {key: obj.get(key) for key in ("object_id", "kind", "sale_membership", "visibility", "state", "relations")}
+        "Physical evidence: " + "; ".join(
+            f"{obj.get('kind')}: {obj.get('state')}; visibility={obj.get('visibility')}; ownership={obj.get('sale_membership')}"
             for obj in boundary.get("observed_objects") or []
-        ], ensure_ascii=False, separators=(",", ":")) if boundary.get("observed_objects") else "",
+        ) if boundary.get("observed_objects") else "",
     ]
     return "\n".join(row for row in rows if row)
 
@@ -370,15 +372,15 @@ def _product_boundary(task: dict[str, Any], edit: dict[str, Any]) -> str:
 def _role_content(
     task: dict[str, Any], role: str, *, white_main: bool = False
 ) -> str:
-    purpose = str(task.get("role_purpose") or "").strip()
-    rows = ["Shopping purpose: " + purpose]
-    image_direction = _compact_token_direction(task.get("image_direction"))
-    if image_direction:
-        rows.append("Composition direction (layout only; product state and display copy are defined separately): " + image_direction)
+    direction = task["image_direction"]
+    rows = ["Canvas layout (normalized left,top,right,bottom; place physical evidence, not source graphics):"]
+    rows.extend(f"Source attachment 1 region {view['source_region']} -> canvas {view['target_region']}; fit proportionally, retaining the physical view's perspective and visible extent."
+                for view in direction["layout"])
+    if role in {"func", "size"} and direction["text_placement"]:
+        rows.append("Text positions (references to the authorized copy below, not additional text): " + "; ".join(
+            f"{row['text_ref']} -> {row['target_region']}" for row in direction["text_placement"]))
     if (task.get("measurement_authority") or {}).get("mode") == "source_image":
         rows.append(_measurement_content(task.get("measurement_authority")))
-    if role == "func":
-        rows.append("Function: show only the source-supported feature relationship and state.")
     return "\n".join(row for row in rows if row)
 
 
@@ -387,7 +389,10 @@ def _family_art_direction(
     role: str,
     *,
     main_policy: str = "",
+    environment: bool = True,
 ) -> str:
+    if not environment and not (role == "main" and main_policy == "white_background"):
+        return "Use the planned canvas around intact evidence views; no added room staging."
     if role == "main" and main_policy == "white_background":
         rows = [
             "Main image requires a white external background with no room or lifestyle staging. "
@@ -414,22 +419,18 @@ def _family_art_direction(
     return "\n".join(row for row in rows if row)
 
 
-def _compact_palette_direction(value: str) -> str:
-    """Project Gemini's final child palette without interpreting or replacing it."""
-    text = _compact_token_direction(value)
-    return "Child palette: " + text + "." if text else ""
-
-
-def _presentation_system(direction: dict[str, Any], *, role: str, main_policy: str = "") -> str:
+def _presentation_system(direction: dict[str, Any], *, role: str, main_policy: str = "", environment: bool = True) -> str:
     """Emit Gemini's one child-wide palette and component system once."""
     if role == "main" and main_policy == "white_background":
         return "Do not apply room, floor, textile, staging, or child room palette tokens to this white-background main image."
-    palette = _compact_palette_direction(direction.get("palette_direction") or "")
+    palette = "Non-product object palette: " + "; ".join(
+        f"{key} = {value}" for key, value in direction["palette_direction"].items()
+    ) if environment else ""
     if role in {"func", "size"}:
         rows = [
             palette,
-            "Typography system: " + _compact_token_direction(direction.get("typography_direction")),
-            "Graphic system: " + _compact_token_direction(direction.get("graphic_direction")),
+            "Typography: " + "; ".join(f"{key} = {value}" for key, value in direction["typography_direction"].items()),
+            "Graphic roles: " + "; ".join(f"{key} = {value}" for key, value in direction["graphic_direction"].items()),
             "Apply environmental colors only to non-product content and graphic colors only to presentation graphics; do not recolor the sold product or add a room to a technical diagram.",
         ]
     else:
@@ -449,7 +450,7 @@ def _compact_token_direction(value: Any) -> str:
 def _measurement_content(value: Any) -> str:
     measurement = value if isinstance(value, dict) else {}
     if measurement.get("mode") == "source_image":
-        candidates = list(measurement.get("source_visible_callouts") or [])
+        candidates = []
         for row in measurement.get("measurement_groups") or []:
             if not isinstance(row, dict):
                 continue
@@ -461,11 +462,12 @@ def _measurement_content(value: Any) -> str:
             if axis and axis != "source_diagram" and not extract_measurements(part):
                 text = f"{axis}: {text}"
             candidates.append(text)
+        candidates.extend(measurement.get("source_visible_callouts") or [])
         candidates.extend(
             row for row in measurement.get("source_visible_text_artifacts") or []
             if isinstance(row, dict) and row.get("kind") in {"measurement", "callout"}
         )
-        inventory, seen = [], set()
+        inventory, seen, seen_pairs = [], set(), set()
         for row in candidates:
             text = normalize_text(row.get("display_text") or row.get("text")) if isinstance(row, dict) else normalize_text(row)
             if not text or re.fullmatch(r"\d+(?:\.\d+)?", text):
@@ -475,10 +477,14 @@ def _measurement_content(value: Any) -> str:
             for item in values:
                 context = context.replace(str(item["raw_text"]).casefold(), " ")
             context = " ".join(re.findall(r"[a-z]+", context))
+            pairs = {item["canonical_pair"] for item in values}
+            if pairs and not context and pairs <= seen_pairs:
+                continue  # A bare transcription adds no object association.
             key = (context, tuple(item["canonical_pair"] for item in values)) if values and context else (text.casefold(), ())
             if key not in seen:
                 inventory.append(text)
                 seen.add(key)
+                seen_pairs.update(pairs)
         return (
             "Measurement copy: Render canonical display copy with readable spacing at its existing source association, not as additional labels. "
             "This inventory aids transcription; the source diagram remains authority for all relationships and unlisted facts."
@@ -498,29 +504,6 @@ def _line(label: str, values: Any) -> str:
         for value in rows if str(value or "").strip()
     )
     return f"{label}: {text}." if text else ""
-
-
-def _conditional_structure_line(values: Any) -> str:
-    rows = values if isinstance(values, list) else [] if values in (None, "") else [values]
-    normalized = [
-        " ".join(str(value or "").split()).rstrip(" .;:")
-        for value in rows
-        if str(value or "").strip()
-    ]
-    normalized = list(dict.fromkeys(normalized))
-    prefix = "Preserve "
-    suffix = " exactly when visible in the editable reference; do not add it when absent"
-    items = [
-        value[len(prefix):-len(suffix)]
-        for value in normalized
-        if value.startswith(prefix) and value.endswith(suffix)
-    ]
-    if normalized and len(items) == len(normalized):
-        return (
-            "Conditional source-visible structures: preserve these structures exactly when visible in the editable reference "
-            "and do not add any when absent: " + "; ".join(items) + "."
-        )
-    return _line("Conditional source-visible structures", normalized)
 
 
 def _render_text_block(values: list[str]) -> str:

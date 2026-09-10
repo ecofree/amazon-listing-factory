@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from .status import input_revision_id
-from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding
+from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding, us_measurement_text, measurement_values_match
 
 def build_renderable_text_contract(
     family: str, measurement: dict[str, Any], *, func_story: dict[str, Any] | None = None,
@@ -14,7 +14,7 @@ def build_renderable_text_contract(
         return {"mode": "none", "strings": []}
     if family == "size":
         if measurement.get("mode") == "source_image":
-            return {"mode": "preserve_source_measurements", "strings": []}
+            return {"mode": "source_measurement_display", "strings": []}
         raise ValueError("size renderable text requires a source measurement image")
     del func_story
     raise ValueError("func renderable text must be copied from the immutable source content contract")
@@ -151,7 +151,9 @@ def measurement_contract(child: dict[str, Any]) -> dict[str, Any]:
         if any(token in key for token in ("package", "shipping", "carton")):
             continue
         if any(token in key for token in ("dimension", "height", "width", "depth", "length", "weight", "capacity", "load")):
-            _append_measurement_record(evidence, str(field), str(value or ""), "apify_spec", 1)
+            unit = (child.get('specs') or {}).get(f'{field}_unit')
+            text = f'{value} {unit}' if unit and not extract_measurements(value) else str(value or '')
+            _append_measurement_record(evidence, str(field), text, "apify_spec", 1)
     unique_evidence: list[dict[str, Any]] = []
     seen_evidence: set[tuple[str, str, str, str]] = set()
     for row in evidence:
@@ -170,8 +172,7 @@ def measurement_contract(child: dict[str, Any]) -> dict[str, Any]:
     conflicts: list[dict[str, Any]] = []
     groups_out: list[dict[str, Any]] = []
     for (part, axis, kind), rows in groups.items():
-        canonical = {str(row.get("canonical_value") or "") for row in rows}
-        if len(canonical) != 1:
+        if not all(measurement_values_match(rows[0]['text'], row['text']) or measurement_values_match(row['text'], rows[0]['text']) for row in rows):
             conflicts.append({"measured_part": part, "axis": axis, "kind": kind, "values": [row["text"] for row in rows]})
             continue
         text = _preferred_measurement_text(rows)
@@ -180,7 +181,7 @@ def measurement_contract(child: dict[str, Any]) -> dict[str, Any]:
             continue
         groups_out.append({
             "id": f"{part}:{axis}:{kind}", "measured_part": part, "axis": axis,
-            "kind": kind, "canonical_value": next(iter(canonical)), "render_text": text,
+            "kind": kind, "canonical_value": rows[0]['canonical_value'], "render_text": text,
         })
         if text and text not in render:
             render.append(text)
@@ -200,7 +201,6 @@ def product_boundary(
     observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the sold-product boundary from program facts and the editable reference."""
-    structure = _unique_text(image_policy.get("structure_invariants") or [])
     normalized = child.get("normalized_facts") if isinstance(child.get("normalized_facts"), dict) else {}
     specs = child.get("specs") if isinstance(child.get("specs"), dict) else {}
     color = visual_product_color(child)
@@ -230,10 +230,6 @@ def product_boundary(
             {"name": observation["variant_identity"]["observed_color"], "source": observation["source_id"]}
             for observation in observations or []
             if (observation.get("variant_identity") or {}).get("observed_color") and observation.get("source_id")
-        ],
-        "conditional_structure_lock": [
-            f"Preserve {value} exactly when visible in the editable reference; do not add it when absent"
-            for value in structure
         ],
         "forbidden_additions": _forbidden_addition_rules(image_policy.get("forbidden_additions") or []),
     }
@@ -329,7 +325,7 @@ def _measurement_axis(part: str) -> str:
 
 def _preferred_measurement_text(rows: list[dict[str, Any]]) -> str:
     imperial = [row for row in rows if str(row.get("unit") or "") in {"in", "ft", "lb", "oz"}]
-    return _measurement_render_text((imperial or rows)[0].get("text"))
+    return us_measurement_text(_measurement_render_text((imperial or rows)[0].get("text")))
 
 
 def _measurement_render_text(value: Any) -> str:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 from typing import Any
+
+from PIL import Image
 
 from .io import file_sha256, read_json
 from .paths import resolve_job_owned_path
@@ -9,6 +12,60 @@ from .plugin import ProductPlugin
 
 
 REFERENCE_KINDS = {"edit_base", "product_evidence", "design_reference"}
+
+
+def physical_views(value: Any) -> list[dict[str, Any]]:
+    """Validate observation-owned view bounds, never guess a whole-page fallback."""
+    if not isinstance(value, list) or len(value) > 16:
+        raise ValueError("Observation physical_views must be a bounded list")
+    seen = set()
+    for row in value:
+        if not isinstance(row, dict) or set(row) != {"view_id", "region"}:
+            raise ValueError("Physical view needs view_id and region")
+        key, box = row["view_id"], row["region"]
+        if not isinstance(key, str) or not key or len(key) > 80 or key in seen:
+            raise ValueError("Physical view identity is missing or duplicated")
+        seen.add(key)
+        if (not isinstance(box, list) or len(box) != 4
+                or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in box)
+                or not (box[0] < box[2] and box[1] < box[3])):
+            raise ValueError("Physical view needs normalized left,top,right,bottom bounds")
+    return value
+
+
+def planning_view_inputs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"attachment_number": index + 1, "source_id": source_id, "view_id": view_id}
+            for index, (source_id, view_id) in enumerate(
+                (source["source_id"], view["view_id"]) for source in sources
+                for view in physical_views((source.get("observation") or {}).get("physical_views")))]
+
+
+def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: Path) -> list[Path]:
+    """Independent, lossless evidence crops; originals remain the edit authority."""
+    paths = []
+    directory.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        views = physical_views((source.get("observation") or {}).get("physical_views"))
+        if not views:
+            raise ValueError(f"{source['source_id']}: no observed physical views; resolve source observation")
+        path = resolve_job_owned_path(job, source["source_path"])
+        if file_sha256(path) != source["source_sha256"]:
+            raise ValueError(f"{source['source_id']}: source changed before planning")
+        with Image.open(path) as image:
+            image.load()
+            for view in views:
+                l, t, r, b = view["region"]
+                box = (math.floor(l * image.width), math.floor(t * image.height),
+                       math.ceil(r * image.width), math.ceil(b * image.height))
+                output = directory / f"view_{len(paths) + 1:03d}.png"
+                with image.crop(box) as crop:
+                    if crop.mode in {"CMYK", "YCbCr", "HSV"}:
+                        with crop.convert("RGB") as rgb:
+                            rgb.save(output, format="PNG")
+                    else:
+                        crop.save(output, format="PNG")
+                paths.append(output)
+    return paths
 
 
 def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str) -> None:
@@ -83,7 +140,8 @@ def reference_prompt(references: list[dict[str, Any]]) -> str:
     return "\n".join(
         f"Attachment {index}: {row['kind']} ({row['source_id']}). {row['purpose']}"
         + (" Structure evidence only; do not copy its setting or graphics." if row["kind"] == "product_evidence" else
-           " Approved style only; never use it for product facts, claims or dimensions." if row["kind"] == "design_reference" else "")
+           " Approved style only; never use it for product facts, claims or dimensions." if row["kind"] == "design_reference" else
+           " Edit its physical product evidence, not its page design; source graphics and decorative setting have no style authority.")
         for index, row in enumerate(references, 1)
     )
 

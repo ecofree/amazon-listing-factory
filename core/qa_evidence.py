@@ -11,7 +11,7 @@ from .status import input_revision_id
 
 QA_EVIDENCE_SCHEMA_VERSION = "qa-evidence-v5"
 QA_EVIDENCE_ARTIFACT = "qa_evidence_v5.jsonl"
-QA_POLICY_VERSION = "observed-facts-three-state-v42-completed-observation"
+QA_POLICY_VERSION = "observed-facts-three-state-v44-source-copy-coverage"
 
 
 class QaEvidenceError(RuntimeError):
@@ -69,8 +69,6 @@ def evidence_is_current(
 ) -> bool:
     try:
         _validate_row(evidence)
-        if not evidence.get("candidate_observation"):
-            return False
         if evidence["child"] != task["child"] or evidence["role"] != task["role"]:
             return False
         if evidence["release_candidate_fingerprint"] != release_candidate_fingerprint(task, candidate):

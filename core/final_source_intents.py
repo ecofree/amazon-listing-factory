@@ -17,10 +17,10 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v14-variant-evidence"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v17-observed-views"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
-SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size"})
+SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant"})
 PLANNING_SOURCE_ROLES = frozenset({"main", "scene", "func", "size"})
 _DIMENSION_WORD = re.compile(r"\b(size|dimensions?|width|height|depth|length|overall|tall|wide|inch(?:es)?|cm|mm|ft|feet)\b", re.I)
 _DIRECTION_WORD = re.compile(r"\b(width|height|depth|length|overall|tall|wide)\b", re.I)
@@ -156,7 +156,7 @@ def read_final_source_intents(job_dir: str | Path, *, plugin: ProductPlugin | No
         reviews = _current_source_intent_reviews(job, list(downloads.values()))
         for (child, source_index, _sha), review in reviews.items():
             row = by_key.get((child, source_index), {})
-            if row.get("role") == "review_required" and str(row.get("classification_reason") or "").startswith("source_"):
+            if review.get('role') != 'excluded_wrong_variant' and row.get("role") == "review_required" and str(row.get("classification_reason") or "").startswith("source_"):
                 continue  # A role-only review cannot waive a source identity conflict.
             if (
                 row.get("role") != review.get("role")
@@ -393,9 +393,9 @@ def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
     source_sha = str(download.get("source_sha256") or "")
     if not source.is_file() or file_sha256(source) != source_sha:
         raise FinalSourceIntentError(f"Source path is invalid or changed: {source_path}")
-    measurements = _measurement_rows(evidence.get("measurements") or [], child)
     trusted_text = list(evidence.get("trusted_text") or [])
     visual = dict(evidence.get("visual_evidence") or {})
+    measurements = _measurement_rows(_observed_measurements(evidence, visual), child)
     identity = visual.get("variant_identity") or {}
     identity_issue = (
         "source_identity_unverified: joint source observation unavailable"
@@ -403,6 +403,8 @@ def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
         "source_variant_conflict: " + str(identity.get("reason") or "visible product contradicts child facts")
         if identity.get("status") == "contradiction" else ""
     )
+    if visual.get('object_identity_conflicts'):
+        identity_issue = 'source_object_conflict: ' + ', '.join(visual['object_identity_conflicts'])
     # A matching child fact can corroborate OCR without a second observation
     # request; a layout signal alone never authorizes arbitrary prop text.
     claims = _authored_claims(trusted_text, visual=visual, product_text=_plain_text({
@@ -496,7 +498,7 @@ def _build_final_row(
     source_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     identity_issue = prepared.get("identity_issue") or ""
-    if identity_issue:
+    if identity_issue and role != "excluded_wrong_variant":
         role, source_review = "review_required", None
     signals = dict(prepared["signals"])
     signals["reference_completeness"] = _reference_completeness(role, signals)
@@ -631,6 +633,25 @@ def _size_strength(row: dict[str, Any]) -> tuple[int, int, int, int]:
         int(signals["measurement_line_count"]),
         -int(row["source_index"]),
     )
+def _observed_measurements(evidence: dict[str, Any], visual: dict[str, Any]) -> list[dict[str, Any]]:
+    """Use joint visual transcription; OCR supplements quantities not observed there."""
+    ocr = list(evidence.get("measurements") or [])
+    if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY:
+        return ocr
+    lines = [row["text"] for row in visual.get("text_observations") or []
+             if row.get("kind") == "measurement"]
+    rows = [{**value, "source_label": line, "source_occurrence": f"visual:{i}:{j}"}
+            for i, line in enumerate(lines) for j, value in enumerate(extract_measurements(line))]
+    # Bare numeric inventory is a recovery aid, never a new measured object.
+    pairs = {row["canonical_pair"] for row in rows}
+    for line in visual.get("visible_numbers_or_units") or []:
+        for value in extract_measurements(line):
+            if value["canonical_pair"] not in pairs:
+                rows.append({**value, "source_label": line, "source_occurrence": f"visual-inventory:{len(rows)}"})
+                pairs.add(value["canonical_pair"])
+    return rows + [row for row in ocr if row.get("canonical_pair") not in pairs]
+
+
 def _measurement_rows(values: list[dict[str, Any]], child: dict[str, Any]) -> list[dict[str, Any]]:
     spec_pairs = _spec_measurement_pairs(child)
     rows: list[dict[str, Any]] = []
@@ -790,7 +811,7 @@ def _visual_semantics(value: Any) -> dict[str, Any]:
     row = value if isinstance(value, dict) else {}
     keys = ("status", "role_guess", "has_dimension_lines", "has_callouts_or_panels",
             "visible_numbers_or_units", "layout_summary", "confidence", "evidence", "error", "reason",
-            "objects", "text_observations", "variant_identity", "child_facts_revision_id", "policy_version")
+            "objects", "physical_views", "text_observations", "variant_identity", "child_facts_revision_id", "policy_version")
     return {key: row.get(key) for key in keys if key in row}
 def _failure_row(plugin: ProductPlugin, download: dict[str, Any], exc: Exception) -> dict[str, Any]:
     source_index = _source_index(download)
@@ -859,15 +880,17 @@ def _validate_row(row: Any) -> None:
         raise FinalSourceIntentError(f"Invalid FinalSourceIntentV2 row: missing={missing}")
     if row.get("status") not in {"success", "failed"}:
         raise FinalSourceIntentError("Invalid FinalSourceIntentV2 status")
-    roles = {"main", "scene", "func", "size", "review_required"} if row.get("status") == "success" else {"failed"}
+    roles = {"main", "scene", "func", "size", "review_required", "excluded_wrong_variant"} if row.get("status") == "success" else {"failed"}
     if row.get("role") not in roles:
         raise FinalSourceIntentError("Invalid FinalSourceIntentV2 role")
+    if row.get('role') == 'excluded_wrong_variant' and (row['source_index'] == 0 or not str(row.get('classification_reason') or '').startswith('human_source_role_review=')):
+        raise FinalSourceIntentError('Source exclusion requires an explicit SHA-bound source review and cannot replace the main source')
     for key in ("evidence_flags", "signals", "ocr_evidence", "pixel_evidence", "visual_evidence"):
         if not isinstance(row.get(key), dict):
             raise FinalSourceIntentError(f"Invalid FinalSourceIntentV2 {key}")
     if row.get("role") in PLANNING_SOURCE_ROLES:
         visual = row["visual_evidence"]
-        if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY or (visual.get("variant_identity") or {}).get("status") not in {"consistent", "unknown"}:
+        if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY or visual.get('object_identity_conflicts') or (visual.get("variant_identity") or {}).get("status") not in {"consistent", "unknown"}:
             raise FinalSourceIntentError("Plannable source requires current, non-conflicting identity evidence")
     for key in ("trusted_text", "claims", "measurements", "warnings"):
         if not isinstance(row.get(key), list):

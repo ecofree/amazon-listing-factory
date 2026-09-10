@@ -13,7 +13,7 @@ from .simple_yaml import load_yaml
 
 PALETTE_REGISTRY_PATH = CONFIGS_ROOT / "palette_registry.yaml"
 PALETTE_REGISTRY_SCHEMA_VERSION = "palette-registry-v2"
-PALETTE_SELECTION_POLICY_VERSION = "dynamic-palette-selection-v8-consistent-ciede2000"
+PALETTE_SELECTION_POLICY_VERSION = "dynamic-palette-selection-v9-material-related-graphics"
 
 
 def _read_registry() -> dict[str, Any]:
@@ -425,11 +425,13 @@ def _candidate_palette(
             _range_value(_role_rules("floor", "lightness", (0.38, 0.60)), (0.38, 0.60), seed, f"{profile_id}:floor:l"),
         ),
     }
-    graphic_ink = _hsl_hex(205.0, 0.24, float((_REGISTRY.get("role_rules", {}).get("graphic", {}) or {}).get("ink_lightness") or 0.18))
-    graphic_surface = _hsl_hex(36.0, 0.14, float((_REGISTRY.get("role_rules", {}).get("graphic", {}) or {}).get("surface_lightness") or 0.94))
-    graphic_line = _hsl_hex(205.0, 0.10, float((_REGISTRY.get("role_rules", {}).get("graphic", {}) or {}).get("line_lightness") or 0.56))
     accent_hue, accent_lightness, accent_saturation = colorsys.rgb_to_hls(*_hex_rgb(palette["accent"]))
     graphic_rules = _REGISTRY.get("role_rules", {}).get("graphic", {})
+    surface_hue, _, _ = colorsys.rgb_to_hls(*_hex_rgb(palette["room_primary"]))
+    # Share the candidate's material/ accent undertones, not a universal blue ink.
+    graphic_ink = _hsl_hex(accent_hue * 360.0, 0.12, float(graphic_rules.get("ink_lightness") or 0.18))
+    graphic_surface = _hsl_hex(surface_hue * 360.0, 0.06, float(graphic_rules.get("surface_lightness") or 0.94))
+    graphic_line = _hsl_hex(accent_hue * 360.0, 0.10, float(graphic_rules.get("line_lightness") or 0.56))
     graphic_accent_saturation = min(
         accent_saturation,
         max(0.0, float(graphic_rules.get("accent_saturation_max") or 0.32)),
@@ -700,6 +702,8 @@ def _semantic_roles() -> dict[str, list[str]]:
 def select_palette_route(*, category_id: str, product_color: Any, route_key: Any, size: Any = "", variation: Any = None) -> dict[str, Any]:
     family = _color_family(product_color)
     anchor = _product_anchor(product_color)
+    if anchor["family"] == "unclassified":
+        return {"color_basis": "unresolved_color_name; use existing product observations and attached pixels, not a guessed swatch"}
     variation_payload = variation if isinstance(variation, dict) else {}
     seed = "|".join((str(category_id or ""), _normalized(product_color), _normalized(route_key), _normalized(size), repr(sorted(variation_payload.items()))))
     generated: list[dict[str, Any]] = []

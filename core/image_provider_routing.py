@@ -66,7 +66,9 @@ def provider_order(plugin: ProductPlugin) -> list[str]:
 
 def apply_role_provider_policy(task: dict[str, Any], plugin: ProductPlugin) -> dict[str, Any]:
     available = provider_order(plugin)
-    ordered = available
+    registry = {entry.name: entry for entry in image_provider_entries()}
+    role = role_key(str(task.get("role") or task.get("role_family") or ""))
+    ordered = [name for name in available if name in registry and role in registry[name].raw.get("allowed_roles", [])]
     unhealthy = _persistently_unhealthy_providers(task) | {
         name for name in ordered if _global_provider_cooldown_active(name)
     }
@@ -115,21 +117,17 @@ def _persistently_unhealthy_providers(task: dict[str, Any]) -> set[str]:
 
 
 def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep one healthy family provider, with one sequential reserve.
-
-    Provider quality is a family-level visual concern.  One primary and one
-    sequential reserve are retained for each child; a reserve is used only
-    after the locked provider reaches a terminal failure.
-    """
-    child_rows: dict[str, list[tuple[int, dict[str, Any], list[str]]]] = {}
+    """Assign one model per child photo/infographic group within role eligibility."""
+    child_rows: dict[tuple[str, str], list[tuple[int, dict[str, Any], list[str]]]] = {}
     for index, task in enumerate(tasks):
         candidates = [str(name) for name in (task.get("providers") or []) if str(name).strip()]
         ordered = _order_by_health(task, candidates)
         child_lane = str(task.get("child_provider_lane_key") or task.get("child") or "default")
-        child_rows.setdefault(child_lane, []).append((index, task, ordered))
+        role_lane = "infographic" if role_key(task.get("role", "")) in {"func", "size"} else "photo"
+        child_rows.setdefault((child_lane, role_lane), []).append((index, task, ordered))
     result: list[dict[str, Any] | None] = [None] * len(tasks)
     assigned_load: dict[str, int] = {}
-    for child_lane, rows in child_rows.items():
+    for (child_lane, role_lane), rows in child_rows.items():
         # First select from the candidates common to the complete child.  In
         # normal production all roles share the same filtered registry list;
         # the union fallback only handles a role-specific capability gap.
@@ -161,12 +159,7 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if family_primary:
             group = image_provider_resource_group(family_primary)
             assigned_load[group] = assigned_load.get(group, 0) + 1
-        lane_pool = [family_primary, *[name for name in candidates if name != family_primary]]
-        lane_pool = list(dict.fromkeys(name for name in lane_pool if name))
         for index, task, ordered in rows:
-            # A child is one visual system. Keep every role on the same
-            # physical provider so exposure, geometry, typography, and model
-            # interpretation do not drift between photo and graphic roles.
             primary = family_primary if family_primary in ordered else (ordered[0] if ordered else "")
             backup = next((name for name in ordered if name != primary), "")
             eligible = [name for name in (primary, backup) if name]
@@ -179,7 +172,7 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "child_provider_backup": backup,
                 "child_provider_lane": child_lane,
                 "child_provider_lock": True,
-                "child_provider_role_lane": "unified",
+                "child_provider_role_lane": role_lane,
             }
     return [row for row in result if row is not None]
 
@@ -312,15 +305,18 @@ def _generate_with_provider_deadline(
                 raise ProviderTransportError(provider_name, f"Provider result unknown after its {timeout:.0f}-second attempt deadline; request_id={request_id}", status="timeout_failure", ambiguous=True)
             try:
                 result = result_queue.get(timeout=min(0.25, remaining))
-                break
             except queue.Empty:
                 if process.is_alive():
                     continue
                 try:
                     result = result_queue.get_nowait()
-                    break
                 except queue.Empty as exc:
-                    raise ProviderTransportError(provider_name, f"Provider subprocess exited without a result (exit_code={process.exitcode})") from exc
+                    raise ProviderTransportError(provider_name, f"Provider subprocess exited without a result (exit_code={process.exitcode})", ambiguous=True) from exc
+            if result.get("event") == "request_prepared":
+                if request_audit is not None:
+                    request_audit.update(result.get("request_audit") or {})
+                continue
+            break
         if result.get("ok") is True:
             if not result_path.is_file():
                 raise ProviderTransportError(provider_name, "Provider subprocess returned no result file")
@@ -367,6 +363,7 @@ def _provider_worker(
         data = generate_with_registry_image_provider(
             provider_name=provider, image_inputs=images, prompt=prompt, mask_bytes=mask,
             request_id=request_id, request_audit=audit,
+            request_observer=lambda snapshot: output.put({"event": "request_prepared", "request_audit": snapshot}),
         )
         partial_path.write_bytes(data)
         os.replace(partial_path, result_path)
@@ -540,7 +537,10 @@ def record_provider_quality_score(
 def _order_by_health(task: dict[str, Any], providers: list[str]) -> list[str]:
     scores = _provider_scores(task, providers)
     order = {name: index for index, name in enumerate(providers)}
-    ranked = sorted(providers, key=lambda name: (-scores[name], order[name]))
+    role = role_key(str(task.get("role") or ""))
+    preferences = {entry.name: (entry.raw.get("role_priority") or {}).get(role, 0) for entry in image_provider_entries()}
+    # Resource-load assignment still distributes busy preferred models.
+    ranked = sorted(providers, key=lambda name: (scores[name] < 0, -preferences.get(name, 0), -scores[name], order[name]))
     return ranked
 
 
@@ -657,6 +657,7 @@ def _provider_configuration_revision(provider: str) -> str:
     if entry is not None:
         credential_material = "\0".join((str(entry.api_key or ""), str(entry.bearer_token or "")))
     material = {
+        "request_budget_policy": "provider-window-v2",
         "physical_identity": image_provider_physical_identity(provider),
         "credential_revision": hashlib.sha256(credential_material.encode("utf-8")).hexdigest(),
     }

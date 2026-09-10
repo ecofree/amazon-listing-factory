@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .text_evidence import normalize_text
+from .text_evidence import normalize_text, extract_measurements, us_measurement_text
 
 
 _DIMENSION_NUMBER = r"\d+(?:\.\d+)?"
@@ -26,41 +26,32 @@ def template_dimensions_from_facts(facts: dict[str, Any], *, category_id: str = 
     for alias, keys in keys_by_alias.items():
         value = _first(facts, *keys)
         if value:
-            dimensions[alias] = _first_number(value) or str(value)
+            unit = _first(facts, *(f"{key}_unit" for key in keys))
+            parsed = extract_measurements(value)
+            separate = extract_measurements('1 ' + unit) if unit else []
+            if parsed and separate and parsed[0]['unit'] != separate[0]['unit']:
+                raise ValueError(f'Conflicting explicit units for {alias}: {parsed[0]["unit"]} and {separate[0]["unit"]}')
+            display = us_measurement_text(value if parsed else f"{value} {unit}")
+            parsed = extract_measurements(display)
+            if len(parsed) == 1:
+                row = parsed[0]
+                number, label = row['number'], row['unit']
+                if label == 'ft':
+                    number, label = str(float(row['canonical_value']) / 25.4), 'in'
+                elif label == 'in' and '/' in number:
+                    number = str(float(row['canonical_value']) / 25.4)
+                dimensions[alias] = _clean_dimension_number(number)
+                dimensions[f"{alias}_unit"] = {'in': 'Inches', 'lb': 'Pounds', 'oz': 'Ounces'}.get(label, label)
+            else:
+                dimensions[alias] = str(value)
     text = _first(facts, "dimensions", "product_dimensions", "item_dimensions", "overall_dimensions")
+    text = us_measurement_text(text, length_unit='in')
     if text:
         dimensions.update({key: value for key, value in _parse_template_dimensions(text, category_id=category_id).items() if key not in dimensions})
     dimension_unit = _infer_dimension_unit(text)
     for alias in ("length", "width", "height", "item_depth"):
         if dimensions.get(alias) and dimension_unit:
             dimensions.setdefault(f"{alias}_unit", dimension_unit)
-    if dimensions.get("item_weight"):
-        weight_unit = _infer_weight_unit(_first(facts, "item_weight", "weight"))
-        if weight_unit:
-            if weight_unit == "Kilograms":
-                try:
-                    pounds = float(str(dimensions["item_weight"]).strip()) * 2.2046226218
-                    dimensions["item_weight"] = f"{pounds:.2f}".rstrip("0").rstrip(".")
-                    dimensions["item_weight_unit"] = "Pounds"
-                except (TypeError, ValueError):
-                    dimensions.setdefault("item_weight_unit", weight_unit)
-            else:
-                dimensions.setdefault("item_weight_unit", weight_unit)
-    # Amazon listing templates use Inches for item dimensions.  Apify specs
-    # often provide a confirmed single-axis value such as ``height=5`` with
-    # ``height_unit=Feet``; preserve the fact by converting that value instead
-    # of emitting the unsupported ``Feet`` allowed value.
-    for alias in ("length", "width", "height", "item_depth"):
-        value = dimensions.get(alias)
-        unit = _first(facts, f"{alias}_unit") or dimensions.get(f"{alias}_unit")
-        if not value or str(unit or "").strip().casefold() not in {"ft", "foot", "feet"}:
-            continue
-        try:
-            inches = float(str(value).strip()) * 12.0
-        except (TypeError, ValueError):
-            continue
-        dimensions[alias] = f"{inches:.2f}".rstrip("0").rstrip(".")
-        dimensions[f"{alias}_unit"] = "Inches"
     return dimensions
 
 
@@ -149,11 +140,6 @@ def _first(values: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def _first_number(value: Any) -> str:
-    match = re.search(_DIMENSION_NUMBER, normalize_text(value))
-    return _clean_dimension_number(match.group(0)) if match else ""
-
-
 def _clean_dimension_number(value: Any) -> str:
     text = str(value or "").strip()
     return text[:-2] if text.endswith(".0") else text
@@ -169,17 +155,4 @@ def _infer_dimension_unit(value: Any) -> str:
         return "Millimeters"
     if re.search(r"\b(?:ft|feet|foot)\b", text):
         return "Feet"
-    return ""
-
-
-def _infer_weight_unit(value: Any) -> str:
-    text = normalize_text(value).casefold()
-    if re.search(r"\b(?:lb|lbs|pound|pounds)\b", text):
-        return "Pounds"
-    if re.search(r"\b(?:oz|ounce|ounces)\b", text):
-        return "Ounces"
-    if re.search(r"\b(?:kg|kilogram|kilograms)\b", text):
-        return "Kilograms"
-    if re.search(r"\b(?:g|gram|grams)\b", text):
-        return "Grams"
     return ""

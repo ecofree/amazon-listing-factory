@@ -20,7 +20,7 @@ def _task(role: str, mode: str = "none") -> dict:
         "category_image_policy": {}, "product_boundary": {},
         "measurement_authority": {"mode": mode, "render_text": []},
         "renderable_text_contract": {
-            "mode": "exact" if family == "func" else "preserve_source_measurements" if mode == "source_image" else "none",
+            "mode": "exact" if family == "func" else "source_measurement_display" if mode == "source_image" else "none",
             "strings": ["Storage That Adapts", "Adjustable Shelf"] if family == "func" else [],
         },
         "source_path": "source.png",
@@ -148,7 +148,8 @@ class QaLiteV1Tests(unittest.TestCase):
             with patch.object(image_qa, "observe_candidate", side_effect=TimeoutError("bounded")):
                 evidence = image_qa._evaluate(Path(tmp), object(), task, candidate)
             self.assertEqual("inconclusive", evidence["automatic_decision"])
-            self.assertFalse(evidence_is_current(evidence, task, candidate))
+            self.assertTrue(evidence_is_current(evidence, task, candidate))
+            self.assertEqual("unavailable", evidence['observation_status'])
             unknown = _observed(task)
             unknown["product_comparison"]["status"] = "unknown"
             with patch.object(image_qa, "observe_candidate", return_value=unknown):

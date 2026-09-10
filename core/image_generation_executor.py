@@ -118,10 +118,8 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
     global_policy = load_provider_policy()
     attempted_providers: list[str] = []
     circuit_skipped_providers: list[str] = []
-    # A role has one bounded production budget, not the sum of every provider's
-    # maximum timeout.  The primary may use the full 420-second slow-provider
-    # window, but at least two minutes remain for a configured fallback.
-    default_role_budget = min(600.0, max(120.0, sum(float(provider_timeout_seconds(name)) for name in providers)))
+    # Reserve time for one fallback, regardless of the number of configured models.
+    default_role_budget = min(600.0, max(float(provider_timeout_seconds(name)) for name in providers) + 120.0)
     try:
         role_budget_seconds = max(60.0, float(os.environ.get("AMAZON_FACTORY_IMAGEGEN_ROLE_DEADLINE_SECONDS") or default_role_budget))
     except ValueError:
@@ -131,7 +129,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
         role_deadline = min(role_deadline, float(task["deadline_monotonic"]))
     if time.monotonic() >= role_deadline:
         raise ImageGenerationError("Image execution deadline exhausted before provider request")
-    for provider_index, provider in enumerate(providers):
+    for provider in providers:
         if provider_run_circuit_open(provider_runtime_circuit_key(provider)):
             circuit_skipped_providers.append(provider)
             _record_generation_progress(task, "image_provider_attempt_skipped_circuit_open", provider)
@@ -141,13 +139,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
         provider_started = time.monotonic()
         try:
             remaining = role_deadline - time.monotonic()
-            remaining_provider_count = max(1, len(providers) - provider_index)
-            fallback_reserve = 120.0 * max(0, remaining_provider_count - 1)
-            provider_budget = min(
-                float(provider_timeout_seconds(provider)),
-                remaining,
-                max(30.0, remaining - fallback_reserve),
-            )
+            provider_budget = min(float(provider_timeout_seconds(provider)), remaining)
             assert_provider_allowed(provider, global_policy)
             attempted_providers.append(provider)
             _record_generation_progress(task, "image_provider_candidate_selected", provider)

@@ -14,7 +14,7 @@ from itertools import combinations
 from typing import Any
 
 from .title_quality import listing_title_quality_issues
-from .text_evidence import extract_measurements
+from .text_evidence import extract_measurements, us_measurement_text, measurement_values_match
 
 
 class CopyWriterError(RuntimeError):
@@ -41,7 +41,7 @@ class CopyWriterConfig:
 COPY_CACHE_MAX_ENTRIES = 256
 _LOGGER = logging.getLogger(__name__)
 COPY_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
-COPY_WRITER_PROMPT_VERSION = "copy-writer-v24-bounded-highlight-selection"
+COPY_WRITER_PROMPT_VERSION = "copy-writer-v25-us-measurements"
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TITLE_PREFERRED_CHARS = 68
 TITLE_MAX_CHARS = 75
@@ -440,9 +440,9 @@ def _rewrite_listing_copy_with_openai(
         else "Child row: use only this child's supplied facts and variation values."
     )
     source_for_model = {
-        "title": _redact_reference_brands(source_title, forbidden_reference_brands),
-        "item_highlights": [_redact_reference_brands(item, forbidden_reference_brands) for item in source_bullets],
-        "description": _redact_reference_brands(source_description, forbidden_reference_brands),
+        "title": us_measurement_text(_redact_reference_brands(source_title, forbidden_reference_brands)),
+        "item_highlights": [us_measurement_text(_redact_reference_brands(item, forbidden_reference_brands)) for item in source_bullets],
+        "description": us_measurement_text(_redact_reference_brands(source_description, forbidden_reference_brands)),
     }
     payload = {
         "model": config.model,
@@ -567,7 +567,6 @@ def _rewrite_listing_copy_with_openai(
                                 "each bullet focuses on a different selling point",
                             ],
                              "description": f"English string targeting 700-1200 chars, hard max {DESCRIPTION_MAX_CHARS}, covering supplied buyer-relevant facts naturally",
-                             "evidence": "not required in the response; the caller records source provenance",
                         },
                     },
                     ensure_ascii=False,
@@ -663,6 +662,7 @@ def _is_non_json_copy_error(error_text: str) -> bool:
         "response is not strict json",
         "response json is not an object",
         "not a json object",
+        "must contain title, item_highlights, bullets, and description keys only",
     )
     return any(marker in text for marker in markers)
 
@@ -783,7 +783,7 @@ def _copy_validation_repair_payload(
 
 def _only_title_validation_errors(error_text: str) -> bool:
     issues = [part.strip().lower() for part in str(error_text or "").split(";") if part.strip()]
-    return bool(issues) and all("title" in issue for issue in issues)
+    return bool(issues) and all("title" in issue and "item_highlights" not in issue for issue in issues)
 
 
 def _only_bullet_length_errors(error_text: str) -> bool:
@@ -1242,10 +1242,8 @@ def _concrete_prompt_facts(product_specific: dict[str, Any]) -> dict[str, str]:
         "number_of_shelves",
         "has_adjustable_shelves",
         "load_capacity",
-        "load_capacity_unit",
         "weight_capacity",
         "item_weight",
-        "item_weight_unit",
         "tree_type",
         "pot_material",
         "room_type",
@@ -1260,7 +1258,11 @@ def _concrete_prompt_facts(product_specific: dict[str, Any]) -> dict[str, str]:
         if value in (None, "", [], {}) or not _include_spec_prompt_fact(key, value):
             continue
         label = key.replace("_", " ").title()
-        out[label] = _spec_prompt_value(value)
+        text = _spec_prompt_value(value)
+        unit = flat.get(f'{key}_unit')
+        if unit and not extract_measurements(text):
+            text = f'{text} {unit}'
+        out[label] = us_measurement_text(text, upper_bound='capacity' in key)
     return out
 
 
@@ -1405,11 +1407,11 @@ def _parse_copy_response(
     bullets_raw = parsed.get("bullets")
     if not isinstance(bullets_raw, list) or len(bullets_raw) != 5 or not all(isinstance(item, str) for item in bullets_raw):
         raise CopyWriterError("Copy AI response must contain exactly five string bullets")
-    title = _model_text(parsed["title"])
-    item_highlights = _normalize_item_highlights(item_highlights_raw)
+    title = _model_text(us_measurement_text(parsed["title"]))
+    item_highlights = _normalize_item_highlights([us_measurement_text(item) for item in item_highlights_raw])
     optional_parent_highlights = str(row_type or "").strip().casefold() == "parent" and not item_highlights
-    bullets = [_model_text(item) for item in bullets_raw]
-    description = _model_text(parsed["description"])
+    bullets = [_model_text(us_measurement_text(item)) for item in bullets_raw]
+    description = _model_text(us_measurement_text(parsed["description"]))
     if not title or not description or any(not item for item in item_highlights) or any(not item for item in bullets):
         raise CopyWriterError("Copy AI response missed title, bullets, or description")
     validation_result = {"title": title, "item_highlights": item_highlights, "bullets": bullets, "description": description}
@@ -1655,23 +1657,28 @@ def _validate_copy_compliance(
         violations.append("unsupported weight capacity")
     if capacity_claim and capacity_fact:
         capacity_terms = r"(?:weight[_ ]capacity|load[_ ]capacity|maximum[_ ]weight|max[_ ]weight|capacity of|supports up to|holds up to|up to)"
-        def capacity_values(value: Any, context: str = "") -> list[float]:
+        def capacity_values(value: Any, context: str = "") -> list[str]:
             if isinstance(value, dict):
-                return [number for key, item in value.items()
-                        for number in capacity_values(item, context + " " + str(key))]
+                numbers = []
+                for key, item in value.items():
+                    unit = value.get(f'{key}_unit')
+                    if unit and not isinstance(item, (dict, list)) and not extract_measurements(item):
+                        item = f'{item} {unit}'
+                    numbers.extend(capacity_values(item, context + ' ' + str(key)))
+                return numbers
             if isinstance(value, list):
                 return [number for item in value for number in capacity_values(item, context)]
             content = str(value)
             if re.search(capacity_terms, context, re.I):
-                return [float(row["canonical_value"]) for row in extract_measurements(content)
+                return [row["text"] for row in extract_measurements(content)
                         if row["kind"] == "weight_g"]
-            return [float(row["canonical_value"])
+            return [row["text"]
                     for match in re.finditer(capacity_terms + r"[^;\n]{0,65}", content, re.I)
                     for row in extract_measurements(match.group()) if row["kind"] == "weight_g"]
 
         known_capacities = capacity_values(product_specific)
         claimed_capacities = capacity_values(text)
-        if known_capacities and any(not any(abs(value - known) <= max(1.0, known * 0.005)
+        if known_capacities and any(not any(measurement_values_match('Capacity: ' + known, value)
                        for known in known_capacities) for value in claimed_capacities):
             violations.append("weight capacity value contradicts product facts")
     if re.search(r"\bergonomic\b", text, re.I) and not re.search(r"\b(?:ergonomic|ansi|bifma)\b", fact_text, re.I):
