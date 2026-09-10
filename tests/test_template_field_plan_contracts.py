@@ -47,6 +47,15 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
             path=Path("template.xlsm"), sheet="Template", max_row=20, max_col=1,
             fields={field: 1}, labels={field: "Item Highlight"}, required=[], existing_rows=[],
         )
+        from core.template_field_plan import compile_field_requirements
+        for mode in ("draft", "submit_ready"):
+            requirements = compile_field_requirements(fields=template.fields, labels=template.labels, aliases=FIELD_ALIASES,
+                template_requirements=[{"field": field, "required": "Required"}], template_mode=mode)
+            for row_type, expected in (("Parent", "pass"), ("Child", "missing_required")):
+                decisions = compile_field_decisions(fields=template.fields, labels=template.labels, aliases=FIELD_ALIASES,
+                    allowed_values={}, values={}, sources={}, requirements=requirements,
+                    row_context={"row_type": row_type}, invalid_candidates={})
+                self.assertEqual(expected, decisions[0]["validation_status"])
         coverage = compile_field_coverage(
             fields=template.fields,
             labels=template.labels,

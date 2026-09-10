@@ -270,12 +270,15 @@ def cmd_review(args: argparse.Namespace) -> int:
     plugin = _load_plugin_for_job(args, job)
     scope = str(getattr(args, "scope", "") or "required")
     if bool(getattr(args, "list", False)):
-        manifest = build_release_manifest(job_dir=job_dir, plugin=plugin)
+        manifest = build_release_manifest(job_dir=job_dir, plugin=plugin, use_working_candidates=True)
         print(json.dumps({"scope": scope, "rows": review_queue(manifest, scope=scope)}, indent=2, ensure_ascii=False))
         return 0
     if not args.approve and not args.reject:
         raise RuntimeError("Review requires --approve, --reject, or --list")
     decision = "approve" if args.approve else "reject"
+    resolutions = read_json(Path(args.resolutions)) if args.resolutions else []
+    if args.candidate_sha256 and not args.child:
+        raise RuntimeError("--candidate-sha256 requires one child/role target")
     if bool(args.child) != bool(args.role):
         raise RuntimeError("Review requires both --child and --role, or neither for an explicit scoped batch")
     quality_score = int(getattr(args, "quality_score", 0) or 0)
@@ -289,10 +292,11 @@ def cmd_review(args: argparse.Namespace) -> int:
             child=args.child,
             role=args.role,
             decision=decision,
-            reason=args.reason,
+            reason=args.reason, resolutions=resolutions,
+            candidate_sha256=args.candidate_sha256,
         )
     else:
-        current = build_release_manifest(job_dir=job_dir, plugin=plugin)
+        current = build_release_manifest(job_dir=job_dir, plugin=plugin, use_working_candidates=True)
         batch_targets = [
             (str(row["child"]), str(row["role"]))
             for row in review_queue(current, scope=scope)
@@ -310,6 +314,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             targets=batch_targets,
             decision=decision,
             reason=args.reason,
+            resolutions=resolutions,
         )
     if quality_score:
         from core.image_provider_routing import record_provider_quality_score
@@ -383,6 +388,7 @@ def cmd_revise(args: argparse.Namespace) -> int:
             reason=args.reason,
             config_path=config_path,
             production=bool(args.production),
+            revision_mode=args.mode, candidate_sha256=args.candidate_sha256,
         )
         attempt_id = uuid.uuid4().hex
         if result.get("tasks"):
@@ -404,7 +410,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 reason="Operator explicitly repaired stale running state from status command",
             )
     state = load_status(job_path)
-    release_path = job_path / "reports" / "release_manifest_v5.json"
+    release_path = job_path / "reports" / "release_manifest_v6.json"
     release = read_json(release_path) if release_path.is_file() else {}
     retryable_generation = [
         {
@@ -560,6 +566,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("review", help="List or review current candidates; required rows are the default queue.")
+    p.add_argument("--candidate-sha256", default="", help="Explicit candidate selection for one child/role.")
+    p.add_argument("--resolutions", default="", help="JSON list of source/candidate-bound resolutions for inconclusive facts.")
     p.add_argument("--job", required=True)
     p.add_argument("--category", default="")
     p.add_argument("--child", default="")
@@ -585,7 +593,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", required=True)
     p.set_defaults(func=cmd_review_source)
 
-    p = sub.add_parser("revise", help="Explicitly full-redraw one child/role candidate after human review; this is not a localized repair.")
+    p = sub.add_parser("revise", help="Edit a selected candidate, or explicitly request a full redraw.")
+    p.add_argument("--mode", choices=["targeted_edit", "full_redraw"], default="targeted_edit")
+    p.add_argument("--candidate-sha256", default="")
     p.add_argument("--job", required=True)
     p.add_argument("--category", default="")
     p.add_argument("--config", default="")

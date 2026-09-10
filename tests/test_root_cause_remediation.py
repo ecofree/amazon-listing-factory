@@ -41,6 +41,12 @@ class RootCauseRemediationTests(unittest.TestCase):
             self.assertTrue(all(path.is_file() for paths in results for path in paths))
 
     def test_apify_normalized_facts_match_product_family_schema(self) -> None:
+        from products.generic_extractors import image_urls
+        own = [f"https://m.media-amazon.com/images/I/own{i}._AC_SL1500_.jpg" for i in range(8)]
+        mixed = "https://m.media-amazon.com/images/I/81mdYYNNueL._AC_SL1500_.jpg"
+        raw = {"asin": "B0FHD4MS3K", "highResolutionImages": [*own, mixed],
+               "variations": [{"asin": "B0FFMWB9XV", "highResolutionImages": ["https://example.com/sibling.jpg"]}]}
+        self.assertEqual([*own, mixed], image_urls(raw))
         normalized = apify._normalized_child_facts(variation_values={"Size": "Full"}, specs={"Product Dimensions": '78" L x 56" W x 65" H'}, specific={}, offer={"list_price": "199.99", "currency": "USD"}, sold_unit_count=1, package_quantity=1)
         child = {"asin": "B000000001", "variation_values": {"Size": "Full"}, "title": "Full Size Bunk Bed", "bullets": [], "description": "Bed frame.", "specs": {"Product Dimensions": '78" L x 56" W x 65" H'}, "normalized_facts": normalized, "sold_unit_count": 1, "sold_unit_count_source": "amazon_single_unit_listing_policy", "package_quantity": 1, "package_quantity_source": "amazon_single_package_policy", "reference_images": [{"url": "https://example.com/image.jpg", "source": "apify"}], "risk_flags": [], "product_specific": {"bed_frame": {}}, "status": "ok"}
         from core.product_family import PRODUCT_FAMILY_POLICY_VERSION

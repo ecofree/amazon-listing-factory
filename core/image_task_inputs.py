@@ -6,22 +6,6 @@ from typing import Any
 from .status import input_revision_id
 from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding
 
-_GENERIC_FUNC_TITLE_WORDS = {
-    "bed", "cabinet", "classic", "crafted", "design", "details", "feature", "features",
-    "first", "frame", "functional", "hardware", "key", "mount", "mounted", "premium",
-    "product", "safe", "secure", "safety", "smart", "storage", "sturdy",
-}
-_FORBIDDEN_FUNC_TITLE_FILLER = {"classic", "crafted", "details", "feature", "features", "functional", "key", "premium", "smart"}
-_NON_STORY_FUNC_TITLES = {
-    "secure wall mounting",
-    "durable painted finish",
-    "user friendly details",
-    "selected solid pine wood",
-    "durable silk foliage",
-    "reliable safety and support",
-}
-
-
 def build_renderable_text_contract(
     family: str, measurement: dict[str, Any], *, func_story: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -59,11 +43,11 @@ def build_func_story_contract(
         raise ValueError("immutable FuncStoryContract is missing")
     title = str(selected.get("title") or "")
     labels = [str(value or "") for value in selected.get("labels") or []]
-    strings = [title, *labels]
+    strings = ([title] if title else []) + labels
     bindings = selected["bindings"]
     if (
-        not title
-        or len(labels) > 6
+        any(not value.strip() for value in strings)
+        or sum(len(value) for value in strings) > 1200
         or len(strings) != len(bindings)
         or len(strings) != len(set(value.casefold() for value in strings))
         or any(
@@ -84,17 +68,6 @@ def build_func_story_contract(
             for row in bindings
         ],
     }
-
-
-def func_story_title_is_specific(title: Any) -> bool:
-    words = [word.casefold() for word in re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?", str(title or ""))]
-    if not 2 <= len(words) <= 6:
-        return False
-    normalized_title = " ".join(" ".join(words).replace("-", " ").split())
-    if normalized_title in _NON_STORY_FUNC_TITLES:
-        return False
-    title_concepts = set(words) - _GENERIC_FUNC_TITLE_WORDS - _FORBIDDEN_FUNC_TITLE_FILLER
-    return bool(title_concepts)
 
 
 def visual_product_color(child: dict[str, Any]) -> str:
@@ -146,9 +119,7 @@ def func_renderable_text_contract(story: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("func story contract is not ready")
     title = str(story.get("title") or "").strip()
     labels = [str(value or "").strip() for value in story.get("labels") or [] if str(value or "").strip()]
-    if not title:
-        raise ValueError("FuncStoryContract must provide one source-supported title")
-    strings = [title, *labels]
+    strings = ([title] if title else []) + labels
     if len(strings) != len(set(value.casefold() for value in strings)):
         raise ValueError("FuncStoryContract contains duplicate renderable strings")
     return {
@@ -226,6 +197,7 @@ def product_boundary(
     child: dict[str, Any],
     *,
     product_type: str,
+    observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the sold-product boundary from program facts and the editable reference."""
     structure = _unique_text(image_policy.get("structure_invariants") or [])
@@ -243,6 +215,7 @@ def product_boundary(
         if value
     )
     return {
+        "observed_objects": [obj for observation in observations or [] for obj in observation.get("objects") or []],
         "sold_product_parts": [
             f"the complete {product_type.lower().replace('_', ' ')} visible in the editable reference",
             "all structural parts, attached supports, and product surfaces visible in that reference",
@@ -253,7 +226,11 @@ def product_boundary(
             "the source-visible open, closed, installed, assembled, or demonstrated product state",
         ],
         "product_color_material": color_material or "preserve the source-visible product color, finish, and material",
-        "observed_product_colors": [{"name": color, "source": "ProductFamilyV3"}] if color else [],
+        "observed_product_colors": [
+            {"name": observation["variant_identity"]["observed_color"], "source": observation["source_id"]}
+            for observation in observations or []
+            if (observation.get("variant_identity") or {}).get("observed_color") and observation.get("source_id")
+        ],
         "conditional_structure_lock": [
             f"Preserve {value} exactly when visible in the editable reference; do not add it when absent"
             for value in structure
@@ -270,7 +247,7 @@ def task_facts(child: dict[str, Any], *, product_type: str) -> dict[str, Any]:
         "color": visual_product_color(child),
         "size": str(normalized.get("size") or "")[:120],
         "variation": visual_variation_values(child),
-        "sold_unit_count": normalized.get("sold_unit_count") or child.get("sold_unit_count"),
+        "sold_unit_count": child.get("sold_unit_count") if child.get("sold_unit_count_source") == "apify_explicit_pack_count" and child.get("sold_unit_count_status") != "conflicted" else None,
     }
 
 

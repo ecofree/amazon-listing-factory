@@ -1,5 +1,4 @@
 from __future__ import annotations
-import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,22 +7,20 @@ from typing import Any
 from .asset_manager import download_artifacts_current, read_download_manifest
 from .image_role_ocr import ocr_evidence_for_image
 from .image_pixel_evidence import inspect_image_pixel_evidence
-from .io import file_sha256, read_jsonl, write_json, write_jsonl
-from .model_router import ModelRouterError, clients_for_scope
+from .io import file_sha256, read_jsonl, write_jsonl
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .product_family import read_product_family
 from .run_scope import ensure_run_scope, row_in_scope
 from .status import input_revision_id, logical_task_id
 from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding, normalize_text
-from .vision_gemini_client import gemini_stream_generate
-FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v1"
-FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v1.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v12-bound-phrases-and-measurements"
+from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
+FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
+FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v14-variant-evidence"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
 SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size"})
-_VISUAL_RECOVERY_POLICY_VERSION = "final-source-intent-visual-recovery-v4-authored-evidence"
 PLANNING_SOURCE_ROLES = frozenset({"main", "scene", "func", "size"})
 _DIMENSION_WORD = re.compile(r"\b(size|dimensions?|width|height|depth|length|overall|tall|wide|inch(?:es)?|cm|mm|ft|feet)\b", re.I)
 _DIRECTION_WORD = re.compile(r"\b(width|height|depth|length|overall|tall|wide)\b", re.I)
@@ -53,6 +50,21 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
     family = read_product_family(job)
     children = {str(row["asin"]): row for row in family["family"]["children"]}
     evidence_by_sha = _collect_evidence_by_sha(job, downloads, workers=_classification_workers(workers, len(downloads)), deadline_monotonic=deadline_monotonic)
+    observations: dict[tuple[str, int], dict[str, Any]] = {}
+    for asin in sorted({str(row.get("child") or "") for row in downloads}):
+        child_downloads = sorted([row for row in downloads if str(row.get("child") or "") == asin], key=_source_index)
+        observation_sources = [{
+            "source_id": f"source_{_source_index(row):02d}",
+            "sha256": row["source_sha256"],
+            "path": resolve_job_owned_path(job, row["raw_path"]),
+            "ocr": evidence_by_sha[row["source_sha256"]].get("trusted_text") or [],
+        } for row in child_downloads]
+        try:
+            observed = observe_child_sources(job, children.get(asin, {}), observation_sources, deadline_monotonic=deadline_monotonic)
+        except Exception as exc:
+            observed = {row["source_id"]: {"status": "failed", "error": f"{type(exc).__name__}: {exc}"} for row in observation_sources}
+        for row in child_downloads:
+            observations[(asin, _source_index(row))] = observed[f"source_{_source_index(row):02d}"]
     prepared_by_child: dict[str, list[dict[str, Any]]] = {}
     for download in downloads:
         try:
@@ -60,7 +72,8 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
                 job,
                 plugin,
                 download,
-                evidence_by_sha[str(download.get("source_sha256") or "")],
+                {**evidence_by_sha[str(download.get("source_sha256") or "")],
+                 "visual_evidence": observations[(str(download.get("child") or ""), _source_index(download))]},
                 children.get(str(download.get("child") or ""), {}),
             )
             prepared["source_review"] = source_reviews.get(
@@ -82,7 +95,7 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
     write_jsonl(artifact, rows)
     persisted = read_jsonl(artifact)
     if len(persisted) != len(rows):
-        raise FinalSourceIntentError("FinalSourceIntentV1 write verification changed the source inventory")
+        raise FinalSourceIntentError("FinalSourceIntentV2 write verification changed the source inventory")
     for row in persisted:
         _validate_row(row)
     return {
@@ -99,7 +112,7 @@ def read_final_source_intents(job_dir: str | Path, *, plugin: ProductPlugin | No
     job = Path(job_dir).resolve()
     artifact = resolve_job_owned_path(job, job / "reports" / FINAL_SOURCE_INTENT_ARTIFACT)
     if not artifact.is_file():
-        raise FinalSourceIntentError(f"Current FinalSourceIntentV1 artifact is missing: {artifact}")
+        raise FinalSourceIntentError(f"Current FinalSourceIntentV2 artifact is missing: {artifact}")
     rows = read_jsonl(artifact)
     downloads = {
         (str(row.get("child") or ""), _source_index(row)): row
@@ -108,40 +121,49 @@ def read_final_source_intents(job_dir: str | Path, *, plugin: ProductPlugin | No
     }
     actual: set[tuple[str, int]] = set()
     by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    fact_revisions = {
+        str(child["asin"]): input_revision_id(source_fact_records(child))
+        for child in read_product_family(job)["family"]["children"]
+    } if require_current else {}
     for row in rows:
         _validate_row(row)
         if plugin is not None and row.get("category_id") != plugin.category_id:
-            raise FinalSourceIntentError("FinalSourceIntentV1 category does not match active plugin")
+            raise FinalSourceIntentError("FinalSourceIntentV2 category does not match active plugin")
         key = (str(row["child"]), int(row["source_index"]))
         if key in actual:
-            raise FinalSourceIntentError(f"Duplicate FinalSourceIntentV1 row: {key[0]}/{key[1]}")
+            raise FinalSourceIntentError(f"Duplicate FinalSourceIntentV2 row: {key[0]}/{key[1]}")
         actual.add(key)
         by_key[key] = row
         if not require_current:
             continue
+        visual = row.get("visual_evidence") or {}
+        if row.get("role") in PLANNING_SOURCE_ROLES and (not fact_revisions.get(key[0]) or visual.get("child_facts_revision_id") != fact_revisions[key[0]]):
+            raise FinalSourceIntentError(f"Source identity observation has stale child facts: {key[0]}/{key[1]}")
         download = downloads.get(key)
         source = _job_path(job, row.get("source_path"))
         if download is None or source is None or not source.is_file():
-            raise FinalSourceIntentError(f"FinalSourceIntentV1 has no current download: {key[0]}/{key[1]}")
+            raise FinalSourceIntentError(f"FinalSourceIntentV2 has no current download: {key[0]}/{key[1]}")
         expected_sha = str(download.get("source_sha256") or "")
         if row.get("source_sha256") != expected_sha or file_sha256(source) != expected_sha:
             raise FinalSourceIntentError(f"Source image SHA changed: {key[0]}/{key[1]}")
         if row.get("input_revision_id") != _semantic_revision(row):
-            raise FinalSourceIntentError(f"FinalSourceIntentV1 semantic revision changed: {key[0]}/{key[1]}")
+            raise FinalSourceIntentError(f"FinalSourceIntentV2 semantic revision changed: {key[0]}/{key[1]}")
     if require_current and actual != set(downloads):
         missing = sorted(set(downloads) - actual)[:5]
         extra = sorted(actual - set(downloads))[:5]
-        raise FinalSourceIntentError(f"FinalSourceIntentV1 inventory mismatch: missing={missing}, extra={extra}")
+        raise FinalSourceIntentError(f"FinalSourceIntentV2 inventory mismatch: missing={missing}, extra={extra}")
     if require_current:
         reviews = _current_source_intent_reviews(job, list(downloads.values()))
         for (child, source_index, _sha), review in reviews.items():
             row = by_key.get((child, source_index), {})
+            if row.get("role") == "review_required" and str(row.get("classification_reason") or "").startswith("source_"):
+                continue  # A role-only review cannot waive a source identity conflict.
             if (
                 row.get("role") != review.get("role")
                 or str(review.get("review_fingerprint") or "") not in str(row.get("classification_reason") or "")
             ):
                 raise FinalSourceIntentError(
-                    f"FinalSourceIntentV1 has not applied current source review: {child}/{source_index}"
+                    f"FinalSourceIntentV2 has not applied current source review: {child}/{source_index}"
                 )
         reviewed_keys = {(child, source_index) for child, source_index, _sha in reviews}
         stale_embedded = [
@@ -151,7 +173,7 @@ def read_final_source_intents(job_dir: str | Path, *, plugin: ProductPlugin | No
         ]
         if stale_embedded:
             raise FinalSourceIntentError(
-                f"FinalSourceIntentV1 contains stale source review: {stale_embedded[0][0]}/{stale_embedded[0][1]}"
+                f"FinalSourceIntentV2 contains stale source review: {stale_embedded[0][0]}/{stale_embedded[0][1]}"
             )
     return rows
 
@@ -159,7 +181,7 @@ def read_final_source_intents(job_dir: str | Path, *, plugin: ProductPlugin | No
 def record_source_intent_review(
     job_dir: str | Path, *, child: str, source_index: int, role: str, reason: str,
 ) -> dict[str, Any]:
-    """Record SHA-bound human evidence consumed by FinalSourceIntentV1."""
+    """Record SHA-bound human evidence consumed by FinalSourceIntentV2."""
     job = Path(job_dir).resolve()
     role = str(role or "").strip().lower()
     reason = " ".join(str(reason or "").split())
@@ -289,7 +311,7 @@ def final_source_intents_current(job_dir: str | Path, plugin: ProductPlugin,
     try:
         rows = read_final_source_intents(job_dir, plugin=plugin, require_current=True)
         if not rows:
-            return False, ["FinalSourceIntentV1 has no scoped source rows"]
+            return False, ["FinalSourceIntentV2 has no scoped source rows"]
         # Evidence incompleteness belongs to the source/role task that uses it.
         # It is not artifact staleness: making one OCR or visual-recovery miss
         # invalidate the whole family suppressed ready siblings and forced a
@@ -362,78 +384,7 @@ def _evidence_for_sha(job: Path, sha: str, downloads: list[dict[str, Any]], *, d
         "text": " ".join(trusted),
         "pixel_evidence": pixels,
     }
-    visual = _visual_recovery(job, source, sha, downloads, base, deadline_monotonic=deadline_monotonic)
-    return {**base, "visual_evidence": visual, "claims": _authored_claims(trusted, visual=visual)}
-def _visual_recovery(job: Path, source: Path, sha: str, downloads: list[dict[str, Any]],
-                     evidence: dict[str, Any], *, deadline_monotonic: float | None = None) -> dict[str, Any]:
-    if not _needs_visual_recovery(downloads, evidence):
-        return {"status": "not_needed", "reason": "deterministic evidence is sufficient"}
-    cache = resolve_job_owned_path(job, job / "reports" / "final_source_intent_visual_evidence" / f"{sha}_{_VISUAL_RECOVERY_POLICY_VERSION}.json")
-    if cache.is_file():
-        try:
-            value = json.loads(cache.read_text(encoding="utf-8"))
-            if (
-                value.get("status") == "success"
-                and value.get("source_sha256") == sha
-                and value.get("policy_version") == _VISUAL_RECOVERY_POLICY_VERSION
-            ):
-                return value
-        except Exception:
-            pass
-    clients = _observation_clients()
-    if not clients:
-        return {"status": "unavailable", "reason": "source-observation provider is not configured"}
-    last_error: Exception | None = None
-    for client in clients:
-        provider = str(client.get("name") or "")
-        try:
-            response = gemini_stream_generate(
-                _visual_recovery_prompt(),
-                [source],
-                client_scope="visual_planning",
-                preferred_client_name=provider,
-                timeout_seconds=25,
-                total_timeout_seconds=35,
-                deadline_monotonic=deadline_monotonic,
-                response_validator=_visual_response_valid,
-            )
-            value = _normalize_visual_evidence(_parse_json_object(response))
-            value.update(
-                {
-                    "status": "success",
-                    "policy_version": _VISUAL_RECOVERY_POLICY_VERSION,
-                    "source_sha256": sha,
-                    "provider_name": provider,
-                }
-            )
-            write_json(cache, value)
-            return value
-        except Exception as exc:
-            last_error = exc
-    return {
-        "status": "failed",
-        "error": f"{type(last_error).__name__}: {last_error}" if last_error else "no usable source-observation provider",
-    }
-def _needs_visual_recovery(downloads: list[dict[str, Any]], evidence: dict[str, Any]) -> bool:
-    if not any(_source_index(row) != 0 for row in downloads):
-        return False
-    ocr = evidence["ocr_evidence"]
-    if ocr.get("retryable") or (ocr.get("error") and evidence.get("trusted_text") == []):
-        return True
-    # OCR engines may return a raw aggregate string without line-level
-    # confidence or geometry.  It is useful as a hint that authored content
-    # may exist, but it is never trusted evidence and must force the visual
-    # recovery/review path instead of selecting a role by itself.
-    if _has_untrusted_raw_text(ocr, evidence.get("trusted_text") or []):
-        return True
-    pixels = evidence.get("pixel_evidence") or {}
-    if _deterministic_size_evidence(evidence):
-        return False
-    if evidence.get("claims"):
-        return False
-    if pixels.get("scene_pixels") and not pixels.get("product_view_pixels"):
-        return False
-    return bool(evidence.get("trusted_text") or pixels.get("product_view_pixels") or pixels.get("error"))
+    return base
 def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
                     evidence: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
     source_index = _source_index(download)
@@ -445,6 +396,13 @@ def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
     measurements = _measurement_rows(evidence.get("measurements") or [], child)
     trusted_text = list(evidence.get("trusted_text") or [])
     visual = dict(evidence.get("visual_evidence") or {})
+    identity = visual.get("variant_identity") or {}
+    identity_issue = (
+        "source_identity_unverified: joint source observation unavailable"
+        if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY else
+        "source_variant_conflict: " + str(identity.get("reason") or "visible product contradicts child facts")
+        if identity.get("status") == "contradiction" else ""
+    )
     # A matching child fact can corroborate OCR without a second observation
     # request; a layout signal alone never authorizes arbitrary prop text.
     claims = _authored_claims(trusted_text, visual=visual, product_text=_plain_text({
@@ -463,13 +421,15 @@ def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
         "ocr_evidence": dict(evidence.get("ocr_evidence") or {}),
         "pixel_evidence": dict(evidence.get("pixel_evidence") or {}),
         "visual_evidence": visual,
+        "identity_issue": identity_issue,
         "signals": signals,
-        "size_candidate": source_index != 0 and bool(signals["has_rich_dimension_layout"]),
+        "size_candidate": not identity_issue and source_index != 0 and bool(signals["has_rich_dimension_layout"]),
     }
 def _finalize_child(prepared_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     reviewed_sizes = [
         row for row in prepared_rows
         if not row.get("final_row")
+        and not row.get("identity_issue")
         and isinstance(row.get("source_review"), dict)
         and row["source_review"].get("role") == "size"
     ]
@@ -518,17 +478,10 @@ def _non_size_role(prepared: dict[str, Any]) -> str:
         signals["has_authored_information"]
         or signals["has_authored_function_text"]
         or signals["has_callout_layout"]
-        or int(signals.get("trusted_text_count") or 0) > 0
     ):
         return "func"
     if visual_role == "scene" and visual_confidence >= 0.55 and not signals["has_authored_information"]:
         return "scene"
-    if (
-        str(visual.get("status") or "") in {"failed", "unavailable"}
-        and signals["has_alternate_product_view"]
-        and not signals["has_authored_information"]
-    ):
-        return "review_required"
     if not signals["has_authored_information"] and (
         signals["has_scene_pixels"] or signals["has_alternate_product_view"]
     ):
@@ -542,6 +495,9 @@ def _build_final_row(
     prepared: dict[str, Any], role: str, *, additional_size: bool,
     source_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    identity_issue = prepared.get("identity_issue") or ""
+    if identity_issue:
+        role, source_review = "review_required", None
     signals = dict(prepared["signals"])
     signals["reference_completeness"] = _reference_completeness(role, signals)
     flags = _evidence_flags(signals)
@@ -560,7 +516,7 @@ def _build_final_row(
         "role": role,
         "classification_reason": (
             f"human_source_role_review={source_review['review_fingerprint']}; {source_review['reason']}"
-            if source_review else _classification_reason(role, signals, additional_size=additional_size)
+            if source_review else identity_issue or _classification_reason(role, signals, additional_size=additional_size)
         ),
         "evidence_flags": flags,
         "signals": signals,
@@ -667,14 +623,6 @@ def _signals(source_index: int, evidence: dict[str, Any], measurements: list[dic
         "visual_role_guess": str(visual.get("role_guess") or "unknown"),
         "visual_confidence": float(visual.get("confidence") or 0.0),
     }
-def _deterministic_size_evidence(evidence: dict[str, Any]) -> bool:
-    measurements = _independent_measurements(evidence.get("measurements") or [])
-    if len(measurements) < 2:
-        return False
-    text = " ".join(evidence.get("trusted_text") or [])
-    line_count = sum(1 for line in evidence.get("trusted_text") or [] if extract_measurements(line))
-    directions = {word.lower() for word in _DIRECTION_WORD.findall(text)}
-    return line_count >= 2 or len(directions) >= 2 or bool(_MULTI_AXIS.search(text)) or len(measurements) >= 3
 def _size_strength(row: dict[str, Any]) -> tuple[int, int, int, int]:
     signals = row["signals"]
     return (
@@ -715,6 +663,10 @@ def _independent_measurements(values: list[dict[str, Any]]) -> list[dict[str, An
     return rows
 def _authored_claims(lines: list[str], *, visual: dict[str, Any] | None = None, product_text: str = "") -> list[dict[str, Any]]:
     visual = visual or {}
+    if visual.get("status") == "success" and visual.get("policy_version") == OBSERVATION_POLICY:
+        return [{"text": normalize_text(row["text"]), "type": "visible_function_concept", "confidence": "source_observed"}
+                for row in visual.get("text_observations") or []
+                if row["kind"] == "marketing" and normalize_text(row["text"])]
     authored = (
         visual.get("role_guess") == "func" and visual.get("has_callouts_or_panels")
         and float(visual.get("confidence") or 0) >= 0.8
@@ -746,9 +698,7 @@ def _claim_concept(value: Any) -> str:
     )
     if not text or has_bad_encoding(text):
         return ""
-    # This is source evidence, not buyer-facing render copy. Long, trustworthy
-    # authored sentences stay bound to the source; the later FuncStory contract
-    # alone owns the 2-6 word renderable rewrite.
+    # Keep complete evidence statements; only the model writes display copy.
     return text.rstrip(" ,;:")
 
 
@@ -839,7 +789,8 @@ def _semantic_revision(row: dict[str, Any]) -> str:
 def _visual_semantics(value: Any) -> dict[str, Any]:
     row = value if isinstance(value, dict) else {}
     keys = ("status", "role_guess", "has_dimension_lines", "has_callouts_or_panels",
-            "visible_numbers_or_units", "layout_summary", "confidence", "evidence", "error", "reason")
+            "visible_numbers_or_units", "layout_summary", "confidence", "evidence", "error", "reason",
+            "objects", "text_observations", "variant_identity", "child_facts_revision_id", "policy_version")
     return {key: row.get(key) for key in keys if key in row}
 def _failure_row(plugin: ProductPlugin, download: dict[str, Any], exc: Exception) -> dict[str, Any]:
     source_index = _source_index(download)
@@ -876,17 +827,19 @@ def _stage_failure(row: dict[str, Any]) -> dict[str, Any]:
         "task": {"logical_task_id": row["logical_task_id"], "input_revision_id": row["input_revision_id"],
                  "child": row["child"], "source_index": str(row.get("source_index") or "")},
         "failure_owner": "classify",
-        "task_status": "blocked",
+        "task_status": "retryable" if (row.get("visual_evidence") or {}).get("status") in {"failed", "unavailable"} else "blocked",
         "error": row.get("error") or row.get("classification_reason") or "final source intent failed",
     }
 def _validate_row(row: Any) -> None:
     if not isinstance(row, dict) or row.get("schema_version") != FINAL_SOURCE_INTENT_SCHEMA_VERSION:
-        raise FinalSourceIntentError("Invalid FinalSourceIntentV1 row")
+        raise FinalSourceIntentError("Invalid FinalSourceIntentV2 row")
+    if row.get("policy_version") != FINAL_SOURCE_INTENT_POLICY_VERSION:
+        raise FinalSourceIntentError("Final source intent policy is stale")
     expected = {"schema_version", "policy_version", "category_id", "child", "source_index", "source_path", "source_sha256", "status", "role", "classification_reason", "evidence_flags", "signals", "ocr_evidence", "pixel_evidence", "visual_evidence", "trusted_text", "claims", "measurements", "shopping_intent", "warnings", "logical_task_id", "input_revision_id"}
     if row.get("status") == "failed":
         expected.add("error")
     if set(row) != expected:
-        raise FinalSourceIntentError(f"FinalSourceIntentV1 has unknown or missing fields: {sorted(set(row) ^ expected)}")
+        raise FinalSourceIntentError(f"FinalSourceIntentV2 has unknown or missing fields: {sorted(set(row) ^ expected)}")
     required = (
         "child",
         "source_index",
@@ -903,29 +856,33 @@ def _validate_row(row: Any) -> None:
         if row.get(key) is None or (not isinstance(row.get(key), int) and not str(row.get(key) or "").strip())
     ]
     if missing:
-        raise FinalSourceIntentError(f"Invalid FinalSourceIntentV1 row: missing={missing}")
+        raise FinalSourceIntentError(f"Invalid FinalSourceIntentV2 row: missing={missing}")
     if row.get("status") not in {"success", "failed"}:
-        raise FinalSourceIntentError("Invalid FinalSourceIntentV1 status")
+        raise FinalSourceIntentError("Invalid FinalSourceIntentV2 status")
     roles = {"main", "scene", "func", "size", "review_required"} if row.get("status") == "success" else {"failed"}
     if row.get("role") not in roles:
-        raise FinalSourceIntentError("Invalid FinalSourceIntentV1 role")
+        raise FinalSourceIntentError("Invalid FinalSourceIntentV2 role")
     for key in ("evidence_flags", "signals", "ocr_evidence", "pixel_evidence", "visual_evidence"):
         if not isinstance(row.get(key), dict):
-            raise FinalSourceIntentError(f"Invalid FinalSourceIntentV1 {key}")
+            raise FinalSourceIntentError(f"Invalid FinalSourceIntentV2 {key}")
+    if row.get("role") in PLANNING_SOURCE_ROLES:
+        visual = row["visual_evidence"]
+        if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY or (visual.get("variant_identity") or {}).get("status") not in {"consistent", "unknown"}:
+            raise FinalSourceIntentError("Plannable source requires current, non-conflicting identity evidence")
     for key in ("trusted_text", "claims", "measurements", "warnings"):
         if not isinstance(row.get(key), list):
-            raise FinalSourceIntentError(f"Invalid FinalSourceIntentV1 {key}")
+            raise FinalSourceIntentError(f"Invalid FinalSourceIntentV2 {key}")
     if row.get("role") == "func":
         source_key = f"{row.get('child')}/{row.get('source_index')}"
         ids: set[str] = set()
         for claim in row["claims"]:
             if not isinstance(claim, dict) or set(claim) != {"evidence_id", "source_sha256", "text", "type", "confidence"}:
-                raise FinalSourceIntentError(f"Invalid FinalSourceIntentV1 func evidence: {source_key}")
+                raise FinalSourceIntentError(f"Invalid FinalSourceIntentV2 func evidence: {source_key}")
             if claim["source_sha256"] != row["source_sha256"] or not claim["evidence_id"]:
-                raise FinalSourceIntentError(f"FinalSourceIntentV1 func evidence is not source-bound: {source_key}")
+                raise FinalSourceIntentError(f"FinalSourceIntentV2 func evidence is not source-bound: {source_key}")
             ids.add(str(claim["evidence_id"]))
         if row["claims"] and len(ids) != len(row["claims"]):
-            raise FinalSourceIntentError(f"FinalSourceIntentV1 func evidence IDs are missing or duplicated: {source_key}")
+            raise FinalSourceIntentError(f"FinalSourceIntentV2 func evidence IDs are missing or duplicated: {source_key}")
 def _trusted_text_lines(ocr: dict[str, Any]) -> list[str]:
     rows: list[str] = []
     lines = ocr.get("lines") or []
@@ -978,77 +935,6 @@ def _empty_evidence(error: str) -> dict[str, Any]:
         "pixel_evidence": {"scene_pixels": False, "product_view_pixels": False, "error": error},
         "visual_evidence": {"status": "failed", "error": error},
     }
-def _observation_clients() -> list[dict[str, str]]:
-    try:
-        clients = clients_for_scope("visual_planning")
-    except ModelRouterError:
-        return []
-    capable: list[dict[str, str]] = []
-    for client in clients:
-        try:
-            capabilities = {str(value) for value in json.loads(client.get("capabilities") or "[]")}
-        except (TypeError, json.JSONDecodeError):
-            capabilities = set()
-        if "source_observation" in capabilities:
-            capable.append(client)
-    return capable
-def _visual_recovery_prompt() -> str:
-    return (
-        "Return JSON only. Decide image purpose from visible pixels, not listing text or outside facts. "
-        "Schema: {\"role_guess\":\"scene|func|size|unknown\",\"has_dimension_lines\":false,"
-        "\"has_callouts_or_panels\":false,\"visible_numbers_or_units\":[\"\"],\"layout_summary\":\"\","
-        "\"confidence\":0.0,\"evidence\":[\"\"]}. Size requires multiple visible measurements plus lines, arrows, "
-        "endpoints, or a clear measurement layout. Func uses authored callouts, panels, detail crops, or functional text. "
-        "Scene is an environment or alternate product view without authored information. For func, evidence must quote complete "
-        "authored product callouts verbatim, excluding text printed on loose props. Do not infer product facts or claims."
-    )
-def _visual_response_valid(text: str) -> bool:
-    value = _parse_json_object(text)
-    return str(value.get("role_guess") or "") in {"scene", "func", "size", "unknown"} and isinstance(value.get("evidence"), list)
-def _parse_json_object(text: str) -> dict[str, Any]:
-    raw = str(text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start < 0 or end <= start:
-            raise
-        value = json.loads(raw[start : end + 1])
-    if not isinstance(value, dict):
-        raise FinalSourceIntentError("Visual recovery response is not a JSON object")
-    return value
-def _normalize_visual_evidence(value: dict[str, Any]) -> dict[str, Any]:
-    role = str(value.get("role_guess") or "unknown").strip().lower()
-    if role not in {"scene", "func", "size", "unknown"}:
-        role = "unknown"
-    numbers = _unique_text(value.get("visible_numbers_or_units"), limit=20)
-    try:
-        confidence = max(0.0, min(1.0, float(value.get("confidence") or 0.0)))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    return {
-        "role_guess": role,
-        "has_dimension_lines": bool(value.get("has_dimension_lines")),
-        "has_callouts_or_panels": bool(value.get("has_callouts_or_panels")),
-        "visible_numbers_or_units": numbers,
-        "visible_number_count": len(numbers),
-        "layout_summary": _compact_text(value.get("layout_summary"), 300),
-        "confidence": round(confidence, 3),
-        "evidence": _unique_text(value.get("evidence"), limit=8),
-    }
-def _unique_text(value: Any, *, limit: int) -> list[str]:
-    values = [value] if isinstance(value, str) else value
-    if not isinstance(values, (list, tuple)):
-        return []
-    rows: list[str] = []
-    for item in values:
-        text = _compact_text(item, 300)
-        if text and text not in rows:
-            rows.append(text)
-    return rows[:limit]
 def _relative_source_path(job: Path, value: Any) -> Path:
     if not str(value or "").strip():
         raise FinalSourceIntentError("Downloaded source path is empty")

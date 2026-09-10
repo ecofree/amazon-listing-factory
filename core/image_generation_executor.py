@@ -31,11 +31,12 @@ from .image_reference_context import (
     generation_reference_primary_path,
     generation_reference_sources,
 )
-from .api_registry import image_provider_supports_mask
+from .api_registry import image_provider_supports_mask, image_provider_supports_multiple_references
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .provider_policy import assert_provider_allowed, load_provider_policy
 from .progress_trace import record_progress
+from .status import input_revision_id
 
 
 def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
@@ -77,6 +78,11 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
         raise CandidateStateError(f"Immutable candidate output already exists without a current manifest: {output_path}")
     reference_sources = generation_reference_sources(task, plugin=plugin)
     image_input_paths = [str(row["path"]) for row in reference_sources]
+    if len(image_input_paths) > 1:
+        compatible = [name for name in providers if image_provider_supports_multiple_references(name, len(image_input_paths))]
+        if not compatible:
+            raise ProviderConfigurationError(providers[0], "No assigned provider supports the required reference set; no request sent")
+        providers = compatible
     has_protected_mask = any(
         isinstance(row, dict) and isinstance(row.get("protected_mask"), dict)
         for row in reference_sources
@@ -182,6 +188,9 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                     error=error,
                 )
 
+            request_id = input_revision_id({"job": task["job_dir"], "task": task["task_fingerprint"],
+                "revision": task.get("candidate_revision", 0), "prompt": prompt, "references": task["generation_references"]})
+            request_audit: dict[str, Any] = {"request_id": request_id, "provider": provider}
             data = generate_with_provider_retries(
                 provider_name=provider,
                 image_input_paths=image_input_paths,
@@ -189,15 +198,14 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 mask_bytes=protected_mask_bytes,
                 attempt_observer=observe_transport_attempt,
                 total_timeout_seconds=provider_budget,
-                request_id=(
-                    f"{task.get('logical_task_id') or ''}:"
-                    f"{int(task.get('candidate_revision') or 0)}"
-                ),
+                request_id=request_id,
+                request_audit=request_audit,
             )
             provider_duration = time.monotonic() - provider_started
             commit_task = {
                 **task,
                 "provider": provider,
+                "request_audit": request_audit,
                 "provider_duration_seconds": provider_duration,
                 "attempted_providers": attempted_providers,
                 "attempted_provider_failures": attempted_failures,
@@ -226,6 +234,9 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             }
         except Exception as exc:
             last_error = exc
+            if getattr(exc, "ambiguous", False):
+                task["request_audit"] = request_audit
+                task["request_outcome"] = "unknown"
             failure_class = provider_failure_class(exc)
             if failure_class == "queue":
                 if attempted_providers and attempted_providers[-1] == provider:
@@ -286,7 +297,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             )
             if failure_class == "configuration":
                 open_provider_run_circuit(provider_runtime_circuit_key(provider), task_id=str(task.get("logical_task_id") or ""))
-            if failure_class in {"contract", "candidate_commit"}:
+            if getattr(exc, "ambiguous", False) or failure_class in {"contract", "candidate_commit"}:
                 # Neither an immutable task-contract failure nor a local
                 # artifact-commit failure can be repaired by spending a backup
                 # provider call.

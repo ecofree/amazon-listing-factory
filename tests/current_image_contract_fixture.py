@@ -38,7 +38,7 @@ def current_image_task(
     role: str = "main",
     *,
     blocked_reason: str = "",
-    source_sha256: str = "source-sha",
+    source_sha256: str = "a" * 64,
     category_id: str = "bathroom_cabinet",
     reason_code: str = "",
     retryable: bool = False,
@@ -94,7 +94,8 @@ def current_image_task(
         )
         references = [
             {
-                "kind": "editable_reference",
+                "kind": "edit_base", "child": "B1", "source_id": "source_00",
+                "purpose": "Edit this product view", "evidence_ids": [],
                 "path": "images/func-source.png" if family == "func" else "images/source.png",
                 "sha256": source_sha256,
             }
@@ -105,7 +106,7 @@ def current_image_task(
             "source_intent_revision_id": "source-intent-revision",
             "source_index": 0,
             "generation_references": references,
-            "generation_reference_sha256": source_sha256,
+            "edit_base_sha256": source_sha256,
             "reference_mode": f"{family}_source_edit",
             "product_facts": {
                 "asin": "B1",
@@ -116,6 +117,7 @@ def current_image_task(
                 "sold_unit_count": 1,
             },
             "product_boundary": {
+                "observed_objects": [],
                 "sold_product_parts": [
                     "the complete bathroom cabinet visible in the editable reference",
                     "all source-visible structural parts and attached hardware",

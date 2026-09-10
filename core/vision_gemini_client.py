@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from http.client import HTTPException
 import io
 import json
 import mimetypes
@@ -143,7 +144,7 @@ def gemini_stream_generate(
             # not consume the visual-planning request budget.
             physical_request_count = max(0, physical_request_count - 1)
             return "queue_unavailable", detail, False
-        status = model_status_from_exception(exc, detail)
+        status = "transport_failure" if isinstance(exc, HTTPException) else model_status_from_exception(exc, detail)
         terminal = status in {"auth_failure", "configuration_failure", "model_not_found", "request_failure"}
         if terminal:
             open_provider_run_circuit(key, task_id=request_id)
@@ -261,7 +262,7 @@ def gemini_stream_generate(
                                 )
                                 continue
                             break
-                        except (ProviderQueueUnavailable, ProviderTransportError, TimeoutError, ConnectionError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+                        except (ProviderQueueUnavailable, ProviderTransportError, HTTPException, TimeoutError, ConnectionError, urllib.error.URLError, urllib.error.HTTPError) as exc:
                             status, error_text, terminal = record_transport_failure(client, exc)
                             last_exc = exc
                             last_status = status
@@ -323,7 +324,7 @@ def gemini_stream_generate(
                                 )
                                 continue
                             break
-                        except (ProviderQueueUnavailable, ProviderTransportError, TimeoutError, ConnectionError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+                        except (ProviderQueueUnavailable, ProviderTransportError, HTTPException, TimeoutError, ConnectionError, urllib.error.URLError, urllib.error.HTTPError) as exc:
                             status, error_text, terminal = record_transport_failure(client, exc)
                             last_exc = exc
                             last_status = status
@@ -394,7 +395,7 @@ def gemini_stream_generate(
                                 )
                                 continue
                             break
-                        except (ProviderQueueUnavailable, ProviderTransportError, TimeoutError, ConnectionError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+                        except (ProviderQueueUnavailable, ProviderTransportError, HTTPException, TimeoutError, ConnectionError, urllib.error.URLError, urllib.error.HTTPError) as exc:
                             status, error_text, terminal = record_transport_failure(client, exc)
                             last_exc = exc
                             last_status = status

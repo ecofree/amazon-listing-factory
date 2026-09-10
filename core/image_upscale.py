@@ -58,7 +58,6 @@ def _realesrgan_resize(data: bytes, target: int) -> bytes:
             "-n", REALESRGAN_MODEL,
             "-s", "4",
             "-f", "png",
-            "-g", "auto",
         ]
         try:
             subprocess.run(
@@ -69,8 +68,13 @@ def _realesrgan_resize(data: bytes, target: int) -> bytes:
                 stderr=subprocess.STDOUT,
                 timeout=30,
             )
-        except Exception as exc:
-            raise ImageUpscaleError(f"Real-ESRGAN failed: {type(exc).__name__}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ImageUpscaleError(f"Real-ESRGAN TimeoutExpired after {exc.timeout}s (native GPU auto)") from exc
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stdout or b"").decode("utf-8", errors="replace")
+            raise ImageUpscaleError(f"Real-ESRGAN exit={exc.returncode}: {output[-300:]}") from exc
+        except OSError as exc:
+            raise ImageUpscaleError(f"Real-ESRGAN launch failed: {exc}") from exc
         try:
             with Image.open(enhanced_path) as enhanced:
                 enhanced.load()
@@ -100,7 +104,7 @@ def upscale_for_publication_with_backend(
                 try:
                     return _realesrgan_resize(bytes(data), target), REALESRGAN_MODEL
                 except ImageUpscaleError as exc:
-                    fallback = f"{UPSCALE_BACKEND}:fallback_from_realesrgan:{type(exc).__name__}"
+                    fallback = f"{UPSCALE_BACKEND}:fallback_from_realesrgan:{' '.join(str(exc).split())[:400]}"
                     return _resize_lanczos(source, target), fallback
             return _resize_lanczos(source, target), UPSCALE_BACKEND
     except ImageUpscaleError:

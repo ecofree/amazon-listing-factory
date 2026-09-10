@@ -18,6 +18,7 @@ from .api_registry import (
     dedupe_image_provider_names,
     image_provider_entries,
     image_provider_physical_identity,
+    image_provider_resource_group,
 )
 from .image_provider_common import (
     ImageGenerationError,
@@ -55,16 +56,6 @@ from .provider_policy import filter_not_forbidden_providers, load_provider_polic
 
 PROVIDER_SUCCESS_LEDGER_SCHEMA_VERSION = 5
 _LEDGER_LOCK = threading.RLock()
-_CURRENT_IMAGE_PROVIDERS = (
-    "aicost_gpt_image_2",
-    "qc_yc_fixed",
-    "cxk_fixed",
-)
-_ROLE_PREFERENCE = {
-    "scene": _CURRENT_IMAGE_PROVIDERS,
-    "func": _CURRENT_IMAGE_PROVIDERS,
-    "size": _CURRENT_IMAGE_PROVIDERS,
-}
 
 
 def provider_order(plugin: ProductPlugin) -> list[str]:
@@ -74,14 +65,8 @@ def provider_order(plugin: ProductPlugin) -> list[str]:
 
 
 def apply_role_provider_policy(task: dict[str, Any], plugin: ProductPlugin) -> dict[str, Any]:
-    role = role_key(str(task.get("role_family") or task.get("role") or ""))
     available = provider_order(plugin)
-    if role == "main":
-        preference = _CURRENT_IMAGE_PROVIDERS
-    else:
-        preference = _ROLE_PREFERENCE.get(role, ())
-    preferred = [name for name in preference if name in available]
-    ordered = [*preferred, *(name for name in available if name not in preferred)]
+    ordered = available
     unhealthy = _persistently_unhealthy_providers(task) | {
         name for name in ordered if _global_provider_cooldown_active(name)
     }
@@ -166,7 +151,7 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         family_primary = min(
             candidates,
             key=lambda name: (
-                assigned_load.get(name, 0) / max(1, provider_concurrency_limit(name)),
+                assigned_load.get(image_provider_resource_group(name), 0) / max(1, provider_concurrency_limit(name)),
                 first_position.get(name, 999),
                 -score_totals.get(name, 0.0),
                 name,
@@ -174,7 +159,8 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             default="",
         )
         if family_primary:
-            assigned_load[family_primary] = assigned_load.get(family_primary, 0) + 1
+            group = image_provider_resource_group(family_primary)
+            assigned_load[group] = assigned_load.get(group, 0) + 1
         lane_pool = [family_primary, *[name for name in candidates if name != family_primary]]
         lane_pool = list(dict.fromkeys(name for name in lane_pool if name))
         for index, task, ordered in rows:
@@ -201,7 +187,7 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def generate_with_provider_retries(
     *, provider_name: str, image_input_paths: list[str], prompt: str,
     mask_bytes: bytes | None = None, attempt_observer: Any | None = None,
-    total_timeout_seconds: float | None = None, request_id: str = "",
+    total_timeout_seconds: float | None = None, request_id: str = "", request_audit: dict[str, Any] | None = None,
 ) -> bytes:
     """Run one physical provider with bounded attempts and a role deadline."""
     circuit = provider_runtime_circuit_key(provider_name)
@@ -251,6 +237,7 @@ def generate_with_provider_retries(
                     mask_bytes=mask_bytes,
                     timeout_seconds=attempt_timeout,
                     request_id=request_id,
+                    request_audit=request_audit,
                 )
             if attempt_observer:
                 assert attempt_started_at is not None
@@ -288,7 +275,7 @@ def generate_with_provider_retries(
             )
             if isinstance(error, ProviderConfigurationError):
                 open_provider_run_circuit(circuit)
-            if circuit_opened or attempt >= provider_attempts(provider_name) or not is_transient_imagegen_error(error):
+            if getattr(error, "ambiguous", False) or circuit_opened or attempt >= provider_attempts(provider_name) or not is_transient_imagegen_error(error):
                 raise error from exc if error is not exc else error
             delay = provider_retry_delay_seconds(provider_name, attempt)
             if time.monotonic() + delay >= run_deadline:
@@ -301,7 +288,7 @@ def generate_with_provider_retries(
 def _generate_with_provider_deadline(
     *, provider_name: str, image_input_paths: list[str], prompt: str,
     mask_bytes: bytes | None = None, timeout_seconds: float | None = None,
-    request_id: str = "",
+    request_id: str = "", request_audit: dict[str, Any] | None = None,
 ) -> bytes:
     assert_imagegen_prompt_contract(prompt, provider_name)
     if not has_registry_image_provider(provider_name):
@@ -322,7 +309,7 @@ def _generate_with_provider_deadline(
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ProviderTransportError(provider_name, f"Provider exceeded its {timeout:.0f}-second attempt deadline", status="timeout_failure")
+                raise ProviderTransportError(provider_name, f"Provider result unknown after its {timeout:.0f}-second attempt deadline; request_id={request_id}", status="timeout_failure", ambiguous=True)
             try:
                 result = result_queue.get(timeout=min(0.25, remaining))
                 break
@@ -337,7 +324,11 @@ def _generate_with_provider_deadline(
         if result.get("ok") is True:
             if not result_path.is_file():
                 raise ProviderTransportError(provider_name, "Provider subprocess returned no result file")
+            if request_audit is not None:
+                request_audit.update(result.get("request_audit") or {})
             return result_path.read_bytes()
+        if request_audit is not None:
+            request_audit.update(result.get("request_audit") or {})
         code = str(result.get("failure_code") or "")
         message = str(result.get("message") or "Provider subprocess failed")
         if code == "local_contract_mismatch":
@@ -370,15 +361,16 @@ def _provider_worker(
     request_id: str, result_path: str, output: Any,
 ) -> None:
     partial_path = Path(f"{result_path}.partial")
+    audit: dict[str, Any] = {"request_id": request_id, "provider": provider}
     try:
         images = [Path(path).read_bytes() for path in image_input_paths]
         data = generate_with_registry_image_provider(
             provider_name=provider, image_inputs=images, prompt=prompt, mask_bytes=mask,
-            request_id=request_id,
+            request_id=request_id, request_audit=audit,
         )
         partial_path.write_bytes(data)
         os.replace(partial_path, result_path)
-        output.put({"ok": True})
+        output.put({"ok": True, "request_audit": audit})
     except Exception as exc:
         output.put({
             "ok": False,
@@ -386,6 +378,7 @@ def _provider_worker(
             "status": provider_failure_status(exc),
             "message": f"{type(exc).__name__}: {exc}",
             "ambiguous": bool(getattr(exc, "ambiguous", False)),
+            "request_audit": audit,
         })
     finally:
         try:
@@ -514,7 +507,7 @@ def record_provider_quality_score(
         and str(row.get("role") or "") == str(role)
     ), None)
     if not isinstance(task, dict):
-        raise ValueError(f"No current ImageTaskV9 for provider quality score: {child}/{role}")
+        raise ValueError(f"No current ImageTaskV10 for provider quality score: {child}/{role}")
     candidate = current_candidate(job, task, required=True)
     try:
         output = resolve_job_owned_path(job, str(candidate.get("output_path") or candidate.get("candidate_path") or ""))
@@ -548,9 +541,7 @@ def _order_by_health(task: dict[str, Any], providers: list[str]) -> list[str]:
     scores = _provider_scores(task, providers)
     order = {name: index for index, name in enumerate(providers)}
     ranked = sorted(providers, key=lambda name: (-scores[name], order[name]))
-    current = [name for name in ranked if name in _CURRENT_IMAGE_PROVIDERS]
-    reserve = [name for name in ranked if name not in _CURRENT_IMAGE_PROVIDERS]
-    return [*current, *reserve] if current else reserve
+    return ranked
 
 
 def _provider_scores(task: dict[str, Any], providers: list[str]) -> dict[str, float]:

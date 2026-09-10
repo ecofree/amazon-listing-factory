@@ -8,7 +8,7 @@ from core.copy_writer import (
     _parse_copy_response,
     _rewrite_listing_copy_with_openai,
 )
-from core.copy_polish import _validate_artifact_provenance
+from core.copy_polish import _validate_artifact_provenance, CopyPolishError
 
 
 def _body(payload: dict) -> str:
@@ -36,11 +36,23 @@ class CopyV1ContractTests(unittest.TestCase):
             "Engineered wood provides sturdy construction",
             "Simple assembly supports quick setup",
         ]
-        _validate_artifact_provenance({
+        artifact = {
             "rows": {"__parent__": row},
             "groups": [],
             "parent_model_request_fingerprint": "parent-fingerprint",
-        })
+        }
+        with self.assertRaises(CopyPolishError):
+            _validate_artifact_provenance(artifact)
+        from core.template_engine import _copy_v1_for_row, TemplateEngineError
+        row["item_highlights"] = ["A" * 75 + " Storage", "B" * 75 + " Shelving"]
+        with self.assertRaises(CopyPolishError):
+            _validate_artifact_provenance(artifact)
+        with self.assertRaises(TemplateEngineError):
+            _copy_v1_for_row(artifact, row_type="Parent", sku="P", asin="B1")
+        for highlights in ([], ["Wall Mounted Storage", "Adjustable Shelf"]):
+            row["item_highlights"] = highlights
+            _validate_artifact_provenance(artifact)
+            self.assertEqual(highlights, _copy_v1_for_row(artifact, row_type="Parent", sku="P", asin="B1")[1])
 
     def test_multiple_item_highlights_and_brandless_size_first_title(self) -> None:
         payload = {
@@ -77,6 +89,9 @@ class CopyV1ContractTests(unittest.TestCase):
         )
         parent_payload = dict(separated)
         parent_payload["item_highlights"] = ["Green"]
+        with self.assertRaises(CopyWriterError):
+            _parse_copy_response(_body(parent_payload), brand="safeplus", row_type="parent")
+        parent_payload["item_highlights"] = []
         parent_result = _parse_copy_response(_body(parent_payload), brand="safeplus", row_type="parent")
         self.assertEqual([], parent_result["item_highlights"])
 
@@ -242,7 +257,7 @@ class CopyV1ContractTests(unittest.TestCase):
                 config=config,
                 category="bed_frame",
                 brand="safeplus",
-                row_type="child",
+                row_type="parent",
                 source_title="Wood Bed Frame",
                 source_bullets=over_budget,
                 source_description="",

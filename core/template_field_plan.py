@@ -169,7 +169,7 @@ def compile_field_requirements(
     }
     submit_ready = str(template_mode or "").strip().casefold() == "submit_ready"
     factory_requirements = {
-        "item_highlight": ("Required", ""),
+        "item_highlight": ("Required", "Child"),
         "brand": ("Required", ""),
         "manufacturer": ("Required", ""),
         "item_type_keyword": ("Required", ""),

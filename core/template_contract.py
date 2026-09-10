@@ -19,7 +19,7 @@ from .template_runtime import (
 )
 
 
-TEMPLATE_INPUT_POLICY_VERSION = "template-input-v8-field-plan-readiness-authority"
+TEMPLATE_INPUT_POLICY_VERSION = "template-input-v9-parent-highlight-contract"
 _TEMPLATE_JOB_FIELDS = (
     "seed_asin",
     "category_id",
@@ -66,7 +66,7 @@ def template_input_fingerprint(
             "template_sha256": file_sha256(template_path),
             "family_sha256": _optional_sha(job_path / "source" / "product_family_v3.json"),
             "copy_sha256": _optional_sha(job_path / "reports" / "copy_v1.json"),
-            "release_sha256": _optional_sha(job_path / "reports" / "release_manifest_v5.json"),
+            "release_sha256": _optional_sha(job_path / "reports" / "release_manifest_v6.json"),
             "publish_sha256": _optional_sha(job_path / "images" / "_r2_image_urls.csv"),
             "partial_publish_sha256": _optional_sha(job_path / "images" / "_r2_image_urls.partial.csv"),
             "job": {

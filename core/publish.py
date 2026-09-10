@@ -180,7 +180,7 @@ def publish_approved_release(
     failures: list[dict[str, str]] = []
     for row in rows:
         if str(row.get("final_decision") or "") != "approved":
-            raise PublishError("Publish accepts only ReleaseManifestV5 approved rows")
+            raise PublishError("Publish accepts only current release manifest approved rows")
         local_path = _publish_local_path(job_path, row.get("local_path"))
         expected_sha = str(row.get("candidate_sha256") or "")
         if not local_path.exists() or not expected_sha or file_sha256(local_path) != expected_sha:

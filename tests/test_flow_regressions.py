@@ -124,6 +124,7 @@ class FlowRegressionTests(unittest.TestCase):
             "job": "job", "scope": "required", "list": False,
             "approve": True, "reject": False, "child": "", "role": "",
             "reason": "batch approval", "quality_tags": "",
+            "resolutions": "", "candidate_sha256": "",
         }
         with (
             patch.object(factory, "_assert_runtime_dependencies"),
@@ -163,7 +164,8 @@ class FlowRegressionTests(unittest.TestCase):
         self.assertIn('"reviewed": 1', emit.call_args.args[0])
         from core.release_manifest import ReleaseManifestError, record_human_reviews
         warning_manifest = {"rows": [{
-            "child": "B1", "role": "main", "automatic_decision": "pass",
+            "child": "B1", "role": "main", "automatic_decision": "inconclusive",
+            "source_sha256": "d" * 64, "unresolved_checks": ["unauthorized_text"],
             "qa_warning_gates": ["ocr_noise"], "candidate_sha256": "a" * 64,
             "release_candidate_fingerprint": "b" * 64, "qa_policy_id": "qa-lite",
             "qa_evidence_fingerprint": "c" * 64,
@@ -171,14 +173,16 @@ class FlowRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "core.release_manifest.build_release_manifest", return_value=warning_manifest,
         ):
-            with self.assertRaisesRegex(ReleaseManifestError, "source/candidate comparison"):
+            with self.assertRaisesRegex(ReleaseManifestError, "Human verification"):
                 record_human_reviews(
                     job_dir=tmp, plugin=plugin, targets=[("B1", "main")],
                     decision="approve", reason="contact sheet checked",
                 )
             record_human_reviews(
                 job_dir=tmp, plugin=plugin, targets=[("B1", "main")],
-                decision="approve", reason="source and candidate compared",
+                decision="approve", reason="Generic title is visible on a loose book, not the cabinet or a brand mark.",
+                resolutions=[{"check": "unauthorized_text", "source_sha256": "d" * 64,
+                              "candidate_sha256": "a" * 64, "conclusion": "confirmed", "evidence": "The text belongs to the book on the shelf, outside the cabinet surface."}],
             )
 
     def test_source_inventory_coverage_keeps_failed_and_review_sources_visible(self) -> None:
@@ -208,6 +212,16 @@ class FlowRegressionTests(unittest.TestCase):
             {"child": "B1", "source_index": 2, "status": "success", "role": "review_required", "source_sha256": "review-sha", "input_revision_id": "review-rev", "classification_reason": "ambiguous authored content"},
             {"child": "B1", "source_index": 3, "status": "failed", "role": "failed", "source_sha256": "classify-sha", "input_revision_id": "classify-rev", "error": "image evidence unavailable"},
         ]
+        from core import production
+        from core.final_source_intents import _stage_failure
+        conflict = {**intents[1], "logical_task_id": "classify:B1:2"}
+        current = {"tasks": intents, "failures": [_stage_failure(conflict)]}
+        request = SimpleNamespace(job_dir=Path("unused"), plugin=SimpleNamespace(), workers=1, deadline_monotonic=None, resume=True)
+        with patch.object(production, "assert_family_matches_plugin"), patch("core.final_source_intents.build_final_source_intents", return_value=current):
+            resumed = production._run_stage("classify", request=request)
+        self.assertEqual(current["failures"], resumed["failures"])
+        self.assertFalse(production._stage_has_usable_output("classify", {"tasks": [conflict]}))
+        self.assertEqual("retryable", _stage_failure({**conflict, "visual_evidence": {"status": "failed"}})["task_status"])
         tasks = [
             {"child": "B1", "role": "main", "source_sha256": "main-sha", "source_intent_revision_id": "main-rev"},
         ]
@@ -315,6 +329,7 @@ class FlowRegressionTests(unittest.TestCase):
             {
                 "child": "B1", "role": role, "role_family": role,
                 "formation_status": "ready", "task_fingerprint": f"task-{role}",
+                "source_sha256": "d" * 64,
                 "input_revision_id": f"revision-{role}", "logical_task_id": f"generate:B1:{role}",
             }
             for role in ("main", "scene")

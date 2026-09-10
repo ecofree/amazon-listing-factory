@@ -132,6 +132,7 @@
     },
     {
       "name": "aicost_gpt_image_2",
+      "resource_group": "aicost_gpt_image_2",
       "family": "image_generation",
       "scope": "image_generation",
       "api_type": "openai_images_edit",
@@ -152,6 +153,7 @@
     },
     {
       "name": "aicost_gpt_image_25_flare",
+      "resource_group": "aicost_gpt_image_2",
       "display": "aicost-gpt-image-2.5-flare",
       "family": "image_generation",
       "scope": "image_generation",
@@ -173,6 +175,7 @@
     },
     {
       "name": "aicost_gpt_image_25_sunburst",
+      "resource_group": "aicost_gpt_image_2",
       "display": "aicost-gpt-image-2.5-sunburst",
       "family": "image_generation",
       "scope": "image_generation",
@@ -257,6 +260,7 @@
     },
     {
       "name": "cxk_fixed",
+      "resource_group": "cxk_fixed",
       "display": "cxk-fixed",
       "family": "image_generation",
       "scope": "image_generation",
@@ -278,6 +282,7 @@
     },
     {
       "name": "cxk_gpt_image_25",
+      "resource_group": "cxk_fixed",
       "display": "cxk-gpt-image-2.5",
       "family": "image_generation",
       "scope": "image_generation",
@@ -299,6 +304,7 @@
     },
     {
       "name": "cxk_gpt_image_25_flare",
+      "resource_group": "cxk_fixed",
       "display": "cxk-gpt-image-2.5-flare",
       "family": "image_generation",
       "scope": "image_generation",

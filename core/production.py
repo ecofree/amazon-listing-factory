@@ -397,21 +397,8 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
 
         return download_reference_images(job_dir=job, plugin=plugin, workers=request.workers, deadline_monotonic=request.deadline_monotonic)
     if stage == "classify":
-        from .final_source_intents import (
-            build_final_source_intents,
-            final_source_intents_current,
-            read_final_source_intents,
-        )
+        from .final_source_intents import build_final_source_intents
 
-        if request.resume:
-            current, _issues = final_source_intents_current(job, plugin, limit=0)
-            if current:
-                return {
-                    "schema_version": "final-source-intent-v1",
-                    "tasks": read_final_source_intents(job, plugin=plugin, require_current=True),
-                    "failures": [],
-                    "reused": True,
-                }
         return build_final_source_intents(job_dir=job, plugin=plugin, workers=request.workers, limit=0, deadline_monotonic=request.deadline_monotonic)
     if stage == "brief":
         from .image_prompt_compiler import (
@@ -589,7 +576,7 @@ def _formation_failures(rows: Iterable[dict[str, Any]], *, owner: str) -> list[d
         failures.append({
             "task": task,
             "failure_owner": owner,
-            # Formation is a current ImageTaskV9 contract result. Retryability
+            # Formation is a current ImageTaskV10 contract result. Retryability
             # belongs to the owning brief/planner attempt, not to a stale task
             # field that can silently change generation semantics.
             "task_status": "blocked",
@@ -680,7 +667,7 @@ def _stage_has_usable_output(stage: str, result: Any) -> bool:
         )
     if stage == "classify":
         return any(
-            isinstance(row, dict) and row.get("status") == "success"
+            isinstance(row, dict) and row.get("status") == "success" and row.get("role") in {"main", "scene", "func", "size"}
             for row in result.get("tasks") or []
         )
     if stage == "brief":
@@ -788,6 +775,7 @@ def _stage_input_revision(stage: str, request: JobRunRequest) -> str:
             })
         payload["source_intent_policy"] = FINAL_SOURCE_INTENT_POLICY_VERSION
         payload["source_intent_schema"] = FINAL_SOURCE_INTENT_SCHEMA_VERSION
+        payload["family"] = _file_identity(job / "source" / "product_family_v3.json")
         payload["sources"] = sorted(
             sources, key=lambda row: (row["child"], row["source_index"], row["sha256"])
         )
@@ -806,7 +794,7 @@ def _stage_input_revision(stage: str, request: JobRunRequest) -> str:
 
         image_policy = compiled_image_policy(request.plugin)
         payload["family"] = _file_identity(job / "source" / "product_family_v3.json")
-        payload["final_source_intents"] = _file_identity(job / "reports" / "final_source_intents_v1.jsonl")
+        payload["final_source_intents"] = _file_identity(job / "reports" / "final_source_intents_v2.jsonl")
         payload["visual_design_kit_policy"] = {
             "schema": VISUAL_DESIGN_KIT_SCHEMA_VERSION,
             "policy": VISUAL_DESIGN_KIT_POLICY_VERSION,
@@ -833,11 +821,13 @@ def _stage_input_revision(stage: str, request: JobRunRequest) -> str:
     elif stage == "qa":
         from .image_tasks import IMAGE_TASK_ARTIFACT
         from .qa_evidence import QA_POLICY_VERSION
+        from .vision_gemini_client import gemini_scope_execution_revision
 
         payload["image_tasks"] = _file_identity(job / "reports" / IMAGE_TASK_ARTIFACT)
         payload["qa_policy"] = QA_POLICY_VERSION
+        payload["observer_execution"] = gemini_scope_execution_revision("vision_qa")
     elif stage == "publish":
-        payload["release"] = _file_identity(job / "reports" / "release_manifest_v5.json")
+        payload["release"] = _file_identity(job / "reports" / "release_manifest_v6.json")
         payload["upload"] = request.upload
         payload["r2_prefix"] = job_data.get("r2_prefix")
     elif stage == "template":
@@ -845,7 +835,7 @@ def _stage_input_revision(stage: str, request: JobRunRequest) -> str:
         payload["template_mode"] = template_mode
         payload["family"] = _file_identity(job / "source" / "product_family_v3.json")
         payload["copy"] = _file_identity(job / "reports" / "copy_v1.json")
-        payload["release"] = _file_identity(job / "reports" / "release_manifest_v5.json")
+        payload["release"] = _file_identity(job / "reports" / "release_manifest_v6.json")
         payload["publish"] = _file_identity(job / "images" / "_r2_image_urls.csv")
         payload["job"] = job_data
     return input_revision_id(payload)
@@ -861,10 +851,10 @@ def _stage_artifact(stage: str, job: Path) -> tuple[str, Path]:
         "fetch": ("product_family_v3", job / "source" / "product_family_v3.json"),
         "copy": ("copy_v1", job / "reports" / "copy_v1.json"),
         "download": ("download_manifest_v2", job / "images" / "download_manifest_v2.json"),
-        "classify": ("final_source_intents_v1", job / "reports" / "final_source_intents_v1.jsonl"),
+        "classify": ("final_source_intents_v2", job / "reports" / "final_source_intents_v2.jsonl"),
         "brief": ("image_prompts_v2", job / "reports" / IMAGE_PROMPT_ARTIFACT),
         "generate": ("imagegen_results_v3", job / "reports" / "imagegen_results_v3.json"),
-        "qa": ("qa_evidence_v4", job / "reports" / "qa_evidence_v4.jsonl"),
+        "qa": ("qa_evidence_v5", job / "reports" / "qa_evidence_v5.jsonl"),
         "publish": ("r2_urls", job / "images" / "_r2_image_urls.csv"),
         "template": ("template_plan", job / "template" / "plan.json"),
     }

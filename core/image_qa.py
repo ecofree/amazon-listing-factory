@@ -6,9 +6,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from .visual_semantics import observe_candidate
 from .candidate_state import CandidateStateError, current_candidate
 from .image_pixel_evidence import inspect_image_pixel_evidence
-from .image_role_ocr import OCR_CONCLUSIVE_CONFIDENCE, cached_ocr_evidence_for_image, ocr_evidence_for_image
+from .image_role_ocr import OCR_CONCLUSIVE_CONFIDENCE, ocr_evidence_for_image
 from .image_task_inputs import task_renderable_text
 from .image_prompt_compiler import prompt_for_task, read_image_prompts, require_current_image_branch
 from .io import load_env
@@ -30,12 +31,10 @@ from .image_task_inputs import release_candidate_fingerprint
 from .image_tasks import read_image_tasks
 from .run_scope import scoped_child_set
 from .status import input_revision_id, logical_task_id
-from .text_evidence import extract_measurements, has_bad_encoding, normalize_text
+from .text_evidence import extract_measurements, normalize_text
 
 
 LOCAL_GATE_NAMES = ("image_integrity", "main_background", "unauthorized_text", "dimension_accuracy")
-_NON_LATIN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
-_UNAUTHORIZED_TEXT_CONFIDENCE = 0.75
 
 
 def run_image_qa(
@@ -66,11 +65,11 @@ def run_image_qa(
             continue
         if isinstance(candidate, dict) and candidate and candidate.get("task_prompt_fingerprint") == prompt["prompt_sha256"]:
             pairs.append((task, candidate))
-    existing: dict[tuple[str, str], dict[str, Any]] = {}
+    existing: dict[tuple[str, str, str], dict[str, Any]] = {}
     qa_evidence_path = job / "reports" / QA_EVIDENCE_ARTIFACT
     if qa_evidence_path.is_file():
         try:
-            existing = {(row["child"], row["role"]): row for row in read_qa_evidence(job)}
+            existing = {(row["child"], row["role"], row["candidate_sha256"]): row for row in read_qa_evidence(job)}
         except Exception as exc:
             record_progress(
                 job,
@@ -81,12 +80,12 @@ def run_image_qa(
         record_progress(job, "qa_evidence_cache_miss")
 
     def evaluate(task: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-        cached = existing.get((task["child"], task["role"]))
+        cached = existing.get((task["child"], task["role"], candidate["candidate_sha256"]))
         if cached and evidence_is_current(cached, task, candidate, job_dir=job):
             return cached
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             raise TimeoutError("QA execution deadline exhausted before evaluation")
-        return _evaluate(job, plugin, task, candidate)
+        return _evaluate(job, plugin, task, candidate, deadline_monotonic=deadline_monotonic)
 
     rows: list[dict[str, Any]] = []
     evaluation_failures: list[dict[str, Any]] = []
@@ -107,7 +106,8 @@ def run_image_qa(
                     "error": f"{type(exc).__name__}: {exc}",
                 })
     rows.sort(key=lambda row: (row["child"], row["role"]))
-    write_qa_evidence(job, rows)
+    kept = {**existing, **{(row["child"], row["role"], row["candidate_sha256"]): row for row in rows}}
+    write_qa_evidence(job, list(kept.values()))
     records = [
         {
             "logical_task_id": logical_task_id("qa", child=row["child"], role=row["role"]),
@@ -144,21 +144,30 @@ def _candidate_state_failure(task: dict[str, Any], exc: CandidateStateError) -> 
     }
 
 
-def _evaluate(job: Path, plugin: ProductPlugin, task: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+def _evaluate(job: Path, plugin: ProductPlugin, task: dict[str, Any], candidate: dict[str, Any], *, deadline_monotonic: float | None = None) -> dict[str, Any]:
     output = resolve_job_owned_path(job, str(candidate["candidate_path"]))
     gates = _local_gates(job, plugin, task, output)
+    observation = {}
+    if not any(row["gate"] == "image_integrity" and row["status"] == "fail" for row in gates):
+        try:
+            observation = observe_candidate(job, task, candidate, deadline_monotonic=deadline_monotonic)
+            semantic = _semantic_gates(task, observation)
+            gates = [row for row in gates if row["gate"] not in {"unauthorized_text", "dimension_accuracy"}] + semantic
+        except Exception as exc:
+            gates.append(_gate("product_fidelity", "inconclusive", f"Independent observation unavailable: {type(exc).__name__}: {exc}"))
     statuses = {row["status"] for row in gates}
-    decision = "fail" if "fail" in statuses else "pass"
+    decision = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
     evidence = {
         "schema_version": QA_EVIDENCE_SCHEMA_VERSION,
         "child": task["child"], "role": task["role"],
         "candidate_path": candidate["candidate_path"], "candidate_sha256": candidate["candidate_sha256"],
         "release_candidate_fingerprint": release_candidate_fingerprint(task, candidate),
         "qa_policy_id": qa_policy_id(task), "automatic_decision": decision,
-        "decision_scope": "qa_lite_hard_facts_only",
+        "decision_scope": "observed_hard_facts_only",
+        "candidate_observation": observation,
         "quality_authority": "human_review_and_provider_ledger",
         "automatic_pass": decision == "pass", "failure_owner": "qa" if decision == "fail" else "",
-        "provider": {"provider": "qa_lite", "model": "local", "protocol": "local"},
+        "provider": observation.get("provider") or {"provider": "unavailable", "model": "unavailable", "protocol": "unavailable"},
         "gates": gates,
         "human_review_checklist": _human_checklist(task),
     }
@@ -199,94 +208,51 @@ def _main_background_gate(plugin: ProductPlugin, task: dict[str, Any], output: P
 
 
 def _ocr_gates(job: Path, task: dict[str, Any], output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    role = task["role_family"]
     try:
         ocr = ocr_evidence_for_image(output, cache_root=job / "reports" / "ocr_evidence")
+        lines = [normalize_text(row.get("text")) for row in ocr.get("lines", [])
+                 if isinstance(row, dict) and float(row.get("confidence") or 0) >= OCR_CONCLUSIVE_CONFIDENCE]
+        evidence = f"OCR observed {lines}; location and semantic ownership require independent observation"
     except Exception as exc:
-        return _ocr_unavailable(role, f"{type(exc).__name__}: {exc}")
-    if not ocr.get("available"):
-        return _ocr_unavailable(role, str(ocr.get("error") or "no reliable OCR result"))
-    evidence_lines = [row for row in ocr.get("lines") or [] if isinstance(row, dict)]
-    lines = [
-        normalize_text(row.get("text")) for row in evidence_lines
-        if float(row.get("confidence") or 0) >= OCR_CONCLUSIVE_CONFIDENCE and normalize_text(row.get("text"))
-    ]
-    damaged = [line for line in lines if has_bad_encoding(line) or len(_NON_LATIN_RE.findall(line)) >= 2]
-    if role in {"func", "size"} and damaged:
-        return _gate("unauthorized_text", "fail", f"high-confidence damaged or non-English text: {damaged}"), _gate("dimension_accuracy", "fail", "damaged text prevents reliable dimension review")
-    if role in {"main", "scene"}:
-        source_lines = [normalize_text(value) for value in _source_ocr_lines(job, task) if normalize_text(value)]
-        unsupported = _unsupported_contract_lines(lines, source_lines)
-        return (
-            _gate("unauthorized_text", "fail", f"new high-confidence readable text is not authorized for this role: {unsupported}")
-            if unsupported else
-            _gate(
-                "unauthorized_text",
-                "pass",
-                "readable text is source-explained and requires human policy review"
-                if lines else "no high-confidence readable text detected",
-                warning=bool(lines),
-            ),
-            _gate("dimension_accuracy", "pass", "dimension gate is not applicable"),
-        )
-    if role == "func":
-        allowed = [
-            normalize_text(value)
-            for value in task_renderable_text(task)
-            if normalize_text(value)
-        ]
-        readable_lines = [
-            normalize_text(row.get("text")) for row in evidence_lines
-            if float(row.get("confidence") or 0) >= _UNAUTHORIZED_TEXT_CONFIDENCE
-            and normalize_text(row.get("text"))
-        ]
-        unsupported = _unsupported_contract_lines(readable_lines, allowed)
-        evidence = (
-            "ordinary prop text is allowed; human review must confirm it is not a third-party brand, logo, "
-            f"or branded package: {unsupported}"
-            if unsupported else
-            "all high-confidence OCR fragments match contracted text"
-        )
-        return _gate("unauthorized_text", "pass", evidence, warning=bool(unsupported)), _gate(
-            "dimension_accuracy", "pass", "func dimensions are not a hard gate"
-        )
-    return _size_ocr_gates(job, task, lines)
+        evidence = f"OCR unavailable: {type(exc).__name__}: {exc}"
+    return (_gate("unauthorized_text", "inconclusive", evidence),
+            _gate("dimension_accuracy", "inconclusive", "Measured objects and endpoints require observation")
+            if task["role_family"] in {"size", "func"} else _gate("dimension_accuracy", "pass", "not applicable"))
 
 
-def _size_ocr_gates(job: Path, task: dict[str, Any], candidate_lines: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
-    authority = task.get("measurement_authority") or {}
-    if authority.get("mode") == "source_image":
-        source_lines = _source_ocr_lines(job, task)
-        source_values = _measurement_values(source_lines)
-        candidate_values = _measurement_values(candidate_lines)
-        if _has_zero_measurement(candidate_lines):
-            evidence = "candidate contains an explicit zero measurement"
-            return _gate("unauthorized_text", "fail", evidence), _gate("dimension_accuracy", "fail", evidence)
-        unconfirmed = sorted(candidate_values - source_values) if source_values else []
-        missing = sorted(source_values - candidate_values) if candidate_values else sorted(source_values)
-        if unconfirmed:
-            evidence = (
-                "candidate OCR contains values not recovered from source OCR; OCR cannot overrule the editable "
-                f"measurement reference, so human source comparison is required: {unconfirmed}"
-            )
-            return _gate("unauthorized_text", "pass", evidence, warning=True), _gate("dimension_accuracy", "pass", evidence, warning=True)
-        if missing:
-            evidence = (
-                "source measurements were not all detected in the candidate; human source comparison required"
-                f"; source values not detected in candidate={missing}"
-            )
-            return _gate("unauthorized_text", "pass", evidence, warning=True), _gate("dimension_accuracy", "pass", evidence, warning=True)
-        if not source_values or not candidate_values:
-            return _gate("unauthorized_text", "pass", "OCR cannot prove the complete source diagram; human review required", warning=True), _gate("dimension_accuracy", "pass", "OCR absence never rejects a source-size edit", warning=True)
-        return _gate("unauthorized_text", "pass", "no definite unauthorized measurement was detected"), _gate("dimension_accuracy", "pass", "human review must confirm every source-visible value, line, endpoint, and measured part was retained", warning=True)
-    expected = _measurement_values(authority.get("render_text") or [])
-    observed = _measurement_values(candidate_lines)
-    wrong = sorted(observed - expected)
+def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
+    allowed = task_renderable_text(task)
+    texts = observation["texts"]
+    authored = [row["text"] for row in texts if row["kind"] in {"marketing", "measurement"} and row["confidence"] >= 0.9]
+    unknown = [row["text"] for row in texts if row["kind"] in {"unknown", "brand", "product_label"} or row["confidence"] < 0.9]
+    marketing = [row["text"] for row in texts if row["kind"] == "marketing" and row["confidence"] >= 0.9]
+    has_diagram = (task.get("measurement_authority") or {}).get("mode") == "source_image"
+    unexpected = _unsupported_contract_lines(marketing if has_diagram else authored, allowed)
+    missing = _unsupported_contract_lines(allowed, authored)
+    if unexpected:
+        text_gate = _gate("unauthorized_text", "fail", f"Located unapproved authored copy: {unexpected}")
+    elif unknown or observation["text_coverage"] != "complete" or missing:
+        text_gate = _gate("unauthorized_text", "inconclusive", f"Unverified text/brand ownership: {unknown}; approved strings not fully observed: {missing}")
+    else:
+        text_gate = _gate("unauthorized_text", "pass", "Located approved copy matches; ordinary prop text is not an authored product claim")
+
+    dimensions = observation["measurements"]
+    wrong = [row for row in dimensions if row["confidence"] >= 0.9 and (
+        row["relationship"] == "different" or (
+            _measurement_values([row["source_text"]]) and _measurement_values([row["candidate_text"]])
+            and _measurement_values([row["source_text"]]) != _measurement_values([row["candidate_text"]])))]
     if wrong:
-        evidence = f"candidate contains unauthorized spec measurements: {wrong}"
-        return _gate("unauthorized_text", "fail", evidence), _gate("dimension_accuracy", "fail", evidence)
-    missing = not expected.issubset(observed)
-    return _gate("unauthorized_text", "pass", "no unauthorized spec measurement detected"), _gate("dimension_accuracy", "pass", "human review required for any OCR-missed spec value" if missing else "all confirmed spec values detected", warning=missing)
+        dimension_gate = _gate("dimension_accuracy", "fail", f"Located measured-object/value/endpoint contradictions: {wrong}")
+    elif (has_diagram and (not dimensions or observation["measurement_coverage"] != "complete")) or observation["measurement_coverage"] == "partial" or any(row["confidence"] < 0.9 or row["relationship"] == "unknown" for row in dimensions):
+        dimension_gate = _gate("dimension_accuracy", "inconclusive", "Incomplete measured-object, value or endpoint observation")
+    else:
+        dimension_gate = _gate("dimension_accuracy", "pass", "Observed measurement relationships match" if dimensions else "No measurement diagram; func numeric claims remain checked as exact authored copy")
+
+    product = observation["product_comparison"]
+    status = {"consistent": "pass", "contradiction": "fail", "unknown": "inconclusive"}[product["status"]]
+    if product["confidence"] < 0.9:
+        status = "inconclusive"
+    return [text_gate, dimension_gate, _gate("product_fidelity", status, str(product))]
 
 
 def _measurement_values(lines: Any) -> set[str]:
@@ -297,23 +263,6 @@ def _measurement_values(lines: Any) -> set[str]:
             if pair:
                 values.add(pair)
     return values
-
-
-def _has_zero_measurement(lines: Any) -> bool:
-    return any(
-        str(row.get("canonical_value") or "").strip() in {"0", "0.0"}
-        for line in lines or []
-        for row in extract_measurements(str(line or ""))
-    )
-
-
-def _source_ocr_lines(job: Path, task: dict[str, Any]) -> list[str]:
-    source = resolve_job_owned_path(job, str(task.get("source_path") or ""))
-    cached = cached_ocr_evidence_for_image(source, cache_root=job / "reports" / "ocr_evidence") if source.is_file() else None
-    return [
-        str(row.get("text") or "").strip() for row in (cached or {}).get("lines") or []
-        if isinstance(row, dict) and float(row.get("confidence") or 0) >= 0.7 and str(row.get("text") or "").strip()
-    ]
 
 
 def _line_matches_any(line: str, allowed: list[str]) -> bool:
@@ -353,28 +302,6 @@ def _unsupported_contract_lines(lines: list[str], allowed: list[str]) -> list[st
     return [line for index, line in enumerate(lines) if index not in supported]
 
 
-def _line_is_contract_fragment(line: str, allowed: list[str]) -> bool:
-    tokens = _ocr_match_tokens(line)
-    compact = _ocr_compact(line)
-    return bool(tokens) and any(
-        any(permitted[index:index + len(tokens)] == tokens for index in range(len(permitted) - len(tokens) + 1))
-        or (
-            len(compact) >= 4
-            and (
-                _ocr_compact(value).startswith(compact)
-                or _ocr_compact(value).endswith(compact)
-            )
-        )
-        or any(
-            compact == "".join(permitted[start:stop])
-            for start in range(len(permitted))
-            for stop in range(start + 1, len(permitted) + 1)
-        )
-        for value in allowed
-        for permitted in [_ocr_match_tokens(value)]
-    )
-
-
 def _ocr_match_tokens(value: str) -> list[str]:
     text = re.sub(r"\bl(?=[a-z]{3,})", "i", value.casefold())
     return ["in" if token == "ln" else token for token in re.findall(r"[a-z0-9]+", text)]
@@ -386,6 +313,8 @@ def _ocr_compact(value: str) -> str:
 
 def _compact_edit_distance_at_most_one(left: str, right: str) -> bool:
     """Tolerate one OCR insertion/deletion/substitution for a complete phrase."""
+    if re.findall(r"\d+(?:\.\d+)?", left) != re.findall(r"\d+(?:\.\d+)?", right):
+        return False
     if not left or not right or abs(len(left) - len(right)) > 1:
         return False
     if left == right:
@@ -403,12 +332,6 @@ def _compact_edit_distance_at_most_one(left: str, right: str) -> bool:
         else:
             skipped = True
     return index == len(short)
-
-
-def _ocr_unavailable(role: str, error: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    if role in {"main", "scene"}:
-        return _gate("unauthorized_text", "pass", f"OCR unavailable; manual text inspection remains: {error}"), _gate("dimension_accuracy", "pass", "not applicable")
-    return _gate("unauthorized_text", "pass", f"OCR unavailable; human text inspection required: {error}", warning=True), _gate("dimension_accuracy", "pass", "OCR absence cannot reject an infographic", warning=True)
 
 
 def _human_checklist(task: dict[str, Any]) -> list[str]:

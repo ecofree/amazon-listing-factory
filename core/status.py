@@ -430,6 +430,7 @@ def _task_runtime_metadata(row: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "transport_attempt", "provider_attempts", "candidate_revision",
         "candidate_sha256", "execution_revision",
+        "request_outcome", "request_audit",
     }
     return {key: row[key] for key in allowed if key in row}
 
@@ -489,6 +490,9 @@ def _write_task(
     if failure_owner:
         row["failure_owner"] = failure_owner
     runtime = _task_runtime_metadata(previous)
+    if previous.get("input_revision_id") != revision_id or status == "success":
+        runtime.pop("request_outcome", None)
+        runtime.pop("request_audit", None)
     runtime.update(metadata or {})
     for key, value in runtime.items():
         if key not in row and value not in (None, "", [], {}):

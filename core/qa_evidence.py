@@ -9,9 +9,9 @@ from .paths import resolve_job_owned_path
 from .status import input_revision_id
 
 
-QA_EVIDENCE_SCHEMA_VERSION = "qa-evidence-v4"
-QA_EVIDENCE_ARTIFACT = "qa_evidence_v4.jsonl"
-QA_POLICY_VERSION = "image-task-generated-pixels-v40-ocr-near-match"
+QA_EVIDENCE_SCHEMA_VERSION = "qa-evidence-v5"
+QA_EVIDENCE_ARTIFACT = "qa_evidence_v5.jsonl"
+QA_POLICY_VERSION = "observed-facts-three-state-v42-completed-observation"
 
 
 class QaEvidenceError(RuntimeError):
@@ -21,9 +21,11 @@ class QaEvidenceError(RuntimeError):
 def qa_policy_id(task: dict[str, Any]) -> str:
     from .image_pixel_evidence import PIXEL_EVIDENCE_VERSION
     from .image_role_ocr import ROLE_OCR_EVIDENCE_CACHE_VERSION
+    from .vision_gemini_client import gemini_scope_execution_revision
 
     return input_revision_id({
         "policy": QA_POLICY_VERSION,
+        "observer_execution": gemini_scope_execution_revision("vision_qa"),
         "role": str(task.get("role_family") or task.get("role") or ""),
         "task_policy": task.get("policy_version") or "",
         "task_fingerprint": task.get("task_fingerprint") or "",
@@ -51,7 +53,7 @@ def write_qa_evidence(job_dir: str | Path, rows: list[dict[str, Any]]) -> None:
 def read_qa_evidence(job_dir: str | Path) -> list[dict[str, Any]]:
     path = Path(job_dir) / "reports" / QA_EVIDENCE_ARTIFACT
     if not path.is_file():
-        raise QaEvidenceError(f"Current QAEvidenceV4 is missing: {path}")
+        raise QaEvidenceError(f"Current {QA_EVIDENCE_SCHEMA_VERSION} is missing: {path}")
     rows = read_jsonl(path)
     for row in rows:
         _validate_row(row)
@@ -67,6 +69,8 @@ def evidence_is_current(
 ) -> bool:
     try:
         _validate_row(evidence)
+        if not evidence.get("candidate_observation"):
+            return False
         if evidence["child"] != task["child"] or evidence["role"] != task["role"]:
             return False
         if evidence["release_candidate_fingerprint"] != release_candidate_fingerprint(task, candidate):
@@ -91,19 +95,25 @@ def evidence_is_current(
 
 def _validate_row(row: Any) -> None:
     if not isinstance(row, dict) or row.get("schema_version") != QA_EVIDENCE_SCHEMA_VERSION:
-        raise QaEvidenceError("Invalid QAEvidenceV4 row")
+        raise QaEvidenceError("Invalid current QA evidence row")
     required = (
         "child", "role", "candidate_path", "candidate_sha256",
         "release_candidate_fingerprint", "qa_policy_id", "evidence_fingerprint",
         "automatic_decision", "gates",
     )
     missing = [field for field in required if row.get(field) in (None, "", [])]
-    if missing or row.get("automatic_decision") not in {"pass", "fail"}:
-        raise QaEvidenceError(f"Invalid QAEvidenceV4 row: missing={missing}")
+    if missing or row.get("automatic_decision") not in {"pass", "fail", "inconclusive"}:
+        raise QaEvidenceError(f"Invalid current QA evidence row: missing={missing}")
     if row.get("evidence_fingerprint") != evidence_fingerprint(row):
-        raise QaEvidenceError("QAEvidenceV4 fingerprint changed")
+        raise QaEvidenceError("QA evidence fingerprint changed")
+    if not isinstance(row["gates"], list):
+        raise QaEvidenceError("QA gates must be a list")
     for gate in row.get("gates") or []:
-        if not isinstance(gate, dict) or gate.get("status") not in {"pass", "fail"}:
-            raise QaEvidenceError("QAEvidenceV4 gate is invalid")
+        if not isinstance(gate, dict) or gate.get("status") not in {"pass", "fail", "inconclusive"}:
+            raise QaEvidenceError("QA gate is invalid")
         if not str(gate.get("gate") or "").strip() or not str(gate.get("evidence") or "").strip():
-            raise QaEvidenceError("QAEvidenceV4 gate requires a name and evidence")
+            raise QaEvidenceError("QA gate requires a name and evidence")
+    statuses = {gate["status"] for gate in row["gates"]}
+    expected = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
+    if row["automatic_decision"] != expected:
+        raise QaEvidenceError("QA decision contradicts its factual gates")

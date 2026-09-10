@@ -60,7 +60,7 @@ Authorization: bearer {TOKEN}
 import json, requests
 
 url = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
-headers = {"Authorization": "bearer 203326d22ce58208eef9d0fd8138bb18432f96a2"}
+headers = {"Authorization": "bearer <PADDLEOCR_API_TOKEN>"}
 
 data = {
     "model": "PaddleOCR-VL-1.6",

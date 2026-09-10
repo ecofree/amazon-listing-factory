@@ -1407,12 +1407,7 @@ def _parse_copy_response(
         raise CopyWriterError("Copy AI response must contain exactly five string bullets")
     title = _model_text(parsed["title"])
     item_highlights = _normalize_item_highlights(item_highlights_raw)
-    optional_parent_highlights = str(row_type or "").strip().casefold() == "parent"
-    if optional_parent_highlights:
-        item_highlights = [
-            item for item in item_highlights
-            if 2 <= len(item.split()) <= ITEM_HIGHLIGHT_MAX_WORDS
-        ]
+    optional_parent_highlights = str(row_type or "").strip().casefold() == "parent" and not item_highlights
     bullets = [_model_text(item) for item in bullets_raw]
     description = _model_text(parsed["description"])
     if not title or not description or any(not item for item in item_highlights) or any(not item for item in bullets):

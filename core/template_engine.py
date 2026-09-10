@@ -13,7 +13,6 @@ from . import listing_data
 from .copy_writer import (
     BULLET_AUDIT_MAX_CHARS,
     DESCRIPTION_MAX_CHARS,
-    ITEM_HIGHLIGHT_MAX_COUNT,
     TITLE_MAX_CHARS,
 )
 from .io import file_sha256, read_json, write_json
@@ -1403,11 +1402,6 @@ def _copy_v1_for_row(
         raise TemplateEngineError(f"Template requires AI CopyV1 provenance for {sku}")
     title = str(row.get("title") or "").strip()
     item_highlights = [str(item).strip() for item in row.get("item_highlights", [])] if isinstance(row.get("item_highlights"), list) else []
-    if row_type == "Parent":
-        # Parent highlights are optional during CopyV1 validation, but the
-        # template has one 2-5 phrase field. Keep the first authored phrases
-        # instead of letting an overlong parent row block template creation.
-        item_highlights = item_highlights[:ITEM_HIGHLIGHT_MAX_COUNT]
     bullets = [str(item).strip() for item in row.get("bullets", [])]
     description = str(row.get("description") or "").strip()
     title_issues = listing_title_quality_issues(title, category="")
@@ -1415,7 +1409,7 @@ def _copy_v1_for_row(
     if (
         not title or len(title) > TITLE_MAX_CHARS
         or title_issues
-        or not item_highlights_text({"item_highlights": item_highlights})
+        or ((row_type != "Parent" or item_highlights) and not item_highlights_text({"item_highlights": item_highlights}))
         or len(bullets) != 5 or any(not item or len(item) > BULLET_AUDIT_MAX_CHARS for item in bullets)
         or not description or len(description) > DESCRIPTION_MAX_CHARS or description_issues
     ):

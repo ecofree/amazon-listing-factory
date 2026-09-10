@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from .image_reference_context import reference_prompt
 import re
 from pathlib import Path
 from typing import Any
@@ -11,14 +13,13 @@ from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .status import input_revision_id, logical_task_id
 from .text_evidence import extract_measurements, normalize_text
-from .visual_design_kit_compiler import _sanitize_role_image_direction
 
 
-PROMPT_CONTRACT_VERSION = "gemini-art-direction-v65-planner-visual-authority"
+PROMPT_CONTRACT_VERSION = "gemini-art-direction-v67-content-ownership"
 PROMPT_REVISION_RESERVE_CHARS = 700
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v50-planner-visual-authority"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v52-content-ownership"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -150,7 +151,7 @@ def prompt_for_task(prompt_artifact: dict[str, Any], task: dict[str, Any]) -> di
     row = matches[0]
     validate_image_prompt(row)
     if row["task_fingerprint"] != task.get("task_fingerprint"):
-        raise ImagePromptError("ImagePromptV2 does not match current ImageTaskV9")
+        raise ImagePromptError("ImagePromptV2 does not match current ImageTaskV10")
     if row["status"] != "ready":
         raise ImagePromptError(str(row.get("error") or "Image prompt formation is blocked"))
     return row
@@ -206,38 +207,23 @@ def compile_task_prompt(
     renderable = task_renderable_text(task)
     text_mode = str((task.get("renderable_text_contract") or {}).get("mode") or "none")
     if renderable:
-        if str(task.get("category_id") or "") == "bed_frame" and role == "func":
-            text_rule = (
-                "Render only the exact strings in the renderable-text block verbatim for the infographic. "
-                "Child-room picture books may use short generic titles only; do not show author names, publishers, "
-                "recognizable third-party brands, logos, trademarks, branded packaging, or product claims."
-            )
-        elif str(task.get("category_id") or "") in {"bathroom_cabinet", "medicine_cabinet"} and role == "func":
-            text_rule = (
-                "Source text is evidence only, not presentation authority. Render only the exact strings in the "
-                "renderable-text block verbatim. Use plain, unbranded, label-free bottles, books, towels, and containers; "
-                "remove all other readable prop text, logos, trademarks, and packaging copy."
-            )
-        else:
-            text_rule = (
-                "Source text is evidence only, not presentation authority. Erase source presentation text and text-bearing staging; "
-                "render only the exact strings in the renderable-text block verbatim and add nothing else."
-            )
+        text_rule = "The renderable-text block is the complete authored copy, including inset captions. Render those strings once; composition prose and source marketing supply no additional display text."
+        if task["measurement_authority"].get("mode") == "source_image":
+            text_rule += " Retain the source measurement diagram under its separate factual measurement authority."
     elif text_mode == "preserve_source_measurements":
-        text_rule = (
-            "Only source-visible measurement facts are renderable; use the canonical display copy supplied for factual callouts with readable spacing. Remove decorative headings, "
-            "field names, captions, marketing copy, and non-factual modules."
-        )
+        text_rule = "Display the source measurement diagram's facts at their existing measured-object and endpoint associations with readable spacing; no extra feature cards or duplicate measurement labels from composition prose."
     else:
-        text_rule = "Do not render any readable text."
-        if role == "main":
-            text_rule = "Main image: no readable text anywhere; erase or replace text-bearing staging, signs, labels, and decorative graphics."
+        text_rule = "No added marketing text, captions or decorative overlays."
+    text_rule += (
+        " Preserve factual product-surface markings, but do not transfer third-party logos or promotional branding. "
+        "Ordinary unbranded prop text is allowed where this role permits props; never treat it as product evidence. "
+        "Do not invent brands, model labels or unreadable pseudo-text."
+    )
     prompt = "\n\n".join((
         f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}",
-        "[ROLE]\n" + str(edit.get("create") or "").strip() + "\n"
-        + _visual_rendering_baseline(role)
+        "[ROLE]\n" + str(edit.get("create") or "").strip()
         + "\n" + _role_content(task, role, white_main=white_main),
-        "[REFERENCE]\n" + _product_boundary(task, edit),
+        "[REFERENCE]\n" + reference_prompt(task["generation_references"]) + "\n" + _product_boundary(task, edit),
         "[STYLE]\n" + _family_art_direction(
             art_direction, role,
             main_policy=main_policy,
@@ -373,17 +359,12 @@ def _product_boundary(task: dict[str, Any], edit: dict[str, Any]) -> str:
         "Source completeness: " + str(edit.get("reference_completeness") or "partial_feature_view") + "; use visible evidence only; do not infer hidden regions.",
         _conditional_structure_line(boundary.get("conditional_structure_lock")),
         _line("Forbidden additions", boundary.get("forbidden_additions")),
+        "Observed objects: " + json.dumps([
+            {key: obj.get(key) for key in ("object_id", "kind", "sale_membership", "visibility", "state", "relations")}
+            for obj in boundary.get("observed_objects") or []
+        ], ensure_ascii=False, separators=(",", ":")) if boundary.get("observed_objects") else "",
     ]
     return "\n".join(row for row in rows if row)
-
-
-def _visual_rendering_baseline(role: str) -> str:
-    """Emit one role-appropriate exposure sentence."""
-    if role == "size":
-        return "Bright neutral technical presentation; crisp edges and readable contrast. No people."
-    if role == "func":
-        return "Bright neutral infographic presentation; light canvas, readable contrast, natural product detail, no shadows behind text. No people."
-    return "Bright airy commercial exposure with neutral daylight, lifted midtones, soft shadows, and clear product separation. No people."
 
 
 def _role_content(
@@ -391,34 +372,14 @@ def _role_content(
 ) -> str:
     purpose = str(task.get("role_purpose") or "").strip()
     rows = ["Shopping purpose: " + purpose]
-    image_direction = "" if white_main else _compact_role_direction(_sanitize_role_image_direction(task.get("image_direction")))
+    image_direction = _compact_token_direction(task.get("image_direction"))
     if image_direction:
-        # Keep the planner's role-level design language; it does not authorize a
-        # fixed layout or replace the product and evidence contracts.
-        rows.append("Image direction: " + image_direction)
-    if role == "size":
+        rows.append("Composition direction (layout only; product state and display copy are defined separately): " + image_direction)
+    if (task.get("measurement_authority") or {}).get("mode") == "source_image":
         rows.append(_measurement_content(task.get("measurement_authority")))
-    elif role == "func":
+    if role == "func":
         rows.append("Function: show only the source-supported feature relationship and state.")
     return "\n".join(row for row in rows if row)
-
-
-def _compact_role_direction(value: Any) -> str:
-    """Keep planner composition language while removing compiler-owned locks."""
-    text = " ".join(str(value or "").split()).strip()
-    if not text:
-        return ""
-    text = text.replace(
-        "vary bedding, accent color, and material contrast",
-        "vary textile texture and material contrast within the child route",
-    )
-    for suffix in (
-        " Bedding/pillows=textile roles only; accent=props/decor only.",
-        " Bedding/pillows=textile roles only; accent=props/decor only",
-    ):
-        if text.endswith(suffix):
-            text = text[: -len(suffix)].rstrip(" .;:")
-    return text
 
 
 def _family_art_direction(
@@ -429,17 +390,17 @@ def _family_art_direction(
 ) -> str:
     if role == "main" and main_policy == "white_background":
         rows = [
-            "White-background main presentation: bright neutral studio exposure, soft grounding shadow, "
-            "clean edge separation, and no room or lifestyle staging."
+            "Main image requires a white external background with no room or lifestyle staging. "
+            "Use the model's main image direction for the permitted product photography."
         ]
     else:
         audience = _compact_token_direction(direction.get("audience_and_market"))
-        staging = _compact_staging_direction(direction.get("environment_and_staging"))
-        photography = _compact_photography_direction(direction.get("photography_direction") or "")
+        staging = _compact_token_direction(direction.get("environment_and_staging"))
+        photography = _compact_token_direction(direction.get("photography_direction"))
         cohesion = _compact_token_direction(direction.get("cohesion_rule"))
         rows = [
             "Market context: " + audience if audience else "",
-            "Staging intent: " + staging if staging and role in {"main", "scene"} else "",
+            "Staging intent (only where the role contains staging): " + staging if staging else "",
             "Photography intent: " + photography if photography else "",
             "Child cohesion: " + cohesion if cohesion else "",
         ]
@@ -453,28 +414,17 @@ def _family_art_direction(
     return "\n".join(row for row in rows if row)
 
 
-def _compact_palette_direction(value: str, *, role: str) -> str:
+def _compact_palette_direction(value: str) -> str:
     """Project Gemini's final child palette without interpreting or replacing it."""
-    del role
     text = _compact_token_direction(value)
     return "Child palette: " + text + "." if text else ""
-
-
-def _compact_photography_direction(value: str) -> str:
-    """Keep Gemini's lighting and material-rendering intent compact."""
-    return _compact_staging_direction(value)
-
-
-def _compact_staging_direction(value: str) -> str:
-    """Project current planner staging without a retired program-prefix reader."""
-    return _sanitize_planner_direction(value)
 
 
 def _presentation_system(direction: dict[str, Any], *, role: str, main_policy: str = "") -> str:
     """Emit Gemini's one child-wide palette and component system once."""
     if role == "main" and main_policy == "white_background":
         return "Do not apply room, floor, textile, staging, or child room palette tokens to this white-background main image."
-    palette = _compact_palette_direction(direction.get("palette_direction") or "", role=role)
+    palette = _compact_palette_direction(direction.get("palette_direction") or "")
     if role in {"func", "size"}:
         rows = [
             palette,
@@ -494,10 +444,6 @@ def _compact_token_direction(value: Any) -> str:
     if not text:
         return ""
     return text
-
-
-def _sanitize_planner_direction(value: Any) -> str:
-    return " ".join(_sanitize_role_image_direction(value).split()).strip(" .;:")
 
 
 def _measurement_content(value: Any) -> str:

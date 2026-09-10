@@ -17,6 +17,7 @@ from . import api_registry
 from .image_provider_common import (
     ImageGenerationError,
     ProviderConfigurationError,
+    ProviderTransportError,
     image_url_download_attempts,
     image_url_download_retry_delay,
     is_transient_imagegen_error,
@@ -82,11 +83,30 @@ def _registry_image_provider_specs() -> dict[str, ImageProviderSpec]:
 
 def generate_with_registry_image_provider(
     *, provider_name: str, image_inputs: list[bytes], prompt: str,
-    mask_bytes: bytes | None = None, request_id: str = ""
+    mask_bytes: bytes | None = None, request_id: str = "", request_audit: dict[str, Any] | None = None,
 ) -> bytes:
     if not image_inputs:
         raise ProviderConfigurationError(provider_name, "image provider requires at least one reference image")
     spec = _image_provider_spec(provider_name)
+    if len(image_inputs) > 1 and not api_registry.image_provider_supports_multiple_references(provider_name, len(image_inputs)):
+        raise ProviderConfigurationError(provider_name, "Route does not support the required reference set")
+    profile = spec.protocol_profile or {} if spec else {}
+    originals = [hashlib.sha256(data).hexdigest() for data in image_inputs]
+    image_inputs = [_bounded_image_data_url_bytes(data) for data in image_inputs]
+    original_mask_sha = hashlib.sha256(mask_bytes).hexdigest() if mask_bytes else ""
+    if mask_bytes is not None:
+        mask_bytes = _validated_mask_bytes(mask_bytes, expected_image_bytes=image_inputs[0])
+    if request_audit is not None:
+        request_audit.update({
+            "request_id": request_id, "provider": provider_name, "model": spec.model if spec else "",
+            "request_size": str(profile.get("request_size") or ""), "quality": str(profile.get("quality") or "low"),
+            "output_contract": str(profile.get("output_contract") or ""),
+            "mask_sha256": hashlib.sha256(mask_bytes).hexdigest() if mask_bytes else "",
+            "original_mask_sha256": original_mask_sha,
+            "inputs": [{"original_sha256": original, "sent_sha256": hashlib.sha256(data).hexdigest(),
+                        "sent_bytes": len(data), "transform": "unchanged" if original == hashlib.sha256(data).hexdigest() else "bounded_image_encoding"}
+                       for original, data in zip(originals, image_inputs)],
+        })
     if spec and spec.api_type == "openai_images_edit":
         return _generate_with_openai_images_edit(
             provider_name=provider_name,
@@ -159,6 +179,8 @@ def _generate_with_openai_images_edit(
             text = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         excerpt = exc.read().decode("utf-8", errors="replace")[:800]
+        if exc.code in {408, 504, 524}:
+            raise ProviderTransportError(provider_name, f"Remote image result unknown after HTTP {exc.code}: {excerpt}", ambiguous=True) from exc
         raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
     except urllib.error.URLError as exc:
         raise ImageGenerationError(f"{provider_name} request failed: {exc}") from exc

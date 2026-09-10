@@ -126,12 +126,18 @@ def image_provider_supports_mask(name: str) -> bool:
     )
 
 
-def image_provider_supports_multiple_references(name: str) -> bool:
+def image_provider_supports_multiple_references(name: str, reference_count: int = 2) -> bool:
     logical_name = str(name or "").strip()
     return any(
         entry.name == logical_name and "multiple_reference_images" in entry.capabilities
+        and reference_count <= int(entry.protocol_profile.get("max_reference_images") or (1 if entry.api_type == "highwayapi" else 16))
         for entry in image_provider_entries()
     )
+
+
+def image_provider_resource_group(name: str) -> str:
+    entry = next((row for row in image_provider_entries() if row.name == name), None)
+    return str((entry.raw.get("resource_group") if entry else "") or name)
 
 
 def dedupe_image_provider_names(names: list[str]) -> list[str]:

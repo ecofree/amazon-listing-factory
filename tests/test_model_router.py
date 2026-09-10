@@ -104,6 +104,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(2, request.call_count)
 
     def test_visual_planning_physical_request_budget_is_enforced(self) -> None:
+        from http.client import IncompleteRead
         clients = [
             {
                 "name": name, "family": "openai_vision", "scope": "visual_planning",
@@ -139,6 +140,14 @@ class ModelRouterTests(unittest.TestCase):
         }
         fallback = {**client, "name": "planner-fallback", "base_url": "https://planner-fallback.example/v1"}
         good = json.dumps({"choices": [{"message": {"content": "good"}}]})
+        events = []
+        with patch("core.vision_gemini_client.gemini_clients", return_value=[client, fallback]), patch(
+            "core.vision_gemini_client._post_vision_request", side_effect=[IncompleteRead(b""), good],
+        ) as truncated, patch("core.vision_gemini_client._deadline_sleep"):
+            self.assertEqual("good", gemini_stream_generate("prompt", [], client_scope="visual_planning",
+                total_timeout_seconds=10, max_physical_requests=2, request_id="truncated-response-test", attempt_observer=events.append))
+        self.assertEqual(2, truncated.call_count)
+        self.assertEqual(["transport_failure", "success"], [event["status"] for event in events])
         with (
             patch("core.vision_gemini_client.gemini_clients", return_value=[client, fallback]),
             patch(

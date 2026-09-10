@@ -50,6 +50,11 @@ class _Plugin:
 
 
 class ProviderRuntimeV1Tests(unittest.TestCase):
+    def setUp(self):
+        memory = patch("core.image_provider_common._system_memory_bytes", return_value=(32 * 1024**3, 20 * 1024**3))
+        memory.start()
+        self.addCleanup(memory.stop)
+
     def tearDown(self) -> None:
         reset_provider_run_circuits()
 
@@ -67,11 +72,18 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             assigned = routing.assign_provider_pool([task])[0]
         self.assertLessEqual(len(assigned["providers"]), 2)
         self.assertEqual(["apimart"], assigned["child_provider_reserve"])
-        self.assertEqual("aicost_gpt_image_2", assigned["child_provider_primary"])
-        self.assertEqual("krill_gpt_image_2", assigned["child_provider_backup"])
+        self.assertEqual("krill_gpt_image_2", assigned["child_provider_primary"])
+        self.assertEqual("aicost_gpt_image_2", assigned["child_provider_backup"])
         self.assertTrue(assigned["child_provider_lock"])
 
     def test_pool_keeps_all_roles_on_one_child_provider(self) -> None:
+        from core.api_registry import image_provider_resource_group
+        entries = [SimpleNamespace(name=name, raw={"resource_group": "account-a"}) for name in ("model-a", "model-b")]
+        with patch("core.api_registry.image_provider_entries", return_value=entries):
+            self.assertEqual(image_provider_resource_group("model-a"), image_provider_resource_group("model-b"))
+            with patch("core.image_generation.provider_concurrency_limit", return_value=1), patch("core.image_generation._memory_worker_cap", return_value=8), patch("core.image_generation._cpu_worker_cap", return_value=8), patch("core.image_generation._policy_parallel_cap", return_value=8):
+                self.assertEqual(1, _effective_generation_workers([
+                    {"providers": ["model-a"]}, {"providers": ["model-b"]}], requested_workers=8))
         tasks = [
             {"child": "B1", "job_dir": "job", "category_id": "bed_frame", "role": role, "providers": ["a", "b", "c"]}
             for role in ("main", "scene", "func")
@@ -200,10 +212,10 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         ):
             ordered = routing._order_by_health({"job_dir": "job"}, providers)
         self.assertEqual(
-            ["qc_yc_fixed", "cxk_fixed", "aicost_gpt_image_2", "highwayapi_gpt_image_2", "apimart"],
+            ["highwayapi_gpt_image_2", "apimart", "qc_yc_fixed", "cxk_fixed", "krill_gpt_image_2"],
             ordered[:5],
         )
-        self.assertEqual(["krill_gpt_image_2", "dragoncode"], ordered[5:])
+        self.assertEqual(["aicost_gpt_image_2", "dragoncode"], ordered[5:])
         tasks = [
             {
                 "child": f"B{i}",
@@ -239,12 +251,13 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 "providers": ["a", "b"], "child_provider_reserve": ["c", "d"],
                 "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "scene",
                 "logical_task_id": "generate:B1:scene", "provider_attempts": {},
+                "task_fingerprint": "fixture-task", "generation_references": [],
             }
             with (
                 patch("core.image_generation_executor.generation_reference_primary_path", return_value=source),
                 patch(
                     "core.image_generation_executor.generation_reference_sources",
-                    return_value=[{"kind": "editable_reference", "path": source}],
+                    return_value=[{"kind": "edit_base", "path": source}],
                 ),
                 patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
                 patch("core.image_generation_executor.load_provider_policy", return_value={}),
@@ -277,17 +290,22 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             output = job / "candidate.png"
             Image.new("RGB", (32, 32), "white").save(source)
             Image.new("RGBA", (32, 32), (255, 255, 255, 128)).save(mask)
+            support = job / "support.png"
+            Image.new("RGB", (32, 32), "blue").save(support)
             source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
             mask_sha = hashlib.sha256(mask.read_bytes()).hexdigest()
             task = {
                 "job_dir": str(job), "output_path": str(output), "prompt": "prompt",
                 "providers": ["unsupported", "a"], "child_provider_reserve": [],
                 "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "func",
-                "logical_task_id": "generate:B1:func", "provider_attempts": {},
+                "logical_task_id": "generate:B1:func", "provider_attempts": {}, "edit_base_sha256": source_sha,
+                "task_fingerprint": "fixture-task",
                 "generation_references": [{
-                    "kind": "editable_reference", "path": "source.png", "sha256": source_sha,
+                    "kind": "edit_base", "path": "source.png", "sha256": source_sha,
+                    "child": "B1", "source_id": "source_00", "purpose": "Edit masked reference", "evidence_ids": [],
                     "protected_mask": {"path": "mask.png", "sha256": mask_sha},
-                }],
+                }, {"kind": "product_evidence", "path": "support.png", "sha256": hashlib.sha256(support.read_bytes()).hexdigest(),
+                    "child": "B1", "source_id": "source_01", "purpose": "Verify drawer side", "evidence_ids": []}],
             }
             with (
                 patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
@@ -296,6 +314,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor.provider_runtime_circuit_key", return_value="provider:a"),
                 patch("core.image_generation_executor.assert_provider_allowed"),
                 patch("core.image_generation_executor.image_provider_supports_mask", side_effect=lambda name: name == "a"),
+                patch("core.image_generation_executor.image_provider_supports_multiple_references", side_effect=lambda name, count: name == "a" and count == 2),
                 patch("core.image_generation_executor.generate_with_provider_retries", return_value=b"pixels") as generate,
                 patch("core.image_generation_executor.commit_candidate_output", side_effect=lambda _job, _task, data: output.write_bytes(data)),
                 patch("core.image_generation_executor._finalize_candidate_bytes", return_value=b"pixels"),
@@ -303,6 +322,26 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor._record_provider_event_audit_only"),
             ):
                 generate_one(task, plugin=_Plugin())
+            from core import image_provider_transport as transport
+            audit = {}
+            spec = transport.ImageProviderSpec(name="a", display="a", url="https://invalid.example", api_type="openai_images_edit",
+                key_env="FIXTURE_ONLY", model="fixture", protocol_profile={"request_size": "1024x1024", "quality": "low"})
+            with patch.object(transport, "_image_provider_spec", return_value=spec), patch.object(
+                transport.api_registry, "image_provider_supports_multiple_references", return_value=True,
+            ), patch.object(transport, "_generate_with_openai_images_edit", return_value=b"candidate") as send:
+                transport.generate_with_registry_image_provider(provider_name="a", image_inputs=[source.read_bytes(), support.read_bytes()],
+                    prompt="fixture", mask_bytes=mask.read_bytes(), request_id="fixture-request", request_audit=audit)
+            sent = send.call_args.kwargs["image_inputs"]
+            self.assertEqual(2, len(sent))
+            self.assertEqual([hashlib.sha256(data).hexdigest() for data in sent], [row["sent_sha256"] for row in audit["inputs"]])
+            self.assertEqual([source_sha, hashlib.sha256(support.read_bytes()).hexdigest()], [row["original_sha256"] for row in audit["inputs"]])
+            self.assertEqual(hashlib.sha256(send.call_args.kwargs["mask_bytes"]).hexdigest(), audit["mask_sha256"])
+            with patch.object(transport, "_image_provider_spec", return_value=spec), patch.object(
+                transport.api_registry, "image_provider_supports_multiple_references", return_value=False,
+            ), patch.object(transport, "_generate_with_openai_images_edit") as unsupported:
+                with self.assertRaises(ProviderConfigurationError):
+                    transport.generate_with_registry_image_provider(provider_name="a", image_inputs=[source.read_bytes(), support.read_bytes()], prompt="fixture")
+                unsupported.assert_not_called()
         self.assertIsNotNone(generate.call_args.kwargs["mask_bytes"])
         self.assertEqual("a", generate.call_args.kwargs["provider_name"])
         self.assertEqual(1, generate.call_count)
@@ -318,12 +357,13 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 "providers": ["a", "b"], "child_provider_reserve": ["c"],
                 "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "scene",
                 "logical_task_id": "generate:B1:scene", "provider_attempts": {},
+                "task_fingerprint": "fixture-task", "generation_references": [],
             }
             with (
                 patch("core.image_generation_executor.generation_reference_primary_path", return_value=source),
                 patch(
                     "core.image_generation_executor.generation_reference_sources",
-                    return_value=[{"kind": "editable_reference", "path": source}],
+                    return_value=[{"kind": "edit_base", "path": source}],
                 ),
                 patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
                 patch("core.image_generation_executor.load_provider_policy", return_value={}),
@@ -406,7 +446,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation.provider_order", return_value=["healthy"]),
                 patch("core.image_generation._generation_execution_revision", return_value="exec"),
                 patch("core.image_generation._runtime_generation_references", return_value=[{
-                    "kind": "editable_reference", "path": "images/source.png", "sha256": "source-sha",
+                    "kind": "edit_base", "path": "images/source.png", "sha256": "source-sha",
                 }]),
                 patch("core.image_generation.apply_role_provider_policy"),
                 patch("core.image_generation.eligible_imagegen_providers", side_effect=lambda _prompt, providers: providers),
@@ -414,7 +454,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation._execute", side_effect=execute),
             ):
                 result = run_image_revision(
-                    job_dir=tmp, plugin=_Plugin(), child="B1", role="main", reason="human revision",
+                    job_dir=tmp, plugin=_Plugin(), child="B1", role="main", reason="human revision", revision_mode="full_redraw",
                 )
         self.assertEqual(str(Path(tmp).resolve()), captured["job_dir"])
         self.assertEqual(1, len(captured["generation_references"]))
@@ -452,13 +492,13 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation.read_image_tasks", return_value={"tasks": [task]}),
                 patch("core.image_generation.current_candidate", return_value={
                     "candidate_revision": 0,
-                    "provider_name": "old-provider",
+                    "provider_name": "old-provider", "candidate_sha256": "b" * 64, "candidate_path": "previous.png",
                 }),
                 patch("core.image_generation.provider_order", return_value=[
                     "old-provider", "new-provider", "reserve-provider",
                 ]),
                 patch("core.image_generation._generation_execution_revision", return_value="exec"),
-                patch("core.image_generation._runtime_generation_references", return_value=[]),
+                patch("core.image_generation._runtime_generation_references", return_value=task["generation_references"]),
                 patch("core.image_generation.apply_role_provider_policy"),
                 patch("core.image_generation.eligible_imagegen_providers", side_effect=lambda _prompt, providers: providers),
                 patch("core.image_generation.assign_provider_pool", side_effect=assign_alternate),
@@ -468,8 +508,12 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                     job_dir=tmp, plugin=_Plugin(), child="B1", role="main",
                     reason="hard-fact QA failure",
                 )
-        self.assertEqual(["new-provider", "reserve-provider"], alternate["providers"])
-        self.assertEqual([], alternate["child_provider_reserve"])
+        self.assertEqual(["old-provider", "new-provider"], alternate["providers"])
+        self.assertEqual(["reserve-provider"], alternate["child_provider_reserve"])
+        self.assertEqual("b" * 64, alternate["edit_base_sha256"])
+        self.assertEqual(task["source_sha256"], alternate["source_sha256"])
+        self.assertEqual(["edit_base", "product_evidence"], [ref["kind"] for ref in alternate["generation_references"]])
+        self.assertIn("TARGETED CANDIDATE EDIT", alternate["prompt"])
 
     def test_configuration_failure_opens_run_circuit(self) -> None:
         error = ProviderConfigurationError("bad", "401")
@@ -635,7 +679,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation.current_candidate", return_value={}),
                 patch("core.image_generation.provider_order", return_value=["p"]),
                 patch("core.image_generation._generation_execution_revision", return_value="exec"),
-                patch("core.image_generation._runtime_generation_references", return_value=[]),
+                patch("core.image_generation._runtime_generation_references", return_value=task["generation_references"]),
                 patch("core.image_generation.apply_role_provider_policy"),
                 patch("core.image_generation.eligible_imagegen_providers", return_value=[]),
                 patch("core.image_generation._execute") as execute,
@@ -655,6 +699,12 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual([], completed)
         self.assertEqual(1, len(failures))
         self.assertEqual("retryable", failures[0]["task_status"])
+        unknown = ProviderTransportError("p", "remote result not received", ambiguous=True)
+        self.assertEqual("review", _generation_failure_status(unknown))
+        with patch.object(routing, "_generate_with_provider_deadline", side_effect=unknown) as transport:
+            with self.assertRaises(ProviderTransportError):
+                routing.generate_with_provider_retries(provider_name="p", image_input_paths=[], prompt="x")
+        self.assertEqual(1, transport.call_count)
         with patch("core.image_generation.generate_one", return_value=task):
             with self.assertRaisesRegex(OSError, "state write"):
                 _execute([task], plugin=_Plugin(), workers=1,

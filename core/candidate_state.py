@@ -22,13 +22,14 @@ from .image_upscale import (
 from .image_provider_common import CandidateCommitError
 from .io import file_sha256, read_json, write_json
 from .paths import resolve_job_owned_path
+from .image_reference_context import validate_reference_set
 
 
 class CandidateStateError(CandidateCommitError):
     pass
 
 
-CANDIDATE_MANIFEST_SCHEMA_VERSION = "candidate-manifest-v6-sha-commit-1600-publication"
+CANDIDATE_MANIFEST_SCHEMA_VERSION = "candidate-manifest-v7-typed-edit-provenance"
 _CANDIDATE_MANIFEST_FIELDS = {
     "schema_version", "child", "role", "logical_task_id", "input_revision_id",
     "task_fingerprint", "candidate_revision", "candidate_sha256", "candidate_path",
@@ -37,6 +38,7 @@ _CANDIDATE_MANIFEST_FIELDS = {
     "attempted_providers", "attempted_provider_failures", "fallback_reason", "upscale_backend",
     "task_prompt_fingerprint", "request_prompt_fingerprint", "prompt_path", "source_path",
     "source_sha256", "transport_attempt", "provider_attempts", "status",
+    "generation_references", "edit_base_sha256", "edit_parent_candidate_sha256", "revision_mode", "request_audit",
 }
 
 
@@ -54,6 +56,27 @@ def candidate_current(job_dir: str | Path, task: dict[str, Any]) -> bool:
     return bool(current_candidate(job_dir, task))
 
 
+def candidate_by_sha(job_dir: str | Path, task: dict[str, Any], candidate_sha256: str) -> dict[str, Any]:
+    """Resolve an explicit choice within this task; never silently fall back."""
+    job = Path(job_dir).resolve()
+    directory = _manifest_path(job, task, 0).parent
+    for path in sorted(directory.glob("candidate*.json")):
+        match = re.fullmatch(r"candidate(0|[1-9]\d*)\.json", path.name)
+        if not match:
+            continue
+        try:
+            row = read_json(path)
+        except (ValueError, OSError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("candidate_sha256") == candidate_sha256:
+            if row.get("candidate_revision") != int(match[1]):
+                raise CandidateStateError("Explicit candidate manifest revision disagrees with its filename")
+            return _recover_bound_manifest(job, row, task)
+    raise CandidateStateError("Explicit candidate SHA is not in the current task")
+
+
 def write_candidate_manifest(
     job_dir: str | Path, task: dict[str, Any], *, candidate_bytes_path: Path | None = None,
     upscale_backend: str = UPSCALE_BACKEND,
@@ -67,7 +90,9 @@ def write_candidate_manifest(
     revision = int(task.get("candidate_revision") or _candidate_revision_from_name(output.name, f"{task.get('task_fingerprint')}.candidate"))
     provider_name = str(task.get("provider") or "")
     provider_identity = image_provider_physical_identity(provider_name)
-    source_sha = _generation_reference_sha(task)
+    source_sha = str(task.get("source_sha256") or "")
+    references = [{**row, "path": _job_owned_path(job_path, row["path"]).relative_to(job_path).as_posix()}
+                  for row in task.get("generation_references", [])]
     manifest = {
         "schema_version": CANDIDATE_MANIFEST_SCHEMA_VERSION,
         "child": str(task.get("child") or ""),
@@ -98,6 +123,11 @@ def write_candidate_manifest(
         "prompt_path": str(task.get("prompt_path") or ""),
         "source_path": source.relative_to(job_path).as_posix(),
         "source_sha256": source_sha,
+        "generation_references": references,
+        "edit_base_sha256": str(task.get("edit_base_sha256") or ""),
+        "edit_parent_candidate_sha256": str(task.get("edit_parent_candidate_sha256") or ""),
+        "revision_mode": str(task.get("revision_mode") or "initial"),
+        "request_audit": dict(task.get("request_audit") or {}),
         "transport_attempt": int(task.get("transport_attempt") or 0),
         "provider_attempts": dict(task.get("provider_attempts") or {}),
         "status": "candidate_ready",
@@ -231,6 +261,14 @@ def _recover_bound_manifest(job_path: Path, manifest: dict[str, Any], task: dict
 
 
 def _validate_manifest_binding(job_path: Path, manifest: dict[str, Any], task: dict[str, Any]) -> None:
+    if task.get("revision_mode") == "targeted_edit":
+        from .image_tasks import read_image_tasks
+
+        bound = [row for row in read_image_tasks(job_path)["tasks"]
+                 if row["task_fingerprint"] == task["task_fingerprint"] and row["logical_task_id"] == task["logical_task_id"]]
+        if len(bound) != 1:
+            raise CandidateStateError("Targeted edit has no unique canonical ImageTask")
+        task = bound[0]
     if not isinstance(manifest, dict) or manifest.get("schema_version") != CANDIDATE_MANIFEST_SCHEMA_VERSION:
         raise CandidateStateError("CandidateManifest schema is stale")
     if set(manifest) != _CANDIDATE_MANIFEST_FIELDS:
@@ -241,10 +279,10 @@ def _validate_manifest_binding(job_path: Path, manifest: dict[str, Any], task: d
         "logical_task_id": str(task.get("logical_task_id") or ""),
         "input_revision_id": str(task.get("input_revision_id") or ""),
         "task_fingerprint": str(task.get("task_fingerprint") or ""),
-        "source_sha256": _generation_reference_sha(task),
+        "source_sha256": str(task.get("source_sha256") or ""),
     }
     if any(str(manifest.get(key) or "") != value for key, value in expected.items()):
-        raise CandidateStateError("CandidateManifest does not match ImageTaskV9")
+        raise CandidateStateError("CandidateManifest does not match ImageTaskV10")
     sha = str(manifest.get("candidate_sha256") or "")
     if len(sha) != 64 or not str(manifest.get("candidate_path") or ""):
         raise CandidateStateError("CandidateManifest has no committed candidate identity")
@@ -264,6 +302,50 @@ def _validate_manifest_binding(job_path: Path, manifest: dict[str, Any], task: d
     task_source = _job_owned_path(job_path, str(task.get("source_path") or ""))
     if manifest_source != task_source:
         raise CandidateStateError("CandidateManifest source path changed")
+    references = manifest["generation_references"]
+    try:
+        validate_reference_set(references, child=manifest["child"], edit_base_sha256=manifest["edit_base_sha256"])
+    except ValueError as exc:
+        raise CandidateStateError(str(exc)) from exc
+    for ref in references:
+        path = _job_owned_path(job_path, ref["path"])
+        if not path.is_file() or file_sha256(path) != ref["sha256"]:
+            raise CandidateStateError("Candidate input reference is missing or changed")
+    mode = manifest["revision_mode"]
+    if mode not in {"initial", "targeted_edit", "full_redraw"}:
+        raise CandidateStateError("Candidate revision mode is invalid")
+    parent = manifest["edit_parent_candidate_sha256"]
+    if mode == "targeted_edit":
+        if len(parent) != 64 or parent != manifest["edit_base_sha256"]:
+            raise CandidateStateError("Targeted edit is not bound to its parent candidate")
+    elif parent or manifest["edit_base_sha256"] != manifest["source_sha256"]:
+        raise CandidateStateError("Initial/full-redraw base must be the original source")
+    expected_refs = [{**ref, "path": _job_owned_path(job_path, ref["path"]).relative_to(job_path).as_posix()}
+                     for ref in task["generation_references"]]
+    if mode == "targeted_edit":
+        original = {**expected_refs[0], "kind": "product_evidence", "purpose": "Original product structure and state evidence"}
+        original.pop("protected_mask", None)
+        if references[1:] != [original, *expected_refs[1:]]:
+            raise CandidateStateError("Targeted edit auxiliary evidence differs from the task")
+        match = re.fullmatch(r"candidate_(\d+)", references[0]["source_id"])
+        if not match or int(match[1]) >= revision:
+            raise CandidateStateError("Targeted edit parent is not an earlier candidate")
+        parent_manifest = read_json(_manifest_path(job_path, task, int(match[1])))
+        if parent_manifest.get("candidate_sha256") != parent or _job_owned_path(job_path, str(parent_manifest.get("candidate_path") or "")) != _job_owned_path(job_path, references[0]["path"]):
+            raise CandidateStateError("Targeted edit parent manifest does not match its pixels")
+    elif references != expected_refs:
+        raise CandidateStateError("Candidate references differ from the task reference contract")
+    audit = manifest["request_audit"]
+    if not isinstance(audit, dict):
+        raise CandidateStateError("Candidate request audit is malformed")
+    sent = audit.get("inputs", [])
+    if manifest.get("provider_name") not in {"copy", "mock"}:
+        if audit.get("provider") != manifest["provider_name"] or audit.get("model") != manifest["provider_model"] or not audit.get("request_id"):
+            raise CandidateStateError("Candidate request identity is inconsistent")
+        if not isinstance(sent, list) or any(not isinstance(row, dict) for row in sent):
+            raise CandidateStateError("Candidate actual-input evidence is malformed")
+        if [row.get("original_sha256") for row in sent] != [row["sha256"] for row in references] or any(not re.fullmatch(r"[0-9a-f]{64}", str(row.get("sent_sha256") or "")) for row in sent):
+            raise CandidateStateError("Candidate has no matching actual-input transport evidence")
     identity = manifest.get("provider_identity") if isinstance(manifest.get("provider_identity"), dict) else {}
     if not identity or image_provider_identity_key(identity) != str(manifest.get("provider_physical") or ""):
         raise CandidateStateError("CandidateManifest provider identity is invalid")
@@ -332,8 +414,6 @@ def _manifest_path(job_path: Path, task: dict[str, Any], revision: int) -> Path:
     return _job_owned_path(job_path, str(path))
 
 
-def _generation_reference_sha(task: dict[str, Any]) -> str:
-    return str(task.get("generation_reference_sha256") or task.get("source_sha256") or "")
 
 
 def _candidate_revision_from_name(name: str, prefix: str) -> int:

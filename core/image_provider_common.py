@@ -362,6 +362,8 @@ _TRANSPORT_ERROR_MARKERS = (
 
 
 def provider_concurrency_limit(provider_name: str) -> int:
+    from .api_registry import image_provider_resource_group
+    provider_name = image_provider_resource_group(provider_name)
     if provider_name == "host_image_memory":
         total, available = _system_memory_bytes()
         if total <= 0:
@@ -400,7 +402,9 @@ def provider_concurrency_slot(provider_name: str, *, deadline: float | None = No
         yield
         return
     effective_deadline = deadline if deadline is not None else time.monotonic() + provider_timeout_seconds(provider_name)
-    semaphore = _provider_semaphore(provider_name, limit)
+    from .api_registry import image_provider_resource_group
+    resource_group = image_provider_resource_group(provider_name)
+    semaphore = _provider_semaphore(resource_group, limit)
     remaining = effective_deadline - time.monotonic()
     if remaining <= 0 or not semaphore.acquire(timeout=max(0.0, remaining)):
         raise ProviderQueueUnavailable(
@@ -410,7 +414,7 @@ def provider_concurrency_slot(provider_name: str, *, deadline: float | None = No
     handle = None
     try:
         while handle is None:
-            handle = _try_acquire_provider_slot(provider_name, limit)
+            handle = _try_acquire_provider_slot(resource_group, limit)
             if handle is not None:
                 break
             remaining = effective_deadline - time.monotonic()

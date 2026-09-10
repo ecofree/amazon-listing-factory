@@ -150,6 +150,9 @@ def run_image_generation(
                 record_task_successes(job_path, owner_stage="generate", attempt_id=attempt_id, tasks=[recovered])
             continue
         state = task_record_current(job_path, task["logical_task_id"], task["input_revision_id"])
+        if state.get("request_outcome") == "unknown":
+            failures.append(_failure({**task, **state}, owner="generation", error="Remote request outcome is unknown; reconcile the recorded request before explicitly revising this image.", status="review"))
+            continue
         if (
             state.get("status") == "blocked"
             and state.get("execution_revision") == execution_revision
@@ -307,7 +310,10 @@ def run_image_revision(
     reason: str,
     config_path: str = "",
     production: bool = False,
+    revision_mode: str = "targeted_edit", candidate_sha256: str = "",
 ) -> dict[str, Any]:
+    if revision_mode not in {"targeted_edit", "full_redraw"}:
+        raise ValueError("Revision mode must be targeted_edit or full_redraw")
     if not str(reason or "").strip():
         raise RuntimeError("Revision requires a human-readable reason")
     job_path = Path(job_dir).resolve()
@@ -325,8 +331,11 @@ def run_image_revision(
         raise RuntimeError(f"Ready image task not found for {child}/{role}")
     candidate_state_corrupt = False
     try:
-        current = current_candidate(job_path, task, required=False) or {}
+        from .candidate_state import candidate_by_sha
+        current = candidate_by_sha(job_path, task, candidate_sha256) if candidate_sha256 else current_candidate(job_path, task, required=False) or {}
     except CandidateStateError:
+        if candidate_sha256 or revision_mode != "full_redraw":
+            raise
         current = {}
         candidate_state_corrupt = True
     providers = provider_order(plugin)
@@ -338,15 +347,31 @@ def run_image_revision(
     revision = _next_candidate_revision(
         job_path, task,
         (int(current_revision) if current_revision is not None else -1) + 1,
-        skip_existing=candidate_state_corrupt,
+        skip_existing=candidate_state_corrupt or bool(candidate_sha256),
     )
-    is_full_redraw = bool(current) or revision > 0
-    request_heading = "EXPLICIT FULL-REDRAW REQUEST" if is_full_redraw else "EXPLICIT MISSING CANDIDATE REQUEST"
-    request_intro = (
-        "Generate a complete new candidate because a human reviewer requested a full-image redraw; this is not a localized text repair. "
-        if is_full_redraw
-        else "Generate the first candidate for this ready role because no current candidate exists. "
-    )
+    mode = revision_mode if current or candidate_state_corrupt else "initial"
+    references = _runtime_generation_references(job_path, task)
+    parent_sha = ""
+    if mode == "targeted_edit":
+        parent_sha = current["candidate_sha256"]
+        source_evidence = {**references[0], "kind": "product_evidence", "purpose": "Original product structure and state evidence"}
+        source_evidence.pop("protected_mask", None)
+        references = [{**source_evidence, "kind": "edit_base", "source_id": f"candidate_{current['candidate_revision']}",
+                       "path": str(resolve_job_owned_path(job_path, current["candidate_path"])), "sha256": parent_sha,
+                       "purpose": "Edit this selected candidate only within the requested changes", "evidence_ids": []},
+                      source_evidence, *references[1:]]
+        from .image_reference_context import reference_prompt
+        from .image_prompt_compiler import _product_boundary
+        old_reference, remainder = base_prompt.split("[REFERENCE]\n", 1)
+        _, after_reference = remainder.split("\n\n[STYLE]", 1)
+        base_prompt = old_reference + "[REFERENCE]\n" + reference_prompt(references) + "\n" + _product_boundary(task, task["edit_contract"]) + "\n\n[STYLE]" + after_reference
+    request_heading = {"targeted_edit": "TARGETED CANDIDATE EDIT", "full_redraw": "EXPLICIT FULL-REDRAW REQUEST",
+                       "initial": "EXPLICIT MISSING CANDIDATE REQUEST"}[mode]
+    request_intro = {
+        "targeted_edit": "Edit attachment 1 only for the listed issue. Preserve other correct product pixels, approved copy, composition and staging.",
+        "full_redraw": "Generate a complete new candidate because a human reviewer requested a full-image redraw; this is not a localized text repair.",
+        "initial": "Generate the first candidate for this ready role because no current candidate exists.",
+    }[mode]
     prompt = _compose_revision_prompt(
         base_prompt=base_prompt,
         request_heading=request_heading,
@@ -364,7 +389,9 @@ def run_image_revision(
     runtime_task = {
         **task,
         "source_path": str(resolve_job_owned_path(job_path, str(task["source_path"]))),
-        "generation_references": _runtime_generation_references(job_path, task),
+        "generation_references": references,
+        "edit_base_sha256": references[0]["sha256"],
+        "edit_parent_candidate_sha256": parent_sha, "revision_mode": mode,
         "output_path": str(resolve_job_owned_path(job_path, relative_output)),
         "candidate_path": relative_output,
         "prompt": prompt,
@@ -412,10 +439,10 @@ def run_image_revision(
             *(str(name) for name in assigned_task.get("providers") or [] if str(name)),
             *(str(name) for name in assigned_task.get("child_provider_reserve") or [] if str(name)),
         ]))
-        alternatives = [name for name in ordered if name != previous_provider]
-        if alternatives:
-            assigned_task["providers"] = alternatives[:2]
-            assigned_task["child_provider_reserve"] = alternatives[2:]
+        if mode == "targeted_edit" and previous_provider in ordered:
+            preferred = [previous_provider, *[name for name in ordered if name != previous_provider]]
+            assigned_task["providers"] = preferred[:2]
+            assigned_task["child_provider_reserve"] = preferred[2:]
     completed, failures = _execute(assigned, plugin=plugin, workers=1)
     if failures:
         return {"schema_version": "imagegen-revision-v1", "tasks": [], "failures": failures}
@@ -425,7 +452,7 @@ def run_image_revision(
         "schema_version": "imagegen-revision-v1",
         "tasks": [result],
         "failures": [],
-        "revision_mode": "full_redraw" if is_full_redraw else "missing_candidate",
+        "revision_mode": mode,
         "revision_reason": str(reason).strip(),
     }
 
@@ -667,7 +694,13 @@ def _effective_generation_workers(
     requested_cap = requested if requested > 0 else task_count
     policy_cap = _policy_parallel_cap()
     provider_cap = 0
+    from .api_registry import image_provider_resource_group
+    groups = set()
     for provider in {_task_primary_provider(task) for task in tasks} - {""}:
+        group = image_provider_resource_group(provider)
+        if group in groups:
+            continue
+        groups.add(group)
         limit = provider_concurrency_limit(provider)
         provider_cap += limit if limit > 0 else task_count
     provider_cap = provider_cap or 1
@@ -700,18 +733,17 @@ def _memory_worker_cap(tasks: list[dict[str, Any]] | None = None) -> int:
     if total <= 0 or available <= 0:
         return 1
     reserve = max(4 * 1024**3, int(total * 0.20))
-    # A generation task keeps one compressed reference and one response in
-    # memory. Use the live machine budget plus a bounded reference-size uplift;
-    # the former 6% of total RAM estimate unnecessarily capped this machine at
-    # two workers despite three independent provider slots.
+    # Multi-reference edits hold the complete input set, not only its largest file.
     largest_reference = 0
     for task in tasks or []:
+        task_bytes = 0
         for row in task.get("generation_references") or []:
             path = row.get("path") if isinstance(row, dict) else row
             try:
-                largest_reference = max(largest_reference, Path(str(path)).stat().st_size)
+                task_bytes += Path(str(path)).stat().st_size
             except (OSError, TypeError, ValueError):
                 continue
+        largest_reference = max(largest_reference, task_bytes)
     estimated_task_peak = max(768 * 1024**2, min(1536 * 1024**2, int(total * 0.04)))
     estimated_task_peak = max(
         estimated_task_peak,
@@ -730,6 +762,8 @@ def _capacity_stall_budget_seconds() -> float:
 
 
 def _generation_failure_status(exc: Exception) -> str:
+    if getattr(exc, "ambiguous", False):
+        return "review"
     # Only a locally compiled immutable prompt/contract may deterministically
     # block the task.  Provider transport, configuration, response decoding,
     # and invalid returned pixels are provider-owned and must remain recoverable.
@@ -745,7 +779,7 @@ def _failure(task: dict[str, Any], *, owner: str, error: str, status: str) -> di
     runtime = {
         key: task[key]
         for key in (
-            "transport_attempt", "provider_attempts", "execution_revision",
+            "transport_attempt", "provider_attempts", "execution_revision", "request_outcome", "request_audit",
         ) if key in task
     }
     return {
@@ -795,7 +829,7 @@ def _generation_execution_revision(providers: list[str]) -> str:
         # Reference cardinality is part of the executable generation contract.
         # A task that was blocked under the old single-reference runtime must
         # be eligible for recovery after the current func dual-reference fix.
-        "generation_reference_contract": "one_role_source_edit-v1",
+        "generation_reference_contract": "typed-reference-edit-base-v2",
         "execution_profiles": sorted(EXECUTION_PROFILES),
         "url_safety_policy": URL_SAFETY_POLICY_VERSION,
         "providers": [],
@@ -838,23 +872,8 @@ def _load_generation_env(*paths: str) -> None:
 
 
 def _runtime_generation_references(job_path: Path, task: dict[str, Any]) -> list[dict[str, Any]]:
-    references = task.get("generation_references")
-    if not isinstance(references, list) or not references:
-        raise RuntimeError(f"Image task has no generation reference set: {task.get('child')}/{task.get('role')}")
-    runtime: list[dict[str, Any]] = []
-    for row in references:
-        if not isinstance(row, dict) or not str(row.get("path") or "").strip():
-            continue
-        path = resolve_job_owned_path(job_path, str(row["path"]))
-        expected_sha = str(row.get("sha256") or "")
-        if not path.is_file() or len(expected_sha) != 64 or file_sha256(path) != expected_sha:
-            raise RuntimeError(f"Image task generation reference is missing or changed: {task.get('child')}/{task.get('role')}")
-        runtime.append({**row, "path": str(path)})
-    editable = [row for row in runtime if row.get("kind") == "editable_reference"]
-    if (
-        len(editable) != 1
-        or len(editable) != len(runtime)
-        or editable[0]["sha256"] != str(task.get("generation_reference_sha256") or "")
-    ):
-        raise RuntimeError(f"Image task generation reference contract is invalid: {task.get('child')}/{task.get('role')}")
-    return runtime
+    from .image_reference_context import generation_reference_sources
+
+    return [{**row, "path": str(row["path"])} for row in generation_reference_sources(
+        {**task, "job_dir": str(job_path)}, plugin=None,
+    )]

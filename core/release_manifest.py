@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .asset_manager import read_download_manifest
-from .candidate_state import CandidateStateError, current_candidate
+from .candidate_state import CandidateStateError, current_candidate, candidate_by_sha
 from .final_source_intents import read_final_source_intents
 from .image_prompt_compiler import image_branch_currentness, read_image_prompts
 from .image_task_inputs import release_candidate_fingerprint
@@ -18,17 +18,19 @@ from .run_scope import row_in_scope, scoped_family_children
 from .status import job_run_lock, task_record_current
 
 
-RELEASE_SCHEMA_VERSION = "release-manifest-v5"
-RELEASE_ARTIFACT = "release_manifest_v5.json"
-HUMAN_REVIEW_SCHEMA_VERSION = "human-review-v4"
-HUMAN_REVIEW_ARTIFACT = "human_review_v4.json"
+RELEASE_SCHEMA_VERSION = "release-manifest-v6"
+RELEASE_ARTIFACT = "release_manifest_v6.json"
+HUMAN_REVIEW_SCHEMA_VERSION = "human-review-v5"
+HUMAN_REVIEW_ARTIFACT = "human_review_v5.json"
 
 
 class ReleaseManifestError(RuntimeError):
     pass
 
 
-def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit: int = 0) -> dict[str, Any]:
+def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit: int = 0,
+                           candidate_choices: dict[tuple[str, str], str] | None = None,
+                           use_working_candidates: bool = False) -> dict[str, Any]:
     del limit
     job_path = Path(job_dir).resolve()
     family = _product_family(job_path)
@@ -52,7 +54,7 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
             }
             for child in expected_children
         }
-        return _persist_release_manifest(job_path, _with_release_diagnostics({
+        payload = _with_release_diagnostics({
             "schema_version": RELEASE_SCHEMA_VERSION,
             "job_id": job_path.name,
             "category_id": plugin.category_id,
@@ -64,7 +66,8 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
             "source_inventory_coverage": source_coverage,
             "children": children,
             "rows": [],
-        }))
+        })
+        return payload if candidate_choices is not None or use_working_candidates else _persist_release_manifest(job_path, payload)
     prompts = read_image_prompts(job_path, category_id=plugin.category_id)["prompts"]
     prompt_by_key = {
         (str(row.get("child") or ""), str(row.get("role") or "")): row
@@ -75,17 +78,20 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
         if role_prefix(row.get("role"))
     ]
     validate_task_inventory(tasks, expected_children, policy.counts)
-    qa_path = job_path / "reports" / "qa_evidence_v4.jsonl"
+    qa_path = job_path / "reports" / "qa_evidence_v5.jsonl"
     evidence_rows = read_qa_evidence(job_path) if qa_path.is_file() else []
-    evidence_by_key = {(row["child"], row["role"]): row for row in evidence_rows}
+    evidence_by_key = {(row["child"], row["role"], row["candidate_sha256"]): row for row in evidence_rows}
     reviews = _review_rows(job_path)
     rows: list[dict[str, Any]] = []
     parent = str(family["family"]["parent_asin"])
     for task in tasks:
         key = (task["child"], task["role"])
         candidate_error = ""
+        selected = next((review for review in reviews.values() if (review["child"], review["role"]) == key and review.get("selected") is True), None)
+        choice = (candidate_choices or {}).get(key, "" if use_working_candidates else str((selected or {}).get("candidate_sha256") or ""))
         try:
-            candidate = current_candidate(job_path, task) if task["formation_status"] == "ready" else {}
+            candidate = ((candidate_by_sha(job_path, task, choice) if choice else current_candidate(job_path, task))
+                         if task["formation_status"] == "ready" else {})
         except CandidateStateError as exc:
             candidate = {}
             candidate_error = f"CandidateStateError: {exc}"
@@ -97,12 +103,12 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
         stale_candidate_prompt = bool(candidate and not candidate_prompt_current)
         if stale_candidate_prompt:
             candidate = {}
-        evidence = evidence_by_key.get(key)
+        evidence = evidence_by_key.get((*key, candidate.get("candidate_sha256", "")))
         evidence_current = bool(
             candidate and evidence and evidence_is_current(evidence, task, candidate, job_dir=job_path)
         )
         automatic = str(evidence.get("automatic_decision") or "") if evidence_current else "unavailable"
-        review = reviews.get(key)
+        review = reviews.get((*key, candidate.get("candidate_sha256", "")))
         review_current = _review_is_current(review, task=task, candidate=candidate, evidence=evidence if evidence_current else {})
         human = str(review.get("decision") or "") if review_current else ""
         generation_state = task_record_current(job_path, task["logical_task_id"], task["input_revision_id"])
@@ -139,6 +145,8 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
                 gate["gate"] for gate in (evidence or {}).get("gates") or []
                 if evidence_current and gate.get("warning") is True
             ],
+            "unresolved_checks": [gate["gate"] for gate in (evidence or {}).get("gates", []) if evidence_current and gate["status"] == "inconclusive"],
+            "source_sha256": task["source_sha256"],
             "human_decision": human,
             "human_reason": str(review.get("reason") or "") if review_current else "",
             "final_decision": final,
@@ -171,7 +179,7 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
         "children": children,
         "rows": rows,
     }
-    return _persist_release_manifest(job_path, _with_release_diagnostics(payload))
+    return _with_release_diagnostics(payload) if candidate_choices is not None or use_working_candidates else _persist_release_manifest(job_path, _with_release_diagnostics(payload))
 
 
 def _candidate_prompt_current(
@@ -189,20 +197,21 @@ def _candidate_prompt_current(
 
 def record_human_review(
     *, job_dir: str | Path, plugin: ProductPlugin, child: str, role: str,
-    decision: str, reason: str = "",
+    decision: str, reason: str = "", candidate_sha256: str = "", resolutions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return record_human_reviews(
         job_dir=job_dir,
         plugin=plugin,
         targets=[(child, role)],
         decision=decision,
-        reason=reason,
+        reason=reason, candidate_choices={(child, role): candidate_sha256}, resolutions=resolutions,
     )
 
 
 def record_human_reviews(
     *, job_dir: str | Path, plugin: ProductPlugin,
     targets: list[tuple[str, str]], decision: str, reason: str = "",
+    candidate_choices: dict[tuple[str, str], str] | None = None, resolutions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     with job_run_lock(job_dir):
         decision = str(decision or "").strip().lower()
@@ -218,7 +227,7 @@ def record_human_reviews(
         }
         if not requested:
             raise ReleaseManifestError("Human review requires at least one child/role target")
-        manifest = build_release_manifest(job_dir=job_dir, plugin=plugin)
+        manifest = build_release_manifest(job_dir=job_dir, plugin=plugin, candidate_choices={key: (candidate_choices or {}).get(key, "") for key in requested})
         available = {
             (str(row.get("child") or ""), str(row.get("role") or "")): row
             for row in manifest["rows"]
@@ -229,38 +238,29 @@ def record_human_reviews(
                 "Unknown release candidate(s): " + ", ".join(f"{child}/{role}" for child, role in missing)
             )
         for key in sorted(requested):
-            automatic = available[key]["automatic_decision"]
-            if automatic != "pass":
-                raise ReleaseManifestError(
-                    f"Candidate cannot be reviewed while automatic decision is {automatic}: {key[0]}/{key[1]}"
-                )
-        warning_targets = [
-            key for key in sorted(requested)
-            if available[key].get("qa_warning_gates")
-        ]
-        reason_folded = reason.casefold()
-        compared_source_candidate = (
-            ("source" in reason_folded and "candidate" in reason_folded)
-            or ("源图" in reason and "候选" in reason)
-        )
-        if decision == "approve" and warning_targets and not compared_source_candidate:
-            raise ReleaseManifestError(
-                "Approving a QA warning requires a specific source/candidate comparison reason: "
-                + ", ".join(f"{child}/{role}" for child, role in warning_targets)
-            )
+            target = available[key]
+            automatic = target["automatic_decision"]
+            if automatic == "unavailable" or (decision == "approve" and automatic == "fail"):
+                raise ReleaseManifestError(f"Candidate cannot be approved before a factual failure is resolved: {key}: {automatic}")
+            if decision == "approve":
+                _validate_resolutions(resolutions or [], target)
         path = Path(job_dir) / "reports" / HUMAN_REVIEW_ARTIFACT
         payload = _load_reviews(path, job_id=Path(job_dir).name)
-        rows = [
-            row for row in payload["rows"]
-            if (str(row["child"]), str(row["role"])) not in requested
-        ]
+        replacing = {(key[0], key[1], available[key]["candidate_sha256"]) for key in requested}
+        rows = [dict(row) for row in payload["rows"]
+                if (row["child"], row["role"], row["candidate_sha256"]) not in replacing]
+        if decision == "approve":
+            for row in rows:
+                if (row["child"], row["role"]) in requested:
+                    row["selected"] = False
         reviewed_at = utc_now()
         for child, role in sorted(requested):
             target = available[(child, role)]
             rows.append({
                 "child": child,
                 "role": role,
-                "decision": decision,
+                "decision": decision, "selected": decision == "approve",
+                "resolutions": [row for row in (resolutions or []) if row.get("candidate_sha256") == target["candidate_sha256"]],
                 "reason": reason,
                 "candidate_sha256": target["candidate_sha256"],
                 "release_candidate_fingerprint": target["release_candidate_fingerprint"],
@@ -334,7 +334,7 @@ def source_inventory_coverage(
         intent_rows = read_final_source_intents(job_path, plugin=plugin, require_current=False)
     except Exception as exc:
         intent_rows = []
-        authority_errors.append(f"FinalSourceIntentV1 unavailable: {type(exc).__name__}: {exc}")
+        authority_errors.append(f"FinalSourceIntentV2 unavailable: {type(exc).__name__}: {exc}")
     intents = {
         (str(row.get("child") or ""), int(row.get("source_index") or 0)): row
         for row in intent_rows
@@ -371,7 +371,7 @@ def source_inventory_coverage(
                 "source_intent_revision_id": "",
                 "image_task_roles": [],
                 "status": "source_intent_missing",
-                "blocking_reason": "downloaded source has no FinalSourceIntentV1 row",
+                "blocking_reason": "downloaded source has no FinalSourceIntentV2 row",
             })
             continue
         role = str(intent.get("role") or "")
@@ -446,7 +446,7 @@ def source_inventory_coverage(
                 "source_intent_revision_id": revision,
                 "image_task_roles": [str(task.get("role") or "") for task in matches],
                 "status": "image_task_missing" if not matches else "image_task_ambiguous",
-                "blocking_reason": "final source intent must map to exactly one ImageTaskV9 row",
+                "blocking_reason": "final source intent must map to exactly one ImageTaskV10 row",
             })
             continue
         coverage_rows.append({
@@ -482,7 +482,7 @@ def current_human_review(
     *,
     evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    review = _review_rows(Path(job_dir)).get((str(task.get("child") or ""), str(task.get("role") or "")))
+    review = _review_rows(Path(job_dir)).get((str(task.get("child") or ""), str(task.get("role") or ""), str(candidate.get("candidate_sha256") or "")))
     return dict(review) if _review_is_current(review, task=task, candidate=candidate, evidence=evidence or {}) else {}
 
 
@@ -491,6 +491,13 @@ def _review_is_current(
     candidate: dict[str, Any], evidence: dict[str, Any],
 ) -> bool:
     if not review or not candidate or not evidence:
+        return False
+    try:
+        _validate_resolutions(review.get("resolutions", []), {
+            "candidate_sha256": candidate["candidate_sha256"], "source_sha256": task["source_sha256"],
+            "unresolved_checks": [gate["gate"] for gate in evidence["gates"] if gate["status"] == "inconclusive"] if review.get("decision") == "approve" else [],
+        })
+    except ReleaseManifestError:
         return False
     return all((
         review.get("candidate_sha256") == candidate.get("candidate_sha256"),
@@ -733,28 +740,48 @@ def _load_reviews(path: Path, *, job_id: str) -> dict[str, Any]:
 
 def _validate_review_payload(data: Any, *, job_id: str, label: Path) -> None:
     if not isinstance(data, dict) or data.get("schema_version") != HUMAN_REVIEW_SCHEMA_VERSION or data.get("job_id") != job_id or not isinstance(data.get("rows"), list):
-            raise ReleaseManifestError(f"Unsupported HumanReviewV4 schema: {label}")
-    seen: set[tuple[str, str]] = set()
+            raise ReleaseManifestError(f"Unsupported HumanReviewV5 schema: {label}")
+    seen: set[tuple[str, str, str]] = set()
+    selections: set[tuple[str, str]] = set()
     required = (
         "child", "role", "decision", "candidate_sha256", "release_candidate_fingerprint",
         "qa_policy_id", "qa_evidence_fingerprint", "reviewed_at",
     )
     for row in data["rows"]:
-        key = (str(row.get("child") or ""), str(row.get("role") or ""))
+        key = (str(row.get("child") or ""), str(row.get("role") or ""), str(row.get("candidate_sha256") or ""))
+        if row.get("selected") is True:
+            if key[:2] in selections or row.get("decision") != "approve":
+                raise ReleaseManifestError("Only one explicitly approved candidate can be selected per role")
+            selections.add(key[:2])
         invalid = (
             not all(str(row.get(field) or "").strip() for field in required)
+            or not isinstance(row.get("selected"), bool) or not isinstance(row.get("resolutions"), list)
             or row.get("decision") not in {"approve", "reject"}
             or (row.get("decision") == "reject" and not str(row.get("reason") or "").strip())
             or key in seen
         )
         if invalid:
-            raise ReleaseManifestError(f"Invalid HumanReviewV4 row: {label}")
+            raise ReleaseManifestError(f"Invalid HumanReviewV5 row: {label}")
         seen.add(key)
 
 
-def _review_rows(job_path: Path) -> dict[tuple[str, str], dict[str, Any]]:
+def _validate_resolutions(resolutions: list[dict[str, Any]], target: dict[str, Any]) -> None:
+    required = set(target.get("unresolved_checks") or [])
+    matched = set()
+    for row in resolutions:
+        if not isinstance(row, dict) or row.get("candidate_sha256") != target["candidate_sha256"]:
+            continue
+        if row.get("check") in required:
+            if row.get("source_sha256") != target["source_sha256"] or row.get("conclusion") != "confirmed" or not str(row.get("evidence") or "").strip():
+                raise ReleaseManifestError("Factual resolution needs matching candidate/source SHA, confirmed conclusion and concrete evidence")
+            matched.add(row["check"])
+    if required - matched:
+        raise ReleaseManifestError("Human verification is required for these inconclusive checks: " + ", ".join(sorted(required - matched)))
+
+
+def _review_rows(job_path: Path) -> dict[tuple[str, str, str], dict[str, Any]]:
     payload = _load_reviews(job_path / "reports" / HUMAN_REVIEW_ARTIFACT, job_id=job_path.name)
-    return {(row["child"], row["role"]): row for row in payload["rows"]}
+    return {(row["child"], row["role"], row["candidate_sha256"]): row for row in payload["rows"]}
 
 
 def _read_optional_object(path: Path) -> dict[str, Any]:

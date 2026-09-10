@@ -36,7 +36,7 @@ from .template_runtime import child_sku, load_template_env, normalize_template_m
 COPY_SCHEMA_VERSION = "copy-v1"
 COPY_ARTIFACT = "copy_v1.json"
 COPY_GROUP_POLICY_VERSION = "copy-group-v5-retryable-ai-output"
-COPY_VALIDATION_POLICY_VERSION = "copy-validation-v9-capacity-values"
+COPY_VALIDATION_POLICY_VERSION = "copy-validation-v10-parent-highlight-contract"
 PARENT_COPY_KEY = "__parent__"
 COPY_IGNORED_FACT_KEYS = {"fabric_type"}
 
@@ -542,7 +542,7 @@ def _validate_copy_row(row: dict[str, Any], *, row_type: str = "child") -> None:
         raise CopyPolishError("Copy title must not contain vertical bars")
     if re.search(r"(?:&|\band|\bwith|\bfor|\bof|\||[,;:])\s*$", title, flags=re.I):
         raise CopyPolishError("Copy title ends with an incomplete phrase")
-    optional_parent_highlights = str(row_type or "").strip().casefold() == "parent"
+    optional_parent_highlights = str(row_type or "").strip().casefold() == "parent" and not item_highlights
     if not optional_parent_highlights and not ITEM_HIGHLIGHT_MIN_COUNT <= len(item_highlights) <= ITEM_HIGHLIGHT_MAX_COUNT:
         raise CopyPolishError(f"Copy item_highlights must contain {ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} phrases")
     if not optional_parent_highlights and any(not isinstance(value, str) or not 2 <= len(value.split()) <= ITEM_HIGHLIGHT_MAX_WORDS for value in item_highlights):

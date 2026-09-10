@@ -135,6 +135,7 @@
     },
     {
       "name": "cxk_fixed",
+      "resource_group": "cxk_fixed",
       "display": "cxk-fixed",
       "family": "image_generation",
       "scope": "image_generation",
