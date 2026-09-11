@@ -98,8 +98,12 @@ def generate_with_registry_image_provider(
     if mask_bytes is not None:
         mask_bytes = _validated_mask_bytes(mask_bytes, expected_image_bytes=image_inputs[0])
     if request_audit is not None:
+        from urllib.parse import urlsplit
+        endpoint = urlsplit(_provider_url(spec) if spec else "")
         request_audit.update({
             "request_id": request_id, "provider": provider_name, "model": spec.model if spec else "",
+            "model_identity_verification": "configured_alias_only",
+            "endpoint": {"scheme": endpoint.scheme, "host": endpoint.hostname, "port": endpoint.port, "path": endpoint.path},
             "request_size": str(profile.get("request_size") or ""), "quality": str(profile.get("quality") or "low"),
             "output_contract": str(profile.get("output_contract") or ""),
             "mask_sha256": hashlib.sha256(mask_bytes).hexdigest() if mask_bytes else "",
@@ -116,6 +120,7 @@ def generate_with_registry_image_provider(
             image_inputs=image_inputs,
             prompt=prompt,
             mask_bytes=mask_bytes,
+            request_audit=request_audit,
         )
     if spec and spec.api_type == "openai_chat_completions_image":
         if mask_bytes is not None:
@@ -145,7 +150,8 @@ def generate_with_registry_image_provider(
 
 
 def _generate_with_openai_images_edit(
-    *, provider_name: str, image_inputs: list[bytes], prompt: str, mask_bytes: bytes | None
+    *, provider_name: str, image_inputs: list[bytes], prompt: str, mask_bytes: bytes | None,
+    request_audit: dict[str, Any] | None = None,
 ) -> bytes:
     spec = _image_provider_spec(provider_name)
     if spec is None or spec.api_type != "openai_images_edit":
@@ -180,6 +186,8 @@ def _generate_with_openai_images_edit(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             text = response.read().decode("utf-8", errors="replace")
+            if request_audit is not None:
+                request_audit["remote_request_id"] = str(response.headers.get("x-request-id") or "")[:200]
     except urllib.error.HTTPError as exc:
         excerpt = exc.read().decode("utf-8", errors="replace")[:800]
         if exc.code in {408, 504, 524}:
@@ -187,8 +195,17 @@ def _generate_with_openai_images_edit(
         raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
     except urllib.error.URLError as exc:
         raise ImageGenerationError(f"{provider_name} request failed: {exc}") from exc
-    data = _decode_image_response(text)
-    return data
+    if request_audit is not None:
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            request_audit["response_metadata"] = {key: value for key in ("model", "id", "created")
+                if isinstance((value := payload.get(key)), (str, int, float)) and len(str(value)) <= 200}
+            if request_audit["response_metadata"].get("model"):
+                request_audit["model_identity_verification"] = "gateway_reported_not_independently_verified"
+    return _decode_image_response(text)
 
 
 def _generate_with_openai_chat_completions_image(

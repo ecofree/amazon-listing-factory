@@ -81,9 +81,13 @@ class GenerationStateContractTests(unittest.TestCase):
             source = job / "images/source.png"
             source.write_bytes(b"immutable source")
             source_sha = file_sha256(source)
+            edit_view = job / 'images/view.png'
+            edit_view.write_bytes(b'immutable cropped view')
+            edit_sha = file_sha256(edit_view)
             refs = [{"kind": "edit_base", "child": "B1", "source_id": "source_00",
-                     "path": "images/source.png", "sha256": source_sha, "purpose": "Edit reference", "evidence_ids": []}]
-            task.update(source_sha256=source_sha, edit_base_sha256=source_sha, generation_references=refs)
+                     "path": "images/view.png", "sha256": edit_sha, "purpose": "Edit reference", "evidence_ids": [],
+                     "original_path": "images/source.png", "original_sha256": source_sha}]
+            task.update(source_sha256=source_sha, edit_base_sha256=edit_sha, generation_references=refs)
             prompt_path = job / "reports/image_prompts/B1/main/revision.prompt.txt"
             prompt_path.parent.mkdir(parents=True)
             prompt_path.write_bytes(b"immutable request prompt")
@@ -112,7 +116,7 @@ class GenerationStateContractTests(unittest.TestCase):
                 "task_prompt_fingerprint": "task-prompt", "request_prompt_fingerprint": request_sha,
                 "prompt_path": str(prompt_path.relative_to(job)),
                 "source_path": "images/source.png", "source_sha256": source_sha,
-                "generation_references": refs, "edit_base_sha256": source_sha,
+                "generation_references": refs, "edit_base_sha256": edit_sha,
                 "edit_parent_candidate_sha256": "", "revision_mode": "initial", "request_audit": {},
                 "transport_attempt": 1, "provider_attempts": {"copy": 1},
                 "status": "candidate_ready",

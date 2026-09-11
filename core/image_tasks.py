@@ -6,12 +6,11 @@ from typing import Any
 
 from .final_source_intents import planning_source_intents, selected_task_source_intents
 from .image_prompt_compiler import PROMPT_CONTRACT_VERSION
-from .image_reference_context import validate_reference_set, validate_supporting_sources
+from .image_reference_context import validate_reference_set, validate_supporting_sources, view_reference, physical_views
 from .image_task_inputs import (
-    build_func_story_contract,
+    build_display_copy_contract,
     build_renderable_text_contract,
     execution_profile,
-    func_renderable_text_contract,
     product_boundary,
     task_facts,
 )
@@ -26,10 +25,10 @@ from .visual_design_kit import compact_product_claims, read_visual_design_kits, 
 
 
 IMAGE_TASK_SCHEMA_VERSION = "image-task-v10"
-IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v24-observed-view-binding"
+IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v29-complete-display-copy"
 IMAGE_TASK_ARTIFACT = "image_tasks_v10.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
-_TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "product_boundary", "measurement_authority", "func_story_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
+_TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "product_boundary", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
 _TASK_BLOCKED_FIELDS = _TASK_BASE_FIELDS | {"formation_reason_code"}
 
 
@@ -176,7 +175,7 @@ def validate_image_task(row: Any) -> None:
         needed = (
             "family_design_id", "family_art_direction", "source_path", "source_sha256",
             "source_intent_revision_id", "generation_references", "product_boundary",
-            "measurement_authority", "func_story_contract", "renderable_text_contract",
+            "measurement_authority", "display_copy_contract", "renderable_text_contract",
             "edit_contract", "execution_profile",
         )
         if row.get("role_family") in {"main", "scene"}:
@@ -189,15 +188,13 @@ def validate_image_task(row: Any) -> None:
             validate_reference_set(references, child=row["child"], edit_base_sha256=row["edit_base_sha256"])
         except ValueError as exc:
             raise ImageTaskError(str(exc)) from exc
-        if references[0]["sha256"] != row["source_sha256"]:
-            raise ImageTaskError("Initial task edit base disagrees with its role source")
+        if (references[0].get("original_sha256") != row["source_sha256"]
+                or references[0].get("original_path") != row["source_path"]):
+            raise ImageTaskError("Edit view provenance disagrees with its original role source")
         boundary = row["product_boundary"]
         if set(boundary) != {"sold_product_parts", "replaceable_staging", "must_not_change", "product_color_material", "observed_product_colors", "forbidden_additions", "observed_objects"}:
             raise ImageTaskError("ImageTaskV10 product boundary is not canonical")
-        if row["role_family"] == "func":
-            expected = func_renderable_text_contract(row.get("func_story_contract") or {})
-        else:
-            expected = build_renderable_text_contract(row["role_family"], row["measurement_authority"])
+        expected = build_renderable_text_contract(row["role_family"], row["measurement_authority"], display_copy=row['display_copy_contract'])
         if row["renderable_text_contract"] != expected:
                 raise ImageTaskError("ImageTaskV10 renderable text changed after formation")
         edit = row.get("edit_contract")
@@ -237,7 +234,7 @@ def _expected_rows(job: Path, plugin: ProductPlugin, *, include_optional: bool =
         )
         for spec in specs:
             rows.append(_form_task(
-                plugin=plugin, child=children[asin], spec=spec,
+                job=job, plugin=plugin, child=children[asin], spec=spec,
                 design_kit=design_kit, image_policy=image_policy,
                 product_type=product_type,
             ))
@@ -284,7 +281,7 @@ def _task_specs(
 
 
 def _form_task(
-    *, plugin: ProductPlugin, child: dict[str, Any], spec: dict[str, Any],
+    *, job: Path, plugin: ProductPlugin, child: dict[str, Any], spec: dict[str, Any],
     design_kit: dict[str, Any], image_policy: dict[str, Any],
     product_type: str,
 ) -> dict[str, Any]:
@@ -329,23 +326,18 @@ def _form_task(
         return _blocked(base, str(source_brief.get("error") or "source brief is pending"))
     try:
         measurement = _measurement_authority(family, child, source)
-        source_reference = _source_reference(design_kit, source)
-        view_regions = {row["view_id"]: row["region"] for row in source_reference["observation"]["physical_views"]}
         image_direction = source_brief["image_direction"]
         story = (
-            build_func_story_contract(
+            build_display_copy_contract(
                 source,
                 source_brief or {},
                 product_claims=_shared_product_claims(design_kit, child),
             )
-            if family == "func" else {
+            if family in {"func", "size"} else {
                 "mode": "none", "title": "", "labels": [], "bindings": [],
             }
         )
-        renderable = (
-            func_renderable_text_contract(story)
-            if family == "func" else build_renderable_text_contract(family, measurement)
-        )
+        renderable = build_renderable_text_contract(family, measurement, display_copy=story)
         boundary = product_boundary(
             image_policy,
             child,
@@ -353,7 +345,7 @@ def _form_task(
             observations=[source.get("visual_evidence") or {}],
         )
         references = _generation_references_for_task(
-            source, source_brief, design_kit, child=str(child["asin"]),
+            source, source_brief, design_kit, job=job, child=str(child["asin"]),
         )
         reference = references[0]
         fields = {
@@ -362,20 +354,17 @@ def _form_task(
             "family_art_direction": art_direction,
             "source_intent_revision_id": str(source.get("input_revision_id") or ""),
             "source_index": int(source.get("source_index") or 0),
-            "source_path": reference["path"],
-            "source_sha256": reference["sha256"],
+            "source_path": source["source_path"],
+            "source_sha256": source["source_sha256"],
             "generation_references": references,
             "edit_base_sha256": reference["sha256"],
             "reference_mode": f"{family}_source_edit",
             "product_facts": task_facts(child, product_type=product_type),
             "product_boundary": boundary,
             "measurement_authority": measurement,
-            "func_story_contract": story,
+            "display_copy_contract": story,
             "renderable_text_contract": renderable,
-            "image_direction": {**image_direction, "layout": [
-                {"source_region": view_regions[row["view_id"]], "target_region": row["target_region"]}
-                for row in image_direction["layout"]
-            ]},
+            "image_direction": image_direction,
             "edit_contract": _edit_contract(
                 family, measurement, image_policy, source_brief or {},
                 product_type=product_type,
@@ -393,19 +382,27 @@ def _form_task(
 
 
 def _generation_references_for_task(
-    source: dict[str, Any], brief: dict[str, Any], kit: dict[str, Any], *, child: str,
+    source: dict[str, Any], brief: dict[str, Any], kit: dict[str, Any], *, job: Path, child: str,
 ) -> list[dict[str, Any]]:
     manifest = kit["source_references"]
     primary = _source_reference(kit, source)
-    refs = [_reference(source, child=child, source_id=primary["source_id"], kind="edit_base",
-                       purpose="Edit this role image; auxiliary images supply only their labeled evidence.")]
+    views = physical_views(primary['observation']['physical_views'])
+    displayed = {row['view_id'] for row in brief['image_direction']['evidence_usage'] if row['usage'] == 'display'}
+    ordered = sorted(views, key=lambda view: view['view_id'] not in displayed)
+    refs = [view_reference(primary, view, job=job, child=child, kind='edit_base' if i == 0 else 'product_evidence')
+            for i, view in enumerate(ordered)]
     selected = validate_supporting_sources(brief["supporting_sources"], manifest, primary["source_id"])
     by_id = {row["source_id"]: row for row in manifest}
     for selection in selected:
-        refs.append(_reference(by_id[selection["source_id"]], child=child, source_id=selection["source_id"],
-                               kind="product_evidence", purpose=selection["purpose"],
-                               evidence_ids=selection["evidence_ids"]))
-    refs.extend(kit.get("approved_design_references", []))
+        support = by_id[selection['source_id']]
+        refs.extend({**view_reference(support, view, job=job, child=child, kind='product_evidence'),
+                     'purpose': selection['purpose']} for view in physical_views(support['observation']['physical_views']))
+    available = {row["source_id"]: row for row in kit.get("approved_design_references", [])}
+    for transfer in brief["image_direction"]["design_transfer"]:
+        key = transfer["reference_id"]
+        if key not in available or brief["role"] not in available[key]["roles"]:
+            raise ImageTaskError("Selected design reference is not approved for this role")
+        refs.append(available[key])
     return refs
 
 
@@ -457,21 +454,6 @@ def _shared_product_claims(
             if isinstance(claim, dict) and str(claim.get("evidence_id") or ""):
                 unique.setdefault(str(claim["evidence_id"]), claim)
     return list(unique.values()) or compact_product_claims(child)
-
-
-def _reference(source: dict[str, Any], *, child: str, source_id: str, kind: str,
-               purpose: str, evidence_ids: list[str] | None = None) -> dict[str, Any]:
-    path, sha = str(source.get("source_path") or ""), str(source.get("source_sha256") or "")
-    if not path or len(sha) != 64:
-        raise ImageTaskError("Reference path or SHA is missing")
-    reference = {"kind": kind, "child": child, "source_id": source_id, "path": path,
-                 "sha256": sha, "purpose": purpose, "evidence_ids": list(evidence_ids or [])}
-    mask_path, mask_sha = str(source.get("protected_mask_path") or ""), str(source.get("protected_mask_sha256") or "")
-    if kind == "edit_base" and (mask_path or mask_sha):
-        if not mask_path or len(mask_sha) != 64:
-            raise ImageTaskError("Protected mask path and SHA must be supplied together")
-        reference["protected_mask"] = {"path": mask_path, "sha256": mask_sha}
-    return reference
 
 
 def _measurement_authority(family: str, child: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
@@ -537,10 +519,7 @@ def _source_visible_factual_text(
     callouts = list(dict.fromkeys(
         _canonical_source_callout(row.get("text"))
         for row in (source.get("visual_evidence") or {}).get("text_observations") or []
-        if row.get("kind") == "measurement" or (
-            source.get("role") == "size" and row.get("kind") == "marketing"
-            and normalize_text(row.get("text")).casefold() in {"dimensions", "measurements", "size", "product size"}
-        )
+        if row.get("kind") == "measurement"
     ))
     for line in lines:
         if not isinstance(line, dict) or float(line.get("confidence") or 0) < 0.68:
@@ -613,7 +592,7 @@ def _edit_contract(
         "func": "Create one square Amazon US function image.",
         "size": "Create one square Amazon US size image.",
     }[family]
-    reference = "Attachment 1 supplies physical product views, not a page design. Separate its real components from adjustment ghosts and graphic overlays."
+    reference = "Each product view binds its own physical evidence; the first is only the transport edit base."
     preserve = [
         "Preserve product geometry, proportions, finish, physical part count, attached parts, demonstrated state and the perspective within each view; retain occlusion and partial-view boundaries without reconstructing unseen surfaces",
     ]
@@ -692,7 +671,7 @@ _TASK_SEMANTIC_FIELDS = frozenset({
     "family_design_id", "family_art_direction", "source_intent_revision_id",
     "source_index", "source_path", "source_sha256", "generation_references",
     "edit_base_sha256", "reference_mode", "product_facts",
-    "product_boundary", "measurement_authority", "func_story_contract",
+    "product_boundary", "measurement_authority", "display_copy_contract",
     "renderable_text_contract", "image_direction",
     "edit_contract", "execution_profile", "prompt_contract_version",
 })

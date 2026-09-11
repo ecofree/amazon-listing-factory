@@ -11,7 +11,7 @@ from .status import input_revision_id
 
 QA_EVIDENCE_SCHEMA_VERSION = "qa-evidence-v5"
 QA_EVIDENCE_ARTIFACT = "qa_evidence_v5.jsonl"
-QA_POLICY_VERSION = "observed-facts-three-state-v44-source-copy-coverage"
+QA_POLICY_VERSION = "observed-facts-three-state-v47-whole-candidate-coverage"
 
 
 class QaEvidenceError(RuntimeError):

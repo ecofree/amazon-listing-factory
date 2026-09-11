@@ -18,6 +18,12 @@ from core.image_tasks import (
 )
 
 
+def current_physical_view(view_id: str = 'view_01', region: list[float] | None = None, *, feature: str = 'frame_support', object_id: str = 'frame') -> dict[str, Any]:
+    box = list(region or [0.1, 0.2, 0.9, 0.8])
+    return {'view_id': view_id, 'region': box, 'extent': 'whole_view',
+            'evidence': [{'feature_id': feature, 'object_id': object_id, 'region': box.copy(), 'physical_facts': ['Visible frame support and its joints']}]}
+
+
 def current_art_direction() -> dict[str, Any]:
     return {
         "audience_and_market": "US homeowners seeking calm, practical bathroom storage with a residential rather than commercial impression.",
@@ -35,8 +41,12 @@ def current_art_direction() -> dict[str, Any]:
 
 
 def current_image_direction(*, environment: str = "designed_environment") -> dict[str, Any]:
-    return {"layout": [{"view_id": "view_01", "target_region": [0.1, 0.1, 0.9, 0.9]}],
-            "text_placement": [], "environment_mode": environment}
+    return {"visual_goal": "Explain the visible physical feature at a glance",
+            "creative_brief": "Lead with the intact product view and a restrained asymmetric copy hierarchy; reuse the child graphic roles",
+            "evidence_usage": [{"view_id": "view_01", "usage": "display", "covered_by": []}],
+            "design_transfer": [],
+            "layout": [{"view_id": "view_01", "target_region": [0.1, 0.1, 0.9, 0.9]}],
+            "text_placement": [], "scene_objects": ['wall', 'floor', 'towels'] if environment == 'designed_environment' else [], "environment_mode": environment}
 
 
 def current_image_task(
@@ -80,7 +90,7 @@ def current_image_task(
                 ],
             }
             if family == "func"
-            else {"mode": "none", "title": "", "labels": [], "bindings": []}
+            else {"mode": "source_claims" if family == "size" else "none", "title": "", "labels": [], "bindings": []}
         )
         strings = [story["title"], *story["labels"]] if family == "func" else []
         measurement = (
@@ -103,6 +113,9 @@ def current_image_task(
                 "purpose": "Edit this product view", "evidence_ids": [],
                 "path": "images/func-source.png" if family == "func" else "images/source.png",
                 "sha256": source_sha256,
+                "original_path": base["source_path"], "original_sha256": source_sha256,
+                "view_id": "view_01", "extent": "whole_view",
+                "visible_evidence": current_physical_view()['evidence'],
             }
         ]
         base.update({
@@ -139,19 +152,16 @@ def current_image_task(
                 "forbidden_additions": [],
             },
             "measurement_authority": measurement,
-            "func_story_contract": story,
+            "display_copy_contract": story,
             "renderable_text_contract": {
                 "mode": (
                     "exact"
-                    if family == "func"
-                    else "source_measurement_display"
-                    if family == "size"
+                    if family in {"func", "size"}
                     else "none"
                 ),
                 "strings": strings,
             },
-            "image_direction": {**current_image_direction(), "layout": [
-                {"source_region": [0.0, 0.0, 1.0, 1.0], "target_region": [0.1, 0.1, 0.9, 0.9]}]},
+            "image_direction": current_image_direction(),
             "edit_contract": _edit_contract(family, measurement, base["category_image_policy"], {}, product_type=category_id),
             "execution_profile": (
                 "reference_infographic_design"

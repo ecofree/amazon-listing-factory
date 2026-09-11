@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +152,10 @@ def commit_candidate_output(job_dir: str | Path, task: dict[str, Any], data: byt
     # Providers commonly return 1024x1024.  Size the bytes before the
     # CandidateManifest is written so candidate, QA, publish and template all
     # refer to the exact same 1600x1600 publication artifact.
+    upscale_started = time.monotonic()
     final_data, upscale_backend = upscale_for_publication_with_backend(data)
+    if isinstance(task.get("request_audit"), dict):
+        task["request_audit"]["upscale_seconds"] = round(time.monotonic() - upscale_started, 3)
     replace_output(staging, final_data)
     assert_image_output(staging)
     manifest = write_candidate_manifest(
@@ -318,8 +322,8 @@ def _validate_manifest_binding(job_path: Path, manifest: dict[str, Any], task: d
     if mode == "targeted_edit":
         if len(parent) != 64 or parent != manifest["edit_base_sha256"]:
             raise CandidateStateError("Targeted edit is not bound to its parent candidate")
-    elif parent or manifest["edit_base_sha256"] != manifest["source_sha256"]:
-        raise CandidateStateError("Initial/full-redraw base must be the original source")
+    elif parent or manifest["edit_base_sha256"] != task["edit_base_sha256"]:
+        raise CandidateStateError("Initial/full-redraw base must be the task's observed edit view")
     expected_refs = [{**ref, "path": _job_owned_path(job_path, ref["path"]).relative_to(job_path).as_posix()}
                      for ref in task["generation_references"]]
     if mode == "targeted_edit":

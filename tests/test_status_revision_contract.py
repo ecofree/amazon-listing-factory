@@ -173,7 +173,7 @@ class StatusRevisionContractTests(unittest.TestCase):
                     "candidate_sha256": "c" * 64,
                 }, {
                     "final_decision": "awaiting_generation",
-                    "automatic_decision": "unavailable",
+                    "automatic_decision": "not_run",
                     "candidate_sha256": "",
                 }]},
             )
@@ -200,6 +200,18 @@ class StatusRevisionContractTests(unittest.TestCase):
             )
             self.assertEqual("success", review_summary["planned_image_completion_status"])
             self.assertEqual(0, review_summary["planned_image_unresolved_count"])
+            source_rows = [{'child': 'B1', 'source_path': f'source{i}.jpg', 'role': 'func'} for i in range(18)]
+            source_rows[15]['role'] = source_rows[16]['role'] = source_rows[17]['role'] = 'review_required'
+            with patch('core.image_tasks.read_image_tasks', return_value={'tasks': source_rows[:15]}), patch(
+                    'core.final_source_intents.read_final_source_intents', return_value=source_rows):
+                counts = production._source_scope_counts(request)
+                self.assertEqual(18, counts['source_input_count'])
+                self.assertEqual(3, counts['source_unresolved_count'])
+                source_rows[-1]['role'] = 'excluded_wrong_variant'
+                counts = production._source_scope_counts(request)
+                self.assertEqual(1, counts['source_excluded_count'])
+                self.assertEqual(2, counts['source_unresolved_count'])
+            self.assertEqual('', review_summary['completed_through_stage'])
             self.assertEqual({"pass": 1}, review_summary["qa_decision_counts"])
             self.assertEqual("local_export_only", summary["publish_mode"])
             image_dir = job / "images"

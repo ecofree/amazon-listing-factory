@@ -73,7 +73,9 @@ class FreezeRecoveryTests(unittest.TestCase):
                         stack.enter_context(patch.object(executor.time, "monotonic", return_value=100))
                         stack.enter_context(patch.object(executor, "provider_concurrency_slot", return_value=contextlib.nullcontext()))
                         stack.enter_context(patch.object(executor, "generation_reference_primary_path", return_value=source))
-                        stack.enter_context(patch.object(executor, "generation_reference_sources", return_value=[{"path": source}]))
+                        stack.enter_context(patch.object(executor, "generation_reference_sources", return_value=[{
+                            "kind": "edit_base", "path": source, "source_id": "source_00", "sha256": "a" * 64,
+                            "purpose": "Product evidence", "evidence_ids": []}]))
                         stack.enter_context(patch.object(executor, "provider_timeout_seconds", return_value=420))
                         stack.enter_context(patch.object(executor, "provider_run_circuit_open", return_value=False))
                         for name in ("assert_imagegen_prompt_preflight", "assert_provider_allowed", "open_provider_run_circuit",

@@ -6,10 +6,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from .visual_semantics import observe_candidate
+from .visual_semantics import observe_candidate, candidate_view_targets
 from .candidate_state import CandidateStateError, current_candidate
 from .image_pixel_evidence import inspect_image_pixel_evidence
-from .image_role_ocr import OCR_CONCLUSIVE_CONFIDENCE, ocr_evidence_for_image
+from .image_provider_common import ProviderQueueUnavailable
+from .vision_errors import VisionRequestError
+from .vision_gemini_client import vision_scope_capacity
 from .image_task_inputs import task_renderable_text
 from .image_prompt_compiler import prompt_for_task, read_image_prompts, require_current_image_branch
 from .io import load_env
@@ -32,9 +34,6 @@ from .image_tasks import read_image_tasks
 from .run_scope import scoped_child_set
 from .status import input_revision_id, logical_task_id
 from .text_evidence import extract_measurements, normalize_text, measurement_values_match, numeric_signature
-
-
-LOCAL_GATE_NAMES = ("image_integrity", "main_background", "unauthorized_text", "dimension_accuracy")
 
 
 def run_image_qa(
@@ -91,7 +90,7 @@ def run_image_qa(
 
     rows: list[dict[str, Any]] = []
     evaluation_failures: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max(1, min(int(workers or 1), len(pairs) or 1))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, min(int(workers or 1), len(pairs) or 1, vision_scope_capacity("vision_qa")))) as pool:
         futures = {pool.submit(evaluate, task, candidate): (task, candidate) for task, candidate in pairs}
         for future in as_completed(futures):
             task, candidate = futures[future]
@@ -104,7 +103,7 @@ def run_image_qa(
                         "input_revision_id": input_revision_id({"task": task.get("task_fingerprint"), "candidate": candidate.get("candidate_sha256"), "qa_error": type(exc).__name__}),
                         "child": task["child"], "role": task["role"],
                     },
-                    "failure_owner": "qa", "task_status": "retryable", "error_code": "qa_evaluator_error",
+                    "failure_owner": "qa", "task_status": "retryable", "error_code": "qa_not_executed_capacity" if isinstance(exc, ProviderQueueUnavailable) else "qa_evaluator_error",
                     "error": f"{type(exc).__name__}: {exc}",
                 })
     rows.sort(key=lambda row: (row["child"], row["role"]))
@@ -163,6 +162,8 @@ def _evaluate(job: Path, plugin: ProductPlugin, task: dict[str, Any], candidate:
             semantic = _semantic_gates(task, observation)
             gates = [row for row in gates if row["gate"] not in {"unauthorized_text", "dimension_accuracy"}] + semantic
         except Exception as exc:
+            if isinstance(exc, ProviderQueueUnavailable) or (isinstance(exc, VisionRequestError) and exc.failure_kind == "queue_unavailable" and exc.metadata.get("physical_request_count") == 0):
+                raise ProviderQueueUnavailable("vision_qa", "QA not executed: vision capacity unavailable; candidate retained") from exc
             gates.append(_gate("product_fidelity", "inconclusive", f"Independent observation unavailable: {type(exc).__name__}: {exc}"))
     statuses = {row["status"] for row in gates}
     decision = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
@@ -197,8 +198,6 @@ def _local_gates(job: Path, plugin: ProductPlugin, task: dict[str, Any], output:
     gates.append(_main_background_gate(plugin, task, output))
     if gates[-1]["status"] == "fail":
         return gates
-    text, dimensions = _ocr_gates(job, task, output)
-    gates.extend((text, dimensions))
     return gates
 
 
@@ -218,19 +217,6 @@ def _main_background_gate(plugin: ProductPlugin, task: dict[str, Any], output: P
     if white:
         return _gate("main_background", "pass", "edge-connected white external canvas detected; sparse functional props remain a human review item")
     return _gate("main_background", "fail", "required white external canvas is absent")
-
-
-def _ocr_gates(job: Path, task: dict[str, Any], output: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    try:
-        ocr = ocr_evidence_for_image(output, cache_root=job / "reports" / "ocr_evidence")
-        lines = [normalize_text(row.get("text")) for row in ocr.get("lines", [])
-                 if isinstance(row, dict) and float(row.get("confidence") or 0) >= OCR_CONCLUSIVE_CONFIDENCE]
-        evidence = f"OCR observed {lines}; location and semantic ownership require independent observation"
-    except Exception as exc:
-        evidence = f"OCR unavailable: {type(exc).__name__}: {exc}"
-    return (_gate("unauthorized_text", "inconclusive", evidence),
-            _gate("dimension_accuracy", "inconclusive", "Measured objects and endpoints require observation")
-            if task["role_family"] in {"size", "func"} else _gate("dimension_accuracy", "pass", "not applicable"))
 
 
 def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
@@ -272,10 +258,15 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
     else:
         dimension_gate = _gate("dimension_accuracy", "pass", "Observed measurement relationships match" if dimensions else "No measurement diagram; func numeric claims remain checked as exact authored copy")
 
-    product = observation["product_comparison"]
-    status = {"consistent": "pass", "contradiction": "fail", "unknown": "inconclusive"}[product["status"]]
-    if product["confidence"] < 0.9:
-        status = "inconclusive"
+    product = observation["product_comparisons"]
+    expected = {(row['source_id'], row['view_id']) for row in candidate_view_targets(task)}
+    observed = [(row['source_id'], row['view_id']) for row in product]
+    complete = (bool(expected) and expected.issubset(observed) and len(observed) == len(set(observed))
+                and all(pair in expected or pair[1].startswith('extra:') for pair in observed)
+                and observation.get('product_coverage') == 'complete')
+    status = ('fail' if any(row['status'] == 'contradiction' and row['confidence'] >= .9 for row in product)
+              else 'pass' if complete and all(row['status'] == 'consistent' and row['confidence'] >= .9 for row in product)
+              else 'inconclusive')
     gates = [text_gate, dimension_gate, _gate("product_fidelity", status, str(product))]
     edit = observation.get('edit_comparison')
     if edit:

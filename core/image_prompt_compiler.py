@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-from .image_reference_context import reference_prompt
+import json
 import re
 from pathlib import Path
 from typing import Any
 
+from .image_reference_context import reference_prompt
 from .image_task_inputs import task_renderable_text
 from .io import read_jsonl, write_bytes_atomic, write_jsonl
 from .plugin import ProductPlugin
@@ -14,15 +15,15 @@ from .status import input_revision_id, logical_task_id
 from .text_evidence import extract_measurements, normalize_text
 
 
-PROMPT_CONTRACT_VERSION = "gemini-art-direction-v71-evidence-view-layout"
+PROMPT_CONTRACT_VERSION = "gemini-art-direction-v78-complete-physical-and-copy"
 PROMPT_REVISION_RESERVE_CHARS = 700
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v56-region-layout"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v63-complete-physical-and-copy"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
-_FORBIDDEN_SCHEMA_TEXT = ("item weight unit", "product dimensions", "source_size_metadata")
+_FORBIDDEN_SCHEMA_TEXT = ("item weight unit", "source_size_metadata")
 _PROMPT_ROW_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "task_fingerprint", "prompt_contract_version", "renderable_text", "status", "error", "prompt", "prompt_sha256", "prompt_path", "input_revision_id", "prompt_fingerprint"}
 
 
@@ -191,7 +192,7 @@ def validate_image_prompt(row: Any) -> None:
 
 
 def compile_task_prompt(
-    *, task: dict[str, Any],
+    *, task: dict[str, Any], targeted_edit: bool = False,
 ) -> str:
     """Project one complete ImageTask without adding design decisions."""
     if task.get("formation_status") != "ready":
@@ -206,12 +207,11 @@ def compile_task_prompt(
     image_direction = task["image_direction"]
     environment = role != "size" and not white_main and image_direction["environment_mode"] == "designed_environment"
     renderable = task_renderable_text(task)
-    text_mode = str((task.get("renderable_text_contract") or {}).get("mode") or "none")
     if renderable:
         text_rule = "The renderable-text block is the complete authored copy, including inset captions. Render those strings once; composition prose and source marketing supply no additional display text."
         if task["measurement_authority"].get("mode") == "source_image":
             text_rule += " Retain the source measurement diagram under its separate factual measurement authority."
-    elif text_mode == "source_measurement_display":
+    elif task["measurement_authority"].get("mode") == "source_image":
         text_rule = "Display authorized US labels with readable spacing at their measured-object associations; no extra feature cards or duplicate measurement labels on the same association. Equal values on different measured objects remain separate."
     else:
         text_rule = "No added marketing text, captions or decorative overlays."
@@ -222,9 +222,10 @@ def compile_task_prompt(
     )
     prompt = "\n\n".join((
         f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}",
-        "[ROLE]\n" + str(edit.get("create") or "").strip()
-        + "\n" + _role_content(task, role, white_main=white_main),
-        "[REFERENCE]\n" + reference_prompt(task["generation_references"]) + "\n" + _product_boundary(task, edit),
+        "[ROLE]\n" + ("Repair the selected candidate in place; preserve its correct composition, staging and product pixels. Original-source coordinates do not apply to this candidate.\n"
+                       + (_measurement_content(task["measurement_authority"]) if task["measurement_authority"].get("mode") == "source_image" else "")
+                       if targeted_edit else str(edit.get("create") or "").strip() + "\n" + _role_content(task, role, white_main=white_main)),
+        "[REFERENCE]\n" + reference_prompt(task["generation_references"], design_transfer=image_direction["design_transfer"], targeted_edit=targeted_edit) + "\n" + _product_boundary(task, edit, targeted_edit=targeted_edit),
         "[STYLE]\n" + _family_art_direction(
             art_direction, role,
             main_policy=main_policy,
@@ -234,6 +235,7 @@ def compile_task_prompt(
             role=role,
             main_policy=main_policy,
             environment=environment,
+            scene_objects=image_direction['scene_objects'],
         ),
         "[TEXT]\n" + text_rule + ("\n" + _render_text_block(renderable) if renderable else ""),
         "[OUTPUT]\nReturn one square Amazon US image only. No commentary, watermark, or unapproved content.",
@@ -346,10 +348,11 @@ def _prompt_failure(task: dict[str, Any], error: str) -> dict[str, Any]:
     }
 
 
-def _product_boundary(task: dict[str, Any], edit: dict[str, Any]) -> str:
+def _product_boundary(task: dict[str, Any], edit: dict[str, Any], *, targeted_edit: bool = False) -> str:
     facts = task.get("product_facts") if isinstance(task.get("product_facts"), dict) else {}
     boundary = task.get("product_boundary") if isinstance(task.get("product_boundary"), dict) else {}
-    authority = " ".join(str(edit.get("reference_authority") or "the role source").split()).strip()
+    authority = ("Original product_evidence attachments bind product facts; attachment 1 is the selected candidate to repair."
+                 if targeted_edit else " ".join(str(edit.get("reference_authority") or "the role source").split()).strip())
     identity = (
         f"type={facts.get('product_type') or 'reference'}; color={facts.get('color') or 'reference'}; "
         f"quantity={facts.get('sold_unit_count') or 'reference'}"
@@ -357,14 +360,14 @@ def _product_boundary(task: dict[str, Any], edit: dict[str, Any]) -> str:
     rows = [
         f"Reference authority: {authority} Identity: {identity}.",
         _line("Preserve", edit.get("preserve")),
-        _line("Edit", edit.get("replace")),
+        "" if targeted_edit else _line("Edit", edit.get("replace")),
         _line("Category constraints", edit.get("forbid")),
-        "Source completeness: " + str(edit.get("reference_completeness") or "partial_feature_view") + "; use visible evidence only; do not infer hidden regions.",
+        "Source completeness: " + str(edit.get("reference_completeness") or "partial_feature_view"),
         _line("Forbidden additions", boundary.get("forbidden_additions")),
-        "Physical evidence: " + "; ".join(
-            f"{obj.get('kind')}: {obj.get('state')}; visibility={obj.get('visibility')}; ownership={obj.get('sale_membership')}"
-            for obj in boundary.get("observed_objects") or []
-        ) if boundary.get("observed_objects") else "",
+        _line("Sold-object states", [f"{obj['object_id']}: {obj['state']}" for obj in boundary.get('observed_objects', [])
+                                   if obj.get('sale_membership') in {'product', 'included_accessory'} and obj.get('state')]),
+        _line("Occlusion", [f"{obj['object_id']} occludes {rel['target_id']}" for obj in boundary.get('observed_objects', [])
+                            for rel in obj.get('relations', []) if rel['predicate'] == 'occludes']),
     ]
     return "\n".join(row for row in rows if row)
 
@@ -373,9 +376,18 @@ def _role_content(
     task: dict[str, Any], role: str, *, white_main: bool = False
 ) -> str:
     direction = task["image_direction"]
-    rows = ["Canvas layout (normalized left,top,right,bottom; place physical evidence, not source graphics):"]
-    rows.extend(f"Source attachment 1 region {view['source_region']} -> canvas {view['target_region']}; fit proportionally, retaining the physical view's perspective and visible extent."
-                for view in direction["layout"])
+    rows = ["Purpose (not a new depicted state): " + direction["visual_goal"],
+            "Composition of existing views: " + direction["creative_brief"],
+            "Evidence use (canvas bounds reposition intact views, not their internal geometry or state):"]
+    positions = {view["view_id"]: view["target_region"] for view in direction["layout"]}
+    primary = task['generation_references'][0]['source_id']
+    references = {ref.get('view_id'): ref for ref in task['generation_references'] if ref.get('view_id') and ref['source_id'] == primary}
+    for view in direction["evidence_usage"]:
+        placement = f"; canvas {positions[view['view_id']]}" if view["view_id"] in positions else ""
+        ref = references.get(view['view_id'], {})
+        features = '; '.join(f"{item['object_id']}/{item['feature_id']}: " + ', '.join(item['physical_facts'])
+                             for item in ref.get('visible_evidence', []))
+        rows.append(f"{view['view_id']}: {view['usage']}; covered by {view['covered_by']}{placement}; {ref.get('extent', '')}; physical features: {features}")
     if role in {"func", "size"} and direction["text_placement"]:
         rows.append("Text positions (references to the authorized copy below, not additional text): " + "; ".join(
             f"{row['text_ref']} -> {row['target_region']}" for row in direction["text_placement"]))
@@ -391,24 +403,20 @@ def _family_art_direction(
     main_policy: str = "",
     environment: bool = True,
 ) -> str:
-    if not environment and not (role == "main" and main_policy == "white_background"):
-        return "Use the planned canvas around intact evidence views; no added room staging."
+    rows = [
+        "Market context: " + _compact_token_direction(direction.get("audience_and_market")),
+        "Photography intent: " + _compact_token_direction(direction.get("photography_direction")),
+    ]
     if role == "main" and main_policy == "white_background":
-        rows = [
+        rows += [
             "Main image requires a white external background with no room or lifestyle staging. "
             "Use the model's main image direction for the permitted product photography."
         ]
+    elif not environment:
+        rows.append("Use the planned canvas around intact evidence views; no added room staging.")
     else:
-        audience = _compact_token_direction(direction.get("audience_and_market"))
-        staging = _compact_token_direction(direction.get("environment_and_staging"))
-        photography = _compact_token_direction(direction.get("photography_direction"))
-        cohesion = _compact_token_direction(direction.get("cohesion_rule"))
-        rows = [
-            "Market context: " + audience if audience else "",
-            "Staging intent (only where the role contains staging): " + staging if staging else "",
-            "Photography intent: " + photography if photography else "",
-            "Child cohesion: " + cohesion if cohesion else "",
-        ]
+        rows.append("Environment: " + _compact_token_direction(direction.get("environment_and_staging")))
+        rows.append("Cohesion: " + _compact_token_direction(direction.get("cohesion_rule")))
     negative = [
         _compact_token_direction(value)
         for value in direction.get("negative_visuals") or []
@@ -419,23 +427,23 @@ def _family_art_direction(
     return "\n".join(row for row in rows if row)
 
 
-def _presentation_system(direction: dict[str, Any], *, role: str, main_policy: str = "", environment: bool = True) -> str:
+def _presentation_system(direction: dict[str, Any], *, role: str, scene_objects: list[str], main_policy: str = "", environment: bool = True) -> str:
     """Emit Gemini's one child-wide palette and component system once."""
     if role == "main" and main_policy == "white_background":
         return "Do not apply room, floor, textile, staging, or child room palette tokens to this white-background main image."
     palette = "Non-product object palette: " + "; ".join(
-        f"{key} = {value}" for key, value in direction["palette_direction"].items()
+        f"{key} = {direction['palette_direction'][key]}" for key in scene_objects
     ) if environment else ""
     if role in {"func", "size"}:
         rows = [
             palette,
             "Typography: " + "; ".join(f"{key} = {value}" for key, value in direction["typography_direction"].items()),
             "Graphic roles: " + "; ".join(f"{key} = {value}" for key, value in direction["graphic_direction"].items()),
-            "Apply environmental colors only to non-product content and graphic colors only to presentation graphics; do not recolor the sold product or add a room to a technical diagram.",
+            "Named object and graphic assignments are shared across this child's images; reference colors are not substitutions.",
         ]
     else:
         rows = [palette]
-        rows.append("Apply this palette to non-product surroundings and staging; keep the sold product finish unchanged.")
+        rows.append("Named object assignments are shared across this child's images; reference colors are not substitutions.")
     return "\n".join(row for row in rows if row)
 
 

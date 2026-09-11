@@ -1,0 +1,110 @@
+{
+  "schema_version": "design-pack-v3",
+  "pack_id": "test-owned-modern-child-bedroom-20260911",
+  "version": "1.1.0",
+  "status": "draft",
+  "production_ready": false,
+  "compatibility": {
+    "categories": [
+      "bed_frame"
+    ]
+  },
+  "design_system": "Bright modern US children's-bedroom presentation: warm-white daylight, quiet charcoal hierarchy, muted blue-gray accents, one restrained mustard accent, generous negative space, product-first scale, thin annotation lines, and compact local backing only where readability needs it.",
+  "assets": [
+    {
+      "asset_id": "test-lifestyle-editorial-01",
+      "local_path": "lifestyle_reference.png",
+      "sha256": "48ba1dca1e93b172f643d7706fb0afaae16b388fa61ad156c953786b4cfc640d",
+      "roles": [
+        "main",
+        "scene"
+      ],
+      "children": [
+        "*"
+      ],
+      "purpose": "Bright natural side light, warm-white residential backdrop, clear product-first scale, pale oak grounding, and restrained blue-gray textile contrast.",
+      "source_url": "local://codex-generated/design-reference/lifestyle/20260911",
+      "author": "Codex ImageGen; project-owned test asset",
+      "asset_license": "Project-owned generated reference for internal testing; no third-party source material",
+      "rights_review": {
+        "status": "pending",
+        "approved_by": "",
+        "approved_at": "",
+        "allowed_uses": [
+          "image_generation_reference"
+        ],
+        "license_evidence": "Generated for this project test on 2026-09-11; no third-party source material was supplied."
+      },
+      "visual_review": {
+        "status": "pending",
+        "approved_by": "",
+        "approved_at": "",
+        "transfer_scope": "Lifestyle reference includes a high headboard absent from the white child; new approved reference region/material is required."
+      },
+      "reference_region": null
+    },
+    {
+      "asset_id": "test-function-editorial-01",
+      "local_path": "function_reference.png",
+      "sha256": "7a34d76bd26f32d12c174518ae85e82db5ec227a727063b873d626b2dbee7ac8",
+      "roles": [
+        "func"
+      ],
+      "children": [
+        "*"
+      ],
+      "purpose": "Asymmetric feature hierarchy, large intact detail area, charcoal and blue-gray graphic roles, thin leader line, compact local backing, and generous whitespace.",
+      "source_url": "local://codex-generated/design-reference/function/20260911",
+      "author": "Codex ImageGen; project-owned test asset",
+      "asset_license": "Project-owned generated reference for internal testing; no third-party source material",
+      "rights_review": {
+        "status": "pending",
+        "approved_by": "",
+        "approved_at": "",
+        "allowed_uses": [
+          "image_generation_reference"
+        ],
+        "license_evidence": "Generated for this project test on 2026-09-11; no third-party source material was supplied."
+      },
+      "visual_review": {
+        "status": "pending",
+        "approved_by": "",
+        "approved_at": "",
+        "transfer_scope": "Placeholder text bars are not a finished typography reference; replace with reviewed finished information design."
+      },
+      "reference_region": null
+    },
+    {
+      "asset_id": "test-measurement-editorial-01",
+      "local_path": "measurement_reference.png",
+      "sha256": "c24ab8781116c8672604e4902bd24e3362f105de75c1ce02ca5b1e4f983871c7",
+      "roles": [
+        "size"
+      ],
+      "children": [
+        "*"
+      ],
+      "purpose": "Clean measurement hierarchy, muted blue-gray dashed arrows, compact callout blocks, precise alignment, and bright low-noise canvas.",
+      "source_url": "local://codex-generated/design-reference/measurement/20260911",
+      "author": "Codex ImageGen; project-owned test asset",
+      "asset_license": "Project-owned generated reference for internal testing; no third-party source material",
+      "rights_review": {
+        "status": "pending",
+        "approved_by": "",
+        "approved_at": "",
+        "allowed_uses": [
+          "image_generation_reference"
+        ],
+        "license_evidence": "Generated for this project test on 2026-09-11; no third-party source material was supplied."
+      },
+      "visual_review": {
+        "status": "pending",
+        "approved_by": "",
+        "approved_at": "",
+        "transfer_scope": "Reference chair contains multiple invented-view stimuli; replace with reviewed measurement styling without product-view transfer."
+      },
+      "reference_region": null
+    }
+  ],
+  "review_note": "Prior project-owner-test-approval assertions were authored by the agent, not signed by the project owner. Withdrawn after live audit. Do not use this pack in production."
+}

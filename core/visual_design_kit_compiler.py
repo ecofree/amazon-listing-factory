@@ -76,8 +76,13 @@ DESIGN_FIELD_SCHEMAS = {
     },
 }
 IMAGE_DIRECTION_SCHEMA = {
+    "visual_goal": "one buyer-facing communication goal; not display copy",
+    "creative_brief": "task-specific focal treatment and composition; do not repeat design_transfer or shared styling",
+    "evidence_usage": [{"view_id": "observed view_id", "usage": "display|integrated|verification", "covered_by": []}],
+    "design_transfer": [{"reference_id": "approved ID", "inherit": "defining features used here", "adapt": "change and reason, or retain as approved"}],
     "layout": [{"view_id": "one observed view_id for this source", "target_region": [0.1, 0.1, 0.9, 0.9]}],
     "text_placement": [{"text_ref": "title|label:0|measurements", "target_region": [0.1, 0.02, 0.9, 0.1]}],
+    "scene_objects": ["only shared palette object names actually used in this role; no bedding for bare-frame views"],
     "environment_mode": "designed_environment|graphic_canvas|source_setting; graphic_canvas for isolated details/technical diagrams, source_setting only where physical context is evidence",
 }
 _BRIEF_BINDING_FIELDS = {
@@ -87,16 +92,15 @@ _BRIEF_BINDING_FIELDS = {
     "role",
 }
 _BRIEF_ROLE_FIELDS = {
-    "main": {"shopping_purpose", "image_direction"},
-    "scene": {"shopping_purpose", "image_direction"},
-    "func": {"shopping_purpose", "image_direction", "func_story_contract", "claim_reviews"},
-    "size": {"shopping_purpose", "image_direction", "measurement_authority", "invent_text"},
+    "main": {"image_direction"},
+    "scene": {"image_direction"},
+    "func": {"image_direction", "display_copy_contract", "claim_reviews"},
+    "size": {"image_direction", "measurement_authority", "display_copy_contract", "claim_reviews"},
 }
 # A complete art-direction field can legitimately be longer than a short
 # label.  Keep a bounded contract, but do not reject a coherent provider
 # response merely because it explains the physical design in detail.
 _ART_DIRECTION_FIELD_MAX = 2200
-_SHOPPING_PURPOSE_MAX = 320
 _MEASUREMENT_RE = re.compile(
     r"(?<![A-Za-z0-9])\d+(?:\.\d+)?\s*"
     r"(?:in(?:ch(?:es)?)?|ft|feet|foot|cm|mm|lb|lbs|pounds?|kg)(?![A-Za-z])",
@@ -126,6 +130,7 @@ _RENDERABLE_COPY_INSTRUCTION_RE = re.compile(
 def compile_visual_design_kit_response(
     raw: Any, *, source_manifest: list[dict[str, Any]], category_id: str = "",
     claim_reviews: dict[str, dict[str, Any]] | None = None,
+    design_references: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Keep shared design valid while isolating incomplete individual briefs."""
     if not isinstance(raw, dict):
@@ -152,6 +157,17 @@ def compile_visual_design_kit_response(
                 category_id=category_id, claim_reviews=claim_reviews or {},
             )
             brief["supporting_sources"] = validate_supporting_sources(draft.get("supporting_sources", []), source_manifest, source["source_id"])
+            if not set(brief['image_direction']['scene_objects']) <= set(art_direction['palette_direction']):
+                raise VisualDesignKitCompileError("Role scene_objects must reference shared palette objects, not invent colors")
+            request = design_binding_request(draft, art_direction, source=source, design_references=design_references)
+            review = (claim_reviews or {}).get(request["key"], {})
+            brief["design_review"] = review
+            if review.get("status") == "contradiction":
+                raise VisualDesignKitCompileError("design binding conflict: " + str(review.get("reason") or ""))
+            approved = {row["source_id"]: row for row in design_references or []}
+            if any(row["reference_id"] not in approved or source["role"] not in approved[row["reference_id"]]["roles"]
+                   for row in brief["image_direction"]["design_transfer"]):
+                raise VisualDesignKitCompileError("Selected design reference is not approved for this role")
             brief["status"] = "ready"
             _validate_briefs([brief], [source], product_claims=product_claims, category_id=category_id)
         except ValueError as exc:
@@ -162,7 +178,7 @@ def compile_visual_design_kit_response(
             }
         briefs.append(brief)
     result = {"family_art_direction": art_direction, "source_briefs": briefs}
-    validate_compiled_visual_design_kit(result, source_manifest=source_manifest, category_id=category_id)
+    validate_compiled_visual_design_kit(result, source_manifest=source_manifest, category_id=category_id, design_references=design_references)
     return result
 
 
@@ -173,10 +189,10 @@ def claim_review_requests(raw: Any, source_manifest: list[dict[str, Any]]) -> li
     requests = {}
     for brief in raw.get("source_briefs") or []:
         source = sources.get(brief.get("source_id")) if isinstance(brief, dict) else None
-        if not source or source["role"] != "func":
+        if not source or source["role"] not in {"func", "size"}:
             continue
         available = _available_claims(source, product_claims)
-        story = brief.get("func_story") or {}
+        story = brief.get("display_copy") or {}
         if not isinstance(story, dict):
             continue
         labels = story.get("labels") if isinstance(story.get("labels"), list) else []
@@ -186,11 +202,26 @@ def claim_review_requests(raw: Any, source_manifest: list[dict[str, Any]]) -> li
             except VisualDesignKitCompileError:
                 continue
             evidence = {key: available[key] for key in bound["evidence_ids"]}
-            if bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
+            if not any(key.startswith('physical:') for key in evidence) and bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
                 continue
             key = claim_key(bound["text"], evidence)
-            requests[key] = {"key": key, "proposed_text": bound["text"], "evidence": evidence}
+            requests[key] = {"kind": "product_claim", "key": key, "source_id": source['source_id'],
+                             "proposed_text": bound["text"], "evidence": evidence}
     return list(requests.values())
+
+
+def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source: dict[str, Any], design_references: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    direction = brief.get("image_direction") or {}
+    text = {key: direction.get(key) for key in ("visual_goal", "creative_brief", "design_transfer", "evidence_usage", "layout", "environment_mode", "scene_objects")} if isinstance(direction, dict) else {}
+    text["role"] = source['role']
+    selected = {row.get('reference_id') for row in text.get('design_transfer') or [] if isinstance(row, dict)}
+    scopes = [{**{key: row[key] for key in ('source_id', 'sha256', 'purpose', 'roles')},
+               'approval_boundary': row['visual_review']['transfer_scope']}
+              for row in design_references or [] if row['source_id'] in selected]
+    from .status import input_revision_id
+    key = input_revision_id({"policy": CLAIM_REVIEW_POLICY, "shared_design": _compile_art_direction(art), "role_design": text,
+        'source_revision': source['input_revision_id'], 'views': source['observation']['physical_views'], 'reference_scopes': scopes})
+    return {"kind": "design_binding", "key": key, "source_id": brief.get("source_id"), "role_design": text, "reference_scopes": scopes}
 
 
 def validate_compiled_visual_design_kit(
@@ -198,13 +229,23 @@ def validate_compiled_visual_design_kit(
     *,
     source_manifest: list[dict[str, Any]],
     category_id: str = "",
+    design_references: list[dict[str, Any]] | None = None,
 ) -> None:
     if not isinstance(data, dict) or set(data) != {"family_art_direction", "source_briefs"}:
         raise VisualDesignKitCompileError("planner response fields do not match the current VisualDesignKit contract")
     _validate_art_direction(data["family_art_direction"])
+    sources = {row['source_id']: row for row in source_manifest}
     for brief in data["source_briefs"]:
         if brief.get("status") == "ready":
             validate_supporting_sources(brief["supporting_sources"], source_manifest, brief["source_id"])
+            review = brief.get("design_review")
+            if not isinstance(review, dict):
+                raise VisualDesignKitCompileError("Design review must be a bound record or an explicit empty record")
+            if review and (review.get("key") != design_binding_request(brief, data["family_art_direction"], source=sources[brief['source_id']], design_references=design_references)["key"]
+                           or review.get("policy") != CLAIM_REVIEW_POLICY
+                           or review.get("status") not in {"supported", "inconclusive"}
+                           or not review.get("response_sha256")):
+                raise VisualDesignKitCompileError("Design review no longer matches this child's design")
     _validate_briefs(
         data["source_briefs"],
         source_manifest,
@@ -252,17 +293,16 @@ def _compile_source_brief(
         "source_intent_revision_id": str(source["input_revision_id"]),
         "source_sha256": str(source["source_sha256"]),
         "role": role,
-        "shopping_purpose": _source_brief_text(draft.get("shopping_purpose"), "shopping_purpose", _SHOPPING_PURPOSE_MAX, category_id=category_id),
-        "image_direction": _image_direction(draft.get("image_direction"), source),
+        "image_direction": _image_direction(draft.get("image_direction"), source, category_id=category_id),
     }
-    if role == "func":
-        result["func_story_contract"] = _compile_func_story(source, draft.get("func_story"), product_claims=product_claims, claim_reviews=claim_reviews)
+    if role in {"func", "size"}:
+        result["display_copy_contract"] = _compile_display_copy(source, draft.get("display_copy"), product_claims=product_claims, claim_reviews=claim_reviews)
         available = _available_claims(source, product_claims)
         used_keys = {claim_key(row["text"], {key: available[key] for key in row["evidence_ids"]})
-                    for row in result["func_story_contract"]["bindings"]}
+                    for row in result["display_copy_contract"]["bindings"]}
         result["claim_reviews"] = {key: value for key, value in claim_reviews.items() if key in used_keys}
-    elif role == "size":
-        result.update(measurement_authority="complete_source_measurement_diagram", invent_text=False)
+    if role == "size":
+        result["measurement_authority"] = "complete_source_measurement_diagram"
     # Placement is optional design metadata, not authority to invent copy.
     # Project only existing copy references; an unused hint cannot block facts.
     result["image_direction"] = {**result["image_direction"], "text_placement": [
@@ -272,7 +312,7 @@ def _compile_source_brief(
 
 
 def _text_refs(brief: dict[str, Any], source: dict[str, Any]) -> set[str]:
-    story = brief.get("func_story_contract") or {}
+    story = brief.get("display_copy_contract") or {}
     refs = {"title"} if story.get("title") else set()
     refs.update(f"label:{i}" for i, _ in enumerate(story.get("labels") or []))
     if brief["role"] == "size" or source.get("measurements"):
@@ -280,27 +320,35 @@ def _text_refs(brief: dict[str, Any], source: dict[str, Any]) -> set[str]:
     return refs
 
 
-def _compile_func_story(
+def _compile_display_copy(
     source: dict[str, Any], value: Any, *,
     product_claims: list[dict[str, Any]] | None = None,
     claim_reviews: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     available = _available_claims(source, product_claims)
     if not isinstance(value, dict) or set(value) != {"title", "labels"} or not isinstance(value.get("labels"), list):
-        raise VisualDesignKitCompileError("func story needs an explicit title choice and label list")
+        raise VisualDesignKitCompileError("display copy needs an explicit title choice and label list")
     title = value["title"]
-    bindings = [_bind_func_story_text(row, available, claim_reviews=claim_reviews)
-                for row in ([title] if title is not None else []) + value["labels"]]
+    bindings, errors = [], []
+    entries = ([("title", title)] if title is not None else []) + [
+        (f"label:{i}", row) for i, row in enumerate(value["labels"])]
+    for location, row in entries:
+        try:
+            bindings.append(_bind_display_text(row, available, claim_reviews=claim_reviews))
+        except VisualDesignKitCompileError as exc:
+            errors.append(f"{location}: {exc}")
+    if errors:
+        raise VisualDesignKitCompileError("; ".join(errors))
     strings = [row["text"] for row in bindings]
     if len(strings) != len(set(text.casefold() for text in strings)) or sum(map(len, strings)) > 1200:
-        raise VisualDesignKitCompileError("func copy is duplicated or exceeds its content budget")
+        raise VisualDesignKitCompileError("display copy is duplicated or exceeds its content budget")
     return {"mode": "source_claims", "title": strings[0] if title is not None else "",
             "labels": strings[1:] if title is not None else strings, "bindings": bindings}
 
 
 def _copy_binding(value: Any, available: dict[str, str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"evidence_ids", "text"}:
-        raise VisualDesignKitCompileError("func story copy is malformed")
+        raise VisualDesignKitCompileError("display copy copy is malformed")
     ids = value.get("evidence_ids")
     text = value.get("text")
     if (
@@ -308,22 +356,22 @@ def _copy_binding(value: Any, available: dict[str, str]) -> dict[str, Any]:
         or len(ids) != len(set(ids)) or not isinstance(text, str) or not text.strip()
         or len(text) > 240 or has_bad_encoding(text)
     ):
-        raise VisualDesignKitCompileError("func story copy has invalid text or evidence scope")
+        raise VisualDesignKitCompileError("display copy copy has invalid text or evidence scope")
     return {"evidence_ids": list(ids), "text": us_measurement_text(text)}
 
 
-def _bind_func_story_text(
+def _bind_display_text(
     value: Any, available: dict[str, str], *,
     claim_reviews: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     bound = _copy_binding(value, available)
     evidence = {key: available[key] for key in bound["evidence_ids"]}
-    if bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
+    if not any(key.startswith('physical:') for key in evidence) and bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
         return bound
     key = claim_key(bound["text"], evidence)
     review = (claim_reviews or {}).get(key) or {}
     if review.get("status") != "supported" or review.get("policy") != CLAIM_REVIEW_POLICY or review.get("key") != key or not review.get("response_sha256"):
-        raise VisualDesignKitCompileError("func claim requires independent evidence review: " + str(review.get("reason") or bound["text"]))
+        raise VisualDesignKitCompileError("display claim requires independent evidence review: " + str(review.get("reason") or bound["text"]))
     return bound
 
 
@@ -390,7 +438,7 @@ def _validate_briefs(
             continue
         if brief.get("status") != "ready":
             raise VisualDesignKitCompileError("source brief readiness is missing")
-        required_fields = _BRIEF_BINDING_FIELDS | _BRIEF_ROLE_FIELDS[role] | {"status", "supporting_sources"}
+        required_fields = _BRIEF_BINDING_FIELDS | _BRIEF_ROLE_FIELDS[role] | {"status", "supporting_sources", "design_review"}
         allowed_fields = required_fields
         missing_fields = sorted(required_fields - set(brief))
         unknown_fields = sorted(set(brief) - allowed_fields)
@@ -406,24 +454,17 @@ def _validate_briefs(
                 f"source_briefs[{index}] fields do not match its {role} contract ({detail})"
             )
         _validate_source_binding(brief, source, index)
-        _valid_text(
-            brief["shopping_purpose"],
-            f"source_briefs[{index}].shopping_purpose",
-            5,
-            _SHOPPING_PURPOSE_MAX,
-        )
-        direction = _image_direction(brief["image_direction"], source)
+        direction = _image_direction(brief["image_direction"], source, category_id=category_id)
         if any(row["text_ref"] not in _text_refs(brief, source) for row in direction["text_placement"]):
             raise VisualDesignKitCompileError("text placement references absent role copy")
-        if role == "func":
-            _validate_func_brief(
+        if role in {"func", "size"}:
+            _validate_display_brief(
                 brief, source, index, product_claims=product_claims,
             )
-        elif (
+        if (
             role == "size"
             and (
                 brief["measurement_authority"] != "complete_source_measurement_diagram"
-                or brief["invent_text"] is not False
             )
         ):
             raise VisualDesignKitCompileError(
@@ -446,21 +487,21 @@ def _validate_source_binding(
         )
 
 
-def _validate_func_brief(
+def _validate_display_brief(
     brief: dict[str, Any], source: dict[str, Any], index: int, *,
     product_claims: list[dict[str, Any]] | None = None,
 ) -> None:
-    story = brief.get("func_story_contract")
+    story = brief.get("display_copy_contract")
     if not isinstance(story, dict) or set(story) != {"mode", "title", "labels", "bindings"} or story.get("mode") != "source_claims":
-        raise VisualDesignKitCompileError(f"source_briefs[{index}] has no canonical FuncStoryContract")
+        raise VisualDesignKitCompileError(f"source_briefs[{index}] has no canonical DisplayCopyContract")
     if not isinstance(story["labels"], list) or not isinstance(story["bindings"], list):
-        raise VisualDesignKitCompileError("func story lists are malformed")
+        raise VisualDesignKitCompileError("display copy lists are malformed")
     strings = ([story["title"]] if story["title"] else []) + story["labels"]
     if len(strings) != len(story["bindings"]) or len(strings) != len(set(strings)):
-        raise VisualDesignKitCompileError("func copy bindings changed")
+        raise VisualDesignKitCompileError("display copy bindings changed")
     available = _available_claims(source, product_claims)
     for text, binding in zip(strings, story["bindings"]):
-        if _bind_func_story_text(binding, available, claim_reviews=brief["claim_reviews"])["text"] != text:
+        if _bind_display_text(binding, available, claim_reviews=brief["claim_reviews"])["text"] != text:
             raise VisualDesignKitCompileError("func text disagrees with its reviewed binding")
 
 
@@ -479,13 +520,21 @@ def _available_claims(
             ),
         }),
     ]
-    return {
+    evidence = {
         str(row.get("evidence_id") or ""): str(row.get("text") or "")
         for row in rows
         if isinstance(row, dict)
         and str(row.get("evidence_id") or "")
         and str(row.get("text") or "").strip()
     }
+    source_id = source['source_id']
+    for view in (source.get('observation') or {}).get('physical_views', []):
+        for feature in view['evidence']:
+            for index, fact in enumerate(feature['physical_facts']):
+                evidence[f"physical:{source_id}:{view['view_id']}:{feature['feature_id']}:{index}"] = fact
+    for index, row in enumerate(source.get('measurements') or []):
+        evidence[f'measurement:{source_id}:{index}'] = str(row.get('source_label') or row.get('text') or '')
+    return evidence
 
 
 def _global_product_claims(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -548,15 +597,35 @@ def _design_mapping(value: Any, schema: dict[str, Any], label: str) -> dict[str,
             for key, item in value.items()}
 
 
-def _image_direction(value: Any, source: dict[str, Any]) -> dict[str, Any]:
-    """Bind canvas geometry, never execute factual prose from a design field."""
+def _image_direction(value: Any, source: dict[str, Any], *, category_id: str = "") -> dict[str, Any]:
+    """One creative contract with explicit evidence disposition, not one panel per crop."""
     if not isinstance(value, dict) or set(value) != set(IMAGE_DIRECTION_SCHEMA):
         raise VisualDesignKitCompileError("image_direction needs the current named design fields")
     if value["environment_mode"] not in {"designed_environment", "graphic_canvas", "source_setting"}:
         raise VisualDesignKitCompileError("image_direction has unknown environment_mode")
+    objects = value['scene_objects']
+    if not isinstance(objects, list) or any(not isinstance(key, str) or not key for key in objects) or len(objects) != len(set(objects)):
+        raise VisualDesignKitCompileError("scene_objects needs unique shared palette object names")
+    for field, maximum in (("visual_goal", 240), ("creative_brief", 700)):
+        _source_brief_text(value[field], field, maximum, category_id=category_id)
+        _reject_renderable_copy_instruction(value[field], field)
+        if re.search(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6})\b", value[field]):
+            raise VisualDesignKitCompileError(f"{field} must reference shared color roles, not redefine colors")
+    refs = value["design_transfer"]
+    if not isinstance(refs, list) or any(not isinstance(row, dict) or set(row) != {"reference_id", "inherit", "adapt"} for row in refs):
+        raise VisualDesignKitCompileError("design_transfer needs reference identity, inheritance and adaptation")
+    ids = [row["reference_id"] for row in refs]
+    if any(not isinstance(key, str) or not key for key in ids) or len(ids) != len(set(ids)):
+        raise VisualDesignKitCompileError("design_transfer must use unique input identities")
+    for row in refs:
+        for field in ("inherit", "adapt"):
+            _source_brief_text(row[field], field, 350, category_id=category_id)
+            _reject_renderable_copy_instruction(row[field], field)
+            if re.search(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6})\b", row[field]):
+                raise VisualDesignKitCompileError("design_transfer must reference shared color roles, not redefine colors")
     for field, fields in (("layout", {"view_id", "target_region"}), ("text_placement", {"text_ref", "target_region"})):
         rows = value[field]
-        if not isinstance(rows, list) or (field == "layout" and not rows):
+        if not isinstance(rows, list):
             raise VisualDesignKitCompileError(f"{field} needs a region list")
         for row in rows:
             if not isinstance(row, dict) or set(row) != fields:
@@ -569,10 +638,33 @@ def _image_direction(value: Any, source: dict[str, Any]) -> dict[str, Any]:
                 box = row[key]
                 if not isinstance(box, list) or len(box) != 4 or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in box) or not (box[0] < box[2] and box[1] < box[3]):
                     raise VisualDesignKitCompileError(f"{field}.{key} requires normalized left,top,right,bottom bounds")
-    known = {row["view_id"] for row in physical_views((source.get("observation") or {}).get("physical_views"))}
+    views = {row["view_id"]: row for row in physical_views((source.get("observation") or {}).get("physical_views"))}
+    known = set(views)
+    usage = value["evidence_usage"]
+    if not isinstance(usage, list) or any(not isinstance(row, dict) or set(row) != {"view_id", "usage", "covered_by"} for row in usage):
+        raise VisualDesignKitCompileError("evidence_usage needs explicit view dispositions")
+    ids = [row["view_id"] for row in usage]
+    if any(not isinstance(key, str) for key in ids) or set(ids) != known or len(ids) != len(known):
+        raise VisualDesignKitCompileError("Every observed view needs one evidence disposition")
+    displayed = {row["view_id"] for row in usage if row["usage"] == "display"}
+    if not displayed:
+        raise VisualDesignKitCompileError("An image must display observed product evidence")
+    for row in usage:
+        links = row["covered_by"]
+        if row["usage"] not in {"display", "integrated", "verification"}:
+            raise VisualDesignKitCompileError("Unknown evidence disposition")
+        if not isinstance(links, list) or any(not isinstance(key, str) or key not in displayed or key == row["view_id"] for key in links):
+            raise VisualDesignKitCompileError("Covered evidence must reference displayed views")
+        if (row["usage"] == "display" and links) or (row["usage"] != "display" and not links):
+            raise VisualDesignKitCompileError("Non-displayed evidence must identify its visible coverage")
+        if links:
+            required = {(item['object_id'], item['feature_id']) for item in views[row['view_id']]['evidence']}
+            visible = {(item['object_id'], item['feature_id']) for key in links for item in views[key]['evidence']}
+            if not required <= visible:
+                raise VisualDesignKitCompileError(f"{row['view_id']}: unique physical evidence is not covered; display its intact view")
     selected = [row["view_id"] for row in value["layout"]]
-    if not known or set(selected) != known or len(selected) != len(known):
-        raise VisualDesignKitCompileError("layout must bind every source physical view once, without hidden or duplicate views")
+    if not set(selected) <= displayed or len(selected) != len(set(selected)):
+        raise VisualDesignKitCompileError("Optional layout can position displayed views only")
     return value
 
 
@@ -600,7 +692,7 @@ def _product_state_mutation(value: str, *, category_id: str = "") -> bool:
 def _reject_renderable_copy_instruction(value: str, label: str) -> None:
     if _RENDERABLE_COPY_INSTRUCTION_RE.search(value):
         raise VisualDesignKitCompileError(
-            f"{label} contains a renderable-copy instruction; readable copy belongs only to FuncStoryContract or MeasurementContract"
+            f"{label} contains a renderable-copy instruction; readable copy belongs only to DisplayCopyContract or MeasurementContract"
         )
 
 

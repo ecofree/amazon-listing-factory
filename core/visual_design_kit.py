@@ -18,6 +18,7 @@ from .io import (
     read_jsonl,
     temporary_environ,
     write_jsonl,
+    write_json,
 )
 from .job import load_job
 from .plugin import ProductPlugin
@@ -29,27 +30,23 @@ from .run_scope import read_run_scope
 from .status import input_revision_id, logical_task_id
 from .text_evidence import clean_evidence_text, has_bad_encoding, us_measurement_text
 from .image_task_inputs import visual_product_color, visual_variation_values
-from .palette_registry import (
-    palette_registry_policy_version,
-    select_palette_route,
-)
+from .palette_registry import planned_palette_diagnostics
 from .vision_gemini_client import gemini_scope_identity, gemini_stream_generate
 from .visual_context import planner_visual_context_instruction
-from .image_reference_context import approved_design_references, physical_views, planning_view_inputs, prepare_planning_views
-from .visual_semantics import review_claims, source_fact_records
+from .image_reference_context import physical_views, planning_view_inputs, prepare_planning_views
+from .design_reference_library import approved_design_references, brand_design_brief, design_reference_usage
+from .visual_semantics import review_planning_bindings, source_fact_records
 from .visual_design_kit_compiler import (
     VisualDesignKitCompileError,
-    cleaned_source_claims,
+    _available_claims,
     claim_review_requests,
+    design_binding_request,
     compile_visual_design_kit_response,
     validate_compiled_visual_design_kit,
     DESIGN_FIELD_SCHEMAS, IMAGE_DIRECTION_SCHEMA,
 )
 VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v11"
-VISUAL_DESIGN_KIT_POLICY_VERSION = (
-    "gemini-child-design-v47-independent-view-inputs-"
-    f"{palette_registry_policy_version()}"
-)
+VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-child-design-v53-physical-facts-and-display-copy"
 VISUAL_DESIGN_KIT_ARTIFACT = "visual_design_kits_v11.jsonl"
 
 _ROW_FIELDS = {"schema_version", "policy_version", "category_id", "child", "source_reference", "source_sha256", "source_references", "child_facts_revision_id", "input_revision_id", "family_design_id", "visual_design_kit_id", "family_art_direction", "source_briefs", "planner", "approved_design_references"}
@@ -99,7 +96,7 @@ def build_visual_design_kits(
             )]
         source_manifest = _source_manifest(sources, child)
         design_refs = approved_design_references(job, asin)
-        prompt = visual_design_kit_prompt(plugin, compact_product_facts(child), policy, source_manifest, design_refs)
+        prompt = visual_design_kit_prompt(plugin, compact_product_facts(child), policy, source_manifest, design_refs, brand_design_brief(job))
         revision, child_facts_revision = _kit_input_revision(child=child, policy=policy, sources=sources, planner_prompt=prompt)
         cached = previous.get(asin)
         cached_current = bool(cached and visual_design_kit_row_current(
@@ -125,6 +122,7 @@ def build_visual_design_kits(
                 _parse_response(text),
                 source_manifest=source_manifest,
                 category_id=plugin.category_id,
+                design_references=design_refs,
             )
             validate_visual_design_kit(
                 compiled,
@@ -168,7 +166,7 @@ def build_visual_design_kits(
                 )
 
         try:
-            source_paths = prepare_planning_views(job, source_manifest, trace_dir / "evidence_views")
+            source_paths = prepare_planning_views(job, source_manifest, trace_dir / "evidence_views", deadline_monotonic=child_deadline)
             source_paths += [resolve_job_owned_path(job, row["path"]) for row in design_refs]
             record_progress(job, "visual_design_kit_started", child=asin, input_revision=revision)
             response_text = json.dumps({
@@ -197,22 +195,25 @@ def build_visual_design_kits(
             planned = _finish_source_briefs(
                 _parse_response(response_text), source_manifest=source_manifest,
                 category_id=plugin.category_id, source_paths=source_paths,
+                source_originals=[resolve_job_owned_path(job, row['source_path']) for row in source_manifest],
                 trace_dir=trace_dir, deadline_monotonic=child_deadline,
                 cached=cached if cached_current else None,
+                design_references=design_refs,
             )
             validate_visual_design_kit(
                 planned,
                 source_manifest=source_manifest,
                 category_id=plugin.category_id,
-            )
-            validate_compiled_visual_design_kit(
-                planned,
-                source_manifest=source_manifest,
-                category_id=plugin.category_id,
+                design_references=design_refs,
             )
             response_path.write_text(
                 json.dumps(planned, indent=2, ensure_ascii=False), encoding="utf-8",
             )
+            write_json(trace_dir / "reference_usage.json", design_reference_usage(job, design_refs, planned["source_briefs"]))
+            try:
+                write_json(trace_dir / "palette_diagnostics.json", planned_palette_diagnostics(planned["family_art_direction"]))
+            except Exception as exc:
+                record_progress(job, "palette_diagnostics_unavailable", child=asin, error=f"{type(exc).__name__}: {exc}"[:300])
             selected_attempt = next(
                 (row for row in reversed(attempts) if row["status"] == "success"),
                 attempts[-1] if attempts else (cached["planner"] if cached_current else {}),
@@ -302,70 +303,104 @@ def build_visual_design_kits(
     }
 
 def _brief_draft(brief: dict[str, Any]) -> dict[str, Any]:
-    draft = {key: brief[key] for key in ("source_id", "shopping_purpose", "image_direction")}
+    draft = {key: brief[key] for key in ("source_id", "image_direction")}
     draft["supporting_sources"] = brief["supporting_sources"]
-    if brief["role"] == "func":
-        bindings = brief["func_story_contract"]["bindings"]
-        has_title = bool(brief["func_story_contract"]["title"])
-        draft["func_story"] = {"title": bindings[0] if has_title else None, "labels": bindings[1:] if has_title else bindings}
+    if brief["role"] in {"func", "size"}:
+        bindings = brief["display_copy_contract"]["bindings"]
+        has_title = bool(brief["display_copy_contract"]["title"])
+        draft["display_copy"] = {"title": bindings[0] if has_title else None, "labels": bindings[1:] if has_title else bindings}
     return draft
 
 
 def _finish_source_briefs(
     raw: dict[str, Any], *, source_manifest: list[dict[str, Any]], category_id: str,
     source_paths: list[Path], trace_dir: Path, deadline_monotonic: float,
+    source_originals: list[Path],
     cached: dict[str, Any] | None,
+    design_references: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     reviews = {key: value for brief in (cached or {}).get("source_briefs", [])
                for key, value in brief.get("claim_reviews", {}).items()}
+    reviews.update({brief["design_review"]["key"]: brief["design_review"]
+                    for brief in (cached or {}).get("source_briefs", []) if brief.get("design_review")})
     review_available = True
+    sources = {source["source_id"]: source for source in source_manifest}
 
     def compile_reviewed(draft: dict[str, Any], attempt: str) -> dict[str, Any]:
         nonlocal review_available
-        requests = [row for row in claim_review_requests(draft, source_manifest) if row["key"] not in reviews]
+        all_requests = [*claim_review_requests(draft, source_manifest),
+                        *(design_binding_request(brief, draft["family_art_direction"], source=sources[brief["source_id"]], design_references=design_references) for brief in draft["source_briefs"])]
+        requests = list({row["key"]: row for row in all_requests if row["key"] not in reviews}.values())
         try:
-            reviews.update(review_claims(requests, trace_dir=trace_dir / attempt, deadline_monotonic=deadline_monotonic))
+            reviews.update(review_planning_bindings(requests, shared_design=draft["family_art_direction"],
+                source_manifest=source_manifest, source_paths=source_originals,
+                trace_dir=trace_dir / attempt, deadline_monotonic=deadline_monotonic))
         except Exception as exc:
             review_available = False
-            (trace_dir / "claim_review_error.txt").write_text(f"{type(exc).__name__}: {exc}", encoding="utf-8")
-        return compile_visual_design_kit_response(draft, source_manifest=source_manifest, category_id=category_id, claim_reviews=reviews)
+            reason = f"Planning review unavailable: {type(exc).__name__}: {exc}"
+            (trace_dir / "planning_review_error.txt").write_text(reason, encoding="utf-8")
+            reviews.update({row['key']: {'status': 'inconclusive', 'reason': reason}
+                            for row in requests if row['kind'] == 'product_claim'})
+        return compile_visual_design_kit_response(draft, source_manifest=source_manifest, category_id=category_id, claim_reviews=reviews, design_references=design_references)
 
     planned = compile_reviewed(raw, "initial")
     pending = [row for row in planned["source_briefs"] if row["status"] == "pending"]
     if not pending or not review_available or time.monotonic() >= deadline_monotonic:
         return planned
     pending_ids = {row["source_id"] for row in pending}
+    evidence_ids = pending_ids | {row['source_id'] for brief in raw['source_briefs'] if brief['source_id'] in pending_ids
+                                 for row in brief.get('supporting_sources', [])}
+    repair_sources = [row for row in source_manifest if row['source_id'] in evidence_ids]
+    attachment_map = planning_view_inputs(source_manifest)
+    repair_paths = [path for item, path in zip(attachment_map, source_paths) if item['source_id'] in evidence_ids]
+    repair_paths.extend(source_paths[len(attachment_map):])
     prompt = (
-        "Repair ONLY the listed source briefs under the unchanged shared child design. "
-        "Return JSON {source_briefs:[...]}, one replacement for every listed source_id. "
+        "Repair the listed source briefs under the unchanged named child design assignments. "
+        "Return JSON {source_briefs:[...],shared_prose:{}}, one replacement for every listed source_id. "
+        "shared_prose may correct only conflicting environment_and_staging, photography_direction or cohesion_rule "
+        "descriptions by reusing named assignments; omit unchanged fields. Palette, typography and graphic values stay unchanged. "
         "Use the original brief schema; preserve complete claim objects, counts and qualifiers. "
-        "Resolve unsupported copy using evidence or omit unsupported optional labels. "
-        "Do not change the shared design or other sources.\n"
+        "Resolve all listed findings together: preserve supported specific features; remove only unsupported qualifiers. "
+        "Resolve role color/material/font conflicts by referencing unchanged shared object/graphic names, not new values. "
+        "Do not redesign the child or change other source briefs.\n"
         + json.dumps({"shared_design": planned["family_art_direction"], "pending": pending,
-                      "source_evidence": [_planner_source_view(row) for row in source_manifest],
-                      "evidence_attachments": planning_view_inputs(source_manifest),
-                      "product_claims": [claim for row in source_manifest for claim in row.get("product_claims") or []],
-                      "schema": _brief_schema_for_source({"source_id": "listed pending source_id", "role": "func"})}, ensure_ascii=False)
+                      "claim_review_findings": [{**row, "review": reviews.get(row["key"], {})}
+                          for row in claim_review_requests({"source_briefs": [brief for brief in raw["source_briefs"]
+                              if brief["source_id"] in pending_ids]}, source_manifest)],
+                      "design_review_findings": [{**request, "review": reviews.get(request["key"], {})}
+                          for brief in raw["source_briefs"] if brief["source_id"] in pending_ids
+                          for request in [design_binding_request(brief, planned["family_art_direction"], source=sources[brief["source_id"]], design_references=design_references)]],
+                      "source_evidence": [_planner_source_view(row) for row in repair_sources],
+                      "evidence_attachments": planning_view_inputs(repair_sources),
+                      "design_references": _planner_design_refs(design_references or [], len(planning_view_inputs(repair_sources))),
+                      "product_claims": {claim['evidence_id']: claim['text'] for row in source_manifest for claim in row.get("product_claims") or []},
+                      "schemas": [_brief_schema_for_source(row) for row in repair_sources if row['source_id'] in pending_ids]}, ensure_ascii=False)
     )
     (trace_dir / "brief_repair_request.txt").write_text(prompt, encoding="utf-8")
 
     def validate_repair(text: str) -> bool:
-        rows = _parse_response(text).get("source_briefs")
+        value = _parse_response(text)
+        rows = value.get("source_briefs")
         if not isinstance(rows, list) or len(rows) != len(pending_ids) or any(not isinstance(row, dict) for row in rows) or {row.get("source_id") for row in rows} != pending_ids:
             raise VisualDesignKitError("local brief repair changed its source inventory")
+        prose = value.get("shared_prose", {})
+        if (not isinstance(prose, dict) or set(prose) - {"environment_and_staging", "photography_direction", "cohesion_rule"}
+                or any(not isinstance(text, str) or not text.strip() for text in prose.values())):
+            raise VisualDesignKitError("local repair attempted to change shared design assignments")
         return True
 
     try:
         response = gemini_stream_generate(
-            prompt, source_paths, client_scope="visual_planning", attempts=1,
-            timeout_seconds=40, total_timeout_seconds=40, max_physical_requests=1,
+            prompt, repair_paths, client_scope="visual_planning", attempts=1,
+            max_physical_requests=1,
             deadline_monotonic=deadline_monotonic, response_validator=validate_repair,
             request_id=f"brief-local-repair:{input_revision_id(pending)}",
         )
         (trace_dir / "brief_repair_response.txt").write_text(response, encoding="utf-8")
         validate_repair(response)
-        repaired = _parse_response(response)["source_briefs"]
-        replacement = {"family_art_direction": planned["family_art_direction"], "source_briefs": [
+        payload = _parse_response(response)
+        repaired = payload["source_briefs"]
+        replacement = {"family_art_direction": {**planned["family_art_direction"], **payload.get("shared_prose", {})}, "source_briefs": [
             *[row for row in raw["source_briefs"] if row["source_id"] not in pending_ids], *repaired,
         ]}
         return compile_reviewed(replacement, "repaired")
@@ -442,7 +477,7 @@ def visual_design_kit_row_current(
         policy = policy or compiled_image_policy(plugin)
         source_manifest = _source_manifest(sources, child_row)
         prompt = visual_design_kit_prompt(
-            plugin, compact_product_facts(child_row), policy, source_manifest, approved_design_references(job, child),
+            plugin, compact_product_facts(child_row), policy, source_manifest, approved_design_references(job, child), brand_design_brief(job),
         )
         expected_revision, expected_child_facts = _kit_input_revision(
             child=child_row, policy=policy, sources=sources, planner_prompt=prompt,
@@ -471,7 +506,6 @@ def compact_product_facts(child: dict[str, Any]) -> dict[str, Any]:
     relevant = {key: value for key, value in specs.items()
                 if any(term in str(key).casefold() for term in ("material", "finish", "color", "style", "room", "mount"))}
     return {
-        "palette_route_key": str(child.get("asin") or child.get("sku") or ""),
         "title": str(child.get("title") or ""),
         "variation": visual_variation_values(child),
         "color": visual_product_color(child),
@@ -505,7 +539,7 @@ def _planner_product_identity(facts: dict[str, Any]) -> dict[str, Any]:
     identity = {
         key: value
         for key, value in facts.items()
-        if key not in {"features", "palette_route_key"} and value not in (None, "", [], {})
+        if key != "features" and value not in (None, "", [], {})
     }
     variation = identity.get("variation")
     if isinstance(variation, dict):
@@ -526,30 +560,14 @@ def _planner_product_identity(facts: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
-def _palette_planning_reference(plugin: ProductPlugin, facts: dict[str, Any]) -> dict[str, Any] | None:
-    """Return one computed color aid without making it executable design state."""
-    if not str(facts.get("color") or "").strip():
-        return None
-    route = select_palette_route(
-        category_id=str(getattr(plugin, "category_id", "") or ""),
-        product_color=facts.get("color"),
-        route_key=facts.get("palette_route_key") or facts.get("title"),
-        size=facts.get("size"),
-        variation=facts.get("variation"),
-    )
-    basis = route.get("selection_basis") if isinstance(route.get("selection_basis"), dict) else {}
-    return {
-        "authority": "advisory_color_analysis_only",
-        "product_color": str(facts.get("color") or "").strip(),
-        "color_basis": route.get("color_basis") or "named_color_approximation_not_pixel_measurement",
-        "computed_starting_palette": route.get("recipe") or {},
-        "computed_harmony_mode": str(route.get("harmony_mode") or ""),
-        "computed_style_profile": str(route.get("profile_id") or ""),
-        "spatial_limits": basis.get("spatial_limits") or {},
-        "starting_palette_metrics_only": route.get("metrics") or {},
-    }
 
-def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], policy: dict[str, Any], source_manifest: list[dict[str, Any]], design_references: list[dict[str, Any]] | None = None) -> str:
+def _planner_design_refs(rows: list[dict[str, Any]], offset: int) -> list[dict[str, Any]]:
+    return [{"attachment_number": offset + index, "reference_id": row["source_id"],
+             "roles": row["roles"], "transfer_principles": row["purpose"], "approval_boundary": row['visual_review']['transfer_scope']}
+            for index, row in enumerate(rows, 1)]
+
+
+def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], policy: dict[str, Any], source_manifest: list[dict[str, Any]], design_references: list[dict[str, Any]] | None = None, brand_brief: dict[str, Any] | None = None) -> str:
     # One response grammar, not a duplicate schema for every gallery image.
     expected_briefs = [_brief_schema_for_source({"source_id": "one source_id from the evidence list", "role": "func"})]
     response_schema = {
@@ -559,7 +577,7 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
             "photography_direction": "light, exposure, white balance, material response; no layout",
             "environment_and_staging": "US setting and prop placement; reuse palette objects, no new colors",
             **DESIGN_FIELD_SCHEMAS,
-            "cohesion_rule": "concise cross-role relationship; do not repeat facts or colors",
+            "cohesion_rule": "name the core reference direction (or autonomous), why it fits this child, and how roles cohere; do not repeat styling values",
             "negative_visuals": ["2-6 concise child-wide design risks"],
         },
         "source_briefs": expected_briefs,
@@ -572,38 +590,33 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
         for claim in source.get("product_claims") or []
         if isinstance(claim, dict) and claim.get("evidence_id") and claim.get("text")
     }
-    palette_reference = _palette_planning_reference(plugin, facts)
-    palette_aid = (
-        "COLOR ANALYSIS AID (NOT DESIGN AUTHORITY)\n"
-        + json.dumps(palette_reference, ensure_ascii=False)
-        + "\nAdvisory, not a quality verdict. Your palette_direction is the sole final child palette for surroundings; graphic_direction owns infographic colors.\n\n"
-        if palette_reference
-        else ""
-    )
     # Keep planner context useful but bounded; the same context is projected
     # again into role prompts, so repeating the full policy here adds noise.
     visual_context_guardrail = planner_visual_context_instruction(policy, max_chars=420)
     return (
-        "Return JSON for one Amazon child. The program owns facts and process. You are the sole visual designer: choose child-wide palette, lighting, staging, typography, graphics and per-image composition.\n\n"
-        "Design from the buyer's question. Each evidence attachment is an independent product/detail crop, not a source page or style example. Remaining backdrop/overlaid graphics within a crop are not design authority.\n"
+        "Return JSON for one Amazon child. The program owns facts and process. You are the sole visual designer.\n\n"
+        "Evidence attachments are intact observed views. Their feature map describes only visible pixels; residual graphics have no design authority.\n"
         "Preserve geometry, finish, physical count, state, perspective and visible extent WITHIN each product view, including visible mattresses in bed main/scene. Redesign canvas positions, view scale, panels, room decor and typography. Use bright, people-free settings.\n\n"
-        + palette_aid
         + (visual_context_guardrail + "\n\n" if visual_context_guardrail else "")
         + "SOURCE BRIEFS\n"
         "supporting_sources=[{source_id,purpose,evidence_ids}]; IDs are source claims or object:object_id, [] for structure without IDs. Supporting views verify structure, not hidden parts.\n"
-        "Return one brief per source_id; omit func_story for non-func. shopping_purpose is an audit-only buyer question.\n"
+        "Return one brief per source_id; display_copy for func and size only. visual_goal identifies the buyer question, not a depicted state. creative_brief arranges the existing physical views, not a reconstructed illustration of the benefit.\n"
         "Main follows category policy; scenes share the object palette. Func hierarchy serves proven features; icons are optional. Partial views stay partial; measurement endpoints stay bound to physical points.\n"
-        "Place each listed view_id for this source exactly once using target_region on your new canvas, normalized [left,top,right,bottom]. Source coordinates are program-bound, not design choices. No prose in layout. Text uses title, zero-based label:N or measurements references; photos use []. Preserve visible extent, not surrounding graphic panels.\n"
-        "Resolve one color/material per non-product object and one treatment per graphic role. Local backing serves readability, not a default full-width capsule; no forced template.\n"
-        "For func, choose only the factual copy actually needed; title may be null and labels may be empty when the visual evidence communicates the purchase question without text. Prefer specific mechanisms over generic benefits; retain counts, objects and qualifiers. Bind every exact display string to its evidence IDs. Natural paraphrases receive independent semantic review; do not imply unsupported performance.\n\n"
+        "Each evidence_usage is {view_id,usage,covered_by}. Non-displayed views may link only to displayed views actually showing the same observed feature_ids and state. Unique joints, slat recesses and measured endpoints remain visible; detail views cannot become whole products. Choose fresh canvas placement, not a mandatory panel per crop. Layout/text_placement may be []; bounds are normalized [left,top,right,bottom]. Text references: title, label:N or measurements; photos use [].\n"
+        "design_transfer selects role-approved references within their transfer_principles: inherit only permitted features and explain adaptations. A reference approval is scoped, not permission to copy its whole style. Use [] without suitable references: autonomous, not reference-calibrated.\n"
+        "Shared art direction fixes this child's adapted styling. creative_brief owns composition; design_transfer owns reference use. Both reuse shared names, not new colors or copy. The image model integrates layout, text and detail within this direction and product facts.\n"
+        "Resolve one color/material per individual non-product object (sheet, duvet, throw, each major pillow separately, not an ensemble with extra unnamed accent colors). scene_objects selects the shared palette names actually used by each role; bare-frame views exclude bedding. creative_brief positions these objects without repeating their colors. One treatment per graphic role; local backing only for readability, no default capsule.\n"
+        "For func/size, display_copy owns all exact titles, group labels and inset captions: title may be null, labels may be empty. Bind each independent string to its local evidence IDs, not a paragraph later split into captions. physical: evidence proves visible structure only, never performance/material specifications; measurement: evidence supports measured-object headings, not new values. Size numeric labels already come from measurement authority: do not repeat them as copy. Prefer specific mechanisms with their counts and qualifiers.\n\n"
         "Source-colored outlines, adjustment ghosts and highlights are diagram notation, not finish or extra physical parts. Size preserves quantities and measurement associations; program-approved US-unit labels replace metric labels.\n\n"
         f"Category: {plugin.category_id}\n"
         f"Product type: {plugin.display_name}\n"
         f"Product identity: {json.dumps(_planner_product_identity(facts), ensure_ascii=False, separators=(',', ':'))}\n"
+        f"User brand design brief (not product facts): {json.dumps(brand_brief or {}, ensure_ascii=False)}\n"
         f"Trusted product fact evidence: {json.dumps(product_claims, ensure_ascii=False, separators=(',', ':'))}\n"
         f"Final source intents: {json.dumps(evidence, ensure_ascii=False, separators=(',', ':'))}\n"
         f"Evidence attachment map: {json.dumps(attachments, separators=(',', ':'))}\n"
-        f"Approved style-only attachments starting at {len(attachments) + 1} (never fact evidence): {json.dumps(design_references or [], ensure_ascii=False)}\n"
+        f"Approved style-only attachments (never fact evidence): {json.dumps(_planner_design_refs(design_references or [], len(attachments)), ensure_ascii=False)}\n"
+        f"Reference design systems: {json.dumps(list(dict.fromkeys(row['design_system'] for row in design_references or [])), ensure_ascii=False)}\n"
         f"Program-owned product-boundary policy: {json.dumps(_planner_policy_view(policy), ensure_ascii=False)}\n"
         f"Required response schema: {json.dumps(response_schema, ensure_ascii=False, separators=(',', ':'))}"
     )
@@ -614,10 +627,11 @@ def validate_visual_design_kit(
     *,
     source_manifest: list[dict[str, Any]],
     category_id: str = "",
+    design_references: list[dict[str, Any]] | None = None,
 ) -> None:
     try:
         validate_compiled_visual_design_kit(
-            data, source_manifest=source_manifest, category_id=category_id,
+            data, source_manifest=source_manifest, category_id=category_id, design_references=design_references,
         )
     except VisualDesignKitCompileError as exc:
         raise VisualDesignKitError(str(exc)) from exc
@@ -642,6 +656,7 @@ def validate_visual_design_kit_row(row: Any, category_id: str = "") -> None:
         },
         source_manifest=sources,
         category_id=category_id or str(row.get("category_id") or ""),
+        design_references=row["approved_design_references"],
     )
     main = next((source for source in sources if source["role"] == "main"), None)
     if main is None or row["source_reference"] != main["source_path"] or row["source_sha256"] != main["source_sha256"]:
@@ -805,23 +820,23 @@ def _validate_source_manifest(rows: Any) -> None:
 
 
 def _planner_source_view(row: dict[str, Any]) -> dict[str, Any]:
+    source_id = row['source_id']
+    views = physical_views((row.get("observation") or {}).get("physical_views"))
     view = {
-        "source_id": row["source_id"],
+        "source_id": source_id,
         "role": row["role"],
-        "physical_evidence": {"objects": [obj for obj in (row.get("observation") or {}).get("objects") or []
-                                          if obj.get("sale_membership") != "staging" or any(rel.get("predicate") == "occludes" for rel in obj.get("relations") or [])]},
+        "physical_evidence": {"views": [{**v, 'evidence': [{**f, 'copy_evidence_ids': [
+            f"physical:{source_id}:{v['view_id']}:{f['feature_id']}:{i}" for i in range(len(f['physical_facts']))]}
+            for f in v['evidence']]} for v in views]},
     }
     if row.get("measurements"):
-        view["measurements"] = [{key: item.get(key) for key in ("text", "source_label", "axis_hint")}
-                                for item in row["measurements"]]
-    if row["role"] == "func":
-        claims: list[dict[str, Any]] = []
-        for claim in cleaned_source_claims(row):
-            claims.append({
-                "evidence_id": claim["evidence_id"],
-                "text": claim["text"],
-            })
-        view["source_supported_claims"] = claims
+        view["measurements"] = [{'evidence_id': f'measurement:{source_id}:{i}',
+                                 **{key: item.get(key) for key in ("text", "source_label", "axis_hint")}}
+                                for i, item in enumerate(row["measurements"])]
+    if row["role"] in {"func", "size"}:
+        view["source_supported_claims"] = [{"evidence_id": key, "text": value}
+                                           for key, value in _available_claims(row, []).items()
+                                           if not key.startswith(('physical:', 'measurement:'))]
     return view
 
 
@@ -829,15 +844,14 @@ def _brief_schema_for_source(source: dict[str, Any]) -> dict[str, Any]:
     role = source["role"]
     common: dict[str, Any] = {
         "source_id": source["source_id"],
-        "shopping_purpose": "specific purpose for this source image",
         "supporting_sources": [],
     }
     common["image_direction"] = IMAGE_DIRECTION_SCHEMA
-    if role == "func":
+    if role in {"func", "size"}:
         common.update({
-            "func_story": {
-                "title": {"evidence_ids": ["listed evidence_id"], "text": "specific factual shopping-story title"},
-                "labels": [{"evidence_ids": ["listed evidence_id"], "text": "complete factual label preserving conditions"}],
+            "display_copy": {
+                "title": {"evidence_ids": ["listed evidence_id"], "text": "factual title or measurement-group heading; null to omit"},
+                "labels": [{"evidence_ids": ["listed evidence_id"], "text": "one complete displayed caption, not combined caption choices"}],
             },
         })
     return common
@@ -903,7 +917,10 @@ def _planner_trace_current(job: Path, row: dict[str, Any]) -> bool:
         if file_sha256(request) != str(planner.get("request_fingerprint") or ""):
             return False
         for brief in row.get("source_briefs", []):
-            for review in brief.get("claim_reviews", {}).values():
+            checks = [*brief.get("claim_reviews", {}).values()]
+            if brief.get("design_review"):
+                checks.append(brief["design_review"])
+            for review in checks:
                 path = resolve_job_owned_path(job, str(review.get("response_path") or ""))
                 if not path.is_file() or file_sha256(path) != review.get("response_sha256"):
                     return False

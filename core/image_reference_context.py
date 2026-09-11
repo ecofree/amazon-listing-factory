@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import math
+import hashlib
+import time
 from typing import Any
 
 from PIL import Image
 
-from .io import file_sha256, read_json
+from .io import file_sha256, write_json
 from .paths import resolve_job_owned_path
 from .plugin import ProductPlugin
 
@@ -20,8 +22,8 @@ def physical_views(value: Any) -> list[dict[str, Any]]:
         raise ValueError("Observation physical_views must be a bounded list")
     seen = set()
     for row in value:
-        if not isinstance(row, dict) or set(row) != {"view_id", "region"}:
-            raise ValueError("Physical view needs view_id and region")
+        if not isinstance(row, dict) or set(row) != {"view_id", "region", "extent", "evidence"}:
+            raise ValueError("Physical view needs view_id, region, extent and observed evidence")
         key, box = row["view_id"], row["region"]
         if not isinstance(key, str) or not key or len(key) > 80 or key in seen:
             raise ValueError("Physical view identity is missing or duplicated")
@@ -30,19 +32,42 @@ def physical_views(value: Any) -> list[dict[str, Any]]:
                 or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in box)
                 or not (box[0] < box[2] and box[1] < box[3])):
             raise ValueError("Physical view needs normalized left,top,right,bottom bounds")
+        if row["extent"] not in {"whole_view", "detail"} or not isinstance(row["evidence"], list) or not row["evidence"]:
+            raise ValueError("Physical view needs its visible extent and feature evidence")
+        features = set()
+        for item in row["evidence"]:
+            if (not isinstance(item, dict) or set(item) != {"feature_id", "object_id", "region", "physical_facts"}
+                    or any(not isinstance(item[k], str) or not item[k].strip() for k in ("feature_id", "object_id"))
+                    or not isinstance(item['physical_facts'], list) or not item['physical_facts']
+                    or any(not isinstance(fact, str) or not fact.strip() for fact in item['physical_facts'])
+                    or item["feature_id"] in features):
+                raise ValueError("View evidence needs unique feature identity, object, visible bounds and physical facts")
+            features.add(item["feature_id"])
+            r = item["region"]
+            if (not isinstance(r, list) or len(r) != 4 or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in r)
+                    or not (box[0] <= r[0] < r[2] <= box[2] and box[1] <= r[1] < r[3] <= box[3])):
+                raise ValueError(f"{key}: crop truncates observed feature {item['feature_id']}; correct its bounds")
     return value
 
 
 def planning_view_inputs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{"attachment_number": index + 1, "source_id": source_id, "view_id": view_id}
-            for index, (source_id, view_id) in enumerate(
-                (source["source_id"], view["view_id"]) for source in sources
+    return [{"attachment_number": index + 1, "source_id": source_id, "view_id": view['view_id']}
+            for index, (source_id, view) in enumerate(
+                (source["source_id"], view) for source in sources
                 for view in physical_views((source.get("observation") or {}).get("physical_views")))]
 
 
-def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: Path) -> list[Path]:
-    """Independent, lossless evidence crops; originals remain the edit authority."""
+def _view_location(job: Path, source: dict[str, Any], view: dict[str, Any], size: tuple[int, int]) -> tuple[Path, tuple[int, int, int, int]]:
+    l, t, r, b = view["region"]
+    box = (math.floor(l * size[0]), math.floor(t * size[1]), math.ceil(r * size[0]), math.ceil(b * size[1]))
+    key = hashlib.sha256(f"{source['source_sha256']}:{box}".encode()).hexdigest()
+    return job / "images" / "evidence_views" / f"{key}.png", box
+
+
+def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: Path, *, deadline_monotonic: float | None = None) -> list[Path]:
+    """Extract immutable physical views shared by planning and image editing."""
     paths = []
+    provenance = []
     directory.mkdir(parents=True, exist_ok=True)
     for source in sources:
         views = physical_views((source.get("observation") or {}).get("physical_views"))
@@ -54,10 +79,10 @@ def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: 
         with Image.open(path) as image:
             image.load()
             for view in views:
-                l, t, r, b = view["region"]
-                box = (math.floor(l * image.width), math.floor(t * image.height),
-                       math.ceil(r * image.width), math.ceil(b * image.height))
-                output = directory / f"view_{len(paths) + 1:03d}.png"
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    raise TimeoutError("Child planning deadline exhausted while preparing evidence")
+                output, box = _view_location(job, source, view, image.size)
+                output.parent.mkdir(parents=True, exist_ok=True)
                 with image.crop(box) as crop:
                     if crop.mode in {"CMYK", "YCbCr", "HSV"}:
                         with crop.convert("RGB") as rgb:
@@ -65,7 +90,28 @@ def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: 
                     else:
                         crop.save(output, format="PNG")
                 paths.append(output)
+                provenance.append({"attachment_number": len(paths), "source_id": source["source_id"],
+                                   "view_id": view["view_id"], "original_sha256": source["source_sha256"],
+                                   "original_region": view["region"], "pixel_box": box,
+                                   "coordinate_frame": "original_source", "derived_path": output.relative_to(job).as_posix(),
+                                   "derived_sha256": file_sha256(output)})
+    write_json(directory / "manifest.json", {"attachments": provenance})
     return paths
+
+
+def view_reference(source: dict[str, Any], view: dict[str, Any], *, job: Path, child: str, kind: str) -> dict[str, Any]:
+    """Use the same extraction and identity as the planning attachments."""
+    path = resolve_job_owned_path(job, source["source_path"])
+    with Image.open(path) as image:
+        crop, _ = _view_location(job, source, view, image.size)
+    if not crop.is_file():
+        raise ValueError(f"Missing current observed view: {view['view_id']}")
+    return {"kind": kind, "child": child, "source_id": source["source_id"], "view_id": view["view_id"],
+            "purpose": "Edit this intact observed view; preserve its perspective, visible extent and physical state.",
+            "evidence_ids": [item["feature_id"] for item in view["evidence"]],
+            "path": crop.relative_to(job).as_posix(), "sha256": file_sha256(crop),
+            "original_path": source["source_path"], "original_sha256": source["source_sha256"],
+            "original_region": view["region"], "extent": view["extent"], "visible_evidence": view["evidence"]}
 
 
 def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str) -> None:
@@ -83,7 +129,7 @@ def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str
             raise ValueError("Reference ownership, source or purpose is missing")
         if len(str(row.get("sha256") or "")) != 64 or not isinstance(row.get("evidence_ids"), list):
             raise ValueError("Reference SHA or evidence scope is invalid")
-        identity = (row["kind"], row["source_id"])
+        identity = (row["kind"], row["source_id"], row.get("view_id"))
         if identity in seen:
             raise ValueError("Duplicate reference")
         seen.add(identity)
@@ -116,34 +162,31 @@ def validate_supporting_sources(value: Any, sources: list[dict[str, Any]], prima
     return value
 
 
-def approved_design_references(job: Path, child: str) -> list[dict[str, Any]]:
-    """Use only explicit current-job inputs; never discover previous outputs."""
-    metadata = read_json(job / "job.json") if (job / "job.json").is_file() else {}
-    rows = metadata.get("approved_design_references", [])
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        raise ValueError("Approved design references must be an explicit list")
-    selected = [row for row in rows if row.get("child") == child]
-    for row in selected:
-        if row.get("kind") != "design_reference" or row.get("evidence_ids") != [] or not row.get("approved_by") or not row.get("approved_at") or not row.get("source_id") or not row.get("purpose"):
-            raise ValueError("Design reference approval or scope is incomplete")
-        path = resolve_job_owned_path(job, str(row.get("path") or ""))
-        if not path.is_file() or file_sha256(path) != row.get("sha256"):
-            raise ValueError("Approved design reference is missing or changed")
-        if path.relative_to(job).parts[0] != "inputs":
-            raise ValueError("Import an approved design reference under current-job inputs before planning")
-    if len({row["source_id"] for row in selected}) != len(selected):
-        raise ValueError("Duplicate approved design reference")
-    return selected
 
 
-def reference_prompt(references: list[dict[str, Any]]) -> str:
-    return "\n".join(
-        f"Attachment {index}: {row['kind']} ({row['source_id']}). {row['purpose']}"
-        + (" Structure evidence only; do not copy its setting or graphics." if row["kind"] == "product_evidence" else
-           " Approved style only; never use it for product facts, claims or dimensions." if row["kind"] == "design_reference" else
-           " Edit its physical product evidence, not its page design; source graphics and decorative setting have no style authority.")
-        for index, row in enumerate(references, 1)
-    )
+def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[dict[str, Any]], targeted_edit: bool = False) -> str:
+    decisions = {row["reference_id"]: row for row in design_transfer}
+    actual = {row["source_id"] for row in references if row["kind"] == "design_reference"}
+    if actual != set(decisions):
+        raise ValueError("Selected design references do not match generation attachments")
+    lines = []
+    for index, row in enumerate(references, 1):
+        if row["kind"] == "design_reference":
+            decision = decisions[row["source_id"]]
+            scope = row['visual_review']['transfer_scope']
+            purpose = f"Reviewed use: {row['purpose']} Approval boundary: {scope} " + (
+                "Style verification only; retain the candidate's established design except for the requested correction."
+                if targeted_edit else f"Inherit within that scope: {decision['inherit']} Adapt: {decision['adapt']}")
+            purpose += " No reference product, branding, copy or dimension transfer."
+        elif row["kind"] == "product_evidence" and row['source_id'] != references[0]['source_id']:
+            purpose = "Supporting physical evidence only; verify existing structure, never transfer another view's state or replace the edit base."
+        elif row["kind"] == "product_evidence" or not targeted_edit:
+            purpose = "Own physical view; follow its assigned evidence use, not source styling."
+        else:
+            purpose = "Selected candidate: retain its design and physical state except for the requested correction."
+        identity = row['source_id'] + (f"/{row['view_id']}" if row.get('view_id') else '')
+        lines.append(f"Attachment {index}: {row['kind']} ({identity}). {purpose}")
+    return "\n".join(lines)
 
 
 def generation_reference_sources(

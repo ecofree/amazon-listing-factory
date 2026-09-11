@@ -359,6 +359,7 @@ class FlowRegressionTests(unittest.TestCase):
         decisions = {row["role"]: row["final_decision"] for row in release["rows"]}
         self.assertEqual("blocked_candidate", decisions["main"])
         self.assertEqual("awaiting_qa", decisions["scene"])
+        self.assertEqual("not_run", next(row for row in release["rows"] if row["role"] == "scene")["automatic_decision"])
         self.assertIn("CandidateStateError", next(row for row in release["rows"] if row["role"] == "main")["task_error"])
 
     def test_r2_upload_permission_error_fails_fast(self) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from functools import partial
 from http.client import HTTPException
 import io
 import json
@@ -19,7 +20,7 @@ from typing import Any, Callable
 from PIL import Image
 
 from .api_registry import model_client_physical_identity
-from .image_provider_common import ProviderQueueUnavailable, ProviderTransportError, provider_concurrency_slot
+from .image_provider_common import ProviderQueueUnavailable, ProviderTransportError, provider_concurrency_slot, provider_concurrency_limit
 from .model_call_health import (
     model_status_from_exception,
     model_provider_cooldown_active,
@@ -91,11 +92,6 @@ def gemini_stream_generate(
                 "Missing vision model endpoint config. Add the required scope provider to configs/api_registry.json."
             ),
         )
-    # Build native-Gemini parts only inside the native protocol branch.  The
-    # OpenAI-compatible branches encode the same references independently;
-    # eager construction here doubled the base64 image payload retained by
-    # every concurrent job and was the main avoidable memory peak in canaries.
-    parts: list[dict[str, Any]] | None = None
     last_exc: Exception | None = None
     last_status = ""
     last_provider = ""
@@ -221,7 +217,7 @@ def gemini_stream_generate(
         if _is_openai_responses_protocol(protocol):
             for candidate_model in candidates:
                 endpoint_url = _openai_responses_url(base_url)
-                openai_payload = _openai_responses_payload(candidate_model, prompt, image_paths, client)
+                openai_payload = partial(_openai_responses_payload, candidate_model, prompt, image_paths, client)
                 for auth_mode in _openai_auth_modes(client):
                     headers = _openai_chat_headers(key, auth_mode=auth_mode, bearer_token=client.get("bearer_token"))
                     for attempt in range(1, max(1, attempts) + 1):
@@ -253,7 +249,7 @@ def gemini_stream_generate(
                                 can_repair=attempt < max(1, attempts),
                             )
                             if action == "repair":
-                                openai_payload = _openai_responses_payload(
+                                openai_payload = partial(_openai_responses_payload,
                                     candidate_model,
                                     _validation_repair_prompt(prompt, validation_error, text),
                                     _validation_repair_image_paths(effective_scope, image_paths),
@@ -283,7 +279,7 @@ def gemini_stream_generate(
         if _is_openai_chat_protocol(protocol):
             for candidate_model in candidates:
                 endpoint_url = _openai_chat_completions_url(base_url)
-                openai_payload = _openai_chat_payload(candidate_model, prompt, image_paths, client)
+                openai_payload = partial(_openai_chat_payload, candidate_model, prompt, image_paths, client)
                 for auth_mode in _openai_auth_modes(client):
                     headers = _openai_chat_headers(key, auth_mode=auth_mode, bearer_token=client.get("bearer_token"))
                     for attempt in range(1, max(1, attempts) + 1):
@@ -315,7 +311,7 @@ def gemini_stream_generate(
                                 can_repair=attempt < max(1, attempts),
                             )
                             if action == "repair":
-                                openai_payload = _openai_chat_payload(
+                                openai_payload = partial(_openai_chat_payload,
                                     candidate_model,
                                     _validation_repair_prompt(prompt, validation_error, text),
                                     _validation_repair_image_paths(effective_scope, image_paths),
@@ -342,10 +338,7 @@ def gemini_stream_generate(
                                 break
                             _deadline_sleep((2 * attempt) + random.uniform(0, 0.5), deadline)
             continue
-        if parts is None:
-            parts = [{"text": prompt}]
-            parts.extend(_image_part(path) for path in image_paths)
-        payload = _gemini_native_payload(parts, client)
+        payload = partial(_native_image_payload, prompt, image_paths, client)
         auth_modes = [str(client["auth_mode"])] if client.get("auth_mode") else _gemini_auth_modes(base_url)
         for candidate_model in candidates:
             for endpoint, parser in (
@@ -384,12 +377,9 @@ def gemini_stream_generate(
                                 can_repair=attempt < max(1, attempts),
                             )
                             if action == "repair":
-                                payload = _gemini_native_payload(
-                                    [{"text": _validation_repair_prompt(prompt, validation_error, text)}]
-                                    + [
-                                        _image_part(path)
-                                        for path in _validation_repair_image_paths(effective_scope, image_paths)
-                                    ],
+                                payload = partial(_native_image_payload,
+                                    _validation_repair_prompt(prompt, validation_error, text),
+                                    _validation_repair_image_paths(effective_scope, image_paths),
                                     client,
                                 )
                                 continue
@@ -961,10 +951,30 @@ def _openai_image_data_url(path: Path) -> str:
     return f"data:{mime};base64,{data}"
 
 
+def _vision_resource(client: dict[str, Any]) -> tuple[str, str]:
+    name = "vision_" + str(client.get("name") or client.get("provider") or "vision")
+    endpoint = urllib.parse.urlsplit(str(client.get("base_url") or ""))
+    identity = (endpoint.scheme.lower(), endpoint.netloc.lower(), str(client.get("api_key") or ""))
+    return name, "vision_" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+
+
+def vision_scope_capacity(scope: str) -> int:
+    capacities = {}
+    for client in gemini_clients(client_scope=scope):
+        name, resource = _vision_resource(client)
+        limit = provider_concurrency_limit(name) or 32
+        capacities[resource] = min(capacities.get(resource, limit), limit)
+    return max(1, sum(capacities.values()))
+
+
+def _native_image_payload(prompt: str, paths: list[Path], client: dict[str, Any]) -> dict[str, Any]:
+    return _gemini_native_payload([{"text": prompt}, *[_image_part(path) for path in paths]], client)
+
+
 def _post_vision_request(
     client: dict[str, Any],
     url: str,
-    payload: dict[str, Any],
+    payload: Callable[[], dict[str, Any]],
     *,
     headers: dict[str, str],
     timeout_seconds: int,
@@ -976,17 +986,17 @@ def _post_vision_request(
     same configured endpoint wait for that endpoint's slot, preventing four
     jobs from immediately exhausting a provider-level concurrency quota.
     """
-    provider = str(client.get("name") or client.get("provider") or client.get("base_url") or "vision")
+    provider, resource = _vision_resource(client)
     # Queue time and request time are different budgets.  A congested primary
     # may wait briefly, but must not consume the complete role deadline and
     # leave every fallback with a near-zero timeout.
     queue_deadline = None
     if deadline is not None:
         queue_deadline = min(deadline, time.monotonic() + 8.0)
-    with provider_concurrency_slot(f"vision_{provider}", deadline=queue_deadline):
+    with provider_concurrency_slot(provider, deadline=queue_deadline, resource_key=resource):
         return _post_json_preserve_redirects(
             url,
-            payload,
+            payload(),
             headers=headers,
             timeout_seconds=_bounded_deadline_timeout(timeout_seconds, deadline),
         )

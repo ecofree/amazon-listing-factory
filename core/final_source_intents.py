@@ -17,7 +17,7 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v17-observed-views"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v18-complete-physical-facts"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
 SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant"})
@@ -398,7 +398,7 @@ def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
     measurements = _measurement_rows(_observed_measurements(evidence, visual), child)
     identity = visual.get("variant_identity") or {}
     identity_issue = (
-        "source_identity_unverified: joint source observation unavailable"
+        "source_identity_unverified: " + str(visual.get("error") or "current joint source observation unavailable")
         if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY else
         "source_variant_conflict: " + str(identity.get("reason") or "visible product contradicts child facts")
         if identity.get("status") == "contradiction" else ""

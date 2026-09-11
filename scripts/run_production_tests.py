@@ -32,7 +32,7 @@ PRODUCTION_TEST_MODULES = (
     "tests.test_freeze_recovery",
     "tests.test_visual_design_remediation",
 )
-MAX_CASES = 98
+MAX_CASES = 100
 MAX_SECONDS = 60.0
 
 

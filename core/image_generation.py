@@ -360,11 +360,8 @@ def run_image_revision(
                        "path": str(resolve_job_owned_path(job_path, current["candidate_path"])), "sha256": parent_sha,
                        "purpose": "Edit this selected candidate only within the requested changes", "evidence_ids": []},
                       source_evidence, *references[1:]]
-        from .image_reference_context import reference_prompt
-        from .image_prompt_compiler import _product_boundary
-        old_reference, remainder = base_prompt.split("[REFERENCE]\n", 1)
-        _, after_reference = remainder.split("\n\n[STYLE]", 1)
-        base_prompt = old_reference + "[REFERENCE]\n" + reference_prompt(references) + "\n" + _product_boundary(task, task["edit_contract"]) + "\n\n[STYLE]" + after_reference
+        from .image_prompt_compiler import compile_task_prompt
+        base_prompt = compile_task_prompt(task={**task, "generation_references": references}, targeted_edit=True)
     request_heading = {"targeted_edit": "TARGETED CANDIDATE EDIT", "full_redraw": "EXPLICIT FULL-REDRAW REQUEST",
                        "initial": "EXPLICIT MISSING CANDIDATE REQUEST"}[mode]
     request_intro = {

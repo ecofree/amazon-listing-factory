@@ -44,6 +44,8 @@ def create_job(
     product_id: str = "",
     out_root: str | Path = JOBS_ROOT,
     timestamp: str | None = None,
+    design_pack_path: str = "",
+    brand_brief_path: str = "",
 ) -> Path:
     stamp = timestamp or _timestamp_slug()
     safe_seed = slug(seed_asin)
@@ -86,6 +88,9 @@ def create_job(
         "created_at": utc_now(),
         "plugin_root": str(plugin.root),
     }
+    from .design_reference_library import import_design_inputs
+    job["design_inputs"] = import_design_inputs(job_dir, category=plugin.category_id,
+                                               pack_path=design_pack_path, brief_path=brand_brief_path)
     write_json(job_dir / "job.json", job)
     status = {
         "schema_version": 7,

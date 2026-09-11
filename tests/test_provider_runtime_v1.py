@@ -268,7 +268,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor.generation_reference_primary_path", return_value=source),
                 patch(
                     "core.image_generation_executor.generation_reference_sources",
-                    return_value=[{"kind": "edit_base", "path": source}],
+                    return_value=[{"kind": "edit_base", "path": source, "source_id": "source_00", "sha256": "a" * 64, "purpose": "Product evidence", "evidence_ids": []}],
                 ),
                 patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
                 patch("core.image_generation_executor.load_provider_policy", return_value={}),
@@ -374,7 +374,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor.generation_reference_primary_path", return_value=source),
                 patch(
                     "core.image_generation_executor.generation_reference_sources",
-                    return_value=[{"kind": "edit_base", "path": source}],
+                    return_value=[{"kind": "edit_base", "path": source, "source_id": "source_00", "sha256": "a" * 64, "purpose": "Product evidence", "evidence_ids": []}],
                 ),
                 patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
                 patch("core.image_generation_executor.load_provider_policy", return_value={}),
@@ -525,6 +525,21 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual(task["source_sha256"], alternate["source_sha256"])
         self.assertEqual(["edit_base", "product_evidence"], [ref["kind"] for ref in alternate["generation_references"]])
         self.assertIn("TARGETED CANDIDATE EDIT", alternate["prompt"])
+        self.assertNotIn("-> canvas", alternate["prompt"])
+        self.assertNotIn("Canvas positions", alternate["prompt"])
+        self.assertNotIn("no style authority", alternate["prompt"])
+        self.assertIn("Selected candidate: retain its design", alternate["prompt"])
+        from core.image_prompt_compiler import compile_task_prompt
+        for role in ("func", "size"):
+            target = current_image_task(role)
+            target["generation_references"] = alternate["generation_references"]
+            prompt = compile_task_prompt(task=target, targeted_edit=True)
+            self.assertNotIn("-> canvas", prompt)
+            self.assertNotIn("Creative treatment:", prompt)
+            self.assertIn("text_color = #303634", prompt)
+            self.assertIn("Preserve:", prompt)
+            if role == "func":
+                self.assertIn("Adjustable Shelf", prompt)
 
     def test_configuration_failure_opens_run_circuit(self) -> None:
         error = ProviderConfigurationError("bad", "401")

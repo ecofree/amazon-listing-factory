@@ -66,6 +66,66 @@ class ModelRouterTests(unittest.TestCase):
         }
         with patch.dict("os.environ", {"AMAZON_FACTORY_API_REGISTRY": json.dumps(image_registry)}, clear=False):
             self.assertEqual(["first", "second"], api_registry.image_provider_names())
+        from pathlib import Path
+        registry = json.loads((Path(__file__).resolve().parents[1] / "configs/api_registry.json").read_text(encoding="utf-8"))
+        rows = {row["name"]: row for row in registry["providers"]}
+        sunburst = rows["cxk_gpt_image_25_sunburst"]
+        self.assertEqual("gpt-image-2.5-sunburst", sunburst["model"])
+        self.assertEqual(["func", "size"], sunburst["allowed_roles"])
+        self.assertTrue(sunburst["enabled"])
+        self.assertEqual(rows["cxk_fixed"]["resource_group"], sunburst["resource_group"])
+        self.assertEqual(rows["cxk_fixed"]["key_env"], sunburst["key_env"])
+        self.assertFalse(rows["qc_yc_fixed"]["enabled"])
+        self.assertFalse(rows["lz_token_gpt_image_2"]["enabled"])
+        import io
+        from email import policy
+        from email.parser import BytesParser
+        from PIL import Image
+        from unittest.mock import MagicMock
+        from core import image_provider_transport as transport
+        spec = transport.ImageProviderSpec(name=sunburst["name"], display="test", url="https://fixture.invalid/v1/images/edits",
+            api_type="openai_images_edit", key_env="FIXTURE", api_key="test-only", model=sunburst["model"],
+            request_size="1024x1024", output_contract="square", protocol_profile=sunburst["protocol_profile"])
+        images = []
+        for color in ("white", "blue"):
+            buffer = io.BytesIO()
+            with Image.new("RGB", (32, 32), color) as image:
+                image.save(buffer, format="PNG")
+            images.append(buffer.getvalue())
+        buffer = io.BytesIO()
+        with Image.new("RGBA", (32, 32), (255, 255, 255, 128)) as image:
+            image.save(buffer, format="PNG")
+        mask = buffer.getvalue()
+        for response_model in (None, sunburst["model"]):
+            audit = {}
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.headers = {"x-request-id": "gateway-fixture"}
+            response.read.return_value = json.dumps({"model": response_model, "created": 123, "data": []}).encode()
+            with patch.object(transport, "_image_provider_spec", return_value=spec), patch.object(
+                    transport.api_registry, "image_provider_supports_multiple_references", return_value=True), patch.object(
+                    transport.urllib.request, "urlopen", return_value=response) as send, patch.object(
+                    transport, "_decode_image_response", return_value=b"candidate"):
+                transport.generate_with_registry_image_provider(provider_name=spec.name, image_inputs=images,
+                    prompt="Exact fixture task", mask_bytes=mask, request_audit=audit)
+            request = send.call_args.args[0]
+            message = BytesParser(policy=policy.default).parsebytes(
+                ("Content-Type: " + request.get_header("Content-type") + "\r\n\r\n").encode() + request.data)
+            parts = list(message.iter_parts())
+            fields = {part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
+                      for part in parts if not part.get_filename()}
+            self.assertEqual(sunburst["model"].encode(), fields["model"])
+            self.assertEqual(b"high", fields["quality"])
+            self.assertEqual(b"1024x1024", fields["size"])
+            files = [part.get_payload(decode=True) for part in parts if part.get_filename()]
+            self.assertEqual(images, files[:2])
+            self.assertEqual(3, len(files))
+            from PIL import ImageChops
+            with Image.open(io.BytesIO(mask)) as original, Image.open(io.BytesIO(files[2])) as sent_mask:
+                self.assertIsNone(ImageChops.difference(original, sent_mask).getbbox())
+            self.assertEqual("gateway-fixture", audit["remote_request_id"])
+            self.assertEqual("gateway_reported_not_independently_verified" if response_model else "configured_alias_only",
+                             audit["model_identity_verification"])
 
     def test_visual_planning_budget_keeps_cross_endpoint_fallback(self) -> None:
         clients = [

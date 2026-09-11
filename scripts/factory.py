@@ -171,6 +171,8 @@ def cmd_new_job(args: argparse.Namespace) -> int:
         product_id_type=args.product_id_type,
         product_id=args.product_id,
         out_root=args.out_root,
+        design_pack_path=args.design_pack,
+        brand_brief_path=args.brand_brief,
     )
     payload: dict[str, object] = {"job": str(job), "job_json": str(job / "job.json"), "category_id": plugin.category_id}
     if detected:
@@ -536,6 +538,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--product-id-type", default="")
     p.add_argument("--product-id", default="")
     p.add_argument("--out-root", default=str(Path(__file__).resolve().parents[1] / "jobs"))
+    p.add_argument("--design-pack", default="", help="Optional approved local design-pack JSON; imported into this job.")
+    p.add_argument("--brand-brief", default="", help="Optional brand design brief JSON; does not change product facts or seller defaults.")
     p.set_defaults(func=cmd_new_job)
 
     p = sub.add_parser("classify-asin", help="Classify an ASIN into a configured product plugin before creating a job.")

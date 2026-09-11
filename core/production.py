@@ -997,9 +997,10 @@ def _write_summary(
         and str(publish_stage.get("status") or "") in {"success", "partial_success", "failed"}
     )
     publish_mode = _publish_mode(request.job_dir, publish_ran=publish_ran)
-    missing_candidate_count = max(0, len(release_rows) - candidate_count)
+    source_scope = _source_scope_counts(request)
+    missing_candidate_count = max(0, len(release_rows) - candidate_count) + (source_scope['source_unresolved_count'] or 0)
     image_completion_status = (
-        "not_run" if not release_rows else "success" if not missing_candidate_count else "incomplete"
+        "incomplete" if missing_candidate_count else "not_run" if not release_rows else "success"
     )
     stage_rows = state.get("stages") if isinstance(state.get("stages"), dict) else {}
     completed_stages = [
@@ -1007,7 +1008,11 @@ def _write_summary(
         if isinstance(stage_rows.get(stage), dict)
         and str(stage_rows[stage].get("status") or "") == "success"
     ]
-    completed_through_stage = completed_stages[-1] if completed_stages else ""
+    completed_through_stage = ""
+    for stage in PRODUCTION_STAGES:
+        if stage not in completed_stages:
+            break
+        completed_through_stage = stage
     template_stage_complete = "template" in completed_stages
     workflow_status = (
         "partial_success"
@@ -1046,7 +1051,7 @@ def _write_summary(
         "workflow_reason": _summary_status_reason(workflow_status, effective_release, error),
         "candidate_count": candidate_count,
         "qa_decision_counts": qa_decision_counts,
-        "classified_not_selected_count": _classified_not_selected_count(request),
+        **source_scope,
         "task_status_counts": task_status_counts,
         "active_task_failure_count": active_failure_count,
         "error": error,
@@ -1107,9 +1112,9 @@ def _publish_mode(job_dir: Path, *, publish_ran: bool) -> str:
     return "local_export_only"
 
 
-def _classified_not_selected_count(request: JobRunRequest) -> int | None:
+def _source_scope_counts(request: JobRunRequest) -> dict[str, Any]:
     try:
-        from .final_source_intents import planning_source_intents
+        from .final_source_intents import read_final_source_intents, PLANNING_SOURCE_ROLES
         from .image_tasks import read_image_tasks
 
         tasks = read_image_tasks(
@@ -1119,12 +1124,16 @@ def _classified_not_selected_count(request: JobRunRequest) -> int | None:
             (str(row.get("child") or ""), str(row.get("source_path") or ""))
             for row in tasks if row.get("source_path")
         }
-        return sum(
-            (str(row.get("child") or ""), str(row.get("source_path") or "")) not in selected
-            for row in planning_source_intents(request.job_dir, plugin=request.plugin)
-        )
-    except Exception:
-        return None
+        rows = read_final_source_intents(request.job_dir, plugin=request.plugin)
+        unselected = [row for row in rows if (str(row.get('child') or ''), str(row.get('source_path') or '')) not in selected]
+        return {'source_scope_status': 'current', 'source_input_count': len(rows),
+                'source_excluded_count': sum(row.get('role') == 'excluded_wrong_variant' for row in rows),
+                'source_unresolved_count': sum(row.get('role') != 'excluded_wrong_variant' for row in unselected),
+                'classified_not_selected_count': sum(row.get('role') in PLANNING_SOURCE_ROLES for row in unselected)}
+    except Exception as exc:
+        return {'source_scope_status': 'unavailable', 'source_scope_error': str(exc)[:300],
+                'source_input_count': None, 'source_excluded_count': None,
+                'source_unresolved_count': None, 'classified_not_selected_count': None}
 
 
 def _current_template_status(job_dir: Path, state: dict[str, Any]) -> str:

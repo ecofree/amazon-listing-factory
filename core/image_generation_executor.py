@@ -182,7 +182,17 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
 
             request_id = input_revision_id({"job": task["job_dir"], "task": task["task_fingerprint"],
                 "revision": task.get("candidate_revision", 0), "prompt": prompt, "references": task["generation_references"]})
-            request_audit: dict[str, Any] = {"request_id": request_id, "provider": provider}
+            request_audit: dict[str, Any] = {
+                "request_id": request_id, "provider": provider,
+                "revision_mode": task.get("revision_mode") or "initial",
+                "reference_count": len(reference_sources),
+                "coordinate_frame": "candidate_in_place" if task.get("revision_mode") == "targeted_edit" else "original_source",
+                "design_transfer": (task.get("image_direction") or {}).get("design_transfer", []),
+                "reference_effect": "not_visually_evaluated",
+                "references": [{"attachment_number": index, **{key: row[key] for key in
+                    ("kind", "source_id", "sha256", "purpose", "evidence_ids")}}
+                    for index, row in enumerate(reference_sources, 1)],
+            }
             data = generate_with_provider_retries(
                 provider_name=provider,
                 image_input_paths=image_input_paths,
@@ -203,9 +213,9 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 "attempted_provider_failures": attempted_failures,
                 "fallback_reason": "fallback_after_provider_failure" if attempted_failures else "",
             }
-            commit_candidate_output(
-                task["job_dir"], commit_task, _finalize_candidate_bytes(data),
-            )
+            commit_started = time.monotonic()
+            commit_candidate_output(task["job_dir"], commit_task, _finalize_candidate_bytes(data))
+            local_seconds = time.monotonic() - commit_started
             _record_provider_event_audit_only(
                 output_path=output_path,
                 provider=provider,
@@ -215,7 +225,9 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 duration_seconds=provider_duration,
                 fallback_reason="fallback_after_provider_failure" if attempted_failures else "",
             )
-            _record_generation_progress(task, "image_provider_attempt_success", provider)
+            _record_generation_progress(task, "image_provider_attempt_success", provider,
+                provider_seconds=round(provider_duration, 3), local_finalize_seconds=round(local_seconds, 3),
+                upscale_seconds=request_audit.get("upscale_seconds", 0))
             return {
                 **task,
                 "provider": provider,
@@ -331,6 +343,7 @@ def _record_generation_progress(
     *,
     status: str = "",
     error: str = "",
+    **metrics: Any,
 ) -> None:
     job_dir = str(task.get("job_dir") or "")
     if not job_dir:
@@ -345,6 +358,7 @@ def _record_generation_progress(
         provider_name=provider,
         status=status,
         error=error,
+        **metrics,
     )
 
 

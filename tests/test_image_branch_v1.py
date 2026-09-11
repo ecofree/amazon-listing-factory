@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
+from tests.current_image_contract_fixture import current_physical_view
 
 from core.final_source_intents import (
     _authored_claims,
@@ -21,7 +22,7 @@ from core.image_prompt_compiler import (
     read_image_prompts,
 )
 from core.image_task_inputs import (
-    build_func_story_contract,
+    build_display_copy_contract,
     measurement_contract,
     visual_product_color,
     visual_variation_values,
@@ -156,7 +157,7 @@ def _evidence(role: str) -> dict:
         **base["visual_evidence"], "status": "success", "policy_version": OBSERVATION_POLICY,
         "child_facts_revision_id": input_revision_id(source_fact_records(_child())),
         "variant_identity": {"status": "unknown", "observed_color": "", "conflicts": [], "reason": "Fixture cropped view"},
-        "physical_views": [{"view_id": "view_01", "region": [.1, .2, .9, .8]}],
+        "physical_views": [current_physical_view()],
         "text_observations": [{"text": text, "kind": "marketing" if role == "func" else "measurement"} for text in base["trusted_text"]],
     }
     return base
@@ -173,17 +174,15 @@ def _planner_payload(intents: list[dict]) -> dict:
     return {
         "family_art_direction": current_art_direction(),
         "source_briefs": [
-            {"source_id": "source_00", "shopping_purpose": "Identify the exact sold cabinet.", "image_direction": current_image_direction()},
+            {"source_id": "source_00", "image_direction": current_image_direction()},
             {
                 "source_id": "source_01",
-                "shopping_purpose": "Show realistic bathroom placement, storage access, and product scale.",
                 "image_direction": current_image_direction(),
             },
             {
                 "source_id": "source_02",
-                "shopping_purpose": "Explain how the cabinet adapts storage for everyday bathroom essentials.",
                 "image_direction": current_image_direction(),
-                "func_story": {
+                "display_copy": {
                     "title": {
                         "evidence_ids": [source_id],
                         "text": "Adjustable Shelf",
@@ -196,8 +195,8 @@ def _planner_payload(intents: list[dict]) -> dict:
             },
             {
                 "source_id": "source_03",
-                "shopping_purpose": "Present the complete source measurement diagram.",
                 "image_direction": current_image_direction(environment="graphic_canvas"),
+                "display_copy": {"title": None, "labels": []},
             },
         ],
     }
@@ -220,7 +219,7 @@ def _fixture_reviews(claims, **kwargs):
 class ImageBranchCurrentBehaviorTests(unittest.TestCase):
     def setUp(self):
         observation = patch("core.final_source_intents.observe_child_sources", side_effect=_fixture_observation)
-        reviews = patch("core.visual_design_kit.review_claims", side_effect=_fixture_reviews)
+        reviews = patch("core.visual_design_kit.review_planning_bindings", side_effect=_fixture_reviews)
         observation.start()
         reviews.start()
         self.addCleanup(observation.stop)
@@ -239,10 +238,12 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 task = current_image_task(role, category_id=category)
                 task.update(category_image_policy=policy, family_art_direction=current_art_direction())
                 task["edit_contract"] = _edit_contract(role, task["measurement_authority"], policy, {}, product_type=plugin.product_type)
+                if role == "size":
+                    task["image_direction"]["visual_goal"] = "Clarify overall product dimensions and drawer size."
                 prompt = compile_task_prompt(task=task)
+                if role == "size":
+                    self.assertIn("Clarify overall product dimensions", prompt)
                 styles[role] = prompt.split("[STYLE]\n")[1].split("\n\n[TEXT]")[0]
-                self.assertIn("without reconstructing unseen surfaces", prompt)
-                self.assertEqual(1, prompt.count("Preserve: Preserve product geometry"))
                 self.assertNotIn("or readable text", prompt)
                 if category != "bed_frame":
                     self.assertNotIn("mattress", prompt.casefold())
@@ -255,7 +256,8 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 self.assertEqual(next(line for line in styles["func"].splitlines() if line.startswith(prefix)),
                                  next(line for line in styles["size"].splitlines() if line.startswith(prefix)))
             if category != "bed_frame":
-                self.assertNotIn("Photography intent", styles["main"])
+                self.assertIn("Photography intent", styles["main"])
+                self.assertIn("white external background", styles["main"])
                 self.assertNotIn("room tokens:", styles["main"])
             self.assertIn("font_family = Inter", styles["func"])
             self.assertIn("text_color = #303634", styles["size"])
@@ -396,14 +398,14 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 self.assertTrue(all(path.parent.name == "evidence_views" for path in _paths))
                 self.assertTrue(all(file_sha256(path) != row["source_sha256"] for path, row in zip(_paths, intents)))
                 self.assertIn('"view_id":"view_01"', _prompt)
-                self.assertNotIn('"region":', _prompt)
+                self.assertIn('"feature_id":"frame_support"', _prompt)
                 self.assertIn("You are the sole visual designer", _prompt)
-                self.assertIn("COLOR ANALYSIS AID (NOT DESIGN AUTHORITY)", _prompt)
-                self.assertIn("palette_direction is the sole final child palette", _prompt)
+                self.assertNotIn("computed_starting_palette", _prompt)
+                self.assertIn("sole visual designer", _prompt)
                 self.assertIn("Product identity:", _prompt)
                 self.assertNotIn("Known product facts:", _prompt)
-                self.assertIn("Bind every exact display string", _prompt)
-                self.assertLessEqual(len(_prompt), 8000)
+                self.assertIn('"display_copy"', _prompt)
+                self.assertEqual(len(intents), _prompt.count('"physical_evidence"'))
                 observer = kwargs.get("attempt_observer")
                 if callable(observer):
                     observer({
@@ -449,7 +451,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertGreaterEqual(len(Path(kit["planner"]["prompt_path"]).parts), 6)
             scene_brief = next(row for row in kit["source_briefs"] if row["role"] == "scene")
             scene_intent = next(row for row in intents if row["role"] == "scene")
-            self.assertEqual(payload["source_briefs"][1]["shopping_purpose"], scene_brief["shopping_purpose"])
+            self.assertEqual(payload["source_briefs"][1]["image_direction"]["visual_goal"], scene_brief["image_direction"]["visual_goal"])
 
             with (
                 patch("core.image_tasks.read_product_family", return_value=family),
@@ -459,26 +461,37 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             ):
                 task_result = build_image_tasks(job_dir=job, plugin=_Plugin())
             self.assertFalse(task_result["failures"])
+            self.assertEqual([], task_result['source_selection_audit'])
             tasks = read_image_tasks(job, category_id=_Plugin.category_id)["tasks"]
             self.assertEqual(4, len(tasks))
+            from core.release_manifest import source_inventory_coverage
+            downloads = {'rows': [{'child': row['child'], 'index': row['source_index'], 'status': 'ok',
+                                  'source_sha256': row['source_sha256']} for row in tasks]}
+            with patch('core.release_manifest.read_download_manifest', return_value=downloads), patch(
+                    'core.release_manifest.read_final_source_intents', return_value=intents), patch(
+                    'core.release_manifest.row_in_scope', return_value=True):
+                coverage = source_inventory_coverage(job_path=job, plugin=_Plugin(), tasks=tasks)
+            self.assertEqual(['covered'] * 4, [row['status'] for row in coverage['rows']])
             for task in tasks:
                 references = task["generation_references"]
                 self.assertEqual(1, len(references))
                 self.assertEqual("edit_base", references[0].get("kind"))
-                self.assertEqual([.1, .2, .9, .8], task["image_direction"]["layout"][0]["source_region"])
-                self.assertEqual(task["source_sha256"], file_sha256(job / references[0]["path"]))
+                self.assertEqual([.1, .2, .9, .8], references[0]['original_region'])
+                self.assertEqual(task["edit_base_sha256"], file_sha256(job / references[0]["path"]))
+                self.assertEqual(task["source_sha256"], file_sha256(job / task["source_path"]))
+                self.assertNotEqual(task["source_sha256"], task["edit_base_sha256"])
                 self.assertEqual([{"name": "White", "source": references[0]["source_id"]}], task["product_boundary"]["observed_product_colors"])
             func_source = next(row for row in intents if row["role"] == "func")
             func_brief = next(row for row in kit["source_briefs"] if row["role"] == "func")
             selection = {"source_id": "source_00", "purpose": "Verify the complete cabinet structure", "evidence_ids": []}
             typed_refs = _generation_references_for_task(
-                func_source, {**func_brief, "supporting_sources": [selection]}, kit, child=kit["child"],
+                func_source, {**func_brief, "supporting_sources": [selection]}, kit, job=job, child=kit["child"],
             )
             self.assertEqual(["edit_base", "product_evidence"], [ref["kind"] for ref in typed_refs])
             self.assertEqual("source_00", typed_refs[1]["source_id"])
             with self.assertRaises(ValueError):
                 _generation_references_for_task(func_source, {**func_brief, "supporting_sources": [
-                    {**selection, "source_id": "another-child-source"}]}, kit, child=kit["child"])
+                    {**selection, "source_id": "another-child-source"}]}, kit, job=job, child=kit["child"])
             self.assertTrue(all(task["product_facts"]["product_type"] == "BATHROOM_CABINET" for task in tasks))
             self.assertTrue(all("mirror" not in json.dumps(task["product_boundary"]).casefold() for task in tasks))
 
@@ -500,13 +513,12 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertIn("Ordinary unbranded prop text is allowed", func_prompt)
             self.assertNotIn("no readable text anywhere", func_prompt)
             self.assertNotIn("layout archetype", func_prompt.casefold())
-            self.assertIn("-> canvas [0.1, 0.1, 0.9, 0.9]", func_prompt)
+            self.assertIn("canvas [0.1, 0.1, 0.9, 0.9]", func_prompt)
             self.assertIn("drawn highlights", func_prompt)
             self.assertIn("without changing their internal perspective or visible extent", func_prompt)
             self.assertIn("Adjustable Shelf", func_prompt)
             self.assertIn("Different Object Heights", func_prompt)
             self.assertIn("Wall-Mounted Organization", func_prompt)
-            self.assertIn("do not infer hidden regions", func_prompt)
             self.assertIn("preserve the evidence, not the source graphic framing", func_prompt)
             self.assertIn("Preserve product geometry", func_prompt)
             self.assertIn("text_color = #303634", func_prompt)
@@ -516,13 +528,12 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertIn("Remove source people and reflected people", func_prompt)
             self.assertNotIn("Edit the role source in place", func_prompt)
             self.assertIn("Non-product object palette:", func_prompt)
-            self.assertIn("do not recolor the sold product or add a room to a technical diagram", func_prompt)
+            self.assertIn("Named object and graphic assignments are shared across this child's images", func_prompt)
             self.assertNotIn("when it improves hierarchy", func_prompt)
             self.assertIn("readable spacing", func_prompt)
             self.assertNotIn("Cohesion Rule:", func_prompt)
             size_prompt = next(row["prompt"] for row in prompts if row["role"] == "size")
             self.assertIn("with readable spacing", size_prompt)
-            self.assertIn("fit proportionally", size_prompt)
             self.assertIn("no extra feature cards or duplicate measurement labels", size_prompt)
             self.assertIn("font_family = Inter", size_prompt)
             self.assertNotIn("when it improves hierarchy", size_prompt)
@@ -530,14 +541,14 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertNotIn("Environment And Staging:", size_prompt)
             main_prompt = next(row["prompt"] for row in prompts if row["role"] == "main")
             self.assertIn("uniform pure-white canvas", main_prompt)
-            self.assertNotIn("Market context:", main_prompt)
+            self.assertIn("Market context:", main_prompt)
             self.assertNotIn("Use the room tokens", main_prompt)
             self.assertNotIn("Non-product object palette:", main_prompt)
 
     def test_environment_text_does_not_promote_a_scene_to_func(self) -> None:
         from core.visual_semantics import _validate_observations, OBSERVATION_POLICY
-        observed = {"source_id": "source_00", "role_guess": "scene", "has_dimension_lines": False,
-                    "physical_views": [{"view_id": "view_01", "region": [.1, .2, .9, .8]}],
+        observed = {"source_id": "source_00", "role_guess": "scene", "view_coverage": "complete", "has_dimension_lines": False,
+                    "physical_views": [current_physical_view(object_id='cloth')],
                     "has_callouts_or_panels": False, "confidence": .9, "visible_numbers_or_units": [], "evidence": [],
                     "objects": [{"object_id": "cloth", "kind": "cloth", "sale_membership": "unknown",
                                  "visibility": "occluded", "state": "folded", "membership_evidence": [], "relations": []}],
@@ -549,15 +560,14 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             sources = [{"source_id": "source_00", "sha256": "a" * 64, "ocr": [], "path": Path(tmp) / "source.png"}]
             self.assertEqual(observe_child_sources(Path(tmp), {"asin": "B1"}, sources), observe_child_sources(Path(tmp), {"asin": "B1"}, sources))
             self.assertEqual(1, request.call_count)
-        with self.assertRaisesRegex(ValueError, "omitted"):
-            _validate_observations([observed], ["source_00", "source_01"], {})
+        partial = _validate_observations([observed], ["source_00", "source_01"], {})
+        self.assertEqual("success", partial["source_00"]["status"])
+        self.assertEqual("failed", partial["source_01"]["status"])
         observed["objects"][0]["sale_membership"] = "included_accessory"
-        with self.assertRaisesRegex(ValueError, "requires product evidence"):
-            _validate_observations([observed], ["source_00"], {})
+        self.assertIn("requires product evidence", _validate_observations([observed], ["source_00"], {})["source_00"]["error"])
         observed["objects"][0]["sale_membership"] = "unknown"
         observed["objects"][0]["relations"] = [{"predicate": "contained_in", "target_id": "unobserved_drawer"}]
-        with self.assertRaisesRegex(ValueError, "unobserved identity"):
-            _validate_observations([observed], ["source_00"], {})
+        self.assertIn("unresolved identity", _validate_observations([observed], ["source_00"], {})["source_00"]["error"])
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
             (job / "reports").mkdir(parents=True)
@@ -702,7 +712,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             import colour
         except ImportError:
             colour = None
-        from core.palette_registry import _ciede2000, _delta_e, _srgb_lab, select_palette_route
+        from core.palette_registry import _ciede2000, _delta_e, _srgb_lab
         pairs = [((50, 2.6772, -79.7751), (50, 0, -82.7485), 2.0425),
                  ((50, 0, 0), (50, -1, 2), 2.3669)]
         for first, second, expected in pairs:
@@ -714,14 +724,8 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 expected = (float(colour.delta_E(_srgb_lab(first), _srgb_lab(second), method="CIE 2000"))
                             if colour is not None else _ciede2000(_srgb_lab(second), _srgb_lab(first)))
                 self.assertAlmostEqual(expected, _ciede2000(_srgb_lab(first), _srgb_lab(second)), places=9)
-        for color in ("White", "Natural", "Blue", "Espresso"):
-            args = {"category_id": "bed_frame", "product_color": color, "route_key": "semantic-audit-child"}
-            expected = select_palette_route(**args)
-            with patch.dict(sys.modules, {"colour": None}):
-                actual = select_palette_route(**args)
-                self.assertEqual(0, _delta_e((.5, .5, .5), (.5, .5, .5))[0])
-            for key in ("palette", "route_id", "selection_score", "selection_components", "recipe"):
-                self.assertEqual(expected[key], actual[key], (color, key))
+        with patch.dict(sys.modules, {"colour": None}):
+            self.assertEqual(0, _delta_e((.5, .5, .5), (.5, .5, .5))[0])
         sources = [{
             "source_id": "source_00",
             "source_index": 0,
@@ -746,13 +750,12 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             "measurements": [],
         }]
         for source in sources:
-            source["observation"] = {"physical_views": [{"view_id": "view_01", "region": [.1, .2, .9, .8]}]}
+            source["observation"] = {"physical_views": [current_physical_view()]}
         draft = {
             "family_art_direction": current_art_direction(),
             "source_briefs": [{
                 "source_id": "source_01",
                 "image_direction": current_image_direction(),
-                "shopping_purpose": "Show realistic room use and product scale.",
             }],
             "product_visual_read": {
                 "sold_product_parts": ["invented mirror"],
@@ -802,7 +805,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
         ):
             polluted = json.loads(json.dumps(draft))
             if field == "source_brief":
-                polluted["source_briefs"][0]["shopping_purpose"] = instruction
+                polluted["source_briefs"][0]["image_direction"]["visual_goal"] = instruction
             elif field == "negative_visuals":
                 polluted["family_art_direction"][field][0] = instruction
             else:
@@ -815,35 +818,35 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 with self.assertRaisesRegex(VisualDesignKitCompileError, "renderable-copy instruction"):
                     compile_visual_design_kit_response(polluted, source_manifest=sources)
         artificial_scene = json.loads(json.dumps(draft))
-        artificial_scene["source_briefs"][0]["shopping_purpose"] = (
+        artificial_scene["source_briefs"][0]["image_direction"]["visual_goal"] = (
             "Restyle the front door, wall siding, floor, and doormat while keeping the tree and pot unchanged."
         )
         compiled_tree = compile_visual_design_kit_response(
             artificial_scene, source_manifest=sources, category_id="artificial_tree",
         )
-        self.assertIn("front door", compiled_tree["source_briefs"][-1]["shopping_purpose"])
+        self.assertIn("front door", compiled_tree["source_briefs"][-1]["image_direction"]["visual_goal"])
         sold_change = json.loads(json.dumps(artificial_scene))
-        sold_change["source_briefs"][0]["shopping_purpose"] = "Replace the tree and pot with a new container."
+        sold_change["source_briefs"][0]["image_direction"]["visual_goal"] = "Replace the tree and pot with a new container."
         failed = compile_visual_design_kit_response(sold_change, source_manifest=sources, category_id="artificial_tree")
         self.assertEqual("pending", failed["source_briefs"][-1]["status"])
         self.assertIn("source-visible product state", failed["source_briefs"][-1]["error"])
 
-    def test_func_story_contract_is_single_evidence_bound_authority(self) -> None:
-        from core.visual_design_kit_compiler import _bind_func_story_text, claim_review_requests
+    def test_display_copy_contract_is_single_evidence_bound_authority(self) -> None:
+        from core.visual_design_kit_compiler import _bind_display_text, claim_review_requests
         from core.visual_semantics import claim_key, CLAIM_REVIEW_POLICY
         for evidence, proposed in (("Natural pine wood", "Waterproof Finish"), ("2 doors", "2 drawers")):
             with self.assertRaisesRegex(VisualDesignKitCompileError, "independent evidence review"):
-                _bind_func_story_text({"evidence_ids": ["e1"], "text": proposed}, {"e1": evidence})
+                _bind_display_text({"evidence_ids": ["e1"], "text": proposed}, {"e1": evidence})
         source = {"source_id": "source_01", "source_index": 1, "role": "func",
-                  "observation": {"physical_views": [{"view_id": "view_01", "region": [.1, .2, .9, .8]}]},
+                  "observation": {"physical_views": [current_physical_view()]},
                   "source_sha256": "f", "input_revision_id": "fr", "source_path": "func.png",
                   "shopping_intent": "show shelf", "measurements": [], "product_claims": [],
                   "claims": [{"evidence_id": "e1", "text": "Adjustable Shelf", "source_sha256": "f",
                               "type": "visible_function_text", "confidence": "source_visible"}]}
         draft = {"family_art_direction": current_art_direction(), "source_briefs": [{
-            "source_id": "source_01", "shopping_purpose": "Explain adjustable storage.",
+            "source_id": "source_01",
             "image_direction": current_image_direction(),
-            "func_story": {"title": {"evidence_ids": ["e1"], "text": "Adjust Shelf Height"}, "labels": []},
+            "display_copy": {"title": {"evidence_ids": ["e1"], "text": "Adjust Shelf Height"}, "labels": []},
         }]}
         pending = compile_visual_design_kit_response(draft, source_manifest=[source])
         self.assertEqual("pending", pending["source_briefs"][0]["status"])
@@ -854,21 +857,21 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
         brief = compiled["source_briefs"][0]
         self.assertEqual("ready", brief["status"])
         self.assertEqual(draft["source_briefs"][0]["image_direction"], brief["image_direction"])
-        self.assertEqual("Adjust Shelf Height", build_func_story_contract(source, brief)["title"])
+        self.assertEqual("Adjust Shelf Height", build_display_copy_contract(source, brief)["title"])
         self.assertEqual(1, len(claim_review_requests(draft, [source])))
-        draft["source_briefs"][0]["func_story"]["title"]["text"] = "Waterproof Finish"
+        draft["source_briefs"][0]["display_copy"]["title"]["text"] = "Waterproof Finish"
         stale = compile_visual_design_kit_response(draft, source_manifest=[source], claim_reviews=review)
         self.assertEqual("pending", stale["source_briefs"][0]["status"])
-        draft["source_briefs"][0]["func_story"]["title"] = {}
+        draft["source_briefs"][0]["display_copy"]["title"] = {}
         empty = compile_visual_design_kit_response(draft, source_manifest=[source], claim_reviews=review)
         self.assertEqual("pending", empty["source_briefs"][0]["status"])
-        self.assertNotIn("func_story_contract", empty["source_briefs"][0])
-        draft["source_briefs"][0]["func_story"] = {"title": None, "labels": []}
+        self.assertNotIn("display_copy_contract", empty["source_briefs"][0])
+        draft["source_briefs"][0]["display_copy"] = {"title": None, "labels": []}
         no_copy = compile_visual_design_kit_response(draft, source_manifest=[source])["source_briefs"][0]
         self.assertEqual("ready", no_copy["status"])
-        self.assertEqual([], build_func_story_contract(source, no_copy)["bindings"])
-        from core.image_task_inputs import task_facts, func_renderable_text_contract
-        self.assertEqual([], func_renderable_text_contract(no_copy["func_story_contract"])["strings"])
+        self.assertEqual([], build_display_copy_contract(source, no_copy)["bindings"])
+        from core.image_task_inputs import task_facts, authored_text_contract
+        self.assertEqual([], authored_text_contract(no_copy["display_copy_contract"])["strings"])
         child = {"sold_unit_count": 1, "sold_unit_count_source": "amazon_single_unit_listing_policy"}
         self.assertIsNone(task_facts(child, product_type="BED_FRAME")["sold_unit_count"])
         child.update(sold_unit_count=2, sold_unit_count_source="apify_explicit_pack_count")

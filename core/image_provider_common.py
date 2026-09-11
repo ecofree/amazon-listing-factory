@@ -386,7 +386,7 @@ def provider_concurrency_limit(provider_name: str) -> int:
 
 
 @contextmanager
-def provider_concurrency_slot(provider_name: str, *, deadline: float | None = None):
+def provider_concurrency_slot(provider_name: str, *, deadline: float | None = None, resource_key: str = ""):
     """Acquire a provider slot across every local factory process.
 
     This is intentionally two-layered.  The thread semaphore limits concurrent
@@ -403,7 +403,7 @@ def provider_concurrency_slot(provider_name: str, *, deadline: float | None = No
         return
     effective_deadline = deadline if deadline is not None else time.monotonic() + provider_timeout_seconds(provider_name)
     from .api_registry import image_provider_resource_group
-    resource_group = image_provider_resource_group(provider_name)
+    resource_group = resource_key or image_provider_resource_group(provider_name)
     semaphore = _provider_semaphore(resource_group, limit)
     remaining = effective_deadline - time.monotonic()
     if remaining <= 0 or not semaphore.acquire(timeout=max(0.0, remaining)):

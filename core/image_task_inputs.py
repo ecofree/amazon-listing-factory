@@ -6,33 +6,28 @@ from typing import Any
 from .status import input_revision_id
 from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding, us_measurement_text, measurement_values_match
 
-def build_renderable_text_contract(
-    family: str, measurement: dict[str, Any], *, func_story: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def build_renderable_text_contract(family: str, measurement: dict[str, Any], *, display_copy: dict[str, Any]) -> dict[str, Any]:
     """Return the only strings an image provider may render as pixels."""
     if family in {"main", "scene"}:
         return {"mode": "none", "strings": []}
-    if family == "size":
-        if measurement.get("mode") == "source_image":
-            return {"mode": "source_measurement_display", "strings": []}
+    if family == "size" and measurement.get("mode") != "source_image":
         raise ValueError("size renderable text requires a source measurement image")
-    del func_story
-    raise ValueError("func renderable text must be copied from the immutable source content contract")
+    if family in {"func", "size"}:
+        return authored_text_contract(display_copy)
+    raise ValueError("Unknown image role")
 
 
-def build_func_story_contract(
+def build_display_copy_contract(
     source: dict[str, Any],
     source_brief: dict[str, Any],
     *,
     product_claims: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Verify and copy the one immutable FuncStoryContract chosen upstream."""
-    claims = {
-        str(row.get("evidence_id") or ""): row
-        for row in [*(source.get("claims") or []), *(product_claims or [])]
-        if isinstance(row, dict) and str(row.get("evidence_id") or "")
-    }
-    selected = source_brief.get("func_story_contract")
+    """Verify and copy the one immutable DisplayCopyContract chosen upstream."""
+    from .visual_design_kit_compiler import _available_claims
+    claims = _available_claims({**source, 'source_id': source_brief['source_id'],
+                               'observation': source.get('visual_evidence') or {}}, product_claims)
+    selected = source_brief.get("display_copy_contract")
     if (
         not isinstance(selected, dict)
         or set(selected) != {"mode", "title", "labels", "bindings"}
@@ -40,7 +35,7 @@ def build_func_story_contract(
         or not isinstance(selected.get("labels"), list)
         or not isinstance(selected.get("bindings"), list)
     ):
-        raise ValueError("immutable FuncStoryContract is missing")
+        raise ValueError("immutable DisplayCopyContract is missing")
     title = str(selected.get("title") or "")
     labels = [str(value or "") for value in selected.get("labels") or []]
     strings = ([title] if title else []) + labels
@@ -60,7 +55,7 @@ def build_func_story_contract(
             for index, row in enumerate(bindings)
         )
     ):
-        raise ValueError("immutable FuncStoryContract or its evidence binding changed")
+        raise ValueError("immutable DisplayCopyContract or its evidence binding changed")
     return {
         "mode": "source_claims", "title": title, "labels": labels,
         "bindings": [
@@ -113,15 +108,15 @@ def visual_variation_values(child: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def func_renderable_text_contract(story: dict[str, Any]) -> dict[str, Any]:
-    """Project buyer-facing strings from one immutable FuncStoryContract."""
+def authored_text_contract(story: dict[str, Any]) -> dict[str, Any]:
+    """Project buyer-facing strings from one immutable DisplayCopyContract."""
     if not isinstance(story, dict) or story.get("mode") != "source_claims":
-        raise ValueError("func story contract is not ready")
+        raise ValueError("display copy contract is not ready")
     title = str(story.get("title") or "").strip()
     labels = [str(value or "").strip() for value in story.get("labels") or [] if str(value or "").strip()]
     strings = ([title] if title else []) + labels
     if len(strings) != len(set(value.casefold() for value in strings)):
-        raise ValueError("FuncStoryContract contains duplicate renderable strings")
+        raise ValueError("DisplayCopyContract contains duplicate renderable strings")
     return {
         "mode": "exact",
         "strings": strings,

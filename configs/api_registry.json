@@ -354,6 +354,29 @@
       "enabled": true
     },
     {
+      "name": "cxk_gpt_image_25_sunburst",
+      "allowed_roles": ["func", "size"],
+      "resource_group": "cxk_fixed",
+      "display": "cxk-gpt-image-2.5-sunburst",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "CXK_FIXED_API_KEY",
+      "model": "gpt-image-2.5-sunburst",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 155,
+      "enabled": true
+    },
+    {
       "name": "highwayapi_gpt_image_2",
       "family": "image_generation",
       "scope": "image_generation",

@@ -206,14 +206,17 @@ def generate_with_provider_retries(
             # permission to spend a backup provider call.
             queue_budget = max(1.0, min(5.0, remaining - 30.0))
             queue_deadline = time.monotonic() + queue_budget
+            queued_at = time.monotonic()
             with provider_concurrency_slot(provider_name, deadline=queue_deadline):
+                if request_audit is not None:
+                    request_audit["provider_queue_seconds"] = round(time.monotonic() - queued_at, 3)
                 if provider_run_circuit_open(circuit):
                     raise ProviderConfigurationError(
                         provider_name,
                         "Provider circuit opened while this task waited for a concurrency slot",
                     )
+                attempt_started_at = time.monotonic()
                 if attempt_observer:
-                    attempt_started_at = time.monotonic()
                     attempt_observer(provider_name, attempt, status="started")
                 request_remaining = run_deadline - time.monotonic()
                 if request_remaining <= 1:
@@ -232,6 +235,8 @@ def generate_with_provider_retries(
                     request_id=request_id,
                     request_audit=request_audit,
                 )
+                if request_audit is not None:
+                    request_audit["provider_execution_seconds"] = round(time.monotonic() - (attempt_started_at or queued_at), 3)
             if attempt_observer:
                 assert attempt_started_at is not None
                 attempt_observer(

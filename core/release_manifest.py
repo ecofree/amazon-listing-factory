@@ -107,7 +107,7 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
         evidence_current = bool(
             candidate and evidence and evidence_is_current(evidence, task, candidate, job_dir=job_path)
         )
-        automatic = str(evidence.get("automatic_decision") or "") if evidence_current else "unavailable"
+        automatic = str(evidence.get("automatic_decision") or "") if evidence_current else "stale" if evidence else "not_run"
         review = reviews.get((*key, candidate.get("candidate_sha256", "")))
         review_current = _review_is_current(review, task=task, candidate=candidate, evidence=evidence if evidence_current else {})
         human = str(review.get("decision") or "") if review_current else ""

@@ -9,7 +9,8 @@ from unittest.mock import patch
 from core import image_qa
 from core.candidate_state import CandidateStateError
 from core.image_tasks import IMAGE_TASK_POLICY_VERSION
-from tests.current_image_contract_fixture import current_image_task, current_prompt_artifact
+from tests.current_image_contract_fixture import current_image_task, current_prompt_artifact, current_image_direction
+from core.visual_semantics import candidate_view_targets
 
 
 def _task(role: str, mode: str = "none") -> dict:
@@ -20,20 +21,25 @@ def _task(role: str, mode: str = "none") -> dict:
         "category_image_policy": {}, "product_boundary": {},
         "measurement_authority": {"mode": mode, "render_text": []},
         "renderable_text_contract": {
-            "mode": "exact" if family == "func" else "source_measurement_display" if mode == "source_image" else "none",
+            "mode": "exact" if family in {"func", "size"} else "none",
             "strings": ["Storage That Adapts", "Adjustable Shelf"] if family == "func" else [],
         },
         "source_path": "source.png",
+        "generation_references": [{"source_id": "source_00", "view_id": "view_01"}],
+        "image_direction": current_image_direction(),
     }
 
 
 def _observed(task: dict) -> dict:
     return {
         "text_coverage": "complete", "measurement_coverage": "not_applicable", "measurements": [],
+        "product_coverage": "complete",
         "texts": [{"text": text, "kind": "marketing", "confidence": 0.99, "region": [0, 0, 1, 1]}
                   for text in task["renderable_text_contract"]["strings"]],
-        "product_comparison": {"status": "consistent", "part": "sold structure", "confidence": 0.99,
-                               "evidence": "Fixture geometry retained", "source_region": [0, 0, 1, 1], "candidate_region": [0, 0, 1, 1]},
+        "product_comparisons": [{"source_id": row['source_id'], "view_id": row['view_id'], "attachment_index": index,
+                                "status": "consistent", "part": "sold structure", "confidence": 0.99,
+                                "evidence": "Fixture geometry retained", "source_region": [0, 0, 1, 1], "candidate_region": [0, 0, 1, 1]}
+                               for index, row in enumerate(candidate_view_targets(task), 2)],
     }
 
 
@@ -112,6 +118,18 @@ class QaLiteV1Tests(unittest.TestCase):
                 progress = stack.enter_context(patch.object(image_qa, "record_progress"))
                 image_qa.run_image_qa(job_dir=tmp, plugin=plugin)
             events = [call.args[1] for call in progress.call_args_list]
+            from core.image_provider_common import ProviderQueueUnavailable
+            from core.vision_errors import VisionRequestError
+            for exc in (ProviderQueueUnavailable("vision", "busy"), VisionRequestError(
+                "vision_qa", "queue_unavailable", "busy", metadata={"physical_request_count": 0})):
+                with ExitStack() as stack:
+                    for context in qa_patches():
+                        stack.enter_context(context)
+                    stack.enter_context(patch.object(image_qa, "observe_candidate", side_effect=exc))
+                    not_executed = image_qa.run_image_qa(job_dir=tmp, plugin=plugin)
+                self.assertEqual([], not_executed["qa"])
+                self.assertEqual("qa_not_executed_capacity", not_executed["failures"][0]["error_code"])
+                self.assertEqual("retryable", not_executed["tasks"][0]["status"])
             self.assertIn("qa_evidence_cache_miss", events)
             self.assertNotIn("qa_evidence_cache_rejected", events)
             qa_path = Path(tmp) / "reports" / image_qa.QA_EVIDENCE_ARTIFACT
@@ -151,7 +169,7 @@ class QaLiteV1Tests(unittest.TestCase):
             self.assertTrue(evidence_is_current(evidence, task, candidate))
             self.assertEqual("unavailable", evidence['observation_status'])
             unknown = _observed(task)
-            unknown["product_comparison"]["status"] = "unknown"
+            unknown["product_comparisons"][0]["status"] = "unknown"
             with patch.object(image_qa, "observe_candidate", return_value=unknown):
                 completed = image_qa._evaluate(Path(tmp), object(), task, candidate)
             self.assertEqual("inconclusive", completed["automatic_decision"])
@@ -182,11 +200,8 @@ class QaLiteV1Tests(unittest.TestCase):
         observation["text_coverage"] = "partial"
         self.assertEqual("inconclusive", image_qa._semantic_gates(task, observation)[0]["status"])
 
-    def test_source_size_ocr_difference_requires_review_not_rejection(self) -> None:
+    def test_source_size_semantic_measurements_require_observed_relationships(self) -> None:
         task = _task("size_01", "source_image")
-        with tempfile.TemporaryDirectory() as tmp, patch.object(image_qa, "ocr_evidence_for_image", return_value={"available": False}):
-            text, dimension = image_qa._ocr_gates(Path(tmp), task, Path(tmp) / "candidate.png")
-        self.assertEqual("inconclusive", dimension["status"])
         observation = _observed(task)
         observation["measurement_coverage"] = "complete"
         measurement = {"object": "cabinet overall width", "source_text": "36 in", "candidate_text": "3 ft",
@@ -217,8 +232,37 @@ class QaLiteV1Tests(unittest.TestCase):
         self.assertEqual("fail", image_qa._semantic_gates(_task("main"), observation)[0]["status"])
         observation["texts"][0]["kind"] = "prop"
         self.assertEqual("pass", image_qa._semantic_gates(_task("scene"), observation)[0]["status"])
-        observation["product_comparison"]["status"] = "contradiction"
+        observation["product_comparisons"][0]["status"] = "contradiction"
         self.assertEqual("fail", image_qa._semantic_gates(_task("scene"), observation)[2]["status"])
+        from copy import deepcopy
+        from core.visual_semantics import _validate_candidate_observation
+        task = _task('func')
+        task['generation_references'].append({'source_id': 'source_00', 'view_id': 'view_02'})
+        task['image_direction']['evidence_usage'].append({'view_id': 'view_02', 'usage': 'display', 'covered_by': []})
+        complete = _observed(task)
+        _validate_candidate_observation(complete)
+        self.assertEqual('pass', image_qa._semantic_gates(task, complete)[2]['status'])
+        partial = deepcopy(complete)
+        partial['product_coverage'] = 'partial'
+        self.assertEqual('inconclusive', image_qa._semantic_gates(task, partial)[2]['status'])
+        extra = deepcopy(complete)
+        extra['product_comparisons'].append({**extra['product_comparisons'][0], 'view_id': 'extra:caster',
+            'status': 'contradiction', 'part': 'drawer stop', 'evidence': 'Wooden stop replaced by a caster brake'})
+        _validate_candidate_observation(extra)
+        self.assertEqual('fail', image_qa._semantic_gates(task, extra)[2]['status'])
+        wrong = deepcopy(complete)
+        wrong['product_comparisons'][1].update(status='contradiction', part='corner', evidence='Mattress added to bare corner')
+        self.assertEqual('fail', image_qa._semantic_gates(task, wrong)[2]['status'])
+        wrong['product_comparisons'][1]['confidence'] = .4
+        self.assertEqual('inconclusive', image_qa._semantic_gates(task, wrong)[2]['status'])
+        complete['product_comparisons'].pop()
+        self.assertEqual('inconclusive', image_qa._semantic_gates(task, complete)[2]['status'])
+        complete['product_comparisons'].append(deepcopy(complete['product_comparisons'][0]))
+        with self.assertRaisesRegex(ValueError, 'repeats a view'):
+            _validate_candidate_observation(complete)
+        del complete['product_comparisons']
+        with self.assertRaisesRegex(ValueError, 'per-view'):
+            _validate_candidate_observation(complete)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.text_evidence import extract_measurements, us_measurement_text, measurement_values_match
+from tests.current_image_contract_fixture import current_physical_view
 from core.template_field_values import template_dimensions_from_facts
 from core.image_qa import _line_matches_any, _unsupported_contract_lines
 from core.visual_design_kit import compact_product_claims
@@ -70,7 +71,8 @@ class UsMeasurementContractTests(unittest.TestCase):
     def test_observer_cache_changes_with_model_without_image_generation(self):
         from core.visual_semantics import observe_candidate
         from tests.test_qa_lite_v1 import _task, _observed
-        task = {**_task('main'), 'generation_references': [], 'product_facts': {}}
+        task = {**_task('main'), 'product_facts': {}}
+        task['generation_references'][0].update(kind='edit_base', path='source.png', sha256='a' * 64, purpose='Original view')
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(_observed(task))) as request:
             candidate = {'candidate_path': 'image.png', 'candidate_sha256': 'c' * 64}
             with patch('core.vision_gemini_client.gemini_scope_execution_revision', return_value='model1'):
@@ -93,7 +95,7 @@ class UsMeasurementContractTests(unittest.TestCase):
             candidate.update(revision_mode='targeted_edit', edit_parent_candidate_sha256=file_sha256(parent_path),
                              prompt_path='edit.txt', request_prompt_fingerprint=file_sha256(prompt_path))
             response = _observed(task)
-            response['edit_comparison'] = {**response['product_comparison'], 'status': 'contradiction', 'evidence': 'Unrequested drawer removed'}
+            response['edit_comparison'] = {**response['product_comparisons'][0], 'status': 'contradiction', 'evidence': 'Unrequested drawer removed'}
             with patch('core.candidate_state.candidate_by_sha', return_value={'candidate_path': 'parent.png'}), patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)) as request:
                 observed = observe_candidate(Path(tmp), task, candidate)
                 self.assertIn('Fix title spacing only', request.call_args.args[0])
@@ -122,8 +124,8 @@ class UsMeasurementContractTests(unittest.TestCase):
 
     def test_object_membership_conflict_is_isolated_to_affected_sources(self):
         from core.visual_semantics import _validate_observations
-        row = {'source_id': 'a', 'role_guess': 'scene', 'has_dimension_lines': False, 'has_callouts_or_panels': False,
-               'physical_views': [{'view_id': 'view_01', 'region': [.1, .1, .9, .9]}],
+        row = {'source_id': 'a', 'role_guess': 'scene', 'view_coverage': 'complete', 'has_dimension_lines': False, 'has_callouts_or_panels': False,
+               'physical_views': [current_physical_view(region=[.1, .1, .9, .9], object_id='drawer')],
                'confidence': .9, 'visible_numbers_or_units': [], 'evidence': [], 'text_observations': [],
                'variant_identity': {'status': 'unknown', 'observed_color': '', 'reason': 'Occluded', 'conflicts': []},
                'objects': [{'object_id': 'drawer', 'kind': 'drawer', 'state': 'open', 'visibility': 'visible',
@@ -131,6 +133,7 @@ class UsMeasurementContractTests(unittest.TestCase):
         other, clear = copy.deepcopy(row), copy.deepcopy(row)
         other['source_id'], other['objects'][0]['sale_membership'] = 'b', 'staging'
         clear['source_id'], clear['objects'][0]['object_id'] = 'c', 'frame'
+        clear['physical_views'][0]['evidence'][0]['object_id'] = 'frame'
         rows = _validate_observations([row, other, clear], ['a', 'b', 'c'], {'product.specs.drawers': '2 drawers'})
         self.assertEqual(['drawer'], rows['a']['object_identity_conflicts'])
         self.assertEqual(['drawer'], rows['b']['object_identity_conflicts'])
