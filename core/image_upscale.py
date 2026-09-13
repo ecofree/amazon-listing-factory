@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
+from .image_provider_common import provider_concurrency_slot
 
 
 PUBLIC_IMAGE_SIZE = 1600
@@ -102,7 +104,8 @@ def upscale_for_publication_with_backend(
             backend = _configured_backend()
             if backend in {"auto", "realesrgan", "real-esrgan"} and _realesrgan_executable().is_file():
                 try:
-                    return _realesrgan_resize(bytes(data), target), REALESRGAN_MODEL
+                    with provider_concurrency_slot('host_gpu_auto', deadline=time.monotonic() + 120):
+                        return _realesrgan_resize(bytes(data), target), REALESRGAN_MODEL
                 except ImageUpscaleError as exc:
                     fallback = f"{UPSCALE_BACKEND}:fallback_from_realesrgan:{' '.join(str(exc).split())[:400]}"
                     return _resize_lanczos(source, target), fallback

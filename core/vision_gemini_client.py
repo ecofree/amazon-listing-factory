@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from functools import partial
-from http.client import HTTPException
+from http.client import HTTPException, IncompleteRead
 import io
 import json
 import mimetypes
@@ -26,6 +26,8 @@ from .model_call_health import (
     model_provider_cooldown_active,
     open_provider_run_circuit,
     provider_run_circuit_open,
+    admit_provider_probe,
+    release_unused_provider_probe,
     record_provider_run_result,
     record_model_call_event,
 )
@@ -127,6 +129,8 @@ def gemini_stream_generate(
                 last_status = "request_budget_exhausted"
                 last_exc = VisionQAError(f"Physical vision request budget exhausted ({max_physical_requests})")
             return False
+        if not admit_provider_probe(key):
+            return False
         physical_request_count += 1
         return True
 
@@ -138,6 +142,7 @@ def gemini_stream_generate(
             # No network request was sent.  A busy local concurrency slot must
             # not consume the visual-planning request budget.
             physical_request_count = max(0, physical_request_count - 1)
+            release_unused_provider_probe(key)
             return "queue_unavailable", detail, False
         status = "transport_failure" if isinstance(exc, HTTPException) else model_status_from_exception(exc, detail)
         terminal = status in {"auth_failure", "configuration_failure", "model_not_found", "request_failure"}
@@ -999,23 +1004,44 @@ def _post_vision_request(
             payload(),
             headers=headers,
             timeout_seconds=_bounded_deadline_timeout(timeout_seconds, deadline),
+            deadline=deadline,
         )
 
 
-def _post_json_preserve_redirects(url: str, payload: dict[str, Any], headers: dict[str, str], *, timeout_seconds: int = 120) -> str:
+def _post_json_preserve_redirects(url: str, payload: dict[str, Any], headers: dict[str, str], *, timeout_seconds: int = 120, deadline: float | None = None) -> str:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     opener = urllib.request.build_opener(_NoRedirectHandler)
     current = url
+    end = min(time.monotonic() + timeout_seconds, deadline if deadline is not None else float('inf'))
+
+    def remaining() -> float:
+        seconds = end - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError('Vision response total deadline exhausted')
+        return seconds
+
     for _ in range(4):
         request = urllib.request.Request(current, data=data, headers=headers, method="POST")
         try:
-            with opener.open(request, timeout=timeout_seconds) as response:
-                return response.read().decode("utf-8", errors="replace")
+            with opener.open(request, timeout=remaining()) as response:
+                chunks = []
+                while not response.isclosed():
+                    # Socket inactivity alone does not bound a trickling SSE response.
+                    response.fp.raw._sock.settimeout(remaining())
+                    chunk = response.read1(65536)
+                    remaining()
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if response.length not in (None, 0):
+                    raise IncompleteRead(b''.join(chunks), response.length)
+                return b''.join(chunks).decode('utf-8', errors='replace')
         except urllib.error.HTTPError as exc:
             if exc.code in REDIRECT_STATUSES:
                 location = exc.headers.get("Location")
                 if location:
                     current = urllib.parse.urljoin(current, location)
+                    exc.close()
                     continue
             raise
     raise VisionQAError(f"Too many redirects for Gemini endpoint: {url}")

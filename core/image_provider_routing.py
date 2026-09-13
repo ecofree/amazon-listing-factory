@@ -7,7 +7,6 @@ import os
 import queue
 import re
 import threading
-import tempfile
 import time
 import calendar
 from pathlib import Path
@@ -22,6 +21,7 @@ from .api_registry import (
 )
 from .image_provider_common import (
     ImageGenerationError,
+    CandidateCommitError,
     ProviderConfigurationError,
     ProviderContentError,
     ProviderQueueUnavailable,
@@ -41,10 +41,12 @@ from .image_provider_common import (
 from .image_provider_transport import generate_with_registry_image_provider, has_registry_image_provider
 from .image_role_utils import role_key
 from .io import read_json, write_json
+from .image_response import RESPONSE_SCHEMA, new_response_path, save_response, save_transport_response, finish_response
 from .model_call_health import (
     model_provider_cooldown_active,
     open_provider_run_circuit,
     provider_run_circuit_open,
+    admit_provider_probe,
     record_model_call_event,
     record_provider_run_result,
 )
@@ -171,7 +173,6 @@ def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "child_provider_primary": primary,
                 "child_provider_backup": backup,
                 "child_provider_lane": child_lane,
-                "child_provider_lock": True,
                 "child_provider_role_lane": role_lane,
             }
     return [row for row in result if row is not None]
@@ -181,7 +182,8 @@ def generate_with_provider_retries(
     *, provider_name: str, image_input_paths: list[str], prompt: str,
     mask_bytes: bytes | None = None, attempt_observer: Any | None = None,
     total_timeout_seconds: float | None = None, request_id: str = "", request_audit: dict[str, Any] | None = None,
-) -> bytes:
+    response_directory: Path | None = None,
+) -> Path:
     """Run one physical provider with bounded attempts and a role deadline."""
     circuit = provider_runtime_circuit_key(provider_name)
     if provider_run_circuit_open(circuit):
@@ -210,7 +212,7 @@ def generate_with_provider_retries(
             with provider_concurrency_slot(provider_name, deadline=queue_deadline):
                 if request_audit is not None:
                     request_audit["provider_queue_seconds"] = round(time.monotonic() - queued_at, 3)
-                if provider_run_circuit_open(circuit):
+                if not admit_provider_probe(circuit):
                     raise ProviderConfigurationError(
                         provider_name,
                         "Provider circuit opened while this task waited for a concurrency slot",
@@ -234,6 +236,7 @@ def generate_with_provider_retries(
                     timeout_seconds=attempt_timeout,
                     request_id=request_id,
                     request_audit=request_audit,
+                    response_directory=response_directory,
                 )
                 if request_audit is not None:
                     request_audit["provider_execution_seconds"] = round(time.monotonic() - (attempt_started_at or queued_at), 3)
@@ -287,18 +290,23 @@ def _generate_with_provider_deadline(
     *, provider_name: str, image_input_paths: list[str], prompt: str,
     mask_bytes: bytes | None = None, timeout_seconds: float | None = None,
     request_id: str = "", request_audit: dict[str, Any] | None = None,
-) -> bytes:
+    response_directory: Path | None = None,
+) -> Path:
     assert_imagegen_prompt_contract(prompt, provider_name)
     if not has_registry_image_provider(provider_name):
         raise ProviderConfigurationError(provider_name, f"Unsupported registry image provider: {provider_name}")
     timeout = max(1.0, float(timeout_seconds or provider_timeout_seconds(provider_name)))
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue(maxsize=1)
-    with tempfile.NamedTemporaryFile(prefix="amazon_factory_image_", suffix=".bin", delete=False) as handle:
-        result_path = Path(handle.name)
+    if response_directory is None or not request_audit or not request_audit.get('response_binding'):
+        raise CandidateCommitError('Durable response binding is required before sending')
+    receipt = new_response_path(response_directory)
+    result_path = receipt.with_suffix('.bin')
+    write_json(receipt, {'schema': RESPONSE_SCHEMA, 'binding': request_audit['response_binding'],
+                        'provider': provider_name, 'status': 'prepared', 'request_audit': dict(request_audit)})
     process = context.Process(
         target=_provider_worker,
-        args=(provider_name, image_input_paths, prompt, mask_bytes, request_id, str(result_path), result_queue),
+        args=(provider_name, image_input_paths, prompt, mask_bytes, request_id, str(receipt), result_queue),
         daemon=True,
     )
     deadline = time.monotonic() + timeout
@@ -327,11 +335,13 @@ def _generate_with_provider_deadline(
                 raise ProviderTransportError(provider_name, "Provider subprocess returned no result file")
             if request_audit is not None:
                 request_audit.update(result.get("request_audit") or {})
-            return result_path.read_bytes()
+            return receipt
         if request_audit is not None:
             request_audit.update(result.get("request_audit") or {})
         code = str(result.get("failure_code") or "")
         message = str(result.get("message") or "Provider subprocess failed")
+        if result.get('local_failure'):
+            raise CandidateCommitError(message)
         if code == "local_contract_mismatch":
             raise ProviderConfigurationError(provider_name, message)
         if code == "provider_transport_failure":
@@ -351,29 +361,37 @@ def _generate_with_provider_deadline(
             process.join(timeout=1)
         result_queue.cancel_join_thread()
         result_queue.close()
-        try:
-            result_path.unlink()
-        except OSError:
-            pass
 
 
 def _provider_worker(
     provider: str, image_input_paths: list[str], prompt: str, mask: bytes | None,
-    request_id: str, result_path: str, output: Any,
+    request_id: str, receipt_path: str, output: Any,
 ) -> None:
-    partial_path = Path(f"{result_path}.partial")
-    audit: dict[str, Any] = {"request_id": request_id, "provider": provider}
+    receipt = Path(receipt_path)
+    record = read_json(receipt)
+    audit = dict(record['request_audit'])
+    remote_complete = False
+    transport_started = False
     try:
         images = [Path(path).read_bytes() for path in image_input_paths]
+        write_json(receipt, {**record, 'status': 'submitted'})
+        def prepared(snapshot):
+            write_json(receipt, {**record, 'status': 'submitted', 'request_audit': dict(snapshot)})
+            output.put({'event': 'request_prepared', 'request_audit': snapshot})
+        transport_started = True
         data = generate_with_registry_image_provider(
             provider_name=provider, image_inputs=images, prompt=prompt, mask_bytes=mask,
             request_id=request_id, request_audit=audit,
-            request_observer=lambda snapshot: output.put({"event": "request_prepared", "request_audit": snapshot}),
+            request_observer=prepared,
+            transport_observer=lambda phase, data, snapshot: save_transport_response(receipt, phase, data, snapshot),
         )
-        partial_path.write_bytes(data)
-        os.replace(partial_path, result_path)
+        remote_complete = True
+        save_response(receipt, data, audit)
         output.put({"ok": True, "request_audit": audit})
     except Exception as exc:
+        has_body = bool(read_json(receipt).get('body_sha256'))
+        if not remote_complete and not has_body and not getattr(exc, 'ambiguous', False):
+            finish_response(receipt, 'known_failure')
         output.put({
             "ok": False,
             "failure_code": provider_failure_code(exc),
@@ -381,12 +399,8 @@ def _provider_worker(
             "message": f"{type(exc).__name__}: {exc}",
             "ambiguous": bool(getattr(exc, "ambiguous", False)),
             "request_audit": audit,
+            "local_failure": remote_complete or has_body or not transport_started or isinstance(exc, MemoryError),
         })
-    finally:
-        try:
-            partial_path.unlink()
-        except OSError:
-            pass
 
 
 def project_provider_success_ledger_path(job_path: Path) -> Path:

@@ -9,7 +9,9 @@ from .text_evidence import has_bad_encoding, us_measurement_text
 
 
 class VisualDesignKitCompileError(ValueError):
-    pass
+    def __init__(self, message: str, *, failure_owner: str = 'brief'):
+        super().__init__(message)
+        self.failure_owner = failure_owner
 
 
 def cleaned_source_claims(source: dict[str, Any]) -> list[dict[str, str]]:
@@ -82,7 +84,7 @@ IMAGE_DIRECTION_SCHEMA = {
     "design_transfer": [{"reference_id": "approved ID", "inherit": "defining features used here", "adapt": "change and reason, or retain as approved"}],
     "layout": [{"view_id": "one observed view_id for this source", "target_region": [0.1, 0.1, 0.9, 0.9]}],
     "text_placement": [{"text_ref": "title|label:0|measurements", "target_region": [0.1, 0.02, 0.9, 0.1]}],
-    "scene_objects": ["only shared palette object names actually used in this role; no bedding for bare-frame views"],
+    "scene_objects": {"observed staging object_id or new:descriptive_name": "shared palette key for restyling; null to omit removable decor"},
     "environment_mode": "designed_environment|graphic_canvas|source_setting; graphic_canvas for isolated details/technical diagrams, source_setting only where physical context is evidence",
 }
 _BRIEF_BINDING_FIELDS = {
@@ -157,13 +159,12 @@ def compile_visual_design_kit_response(
                 category_id=category_id, claim_reviews=claim_reviews or {},
             )
             brief["supporting_sources"] = validate_supporting_sources(draft.get("supporting_sources", []), source_manifest, source["source_id"])
-            if not set(brief['image_direction']['scene_objects']) <= set(art_direction['palette_direction']):
+            if not {key for key in brief['image_direction']['scene_objects'].values() if key is not None} <= set(art_direction['palette_direction']):
                 raise VisualDesignKitCompileError("Role scene_objects must reference shared palette objects, not invent colors")
-            request = design_binding_request(draft, art_direction, source=source, design_references=design_references)
+            request = design_binding_request(draft, art_direction, source=source, source_manifest=source_manifest, design_references=design_references)
             review = (claim_reviews or {}).get(request["key"], {})
             brief["design_review"] = review
-            if review.get("status") == "contradiction":
-                raise VisualDesignKitCompileError("design binding conflict: " + str(review.get("reason") or ""))
+            _validate_physical_review(request, review)
             approved = {row["source_id"]: row for row in design_references or []}
             if any(row["reference_id"] not in approved or source["role"] not in approved[row["reference_id"]]["roles"]
                    for row in brief["image_direction"]["design_transfer"]):
@@ -175,6 +176,7 @@ def compile_visual_design_kit_response(
                 "source_id": source["source_id"], "source_sha256": source["source_sha256"],
                 "source_intent_revision_id": source["input_revision_id"], "role": source["role"],
                 "status": "pending", "error": str(exc), "draft": draft,
+                "failure_owner": getattr(exc, 'failure_owner', 'brief'),
             }
         briefs.append(brief)
     result = {"family_art_direction": art_direction, "source_briefs": briefs}
@@ -210,18 +212,51 @@ def claim_review_requests(raw: Any, source_manifest: list[dict[str, Any]]) -> li
     return list(requests.values())
 
 
-def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source: dict[str, Any], design_references: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source: dict[str, Any], source_manifest: list[dict[str, Any]] = (), design_references: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     direction = brief.get("image_direction") or {}
     text = {key: direction.get(key) for key in ("visual_goal", "creative_brief", "design_transfer", "evidence_usage", "layout", "environment_mode", "scene_objects")} if isinstance(direction, dict) else {}
     text["role"] = source['role']
+    text['supporting_sources'] = brief.get('supporting_sources', [])
+    sources = {row['source_id']: row for row in source_manifest}
+    supports = []
+    for selection in text['supporting_sources']:
+        support = sources.get(selection.get('source_id'), {})
+        supports.append({**selection, 'source_sha256': support.get('source_sha256'),
+            'source_revision': support.get('input_revision_id'),
+            'views': [view for view in support.get('observation', {}).get('physical_views', []) if view['view_id'] == selection.get('view_id')],
+            'crops': [crop for crop in support.get('crop_provenance', []) if crop['view_id'] == selection.get('view_id')]})
+    views = source['observation']['physical_views']
+    risks = ['coverage_transfer:' + row['view_id'] for row in text.get('evidence_usage') or []
+             if row.get('usage') != 'display']
+    risks += ['view_fidelity:' + crop['view_id'] for crop in source.get('crop_provenance', [])
+              if crop.get('pixel_box') != [0, 0, *crop.get('source_size', [])]]
     selected = {row.get('reference_id') for row in text.get('design_transfer') or [] if isinstance(row, dict)}
     scopes = [{**{key: row[key] for key in ('source_id', 'sha256', 'purpose', 'roles')},
                'approval_boundary': row['visual_review']['transfer_scope']}
               for row in design_references or [] if row['source_id'] in selected]
     from .status import input_revision_id
     key = input_revision_id({"policy": CLAIM_REVIEW_POLICY, "shared_design": _compile_art_direction(art), "role_design": text,
-        'source_revision': source['input_revision_id'], 'views': source['observation']['physical_views'], 'reference_scopes': scopes})
-    return {"kind": "design_binding", "key": key, "source_id": brief.get("source_id"), "role_design": text, "reference_scopes": scopes}
+        'source_revision': source['input_revision_id'], 'source_sha256': source['source_sha256'],
+        'views': views, 'crops': source.get('crop_provenance', []), 'supporting_evidence': supports,
+        'crop_policy': 'floor-ceil-original-png-v1', 'reference_scopes': scopes})
+    return {"kind": "design_binding", "key": key, "source_id": brief.get("source_id"), "role_design": text,
+            "reference_scopes": scopes, "physical_operations": sorted(set(risks)), "supporting_evidence": supports,
+            'crop_provenance': source.get('crop_provenance', [])}
+
+
+def _validate_physical_review(request: dict[str, Any], review: dict[str, Any]) -> None:
+    findings = review.get('findings', [])
+    conflicts = [row for row in findings if row.get('status') == 'contradiction']
+    if conflicts:
+        source_error = any(str(row.get('operation', '')).startswith('view_fidelity:') for row in conflicts)
+        raise VisualDesignKitCompileError('planning evidence conflict: ' + '; '.join(str(row['reason']) for row in conflicts),
+                                         failure_owner='observation' if source_error else 'brief')
+    supported = {row.get('operation') for row in findings
+                 if row.get('kind') == 'physical_structure' and row.get('status') == 'supported'}
+    missing = set(request['physical_operations']) - supported
+    if missing:
+        raise VisualDesignKitCompileError('Physical operation needs pixel-bound review: ' + ', '.join(sorted(missing)),
+                                         failure_owner='review')
 
 
 def validate_compiled_visual_design_kit(
@@ -241,9 +276,10 @@ def validate_compiled_visual_design_kit(
             review = brief.get("design_review")
             if not isinstance(review, dict):
                 raise VisualDesignKitCompileError("Design review must be a bound record or an explicit empty record")
-            if review and (review.get("key") != design_binding_request(brief, data["family_art_direction"], source=sources[brief['source_id']], design_references=design_references)["key"]
+            request = design_binding_request(brief, data["family_art_direction"], source=sources[brief['source_id']], source_manifest=source_manifest, design_references=design_references)
+            _validate_physical_review(request, review)
+            if review and (review.get("key") != request["key"]
                            or review.get("policy") != CLAIM_REVIEW_POLICY
-                           or review.get("status") not in {"supported", "inconclusive"}
                            or not review.get("response_sha256")):
                 raise VisualDesignKitCompileError("Design review no longer matches this child's design")
     _validate_briefs(
@@ -432,7 +468,8 @@ def _validate_briefs(
         source = expected[source_id]
         role = str(source["role"])
         if brief.get("status") == "pending":
-            if set(brief) != _BRIEF_BINDING_FIELDS | {"status", "error", "draft"} or not brief.get("error") or not isinstance(brief.get("draft"), dict):
+            if (set(brief) != _BRIEF_BINDING_FIELDS | {"status", "error", "draft", "failure_owner"}
+                    or brief['failure_owner'] not in {'observation', 'brief', 'review'} or not brief.get("error") or not isinstance(brief.get("draft"), dict)):
                 raise VisualDesignKitCompileError("invalid pending source brief")
             _validate_source_binding(brief, source, index)
             continue
@@ -604,8 +641,23 @@ def _image_direction(value: Any, source: dict[str, Any], *, category_id: str = "
     if value["environment_mode"] not in {"designed_environment", "graphic_canvas", "source_setting"}:
         raise VisualDesignKitCompileError("image_direction has unknown environment_mode")
     objects = value['scene_objects']
-    if not isinstance(objects, list) or any(not isinstance(key, str) or not key for key in objects) or len(objects) != len(set(objects)):
-        raise VisualDesignKitCompileError("scene_objects needs unique shared palette object names")
+    if (not isinstance(objects, dict) or any(not isinstance(key, str) or not key
+            or (palette is not None and (not isinstance(palette, str) or not palette)) for key, palette in objects.items())):
+        raise VisualDesignKitCompileError('scene_objects maps physical staging identities to shared palette keys or omission')
+    observed = {row['object_id']: row for row in source.get('observation', {}).get('objects') or []}
+    for key, palette in objects.items():
+        if key.startswith('new:'):
+            continue
+        obj = observed.get(key, {})
+        if obj.get('sale_membership') != 'staging':
+            raise VisualDesignKitCompileError('A scene edit must identify observed staging, not a sold or unknown object: ' + key)
+        if palette is None and any(rel['predicate'] == 'occludes' for rel in obj['relations']):
+            raise VisualDesignKitCompileError('Restyle occluding staging without revealing unseen product: ' + key)
+    # White mains have no staging palette. Other roles must not silently inherit source props.
+    if source['role'] != 'main' or category_id == 'bed_frame' or objects:
+        missing = {key for key, obj in observed.items() if obj['sale_membership'] == 'staging' and obj['visibility'] == 'visible'} - set(objects)
+        if missing:
+            raise VisualDesignKitCompileError('Resolve visible staging objects in scene_objects: ' + ', '.join(sorted(missing)))
     for field, maximum in (("visual_goal", 240), ("creative_brief", 700)):
         _source_brief_text(value[field], field, maximum, category_id=category_id)
         _reject_renderable_copy_instruction(value[field], field)

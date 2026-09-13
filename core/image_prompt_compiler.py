@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .image_reference_context import reference_prompt
+from .image_reference_context import reference_prompt, measurement_attachment_location
 from .image_task_inputs import task_renderable_text
 from .io import read_jsonl, write_bytes_atomic, write_jsonl
 from .plugin import ProductPlugin
@@ -15,11 +15,11 @@ from .status import input_revision_id, logical_task_id
 from .text_evidence import extract_measurements, normalize_text
 
 
-PROMPT_CONTRACT_VERSION = "gemini-art-direction-v78-complete-physical-and-copy"
+PROMPT_CONTRACT_VERSION = "gemini-art-direction-v81-attachment-located-edits"
 PROMPT_REVISION_RESERVE_CHARS = 700
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v63-complete-physical-and-copy"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v64-object-scoped-design"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -223,7 +223,7 @@ def compile_task_prompt(
     prompt = "\n\n".join((
         f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}",
         "[ROLE]\n" + ("Repair the selected candidate in place; preserve its correct composition, staging and product pixels. Original-source coordinates do not apply to this candidate.\n"
-                       + (_measurement_content(task["measurement_authority"]) if task["measurement_authority"].get("mode") == "source_image" else "")
+                       + (_measurement_content(task["measurement_authority"], task['generation_references']) if task["measurement_authority"].get("mode") == "source_image" else "")
                        if targeted_edit else str(edit.get("create") or "").strip() + "\n" + _role_content(task, role, white_main=white_main)),
         "[REFERENCE]\n" + reference_prompt(task["generation_references"], design_transfer=image_direction["design_transfer"], targeted_edit=targeted_edit) + "\n" + _product_boundary(task, edit, targeted_edit=targeted_edit),
         "[STYLE]\n" + _family_art_direction(
@@ -366,8 +366,9 @@ def _product_boundary(task: dict[str, Any], edit: dict[str, Any], *, targeted_ed
         _line("Forbidden additions", boundary.get("forbidden_additions")),
         _line("Sold-object states", [f"{obj['object_id']}: {obj['state']}" for obj in boundary.get('observed_objects', [])
                                    if obj.get('sale_membership') in {'product', 'included_accessory'} and obj.get('state')]),
-        _line("Occlusion", [f"{obj['object_id']} occludes {rel['target_id']}" for obj in boundary.get('observed_objects', [])
-                            for rel in obj.get('relations', []) if rel['predicate'] == 'occludes']),
+        _line("Object relations", [f"{obj['object_id']} {rel['predicate']} {rel['target_id']}"
+                                  for obj in boundary.get('observed_objects', []) for rel in obj.get('relations', [])
+                                  if rel['predicate'] in {'part_of', 'contained_in', 'occludes'}]),
     ]
     return "\n".join(row for row in rows if row)
 
@@ -392,7 +393,7 @@ def _role_content(
         rows.append("Text positions (references to the authorized copy below, not additional text): " + "; ".join(
             f"{row['text_ref']} -> {row['target_region']}" for row in direction["text_placement"]))
     if (task.get("measurement_authority") or {}).get("mode") == "source_image":
-        rows.append(_measurement_content(task.get("measurement_authority")))
+        rows.append(_measurement_content(task.get("measurement_authority"), task['generation_references']))
     return "\n".join(row for row in rows if row)
 
 
@@ -413,7 +414,7 @@ def _family_art_direction(
             "Use the model's main image direction for the permitted product photography."
         ]
     elif not environment:
-        rows.append("Use the planned canvas around intact evidence views; no added room staging.")
+        rows.append("Use the planned canvas around intact evidence views, including their existing contents; no added room staging.")
     else:
         rows.append("Environment: " + _compact_token_direction(direction.get("environment_and_staging")))
         rows.append("Cohesion: " + _compact_token_direction(direction.get("cohesion_rule")))
@@ -427,13 +428,14 @@ def _family_art_direction(
     return "\n".join(row for row in rows if row)
 
 
-def _presentation_system(direction: dict[str, Any], *, role: str, scene_objects: list[str], main_policy: str = "", environment: bool = True) -> str:
+def _presentation_system(direction: dict[str, Any], *, role: str, scene_objects: dict[str, str | None], main_policy: str = "", environment: bool = True) -> str:
     """Emit Gemini's one child-wide palette and component system once."""
     if role == "main" and main_policy == "white_background":
         return "Do not apply room, floor, textile, staging, or child room palette tokens to this white-background main image."
-    palette = "Non-product object palette: " + "; ".join(
-        f"{key} = {direction['palette_direction'][key]}" for key in scene_objects
-    ) if environment else ""
+    palette = "Non-product object edits: " + "; ".join(
+        f"{object_id} = " + (direction['palette_direction'][key] if key is not None else 'omit removable decor')
+        for object_id, key in scene_objects.items()
+    ) if scene_objects else ""
     if role in {"func", "size"}:
         rows = [
             palette,
@@ -455,54 +457,14 @@ def _compact_token_direction(value: Any) -> str:
     return text
 
 
-def _measurement_content(value: Any) -> str:
-    measurement = value if isinstance(value, dict) else {}
-    if measurement.get("mode") == "source_image":
-        candidates = []
-        for row in measurement.get("measurement_groups") or []:
-            if not isinstance(row, dict):
-                continue
-            text = str(row.get("render_text") or "").strip()
-            part = str(row.get("measured_part") or "").strip()
-            axis = str(row.get("axis") or "").strip()
-            if part and part != "source_visible":
-                text = part if extract_measurements(part) else f"{part}: {text}"
-            if axis and axis != "source_diagram" and not extract_measurements(part):
-                text = f"{axis}: {text}"
-            candidates.append(text)
-        candidates.extend(measurement.get("source_visible_callouts") or [])
-        candidates.extend(
-            row for row in measurement.get("source_visible_text_artifacts") or []
-            if isinstance(row, dict) and row.get("kind") in {"measurement", "callout"}
-        )
-        inventory, seen, seen_pairs = [], set(), set()
-        for row in candidates:
-            text = normalize_text(row.get("display_text") or row.get("text")) if isinstance(row, dict) else normalize_text(row)
-            if not text or re.fullmatch(r"\d+(?:\.\d+)?", text):
-                continue  # Naked OCR numbers have no unit/object authority; keep them in evidence only.
-            values = extract_measurements(text)
-            context = text.casefold()
-            for item in values:
-                context = context.replace(str(item["raw_text"]).casefold(), " ")
-            context = " ".join(re.findall(r"[a-z]+", context))
-            pairs = {item["canonical_pair"] for item in values}
-            if pairs and not context and pairs <= seen_pairs:
-                continue  # A bare transcription adds no object association.
-            key = (context, tuple(item["canonical_pair"] for item in values)) if values and context else (text.casefold(), ())
-            if key not in seen:
-                inventory.append(text)
-                seen.add(key)
-                seen_pairs.update(pairs)
-        return (
-            "Measurement copy: Render canonical display copy with readable spacing at its existing source association, not as additional labels. "
-            "This inventory aids transcription; the source diagram remains authority for all relationships and unlisted facts."
-            + (" Source-observed facts: " + "; ".join(inventory) + "." if inventory else "")
-        )
-    groups = [
-        f"{row.get('measured_part')} / {row.get('axis')}: {row.get('render_text')}"
-        for row in measurement.get("measurement_groups") or [] if isinstance(row, dict)
-    ]
-    return "Confirmed measurement relationships: " + "; ".join(groups) + "."
+def _measurement_content(value: Any, references: list[dict[str, Any]]) -> str:
+    rows = []
+    for row in value.get('measurement_groups', []):
+        location = measurement_attachment_location(row, references)
+        rows.append(f"{row['measured_part']} / {row['axis']}: {row['render_text']} @ " + json.dumps(location, separators=(',', ':')))
+    return ('Measurement copy: replace each located source label once with its US-unit text; retain its measured object and endpoints. '
+            'Named coordinates locate evidence within the numbered ATTACHMENT, not the output canvas. Null endpoints identify capacity/weight badges. '
+            + '; '.join(rows))
 
 
 def _line(label: str, values: Any) -> str:

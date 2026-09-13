@@ -11,7 +11,12 @@ explicit optional local inputs. Omitting them keeps autonomous Gemini planning.
 The brand brief accepts audience, positioning, design_priorities and avoid.
 Seller defaults, source facts and category main-image policies do not change.
 
-The only current pack schema is `design-pack-v3`. A production pack needs:
+The only current pack schema is `design-pack-v4`. Approval scope is explicit:
+`production` requires `production_ready=true`; `evaluation` requires
+`production_ready=false` and explicit child IDs (no wildcard). Assistant review
+for a limited test is not project-owner or commercial approval. Neither scope
+is auto-discovered or required when running without an external reference.
+A production pack needs:
 pack_id, version, status=approved, production_ready=true, compatibility.categories,
 design_system and assets. Every asset needs:
 

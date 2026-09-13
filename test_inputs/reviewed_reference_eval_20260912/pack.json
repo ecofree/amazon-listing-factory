@@ -1,0 +1,140 @@
+{
+  "schema_version": "design-pack-v4",
+  "pack_id": "assistant-reviewed-evaluation-20260912",
+  "version": "1",
+  "status": "approved",
+  "approval_scope": "evaluation",
+  "production_ready": false,
+  "compatibility": {
+    "categories": [
+      "bed_frame",
+      "bathroom_cabinet"
+    ]
+  },
+  "design_system": "Evaluation of photography clarity and readable label hierarchy. Each child owns its palette and composition; these assets neither prove product facts nor constitute a commercial design library.",
+  "assets": [
+    {
+      "asset_id": "bed-photography",
+      "local_path": "bed_photo.png",
+      "sha256": "f37abf749a26a0656571bce0eb34e2de8c58d07e2491506b92868425c597673a",
+      "children": [
+        "B0FFMWB9XV"
+      ],
+      "roles": [
+        "main",
+        "scene"
+      ],
+      "reference_region": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "purpose": "Study soft daylight, fabric texture and restrained prop density. Do not inherit the product, open-drawer state, exact bedding palette or room layout.",
+      "source_url": "test_runs/final_freeze_20260911T153354Z/B0FFMWB9XV_20260911T153355956470/images/generated/B0FFMWB9XV/main/40b55a697a465fe6937eb2ddb6a7e569a150df899f46297f986f28eee3504187.candidate0.png",
+      "author": "Existing project image-model output; not independently authored product evidence",
+      "asset_license": "User-authorized internal evaluation reference only; commercial rights not independently established",
+      "rights_review": {
+        "status": "approved",
+        "approved_by": "Codex assistant, scoped user authorization",
+        "approved_at": "2026-09-12",
+        "allowed_uses": [
+          "image_generation_reference"
+        ],
+        "license_evidence": "User authorized assistant screening and review for this round's test references in this conversation. No project-owner or commercial approval asserted."
+      },
+      "visual_review": {
+        "status": "approved",
+        "approved_by": "Codex assistant",
+        "approved_at": "2026-09-12",
+        "product_clarity": "Inspected original image; reference does not authorize its product structure.",
+        "information_hierarchy": "Clear subject/background separation and usable natural-light cues.",
+        "evidence_fit": "Style only. New child source observations remain the sole physical evidence.",
+        "series_cohesion": "Do not copy this example's exact colors. Use the current child's named design assignments.",
+        "transfer_scope": "Photography qualities only. Warm cast is not the required white balance; child plan owns object colors and room composition."
+      }
+    },
+    {
+      "asset_id": "cabinet-photography",
+      "local_path": "cabinet_photo.png",
+      "sha256": "a4607ac0f5c9f41ada6dac405c5385c5f9c6d2370aae737d1e19b3707d9ce7f1",
+      "children": [
+        "B0F4KL1C4H"
+      ],
+      "roles": [
+        "scene"
+      ],
+      "reference_region": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "purpose": "Study residential context, legible painted surfaces and uncluttered unbranded props. Not a source for cabinet geometry, storage state, green tiles or exact furniture arrangement.",
+      "source_url": "test_runs/freeze_20260910_4cat_2child/B0F4KL1C4H_20260910T073514047174/images/generated/B0F4KL1C4H/scene/8c3a63458e2e17145a964e048f0e57e81da3e9884c2e2da8ec9f1093f03651c3.candidate0.png",
+      "author": "Existing project image-model output; not independently authored product evidence",
+      "asset_license": "User-authorized internal evaluation reference only; commercial rights not independently established",
+      "rights_review": {
+        "status": "approved",
+        "approved_by": "Codex assistant, scoped user authorization",
+        "approved_at": "2026-09-12",
+        "allowed_uses": [
+          "image_generation_reference"
+        ],
+        "license_evidence": "User authorized assistant screening and review for this round's test references in this conversation. No project-owner or commercial approval asserted."
+      },
+      "visual_review": {
+        "status": "approved",
+        "approved_by": "Codex assistant",
+        "approved_at": "2026-09-12",
+        "product_clarity": "Inspected original image; reference does not authorize its product structure.",
+        "information_hierarchy": "Clear subject/background separation and usable natural-light cues.",
+        "evidence_fit": "Style only. New child source observations remain the sole physical evidence.",
+        "series_cohesion": "Do not copy this example's exact colors. Use the current child's named design assignments.",
+        "transfer_scope": "Photography context only; no main-image use and no mandatory palette, mirror, toilet or open door transfer."
+      }
+    },
+    {
+      "asset_id": "graphic-label-typesetting",
+      "local_path": "graphic_type.png",
+      "sha256": "0b60c81703f1ecb8a9e7ee19ff6ef4c327b6c35d892f7b449b064ebab082b5d6",
+      "children": [
+        "B0FFMWB9XV",
+        "B0F4KL1C4H"
+      ],
+      "roles": [
+        "func",
+        "size"
+      ],
+      "reference_region": [
+        0.16,
+        0.815,
+        0.49,
+        0.985
+      ],
+      "purpose": "Study readable sans-serif label spacing and concise two-line hierarchy only. Use the current child's authorized wording, font and color assignments.",
+      "source_url": "test_runs/final_freeze_20260911T153354Z/B0FFMWB9XV_20260911T153355956470/images/generated/B0FFMWB9XV/func_02/b57ad6f5a66b985df95dda4e533fa2db65ebbd1bc4cb0ac78120d3d2560a383e.candidate0.png",
+      "author": "Existing project image-model output; not independently authored product evidence",
+      "asset_license": "User-authorized internal evaluation reference only; commercial rights not independently established",
+      "rights_review": {
+        "status": "approved",
+        "approved_by": "Codex assistant, scoped user authorization",
+        "approved_at": "2026-09-12",
+        "allowed_uses": [
+          "image_generation_reference"
+        ],
+        "license_evidence": "User authorized assistant screening and review for this round's test references in this conversation. No project-owner or commercial approval asserted."
+      },
+      "visual_review": {
+        "status": "approved",
+        "approved_by": "Codex assistant",
+        "approved_at": "2026-09-12",
+        "product_clarity": "Inspected original image; reference does not authorize its product structure.",
+        "information_hierarchy": "Readable separated words and restrained two-line labels; only the specified crop is supplied.",
+        "evidence_fit": "Style only. New child source observations remain the sole physical evidence.",
+        "series_cohesion": "Do not copy this example's exact colors. Use the current child's named design assignments.",
+        "transfer_scope": "Text-spacing specimen only, not a full infographic, size diagram, icon, backing, product or fact reference."
+      }
+    }
+  ]
+}

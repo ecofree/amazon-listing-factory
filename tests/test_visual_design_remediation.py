@@ -24,33 +24,89 @@ class VisualDesignRemediationTests(unittest.TestCase):
         from core.final_source_intents import _semantic_revision
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
-            with Image.new("RGB", (100, 100), "magenta") as poster:
-                poster.paste((180, 140, 80), (10, 10, 40, 40))
-                poster.paste((20, 180, 90), (60, 60, 90, 90))
+            with Image.new("RGB", (200, 120), "magenta") as poster:
+                poster.paste((180, 140, 80), (20, 30, 80, 60))
+                poster.paste((20, 180, 90), (120, 75, 180, 105))
                 poster.save(job / "source.png")
-            views = [current_physical_view('upper', [.1, .1, .4, .4], feature='slats'),
-                     current_physical_view('lower', [.6, .6, .9, .9], feature='edge_joint')]
+            views = [current_physical_view('upper', [.1, .25, .4, .5], feature='slats'),
+                     current_physical_view('lower', [.6, .625, .9, .875], feature='edge_joint')]
             source = {"source_id": "source_02", "source_path": "source.png",
                       "source_sha256": file_sha256(job / "source.png"), "observation": {"physical_views": views}}
             paths = prepare_planning_views(job, [source], job / "trace")
             self.assertEqual([{"attachment_number": i + 1, "source_id": "source_02", 'view_id': view['view_id']}
                               for i, view in enumerate(views)], planning_view_inputs([source]))
             with Image.open(job / "source.png") as original:
-                for path, box in zip(paths, ((10, 10, 40, 40), (60, 60, 90, 90))):
+                for path, box in zip(paths, ((20, 30, 80, 60), (120, 75, 180, 105))):
                     with Image.open(path) as crop, original.crop(box) as expected:
                         self.assertIsNone(ImageChops.difference(crop, expected).getbbox())
                         self.assertNotIn((255, 0, 255), set(crop.getdata()))
             self.assertEqual(source["source_sha256"], file_sha256(job / "source.png"))
+            from core.image_reference_context import view_reference, measurement_attachment_location
+            from core.visual_semantics import _validate_source_measurements
+            from tests.current_image_contract_fixture import current_observed_measurement
+            badge = {**current_observed_measurement('300 lbs', kind='capacity'), 'view_id': 'upper',
+                     'region': dict(left=.125, top=.0625, right=.375, bottom=.1875)}
+            _validate_source_measurements([badge], views)
+            located = {'source_id': 'source_02', 'view_id': 'upper', 'source_region': badge['region'], 'source_endpoints': None}
+            source['measurements'] = [located]
+            prepare_planning_views(job, [source], job / 'with_badge')
+            ref = view_reference(source, views[0], job=job, child='B1', kind='edit_base')
+            self.assertEqual(dict(left=.1, top=7/120, right=.4, bottom=.5), ref['original_region'])
+            with Image.open(job / ref['path']) as crop:
+                self.assertEqual((60, 53), crop.size)
+            projected = measurement_attachment_location(located, [ref])
+            self.assertEqual(1, projected['attachment'])
+            self.assertAlmostEqual(5/60, projected['label']['left'])
+            self.assertAlmostEqual(.5/53, projected['label']['top'])
+            self.assertIsNone(projected['endpoints'])
+            located['source_endpoints'] = [dict(x=.1, y=.25), dict(x=.4, y=.5)]
+            projected = measurement_attachment_location(located, [ref])
+            self.assertEqual(dict(x=1.0, y=1.0), projected['endpoints'][1])
+            source.pop('measurements')
             narrow = current_physical_view('drawer', [.29, .457, .299, .838], feature='drawer')
-            narrow['evidence'][0]['region'] = [.04, .457, .299, .838]
+            narrow['evidence'][0]['region'] = dict(left=.04, top=.457, right=.299, bottom=.838)
             with self.assertRaisesRegex(ValueError, 'truncates observed feature'):
                 physical_views([narrow])
             before = _semantic_revision({"visual_evidence": {"physical_views": views}})
-            views[0]["region"][0] = .09
+            views[0]["region"]['left'] = .09
             self.assertNotEqual(before, _semantic_revision({"visual_evidence": {"physical_views": views}}))
             for invalid in (None, [{"view_id": "x", "region": [0, 0, float('nan'), 1]}], [views[0], views[0]]):
                 with self.assertRaises(ValueError):
                     physical_views(invalid)
+            from core.visual_design_kit_compiler import compile_visual_design_kit_response, design_binding_request
+            from tests.current_image_contract_fixture import current_art_direction, current_image_direction
+            from core.visual_semantics import CLAIM_REVIEW_POLICY
+            cropped = {**source, 'role': 'scene', 'input_revision_id': 'crop',
+                       'observation': {'physical_views': [current_physical_view(region=[.201, .237, .985, .708])]},
+                       'crop_provenance': [{'view_id': 'view_01', 'pixel_size': [784, 471]}]}
+            draft = {'source_id': cropped['source_id'], 'image_direction': current_image_direction()}
+            raw = {'family_art_direction': current_art_direction(), 'source_briefs': [draft]}
+            request = design_binding_request(draft, raw['family_art_direction'], source=cropped)
+            self.assertEqual(['view_fidelity:view_01'], request['physical_operations'])
+            self.assertEqual('pending', compile_visual_design_kit_response(raw, source_manifest=[cropped])['source_briefs'][0]['status'])
+            review = {'key': request['key'], 'policy': CLAIM_REVIEW_POLICY, 'response_sha256': 'b' * 64,
+                      'status': 'supported', 'findings': [{'kind': 'physical_structure', 'operation': 'view_fidelity:view_01',
+                          'status': 'contradiction', 'reason': 'Actual crop cuts the cabinet feet visible in original'}]}
+            blocked = compile_visual_design_kit_response(raw, source_manifest=[cropped], claim_reviews={request['key']: review})
+            self.assertIn('cuts the cabinet feet', blocked['source_briefs'][0]['error'])
+            self.assertEqual('observation', blocked['source_briefs'][0]['failure_owner'])
+            import time
+            from core.visual_design_kit import _finish_source_briefs, _planner_source_view
+            with patch('core.visual_design_kit.review_planning_bindings', return_value={request['key']: review}), patch('core.visual_design_kit.gemini_stream_generate') as repair:
+                result = _finish_source_briefs(raw, source_manifest=[cropped], category_id='bed_frame',
+                    source_paths=[], source_originals=[], trace_dir=job, deadline_monotonic=time.monotonic()+10, cached=None)
+                self.assertEqual('observation', result['source_briefs'][0]['failure_owner'])
+                repair.assert_not_called()
+            # Full-size fixtures do not acquire a second mandatory aesthetic approval.
+            cropped['crop_provenance'] = []
+            cropped['observation']['objects'] = [{'object_id': 'pillow', 'sale_membership': 'staging', 'visibility': 'visible',
+                                                 'kind': 'pillow', 'state': 'one pillow partially covering the frame',
+                                                 'relations': [{'predicate': 'occludes', 'target_id': 'frame'}]}]
+            self.assertEqual(cropped['observation']['objects'], _planner_source_view(cropped)['objects'])
+            missing = compile_visual_design_kit_response(raw, source_manifest=[cropped])
+            self.assertIn('pillow', missing['source_briefs'][0]['error'])
+            draft['image_direction']['scene_objects']['pillow'] = 'towels'
+            self.assertEqual('ready', compile_visual_design_kit_response(raw, source_manifest=[cropped])['source_briefs'][0]['status'])
             source["observation"]["physical_views"] = []
             with self.assertRaisesRegex(ValueError, "no observed physical views"):
                 prepare_planning_views(job, [source], job / "empty")
@@ -99,7 +155,25 @@ class VisualDesignRemediationTests(unittest.TestCase):
         denied = compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]
         self.assertIn('unique physical evidence is not covered', denied['error'])
         views[0]['evidence'].append({**views[1]['evidence'][0], 'region': views[0]['region'].copy()})
-        self.assertEqual("ready", compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]["status"])
+        self.assertEqual("pending", compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]["status"])
+        from core.visual_design_kit_compiler import design_binding_request
+        from core.visual_semantics import CLAIM_REVIEW_POLICY
+        request = design_binding_request(raw['source_briefs'][0], raw['family_art_direction'], source=source)
+        verdict = {'key': request['key'], 'policy': CLAIM_REVIEW_POLICY, 'response_sha256': 'c' * 64,
+                   'status': 'inconclusive', 'reason': 'Cannot verify merged corner', 'findings': []}
+        self.assertEqual('pending', compile_visual_design_kit_response(raw, source_manifest=[source],
+            claim_reviews={request['key']: verdict})['source_briefs'][0]['status'])
+        verdict.update(status='supported', findings=[{'kind': 'physical_structure', 'operation': 'coverage_transfer:view_02',
+                       'status': 'supported', 'reason': 'Reviewer compared both actual corner views'}])
+        self.assertEqual('ready', compile_visual_design_kit_response(raw, source_manifest=[source],
+            claim_reviews={request['key']: verdict})['source_briefs'][0]['status'])
+        support = {**source, 'source_id': 'source_01', 'source_sha256': 'b' * 64}
+        draft_with_support = {**raw['source_briefs'][0], 'supporting_sources': [
+            {'source_id': 'source_01', 'view_id': 'view_01', 'purpose': 'Verify corner', 'evidence_ids': []}]}
+        before = design_binding_request(draft_with_support, raw['family_art_direction'], source=source, source_manifest=[source, support])
+        draft_with_support['supporting_sources'][0]['view_id'] = 'view_02'
+        after = design_binding_request(draft_with_support, raw['family_art_direction'], source=source, source_manifest=[source, support])
+        self.assertNotEqual(before['key'], after['key'])
         direction["evidence_usage"].pop()
         rejected = compile_visual_design_kit_response(raw, source_manifest=[source])
         self.assertIn("Every observed view", rejected["source_briefs"][0]["error"])
@@ -119,7 +193,9 @@ class VisualDesignRemediationTests(unittest.TestCase):
         def review(requests, **kwargs):
             return {row["key"]: {"key": row["key"], "policy": CLAIM_REVIEW_POLICY, "response_sha256": "b" * 64,
                 "status": "contradiction" if row["kind"] == "design_binding" else "inconclusive",
-                "reason": "towels conflicts with shared palette" if row["kind"] == "design_binding" else row["proposed_text"]}
+                "reason": "towels conflicts with shared palette" if row["kind"] == "design_binding" else row["proposed_text"],
+                'findings': [{'kind': 'design_binding', 'operation': 'target:towels', 'status': 'contradiction',
+                              'reason': 'towels conflicts with shared palette'}] if row['kind'] == 'design_binding' else []}
                 for row in requests}
         def repair_all(prompt, attachments, **kwargs):
             for detail in ("Drawers stay aligned", "Effortless pull-out", "towels conflicts with shared palette"):
@@ -156,8 +232,9 @@ class VisualDesignRemediationTests(unittest.TestCase):
         request = design_binding_request(exact, raw["family_art_direction"], source=source)
         conflict = review([request])
         checked = compile_visual_design_kit_response({**raw, "source_briefs": [exact]}, source_manifest=[source], claim_reviews=conflict)
-        self.assertIn("design binding conflict", checked["source_briefs"][0]["error"])
+        self.assertIn("planning evidence conflict", checked["source_briefs"][0]["error"])
         conflict[request["key"]]["status"] = "inconclusive"
+        conflict[request['key']]['findings'] = []
         checked = compile_visual_design_kit_response({**raw, "source_briefs": [exact]}, source_manifest=[source], claim_reviews=conflict)
         self.assertEqual("ready", checked["source_briefs"][0]["status"])
 
@@ -198,7 +275,12 @@ class VisualDesignRemediationTests(unittest.TestCase):
         self.assertNotIn("role_purpose", task)
         task["image_direction"]["environment_mode"] = "graphic_canvas"
         compiled = compile_task_prompt(task=task)
-        for old in ("Shopping purpose:", "Staging intent:", "Non-product object palette:"):
+        self.assertIn('towels = #8A999E', compiled)
+        task['product_boundary']['observed_objects'] = [{'object_id': 'towel', 'relations': [{'predicate': 'contained_in', 'target_id': 'drawer_1'}]}]
+        before = compile_task_prompt(task=task)
+        task['product_boundary']['observed_objects'][0]['relations'][0]['target_id'] = 'drawer_2'
+        self.assertNotEqual(before, compile_task_prompt(task=task))
+        for old in ("Shopping purpose:", "Staging intent:"):
             self.assertNotIn(old, compiled)
         self.assertEqual(1, compiled.count("text_color = #303634"))
         self.assertEqual(1, compiled.count("Adjustable Shelf"))
@@ -226,24 +308,32 @@ class VisualDesignRemediationTests(unittest.TestCase):
 
     def test_observed_size_facts_survive_projection_without_qa_false_failure(self):
         from core.final_source_intents import _observed_measurements, _measurement_rows
-        from core.image_tasks import _measurement_authority, _measurement_role
+        from core.image_tasks import _measurement_authority
         from core.visual_semantics import OBSERVATION_POLICY
         from core.image_qa import _semantic_gates
         from tests.test_qa_lite_v1 import _task, _observed
+        from tests.current_image_contract_fixture import current_observed_measurement
         visual = {"status": "success", "policy_version": OBSERVATION_POLICY, "visible_numbers_or_units": ['57"'],
+                  'measurements': [current_observed_measurement(), current_observed_measurement('300 lbs', 'Bed capacity', 'capacity', key='load', kind='capacity')],
                   "text_observations": [{"text": "Dimensions", "kind": "marketing"},
                                         {"text": "300 lbs", "kind": "measurement"}]}
         source = {"role": "size", "visual_evidence": visual,
-                  "ocr_evidence": {"lines": [{"text": "300Ibs", "confidence": .93, "box": [0, 0, 1, 1]}]},
-                  "measurements": _measurement_rows(_observed_measurements({}, visual), {})}
+                  "ocr_evidence": {"lines": [{"text": "17'", "confidence": .93, "box": [0, 0, 1, 1]}]},
+                  "measurements": _measurement_rows(_observed_measurements(visual), {})}
         authority = _measurement_authority("size", {}, source)
         self.assertEqual(2, len(authority["measurement_groups"]))
-        self.assertIn("300 lbs", authority["source_visible_callouts"])
-        self.assertNotIn("Dimensions", authority["source_visible_callouts"])
-        self.assertEqual("300 lbs", authority["source_visible_text_artifacts"][0]["display_text"])
-        self.assertEqual("weight", _measurement_role("Item Weight: 300 lbs"))
-        self.assertEqual("mass_callout", _measurement_role("300 lbs"))
-        self.assertEqual("load_capacity", _measurement_role("Weight Capacity: 300 lbs"))
+        self.assertEqual(['17 in', '300 lb'], authority['render_text'])
+        self.assertEqual('load_capacity', authority['measurement_groups'][1]['measurement_role'])
+        self.assertNotIn('source_visible_callouts', authority)
+        values = _observed_measurements(visual)
+        self.assertEqual(2, len(values))
+        self.assertNotIn('17 ft', [r['text'] for r in values])
+        from core.visual_semantics import _validate_source_measurements, _validate_candidate_observation
+        from copy import deepcopy
+        repeated = deepcopy(visual['measurements'])
+        repeated[1] = {**repeated[0], 'measurement_id': 'ocr-read', 'text': '17 ft'}
+        with self.assertRaisesRegex(ValueError, 'competing readings'):
+            _validate_source_measurements(repeated, [current_physical_view()])
         task = _task("size", "source_image")
         task['renderable_text_contract'] = {'mode': 'exact', 'strings': ['Dimensions']}
         task["measurement_authority"] = authority
@@ -258,6 +348,19 @@ class VisualDesignRemediationTests(unittest.TestCase):
         self.assertEqual("fail", _semantic_gates(task, obs)[1]["status"])
         obs["texts"].append({"text": "Waterproof", "kind": "marketing", "confidence": .99})
         self.assertEqual("fail", _semantic_gates(task, obs)[0]["status"])
+        located = _observed(task)
+        located['measurement_coverage'] = 'complete'
+        located['measurements'] = [{'measurement_id': 'width', 'object': 'cabinet width', 'source_id': 'source_00',
+            'attachment_index': 2, 'source_text': '17 in', 'candidate_text': '13.5 in', 'relationship': 'different',
+            'confidence': .99, 'source_region': dict(left=.1, top=.1, right=.2, bottom=.2), 'candidate_region': dict(left=.2, top=.2, right=.3, bottom=.3)},
+            {'measurement_id': 'ghost', 'object': 'unlocatable OCR', 'source_id': 'source_00', 'attachment_index': 2,
+             'source_text': '17 ft', 'candidate_text': '17 in', 'relationship': 'different', 'confidence': .99,
+             'source_region': dict(left=0, top=0, right=0, bottom=0), 'candidate_region': dict(left=.2, top=.2, right=.3, bottom=.3)}]
+        _validate_candidate_observation(located)
+        self.assertEqual('unknown', located['measurements'][1]['relationship'])
+        self.assertEqual('fail', _semantic_gates(task, located)[1]['status'])
+        located['measurements'].pop(0)
+        self.assertEqual('inconclusive', _semantic_gates(task, located)[1]['status'])
 
     def test_complete_single_word_claims_remain_bindable(self):
         source = {"source_id": "source_00", "claims": [{"evidence_id": str(i), "text": word}
@@ -283,7 +386,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
         from core.visual_semantics import review_planning_bindings
         from tests.current_image_contract_fixture import current_art_direction
         deadline = time.monotonic() + 80
-        response = json.dumps({'reviews': [{'key': requests[0]['key'], 'status': 'supported', 'reason': 'Visible local structure'}]})
+        response = json.dumps({'reviews': [{'key': requests[0]['key'], 'status': 'supported', 'reason': 'Visible local structure',
+            'findings': [{'kind': 'copy_fact', 'operation': 'source_00', 'status': 'supported', 'reason': 'Visible frame joints'}]}]})
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', return_value=response) as remote:
             review_planning_bindings(requests, trace_dir=Path(tmp), shared_design=current_art_direction(), deadline_monotonic=deadline)
         self.assertEqual(deadline, remote.call_args.kwargs['deadline_monotonic'])
@@ -368,7 +472,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
                      "rights_review": approval, "visual_review": visual,
                      "reference_region": [.25, .25, .75, .75],
                      "purpose": "Asymmetric hierarchy and generous breathing room"}
-            pack = {"schema_version": "design-pack-v3", "pack_id": "fixture", "version": "1",
+            pack = {"schema_version": "design-pack-v4", "pack_id": "fixture", "version": "1", 'approval_scope': 'production',
                     "status": "approved", "production_ready": True,
                     "design_system": "Test-only light photography and editorial information hierarchy",
                     "compatibility": {"categories": ["bed_frame"]}, "assets": [asset]}
@@ -470,6 +574,15 @@ class VisualDesignRemediationTests(unittest.TestCase):
             write_json(root / "pack.json", {**pack, "compatibility": {"categories": ["*"]}})
             cross = create_job(**{**kwargs, "plugin": load_plugin("bathroom_cabinet")}, design_pack_path=str(root / "pack.json"))
             self.assertEqual(1, len(approved_design_references(cross, "B1")))
+            evaluation = {**deepcopy(pack), 'approval_scope': 'evaluation', 'production_ready': False}
+            write_json(root / 'pack.json', evaluation)
+            limited = create_job(**kwargs, design_pack_path=str(root / 'pack.json'))
+            self.assertEqual('evaluation', approved_design_references(limited, 'B1')[0]['approval_scope'])
+            self.assertFalse(load_job(limited)['design_inputs']['pack']['production_ready'])
+            evaluation['assets'][0]['children'] = ['*']
+            write_json(root / 'pack.json', evaluation)
+            with self.assertRaisesRegex(ValueError, 'explicit child scope'):
+                create_job(**kwargs, design_pack_path=str(root / 'pack.json'))
             invalid = deepcopy(pack)
             invalid["assets"][0]["reference_region"] = [0, 0, 2, 1]
             write_json(root / "pack.json", invalid)
@@ -515,6 +628,48 @@ class VisualDesignRemediationTests(unittest.TestCase):
                 client._post_vision_request(endpoint, "https://fixture.invalid", payload, headers={}, timeout_seconds=5, deadline=time.monotonic() + 1)
             network.assert_not_called()
         self.assertEqual(2, len(events))
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+        from http.client import IncompleteRead
+        class ResponseHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                if self.path == '/redirect':
+                    self.send_response(307)
+                    self.send_header('Location', '/slow')
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', '2' if self.path == '/ok' else '100')
+                self.end_headers()
+                try:
+                    if self.path in {'/ok', '/truncated'}:
+                        self.wfile.write(b'{}')
+                    else:
+                        for _ in range(20):
+                            self.wfile.write(b'x')
+                            self.wfile.flush()
+                            time.sleep(.04)
+                except ConnectionError:
+                    pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), ResponseHandler)
+        thread = Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{server.server_port}'
+            self.assertEqual('{}', client._post_json_preserve_redirects(url+'/ok', {}, {}, timeout_seconds=2))
+            with self.assertRaises(IncompleteRead):
+                client._post_json_preserve_redirects(url+'/truncated', {}, {}, timeout_seconds=2)
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                client._post_json_preserve_redirects(url+'/redirect', {}, {}, timeout_seconds=2, deadline=started+.15)
+            self.assertLess(time.monotonic()-started, .6)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
         alias = {**endpoint, "name": "alias", "model": "different-model"}
         other = {**endpoint, "name": "other", "base_url": "https://other.invalid/v1"}
         with patch.object(client, "gemini_clients", return_value=[endpoint, alias, other]), patch.object(client, "provider_concurrency_limit", return_value=1):
@@ -522,7 +677,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
             self.assertEqual(client._vision_resource(endpoint)[1], client._vision_resource(alias)[1])
         valid = {"source_id": "source_00", "role_guess": "scene", "view_coverage": "complete", "has_dimension_lines": False,
                  "has_callouts_or_panels": False, "visible_numbers_or_units": [], "confidence": .95, "evidence": [],
-                 "objects": [{'object_id': 'frame', 'kind': 'frame', 'state': 'visible frame', 'sale_membership': 'unknown', 'visibility': 'visible', 'relations': []}], "text_observations": [], "physical_views": [current_physical_view('v1', [0, 0, 1, 1])],
+                 "measurements": [], "objects": [{'object_id': 'frame', 'kind': 'frame', 'state': 'visible frame', 'sale_membership': 'unknown', 'visibility': 'visible', 'relations': []}], "text_observations": [], "physical_views": [current_physical_view('v1', [0, 0, 1, 1])],
                  "variant_identity": {"status": "unknown", "observed_color": "", "reason": "Occluded", "conflicts": []}}
         bad = {**deepcopy(valid), "source_id": "source_01", "physical_views": []}
         with tempfile.TemporaryDirectory() as tmp:
@@ -547,7 +702,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
             with patch("core.visual_semantics.gemini_stream_generate", side_effect=[json.dumps({"sources": [malformed]}), json.dumps({"sources": [bad]})]) as repaired:
                 result = observe_child_sources(job, {"asin": "B2"}, sources[1:])
             self.assertEqual(2, repaired.call_count)
-            self.assertIn('normalized left,top,right,bottom', repaired.call_args.args[0])
+            self.assertIn('"left"', repaired.call_args.args[0])
+            self.assertNotIn('"region": [', repaired.call_args.args[0])
             self.assertTrue(all(row["status"] == "success" for row in result.values()))
 
 

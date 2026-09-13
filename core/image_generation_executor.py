@@ -3,11 +3,14 @@ from __future__ import annotations
 import io
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from .candidate_state import CandidateStateError, commit_candidate_output
 from .image_provider_common import (
     ImageGenerationError,
+    CandidateCommitError,
+    ProviderContentError,
     PromptCompileError,
     ProviderConfigurationError,
     ProviderTransportError,
@@ -37,15 +40,26 @@ from .paths import resolve_job_owned_path
 from .provider_policy import assert_provider_allowed, load_provider_policy
 from .progress_trace import record_progress
 from .status import input_revision_id
+from .image_response import recover_response, response_binding, response_directory, finish_response, materialize_response
+from .image_resources import reserve_image, release_image
 
 
 def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
+    saved = recover_response(task)
+    if saved:
+        return {**task, 'provider': saved['provider'], 'request_audit': saved['request_audit'],
+                'raw_response_path': saved['receipt_path'], 'provider_attempts': saved['request_audit'].get('provider_attempts', {})}
     deadlines = [float(task[key]) for key in ("deadline_monotonic", "role_deadline_monotonic") if task.get(key) is not None]
-    deadline = min([time.monotonic() + 5.0, *deadlines])
-    if time.monotonic() >= deadline:
+    if deadlines and time.monotonic() >= min(deadlines):
         raise ImageGenerationError("Image execution deadline exhausted before memory admission")
-    with provider_concurrency_slot("host_image_memory", deadline=deadline):
-        return _generate_admitted(task, plugin=plugin)
+    reserve_image(task)
+    try:
+        result = _generate_admitted(task, plugin=plugin)
+    except Exception:
+        release_image(task)
+        raise
+    release_image(task, buffered=True)
+    return result
 
 
 def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
@@ -53,9 +67,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
     output_path = resolve_job_owned_path(str(task.get("job_dir") or ""), str(task.get("output_path") or ""))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = str(task["prompt"])
-    # Provider assignment locks a child to one ordered family lane.  The
-    # reserve entries are the same lane's sequential fallbacks; omitting them
-    # made a configured third provider unreachable after two content failures.
+    # Role-compatible routes remain ordered; local processing never re-enters this loop.
     providers = list(dict.fromkeys([
         *(str(name) for name in task.get("providers", []) if str(name).strip()),
         *(str(name) for name in task.get("child_provider_reserve", []) if str(name).strip()),
@@ -66,12 +78,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             raise ImageGenerationError("AMAZON_FACTORY_IMAGEGEN_MODE=copy/mock is disabled for production image generation")
         if output_path.exists():
             raise CandidateStateError(f"Immutable candidate output already exists without a current manifest: {output_path}")
-        commit_candidate_output(
-            task["job_dir"],
-            {**task, "provider": imagegen_mode},
-            _finalize_candidate_bytes(source_path.read_bytes()),
-        )
-        return {**task, "provider": imagegen_mode, "bytes": output_path.stat().st_size}
+        return {**task, 'provider': imagegen_mode, 'local_source_path': str(source_path)}
     if not providers:
         raise ImageGenerationError(f"No allowed image providers configured for {plugin.category_id}")
     if output_path.exists():
@@ -153,6 +160,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                     counts[current_provider] = min(2, int(counts.get(current_provider) or 0) + 1)
                     task["provider_attempts"] = counts
                     task["provider_attempts_exact"] = True
+                    request_audit['provider_attempts'] = counts
                 try:
                     record_provider_transport_attempt_event(
                         output_path=output_path,
@@ -184,6 +192,8 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 "revision": task.get("candidate_revision", 0), "prompt": prompt, "references": task["generation_references"]})
             request_audit: dict[str, Any] = {
                 "request_id": request_id, "provider": provider,
+                'response_binding': response_binding(task),
+                'logical_task_id': task['logical_task_id'],
                 "revision_mode": task.get("revision_mode") or "initial",
                 "reference_count": len(reference_sources),
                 "coordinate_frame": "candidate_in_place" if task.get("revision_mode") == "targeted_edit" else "original_source",
@@ -193,7 +203,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                     ("kind", "source_id", "sha256", "purpose", "evidence_ids")}}
                     for index, row in enumerate(reference_sources, 1)],
             }
-            data = generate_with_provider_retries(
+            receipt = generate_with_provider_retries(
                 provider_name=provider,
                 image_input_paths=image_input_paths,
                 prompt=prompt,
@@ -202,7 +212,20 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 total_timeout_seconds=provider_budget,
                 request_id=request_id,
                 request_audit=request_audit,
+                response_directory=response_directory(task),
             )
+            task['request_audit'] = request_audit
+            from PIL import Image, UnidentifiedImageError
+            try:
+                with Image.open(receipt.with_suffix('.bin')) as image:
+                    if image.width != image.height or min(image.size) <= 0:
+                        raise ProviderContentError(provider, 'Generated image has an invalid canvas')
+                    image.verify()
+            except (UnidentifiedImageError, ProviderContentError) as exc:
+                finish_response(receipt, 'rejected_content')
+                raise ProviderContentError(provider, str(exc)) from exc
+            except Exception as exc:
+                raise CandidateCommitError(f'Paid response saved; local validation failed: {exc}') from exc
             provider_duration = time.monotonic() - provider_started
             commit_task = {
                 **task,
@@ -212,10 +235,8 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 "attempted_providers": attempted_providers,
                 "attempted_provider_failures": attempted_failures,
                 "fallback_reason": "fallback_after_provider_failure" if attempted_failures else "",
+                'raw_response_path': str(receipt),
             }
-            commit_started = time.monotonic()
-            commit_candidate_output(task["job_dir"], commit_task, _finalize_candidate_bytes(data))
-            local_seconds = time.monotonic() - commit_started
             _record_provider_event_audit_only(
                 output_path=output_path,
                 provider=provider,
@@ -225,23 +246,16 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 duration_seconds=provider_duration,
                 fallback_reason="fallback_after_provider_failure" if attempted_failures else "",
             )
-            _record_generation_progress(task, "image_provider_attempt_success", provider,
-                provider_seconds=round(provider_duration, 3), local_finalize_seconds=round(local_seconds, 3),
-                upscale_seconds=request_audit.get("upscale_seconds", 0))
-            return {
-                **task,
-                "provider": provider,
-                "provider_duration_seconds": provider_duration,
-                "attempted_providers": attempted_providers,
-                "attempted_provider_failures": attempted_failures,
-                "bytes": output_path.stat().st_size,
-            }
+            _record_generation_progress(task, 'image_response_saved', provider, provider_seconds=round(provider_duration, 3))
+            return commit_task
         except Exception as exc:
             last_error = exc
             if getattr(exc, "ambiguous", False):
                 task["request_audit"] = request_audit
                 task["request_outcome"] = "unknown"
             failure_class = provider_failure_class(exc)
+            if failure_class == 'candidate_commit':
+                raise
             if failure_class == "queue":
                 if attempted_providers and attempted_providers[-1] == provider:
                     attempted_providers.pop()
@@ -257,23 +271,6 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 # the task on the same saturated provider made independent
                 # jobs wait until the batch stall budget expired even when a
                 # configured reserve was idle.
-                attempted_failures.append({
-                    "provider": provider,
-                    "failure_class": failure_class,
-                    "failure_code": provider_failure_code(exc),
-                    "status": provider_failure_status(exc),
-                    "duration_seconds": round(time.monotonic() - provider_started, 3),
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-                _record_provider_event_audit_only(
-                    output_path=output_path,
-                    provider=provider,
-                    task=task,
-                    status=provider_failure_status(exc),
-                    error=f"{type(exc).__name__}: {exc}",
-                    failure_class=failure_class,
-                    duration_seconds=time.monotonic() - provider_started,
-                )
                 continue
             attempted_failures.append({
                 "provider": provider,
@@ -319,6 +316,35 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             "All eligible providers are already circuit-open for this run: " + ", ".join(circuit_skipped_providers),
         )
     raise ImageGenerationError(f"All providers failed for {task['child']}/{task['role']}")
+
+
+def finalize_candidate(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
+    del plugin
+    started = time.monotonic()
+    try:
+        from .candidate_state import current_candidate
+        if not current_candidate(task['job_dir'], task):
+            receipt = Path(task['raw_response_path']) if task.get('raw_response_path') else None
+            if receipt:
+                saved = recover_response(task)
+                if not saved or saved['receipt_path'] != str(receipt):
+                    raise CandidateCommitError('Raw response no longer matches the current request')
+            deadline = min(time.monotonic() + 120, float(task.get('deadline_monotonic') or float('inf')))
+            with provider_concurrency_slot('host_image_finalize', deadline=deadline):
+                reserve_image(task, local=True)
+                path = materialize_response(receipt) if receipt else Path(task['local_source_path'])
+                commit_candidate_output(task['job_dir'], task, _finalize_candidate_bytes(path.read_bytes()))
+        if task.get('raw_response_path'):
+            finish_response(Path(task['raw_response_path']), 'finalized')
+        _record_generation_progress(task, 'image_candidate_committed', str(task.get('provider') or ''),
+            local_finalize_seconds=round(time.monotonic() - started, 3))
+        return {**task, 'bytes': Path(task['output_path']).stat().st_size}
+    except Exception as exc:
+        if isinstance(exc, CandidateCommitError):
+            raise
+        raise CandidateCommitError(f'Local finalization failed; saved response retained: {type(exc).__name__}: {exc}') from exc
+    finally:
+        release_image(task)
 
 
 def _record_provider_event_audit_only(**event: Any) -> None:

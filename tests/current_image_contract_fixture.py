@@ -19,7 +19,7 @@ from core.image_tasks import (
 
 
 def current_physical_view(view_id: str = 'view_01', region: list[float] | None = None, *, feature: str = 'frame_support', object_id: str = 'frame') -> dict[str, Any]:
-    box = list(region or [0.1, 0.2, 0.9, 0.8])
+    box = dict(zip(('left', 'top', 'right', 'bottom'), region or [0.1, 0.2, 0.9, 0.8]))
     return {'view_id': view_id, 'region': box, 'extent': 'whole_view',
             'evidence': [{'feature_id': feature, 'object_id': object_id, 'region': box.copy(), 'physical_facts': ['Visible frame support and its joints']}]}
 
@@ -40,13 +40,19 @@ def current_art_direction() -> dict[str, Any]:
     }
 
 
+def current_observed_measurement(text='17 in', object_name='Cabinet', axis='width', *, key='width', kind='dimension'):
+    return {'measurement_id': key, 'text': text, 'object': object_name, 'axis': axis,
+            'view_id': 'view_01', 'region': {'left': .2, 'top': .25, 'right': .3, 'bottom': .3}, 'kind': kind,
+            'endpoints': [{'x': .2, 'y': .4}, {'x': .7, 'y': .4}] if kind == 'dimension' else None}
+
+
 def current_image_direction(*, environment: str = "designed_environment") -> dict[str, Any]:
     return {"visual_goal": "Explain the visible physical feature at a glance",
             "creative_brief": "Lead with the intact product view and a restrained asymmetric copy hierarchy; reuse the child graphic roles",
             "evidence_usage": [{"view_id": "view_01", "usage": "display", "covered_by": []}],
             "design_transfer": [],
             "layout": [{"view_id": "view_01", "target_region": [0.1, 0.1, 0.9, 0.9]}],
-            "text_placement": [], "scene_objects": ['wall', 'floor', 'towels'] if environment == 'designed_environment' else [], "environment_mode": environment}
+            "text_placement": [], "scene_objects": {f'new:{key}': key for key in ('wall', 'floor', 'towels')} if environment == 'designed_environment' else {}, "environment_mode": environment}
 
 
 def current_image_task(

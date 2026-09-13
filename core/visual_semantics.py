@@ -10,12 +10,12 @@ from .io import file_sha256, parse_json_object_response, read_json, write_json
 from .status import input_revision_id
 from .vision_gemini_client import gemini_stream_generate
 from .text_evidence import extract_measurements
-from .image_reference_context import physical_views
+from .image_reference_context import physical_views, source_box, source_point
 
 
-OBSERVATION_POLICY = "child-joint-observation-v11-complete-physical-facts"
-CLAIM_REVIEW_POLICY = "planning-binding-review-v5-typed-evidence"
-CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v8-whole-candidate-coverage"
+OBSERVATION_POLICY = "child-joint-observation-v13-named-source-coordinates"
+CLAIM_REVIEW_POLICY = "planning-binding-review-v7-pixel-and-target-scopes"
+CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v10-named-coordinates"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "staging", "unknown"}
 
@@ -100,9 +100,9 @@ def observe_child_sources(
             "visible_numbers_or_units": [],
             "layout_summary": "classification evidence only, not a design prescription",
             "view_coverage": "complete|partial; all product photos, insets and diagrams on the original page accounted for",
-            "physical_views": [{"view_id": "view_01", "region": [0.0, 0.0, 1.0, 1.0],
+            "physical_views": [{"view_id": "view_01", "region": {"left": 0.12, "top": 0.23, "right": 0.87, "bottom": 0.94},
                 "extent": "whole_view|detail", "evidence": [{"feature_id": "stable physical feature/state identity shared ONLY if visibly present in both views",
-                    "object_id": "one observed object_id", "region": [0.0, 0.0, 1.0, 1.0],
+                    "object_id": "one observed object_id", "region": {"left": 0.12, "top": 0.23, "right": 0.87, "bottom": 0.94},
                     "physical_facts": ["one directly visible part, geometry, mechanism, finish, local count or state; confirmed absence only with visible evidence"]}]}],
             "confidence": 0.0,
             "evidence": [],
@@ -113,6 +113,12 @@ def observe_child_sources(
                 "conflicts": [{"fact_id": "product.*", "observed": "visible conflicting attribute"}],
             },
             "text_observations": [{"text": "verbatim", "kind": "product_label|marketing|measurement|prop|unknown"}],
+            "measurements": [{"measurement_id": "unique source-local annotation identity",
+                "text": "one visible quantity with unit", "object": "actual measured object or compartment",
+                "axis": "width|depth|height|length|thickness|diameter|capacity|weight",
+                "region": {"left": 0.15, "top": 0.07, "right": 0.25, "bottom": 0.12},
+                "endpoints": [{"x": 0.12, "y": 0.3}, {"x": 0.87, "y": 0.3}],
+                "kind": "dimension|capacity|weight", "view_id": "physical view of the measured object, not necessarily containing the label"}],
             "objects": [{
                 "object_id": "stable child-local identity across views",
                 "kind": "physical object category such as bed frame, drawer or quilt; no decorative color/style",
@@ -128,7 +134,7 @@ def observe_child_sources(
         "Observe the gallery returned for ONE child together; gallery ownership does not prove variant identity. "
         "Return exactly one JSON object with a top-level sources array. Do not wrap it in schema, result, data or observations. "
         "Keep each source_id aligned with its attachment. Report physical evidence separately from source graphics: "
-        "layout_summary holds source styling and drawn annotations; physical_facts hold atomic real-part facts only. Measurement endpoints remain factual evidence. "
+        "layout_summary holds source styling and drawn annotations; physical_facts hold atomic real-part facts only. "
         "Separate authored marketing/dimensions, product surface labels and loose prop text. "
         "Ordinary books do not make a scene a function infographic. Quote complete visible claims, "
         "including counts, measured objects and qualifiers; leave illegible text unknown. "
@@ -136,15 +142,21 @@ def observe_child_sources(
         "locate its visible physical features first (evidence object_id, feature_id, region, physical_facts), "
         "then enclose ALL of that view's visible product, attached parts and occluding accessories in physical_views.region. "
         "A feature_id identifies the same visible structure AND state, not merely the same product; an edge joint is not slatted support. "
-        "Use normalized left,top,right,bottom on the original attachment, left < right and top < bottom, for feature and view bounds. "
+        "Source regions are named {left,top,right,bottom}; endpoints are named {x,y}. All coordinates are fractions of the ORIGINAL attachment width/height. "
+        "Left/right measure horizontal distance from the left edge; top/bottom measure vertical distance from the top edge. Never return coordinate arrays. "
         "Use whole_view for a complete visible product view, detail for a partial close-up. "
         "Exclude separable title bands and room decor, never a visible drawer/leg or occluding bedding just to remove graphics. "
-        "For size enclose each complete measurement diagram, including its labels, lines and physical endpoints, "
-        "without unrelated page headers; transcribe labels in text_observations too. "
+        "Each physical view encloses its complete measured product and both physical endpoints. Record each annotation once in measurements: "
+        "the specific measured part/property (underbed clearance is not overall bed height), axis, one quantity/unit and its original-page label region. "
+        "A dimension label or capacity badge can lie OUTSIDE the product view; bind it to the measured view without moving its coordinates. "
+        "Capacity/weight badges have null endpoints. "
+        "Resolve OCR against pixels at the same annotation; inches and feet readings of one mark are alternatives, not two facts. "
+        "Never promote unlocated OCR or a bare number into measurements; report unreadable annotations in evidence. "
         "physical_views=[] only if no product view can be identified. "
         "Mark view_coverage partial if any product-bearing region cannot be fully located; never silently drop a small inset. "
         "Alternative adjustment positions, arrows, ghosted parts and inset borders are diagram notation, not additional physical components. "
-        "Record staging only for editing/occlusion; its colors, patterns and decor never belong in physical_facts or object state. "
+        "Inventory visible bedding, pillows, contents and tabletop props as separate staging objects, including those inside the product view. "
+        "Their colors, patterns and decor never belong in physical_facts or product state. "
         "A product object's state describes that product alone: bedding belongs to its own staging object, "
         "linked by occludes; never embed bedding colors, wall colors or props inside the product state. "
         "An object inside a drawer is contained_in, not automatically part_of. "
@@ -268,6 +280,9 @@ def _validate_observation_rows(
         if row.get('view_coverage') != 'complete':
             raise ValueError('Physical view inventory is incomplete; locate every product-bearing region')
         views = physical_views(row.get("physical_views"))
+        _validate_source_measurements(row.get('measurements'), views)
+        if row['has_dimension_lines'] and not any(item['kind'] == 'dimension' for item in row['measurements']):
+            raise ValueError('Visible dimension lines need located measurements, not an empty inventory')
         if not views and row["role_guess"] != "unknown":
             raise ValueError("Recognized source needs observed physical views")
         if not isinstance(objects, list) or not isinstance(texts, list):
@@ -275,6 +290,10 @@ def _validate_observation_rows(
         for item in texts:
             if not isinstance(item, dict) or item.get("kind") not in TEXT_KINDS or not isinstance(item.get("text"), str):
                 raise ValueError("invalid observed text category")
+        transcribed = {m['canonical_pair'] for item in texts if item['kind'] == 'measurement' for m in extract_measurements(item['text'])}
+        located = {m['canonical_pair'] for item in row['measurements'] for m in extract_measurements(item['text'])}
+        if not transcribed <= located:
+            raise ValueError('Locate every transcribed measurement; do not omit badges or invent a second reading')
         seen_objects: set[str] = set()
         for obj in objects:
             if not isinstance(obj, dict) or not obj.get("object_id") or not obj.get("kind"):
@@ -306,6 +325,41 @@ def _validate_observation_rows(
     return result
 
 
+def _validate_source_measurements(rows: Any, views: list[dict[str, Any]]) -> None:
+    if not isinstance(rows, list):
+        raise ValueError('Observation needs a located measurement inventory, empty when not applicable')
+    by_view = {view['view_id']: source_box(view['region']) for view in views}
+    identities, locations = set(), set()
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != {'measurement_id', 'text', 'object', 'axis', 'region', 'endpoints', 'kind', 'view_id'}
+                or not all(isinstance(row[k], str) and row[k].strip() for k in ('measurement_id', 'text', 'object', 'axis', 'view_id'))
+                or row['measurement_id'] in identities or row['view_id'] not in by_view
+                or row['kind'] not in {'dimension', 'capacity', 'weight'}
+                or len(extract_measurements(row['text'])) != 1 or not re_has_object_name(row['object'])):
+            raise ValueError('Measurement needs one located quantity and an actual measured object')
+        box, region = by_view[row['view_id']], source_box(row['region'])
+        location = (row['view_id'], tuple(region))
+        if location in locations:
+            raise ValueError('One annotation has competing readings; resolve its original pixels')
+        identities.add(row['measurement_id'])
+        locations.add(location)
+        points = row['endpoints']
+        if row['kind'] == 'dimension':
+            if (not isinstance(points, list) or len(points) != 2 or points[0] == points[1]
+                    or any(not (box[0] <= x <= box[2] and box[1] <= y <= box[3])
+                           for x, y in map(source_point, points))):
+                raise ValueError('Dimension needs both physical endpoints inside its view')
+        elif points is not None:
+            raise ValueError('Capacity and weight are callouts, not dimension lines')
+
+
+def re_has_object_name(text: str) -> bool:
+    import re
+    for value in extract_measurements(text):
+        text = text.replace(value['raw_text'], '')
+    return bool(re.search(r'[A-Za-z]{2,}', text))
+
+
 def claim_key(text: str, evidence: dict[str, str]) -> str:
     return input_revision_id({"policy": CLAIM_REVIEW_POLICY, "text": text, "evidence": evidence})
 
@@ -314,6 +368,7 @@ def review_planning_bindings(
     claims: list[dict[str, Any]], *, trace_dir: Path,
     shared_design: dict[str, Any],
     source_manifest: list[dict[str, Any]] = (), source_paths: list[Path] = (),
+    view_paths: list[Path] = (),
     deadline_monotonic: float | None = None,
 ) -> dict[str, dict[str, Any]]:
     """One existing planning review request for facts and explicit design bindings, not aesthetics."""
@@ -331,6 +386,15 @@ def review_planning_bindings(
                 raise ValueError("unknown or repeated claim review")
             if row.get("status") not in {"supported", "contradiction", "inconclusive"} or not str(row.get("reason") or "").strip():
                 raise ValueError("claim review requires a verdict and evidence explanation")
+            findings = row.get('findings')
+            if not isinstance(findings, list) or not findings:
+                raise ValueError('Review needs typed findings, including physical coverage for design bindings')
+            for finding in findings:
+                if (not isinstance(finding, dict) or finding.get('kind') not in
+                    {'physical_structure', 'measurement', 'copy_fact', 'design_binding'}
+                    or finding.get('status') not in {'supported', 'contradiction', 'inconclusive'}
+                    or not str(finding.get('reason') or '').strip() or not isinstance(finding.get('operation'), str)):
+                    raise ValueError('Malformed typed review finding')
             seen.add(row["key"])
         return True
 
@@ -339,7 +403,13 @@ def review_planning_bindings(
         "verify proposed text against its supplied typed evidence and corresponding source pixels. "
         "physical: IDs prove only the observed geometry, local parts or state, never material specifications, load or performance. "
         "measurement: IDs support truthful group headings without asserting new measurements. Other IDs are quoted source statements. "
-        "Return JSON {reviews:[{key,status,reason}]}; status is supported, contradiction or inconclusive. "
+        "Return JSON {reviews:[{key,status,reason,findings:[{kind,operation,status,reason}]}]}; "
+        "kind is physical_structure, measurement, copy_fact or design_binding. Status is supported, contradiction or inconclusive. "
+        "For design entries, report each physical_operations separately using its exact operation ID. "
+        "view_fidelity compares the ORIGINAL and ACTUAL CROP attachments: complete visible product coverage, "
+        "correct whole/detail extent, preserved state, and no reconstruction of unseen product in the proposed composition. "
+        "A matching feature list or the declared whole_view does not prove coverage. Cite visible parts in both images. "
+        "For other findings operation names the affected source/view or text. "
         "Compare object, property, quantity, unit, conditions, negation and scope. IDs and matching "
         "numbers alone do not imply support. Two doors do not support two drawers. Pine wood does "
         "not imply waterproof. Preserve per-shelf versus whole-product and static-load qualifiers. "
@@ -347,17 +417,17 @@ def review_planning_bindings(
         "or use the designer's confidence as evidence. For design_binding entries, compare each role's "
         "composition against shared_design and reference transfer against that entry's reference_scopes. "
         "Selected reference purposes bound what may be inherited; a designer summary cannot broaden that scope. Detect explicit "
-        "reassignments of the SAME object's color/material or the SAME graphic/font role, including natural "
-        "language colors rather than just hex. A blue quilt assigned sage green is a contradiction; distinct "
-        "objects and plausible lighting changes are not. Major staged objects need named palette assignments; "
-        "a newly introduced throw/pillow cannot invent an unassigned accent color. Quote conflicting fields. "
+        "conflicting TARGET assignments of the SAME object's color/material or SAME graphic/font role. "
+        "scene_objects explicitly authorizes restyling source staging into its shared palette assignment; "
+        "a source blue quilt changed to planned sage is allowed, not a factual contradiction. "
+        "Compare target prose against target palette, never source staging color against target color. Quote both conflicting target fields. "
         "A product-only white-background main does not use the room palette; a graphic_canvas does not require "
-        "room objects or their colors. Respect these scopes rather than flagging palette omissions. "
+        "room objects, but existing visible bedding/contents still use their selected named colors. "
         "Named palette and graphic values define the shared assignment. Check shared staging/photography/cohesion "
         "prose against those assignments too; identify explicit conflicts as shared_prose conflicts. "
         "A grouped textile ensemble with one hex but extra differently colored pillows/throws is an ambiguous assignment, "
         "not a complete per-object palette. Every major staged object must use its named assignment. "
-        "Using the ORIGINAL source attachments and supplied view bounds, verify each role's physical coverage: "
+        "Using each ORIGINAL/CROP attachment pair, verify each role's physical coverage: "
         "a crop must include the visible features it claims; integrated/verification views must have their actual unique feature/state "
         "and measurement endpoints visible in their displayed counterparts. Check pixels, not the designer's assertion or repeated IDs. "
         "Expanding a detail into a complete product, omitted visible drawers, or adding a second product is a contradiction. "
@@ -370,7 +440,11 @@ def review_planning_bindings(
         "product requirements. Missing/ambiguous information is inconclusive, not contradiction.\n"
         + json.dumps({"shared_design": shared_design, "bindings": claims,
                       "source_views": [{"attachment_number": i + 1, "source_id": source['source_id'],
-                          "views": source['observation']['physical_views']} for i, source in enumerate(source_manifest)]}, ensure_ascii=False)
+                          "views": source['observation']['physical_views']} for i, source in enumerate(source_manifest)],
+                      "actual_crop_attachments": [{"attachment_number": len(source_paths) + i + 1,
+                          "source_id": source['source_id'], "view_id": view['view_id']}
+                          for i, (source, view) in enumerate((source, view) for source in source_manifest
+                              for view in source['observation']['physical_views'])]}, ensure_ascii=False)
     )
     trace_dir.mkdir(parents=True, exist_ok=True)
     from .palette_registry import planned_palette_diagnostics
@@ -384,7 +458,7 @@ def review_planning_bindings(
     (trace_dir / "planning_review_request.txt").write_text(prompt, encoding="utf-8")
     _events, record = _attempt_trace(trace_dir / "planning_review_attempts.json")
     response = gemini_stream_generate(
-        prompt, list(source_paths), client_scope="visual_planning", attempts=1,
+        prompt, [*source_paths, *view_paths], client_scope="visual_planning", attempts=1,
         max_physical_requests=1,
         deadline_monotonic=deadline_monotonic, response_validator=validate,
         request_id=f"claim-review:{input_revision_id(claims)}", attempt_observer=record,
@@ -424,7 +498,7 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
     attachments = [{"attachment_index": index, "source_id": ref.get('source_id') or f"source_{int(task.get('source_index') or 0):02d}",
                     "view_id": ref.get('view_id'), "purpose": ref.get('purpose'), "sha256": ref['sha256']} for index, ref in enumerate(product_refs, 2)]
     required_views = candidate_view_targets(task)
-    measurement_sources = [{key: row.get(key) for key in ('id', 'source_id', 'source_text', 'measured_part', 'axis')}
+    measurement_sources = [{key: row.get(key) for key in ('id', 'source_id', 'source_text', 'measured_part', 'axis', 'view_id', 'source_region', 'source_endpoints')}
                            for row in (task.get('measurement_authority') or {}).get('measurement_groups', [])]
     edit_scope = {}
     if candidate.get('revision_mode') == 'targeted_edit':
@@ -453,27 +527,27 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
     schema = {
         "text_coverage": "complete|partial|unreadable",
         "texts": [{"text": "verbatim observed text", "kind": "marketing|measurement|product_label|prop|brand|unknown",
-                   "confidence": 0.0, "region": [0.0, 0.0, 1.0, 1.0]}],
+                   "confidence": 0.0, "region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
         "measurements": [{"measurement_id": "source measurement id, or null for unlisted evidence", "object": "measured part and axis", "source_id": "source_id from attachments", "attachment_index": 2,
                           "source_text": "observed in attachment 2+",
                           "candidate_text": "observed in attachment 1", "relationship": "same|different|unknown",
-                          "source_endpoints": [[0.0, 0.0], [1.0, 1.0]], "candidate_endpoints": [[0.0, 0.0], [1.0, 1.0]],
-                          "confidence": 0.0, "source_region": [0.0, 0.0, 1.0, 1.0], "candidate_region": [0.0, 0.0, 1.0, 1.0]}],
+                          "source_endpoints": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}], "candidate_endpoints": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
+                          "confidence": 0.0, "source_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0), "candidate_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
         "measurement_coverage": "complete|partial|not_applicable",
         "product_coverage": "complete|partial",
         "product_comparisons": [{"view_id": "required view_id or extra:unique_id for an additional depicted detail", "source_id": "its source_id", "attachment_index": 2,
                                "status": "consistent|contradiction|unknown", "part": "specific sold part",
                                "evidence": "source/candidate geometry, count, finish and state comparison, not aesthetics",
-                               "confidence": 0.0, "source_region": [0.0, 0.0, 1.0, 1.0], "candidate_region": [0.0, 0.0, 1.0, 1.0]}],
+                               "confidence": 0.0, "source_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0), "candidate_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
     }
     if edit_scope:
         schema['edit_comparison'] = {'status': 'consistent|contradiction|unknown', 'part': 'specific unexpected change',
                                      'evidence': 'Compare parent and candidate outside the requested change; no aesthetic rating',
-                                     'confidence': 0.0, 'source_region': [0.0, 0.0, 1.0, 1.0], 'candidate_region': [0.0, 0.0, 1.0, 1.0]}
+                                     'confidence': 0.0, 'source_region': dict(left=0.0, top=0.0, right=1.0, bottom=1.0), 'candidate_region': dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}
     prompt = (
         "Attachment 1 is the generated candidate; subsequent attachments are the same child's product evidence. "
         "Observe the actual pixels independently; no expected display copy is supplied. Return the completed observation object, not its schema or input context. "
-        "Transcribe candidate text verbatim. Regions are normalized [left, top, right, bottom]; endpoints are [x, y]. Distinguish marketing/dimensions from "
+        "Transcribe candidate text verbatim. Regions use named {left,top,right,bottom}; endpoints use {x,y}, normalized to the specified attachment, not another crop or output. Distinguish marketing/dimensions from "
         "product surface labels and loose props; do not guess illegible words or brand identity. "
         "Compare physical quantities, measured objects and both endpoints; equivalent US-unit conversion with display rounding is not a product change. Transcribe both numbers exactly; bind each listed measurement id once. Use null endpoints for non-diagram callouts and unknown for unreadable geometry. "
         "Return one product_comparisons row per required view, bound to its source/view attachment, plus extra:unique_id rows "
@@ -509,10 +583,11 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
         return True
     events, record = _attempt_trace(path.with_suffix(".attempts.json"))
     raw = gemini_stream_generate(prompt, images, client_scope="vision_qa", attempts=1,
-                                timeout_seconds=50, total_timeout_seconds=50, max_physical_requests=1,
+        max_physical_requests=1,
                                 deadline_monotonic=deadline_monotonic, response_validator=validate,
                                 request_id=f"candidate-observation:{revision}", attempt_observer=record)
     result = parse_json_object_response(raw)
+    _validate_candidate_observation(result)
     validate(raw)
     success = next((event for event in reversed(events) if event.get("status") == "success"), {})
     result["provider"] = {key: success.get(key) or "unavailable" for key in ("provider", "model", "protocol")}
@@ -532,20 +607,28 @@ def _validate_candidate_observation(value: Any) -> None:
     for row in value["texts"]:
         if not isinstance(row, dict) or row.get("kind") not in TEXT_KINDS | {"brand"} or not isinstance(row.get("text"), str):
             raise ValueError("Candidate text observation is malformed")
-        _observation_location(row, ("region",))
+        _located_finding(row, ('region',), 'kind', 'unknown')
     for row in value["measurements"]:
         if not isinstance(row, dict) or row.get("relationship") not in {"same", "different", "unknown"} or not row.get("object"):
             raise ValueError("Candidate measured-object relationship is missing")
         if not isinstance(row.get("source_text"), str) or not isinstance(row.get("candidate_text"), str):
             raise ValueError("Observed source and candidate measurement text is required")
-        _observation_location(row, ("source_region", "candidate_region"))
+        if not _located_finding(row, ('source_region', 'candidate_region'), 'relationship', 'unknown'):
+            value['measurement_coverage'] = 'partial'
         if not row.get('source_id') or type(row.get('attachment_index')) is not int or row['attachment_index'] < 2:
             raise ValueError('Measurement source attachment is missing')
         for field in ('source_endpoints', 'candidate_endpoints'):
             points = row.get(field)
-            if points is not None and (not isinstance(points, list) or len(points) != 2 or any(
-                not isinstance(p, list) or len(p) != 2 or any(type(n) not in (int, float) or not 0 <= n <= 1 for n in p) for p in points)):
-                raise ValueError('Measurement endpoints must be two normalized points, or null for a non-diagram callout')
+            try:
+                if points is not None:
+                    if not isinstance(points, list) or len(points) != 2 or points[0] == points[1]:
+                        raise ValueError('Invalid measurement endpoints')
+                    for point in points:
+                        source_point(point)
+            except ValueError:
+                row.update(relationship='unknown', confidence=0.0, location_error='Invalid measurement endpoints')
+                row[field] = None
+                value['measurement_coverage'] = 'partial'
     comparisons = value.get("product_comparisons")
     if not isinstance(comparisons, list):
         raise ValueError("Candidate per-view product comparisons are missing")
@@ -559,12 +642,24 @@ def _validate_candidate_observation(value: Any) -> None:
         if key in seen:
             raise ValueError('Candidate product comparison repeats a view')
         seen.add(key)
-        _observation_location(comparison, ("source_region", "candidate_region"))
+        if not _located_finding(comparison, ('source_region', 'candidate_region'), 'status', 'unknown'):
+            value['product_coverage'] = 'partial'
     if 'edit_comparison' in value:
         edit = value['edit_comparison']
         if not isinstance(edit, dict) or edit.get('status') not in {'consistent', 'contradiction', 'unknown'} or not edit.get('evidence'):
             raise ValueError('Edit comparison is invalid')
-        _observation_location(edit, ('source_region', 'candidate_region'))
+        _located_finding(edit, ('source_region', 'candidate_region'), 'status', 'unknown')
+
+
+def _located_finding(row: dict[str, Any], regions: tuple[str, ...], field: str, unknown: str) -> bool:
+    try:
+        _observation_location(row, regions)
+        return True
+    except ValueError as exc:
+        row.update({field: unknown, 'confidence': 0.0, 'location_error': str(exc)})
+        for region in regions:
+            row[region] = None
+        return False
 
 
 def _observation_location(row: dict[str, Any], regions: tuple[str, ...]) -> None:
@@ -572,6 +667,4 @@ def _observation_location(row: dict[str, Any], regions: tuple[str, ...]) -> None
     if not isinstance(confidence, (float, int)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
         raise ValueError("Invalid observation confidence")
     for field in regions:
-        box = row.get(field)
-        if not isinstance(box, list) or len(box) != 4 or any(not isinstance(x, (int, float)) or not 0 <= x <= 1 for x in box) or box[0] >= box[2] or box[1] >= box[3]:
-            raise ValueError("Observation needs a nonempty normalized region")
+        source_box(row.get(field))

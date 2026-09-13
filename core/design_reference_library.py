@@ -15,7 +15,7 @@ from .paths import resolve_job_owned_path
 ROLES = {"main", "scene", "func", "size"}
 BRIEF_FIELDS = {"audience", "positioning", "design_priorities", "avoid"}
 VISUAL_REVIEW_FIELDS = {"product_clarity", "information_hierarchy", "evidence_fit", "series_cohesion", "transfer_scope"}
-REFERENCE_INPUT_POLICY = "reviewed-reference-region-v1"
+REFERENCE_INPUT_POLICY = "reviewed-reference-region-v2-scoped-approval"
 
 
 def _brief(value: Any) -> dict[str, Any]:
@@ -51,10 +51,11 @@ def import_design_inputs(job: Path, *, category: str, pack_path: str = "", brief
         return {"brand_brief": brief, "pack": {}, "references": []}
     path = Path(pack_path).resolve()
     pack = read_json(path)
-    if (not isinstance(pack, dict) or pack.get("schema_version") != "design-pack-v3"
-            or pack.get("status") != "approved" or pack.get("production_ready") is not True
+    if (not isinstance(pack, dict) or pack.get("schema_version") != "design-pack-v4"
+            or pack.get("approval_scope") not in {'production', 'evaluation'}
+            or pack.get("status") != "approved" or pack.get("production_ready") is not (pack.get('approval_scope') == 'production')
             or not pack.get("pack_id") or not pack.get("version")):
-        raise ValueError("Explicit design pack is not production-approved; draft examples are not assets")
+        raise ValueError("Explicit design pack lacks a current scoped approval; draft examples are not assets")
     categories = (pack.get("compatibility") or {}).get("categories", [])
     if not isinstance(categories, list) or not all(isinstance(item, str) for item in categories):
         raise ValueError("Design pack category scope must be a list")
@@ -79,6 +80,8 @@ def import_design_inputs(job: Path, *, category: str, pack_path: str = "", brief
         rights, review = asset["rights_review"], asset["visual_review"]
         roles = asset.get("roles")
         children = asset.get("children", ["*"])
+        if pack['approval_scope'] == 'evaluation' and (not children or '*' in children):
+            raise ValueError('Evaluation references require explicit child scope')
         if (not isinstance(roles, list) or not roles or any(role not in ROLES for role in roles)
                 or not isinstance(children, list) or not children or any(not isinstance(child, str) or not child for child in children)):
             raise ValueError(f"{asset_id}: role or child scope is invalid")
@@ -95,6 +98,7 @@ def import_design_inputs(job: Path, *, category: str, pack_path: str = "", brief
             "roles": list(dict.fromkeys(roles)), "children": list(dict.fromkeys(children)),
             "original_sha256": asset["sha256"], "reference_region": asset["reference_region"],
             "input_policy": REFERENCE_INPUT_POLICY,
+            'approval_scope': pack['approval_scope'],
             "evidence_ids": [], "approved_by": review["approved_by"], "approved_at": review["approved_at"],
             "pack_id": pack["pack_id"], "pack_version": pack["version"], "pack_sha256": file_sha256(path),
             "design_system": system,
@@ -119,7 +123,8 @@ def import_design_inputs(job: Path, *, category: str, pack_path: str = "", brief
         row["sha256"] = hashlib.sha256(data).hexdigest()
         row["path"] = f"inputs/design/{row['sha256']}.png"
         write_bytes_atomic(job / row["path"], data)
-    return {"brand_brief": brief, "pack": {"id": pack["pack_id"], "version": pack["version"], "sha256": file_sha256(path)},
+    return {"brand_brief": brief, "pack": {"id": pack["pack_id"], "version": pack["version"], "sha256": file_sha256(path),
+            'approval_scope': pack['approval_scope'], 'production_ready': pack['production_ready']},
             "references": [row for _, row in rows]}
 
 
@@ -141,7 +146,9 @@ def approved_design_references(job: Path, child: str) -> list[dict[str, Any]]:
         if child not in row.get("children", []) and "*" not in row.get("children", []):
             continue
         _approved_asset(row)
-        if row.get("input_policy") != REFERENCE_INPUT_POLICY or len(str(row.get("original_sha256") or "")) != 64:
+        if (row.get("input_policy") != REFERENCE_INPUT_POLICY or len(str(row.get("original_sha256") or "")) != 64
+                or row.get('approval_scope') not in {'evaluation', 'production'}
+                or (row['approval_scope'] == 'evaluation' and '*' in row.get('children', []))):
             raise ValueError("Design reference lacks current reviewed-region provenance; re-import approved inputs")
         path = resolve_job_owned_path(job, str(row.get("path") or ""))
         if (not path.is_relative_to(job.resolve() / "inputs") or not path.is_file()
@@ -171,4 +178,5 @@ def design_reference_usage(job: Path, references: list[dict[str, Any]], briefs: 
                  else "autonomous_no_external_standard")
         rows.append({"source_id": brief["source_id"], "role": brief["role"], "status": state,
                      "available": available, "selected": selected})
-    return {"reference_requested": requested, "roles": rows, "visual_acceptance": "not_evaluated"}
+    return {"reference_requested": requested, "roles": rows, "visual_acceptance": "not_evaluated",
+            'approval_scope': metadata.get('design_inputs', {}).get('pack', {}).get('approval_scope', 'none')}

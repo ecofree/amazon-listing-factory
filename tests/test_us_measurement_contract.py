@@ -85,7 +85,7 @@ class UsMeasurementContractTests(unittest.TestCase):
             output = json.loads(prompt.split('OUTPUT OBJECT (these fields are top-level):\n', 1)[1])
             self.assertIn('text_coverage', output)
             self.assertNotIn('schema', output)
-            self.assertIn('[left, top, right, bottom]', prompt)
+            self.assertIn('named {left,top,right,bottom}', prompt)
         from core.io import file_sha256
         from core.image_qa import _semantic_gates
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,7 +126,7 @@ class UsMeasurementContractTests(unittest.TestCase):
         from core.visual_semantics import _validate_observations
         row = {'source_id': 'a', 'role_guess': 'scene', 'view_coverage': 'complete', 'has_dimension_lines': False, 'has_callouts_or_panels': False,
                'physical_views': [current_physical_view(region=[.1, .1, .9, .9], object_id='drawer')],
-               'confidence': .9, 'visible_numbers_or_units': [], 'evidence': [], 'text_observations': [],
+               'confidence': .9, 'visible_numbers_or_units': [], 'evidence': [], 'text_observations': [], 'measurements': [],
                'variant_identity': {'status': 'unknown', 'observed_color': '', 'reason': 'Occluded', 'conflicts': []},
                'objects': [{'object_id': 'drawer', 'kind': 'drawer', 'state': 'open', 'visibility': 'visible',
                             'sale_membership': 'product', 'membership_evidence': [{'fact_id': 'product.specs.drawers', 'quote': '2 drawers'}], 'relations': []}]}

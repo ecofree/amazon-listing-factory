@@ -210,7 +210,7 @@ def provider_failure_class(exc: Exception) -> str:
 
 
 def normalize_provider_error(provider_name: str, exc: Exception) -> Exception:
-    if isinstance(exc, (PromptCompileError, ProviderFailure)):
+    if isinstance(exc, (PromptCompileError, CandidateCommitError, ProviderFailure)):
         return exc
     message = f"{type(exc).__name__}: {exc}"
     if _structured_content_rejection(exc):
@@ -364,12 +364,8 @@ _TRANSPORT_ERROR_MARKERS = (
 def provider_concurrency_limit(provider_name: str) -> int:
     from .api_registry import image_provider_resource_group
     provider_name = image_provider_resource_group(provider_name)
-    if provider_name == "host_image_memory":
-        total, available = _system_memory_bytes()
-        if total <= 0:
-            return 1
-        reserve = max(4 * 1024**3, int(total * 0.20))
-        return max(0, min(8, (available - reserve) // (1536 * 1024**2)))
+    if provider_name in {'host_image_finalize', 'host_gpu_auto'}:
+        return 1
     suffix = provider_env_suffix(provider_name)
     specific = os.environ.get(f"AMAZON_FACTORY_PROVIDER_CONCURRENCY_{suffix}")
     is_vision = str(provider_name or "").casefold().startswith("vision_")
@@ -396,8 +392,6 @@ def provider_concurrency_slot(provider_name: str, *, deadline: float | None = No
     semaphore is invisible to other processes.
     """
     limit = provider_concurrency_limit(provider_name)
-    if provider_name == "host_image_memory" and limit == 0:
-        raise ProviderQueueUnavailable(provider_name, "Insufficient available memory for an image execution lease")
     if limit <= 0:
         yield
         return

@@ -4,6 +4,7 @@ from pathlib import Path
 import math
 import hashlib
 import time
+import io
 from typing import Any
 
 from PIL import Image
@@ -16,6 +17,24 @@ from .plugin import ProductPlugin
 REFERENCE_KINDS = {"edit_base", "product_evidence", "design_reference"}
 
 
+def source_box(value: Any) -> tuple[float, float, float, float]:
+    """Source coordinates have named axes in the original image, never inferred order."""
+    if not isinstance(value, dict) or set(value) != {'left', 'top', 'right', 'bottom'}:
+        raise ValueError('Source region needs named left, top, right, bottom coordinates')
+    box = tuple(value[key] for key in ('left', 'top', 'right', 'bottom'))
+    if (any(type(n) not in (int, float) or not 0 <= n <= 1 for n in box)
+            or not (box[0] < box[2] and box[1] < box[3])):
+        raise ValueError('Source region must be nonempty normalized original-image bounds')
+    return box
+
+
+def source_point(value: Any) -> tuple[float, float]:
+    if (not isinstance(value, dict) or set(value) != {'x', 'y'}
+            or any(type(n) not in (int, float) or not 0 <= n <= 1 for n in value.values())):
+        raise ValueError('Source endpoint needs normalized original-image x and y')
+    return value['x'], value['y']
+
+
 def physical_views(value: Any) -> list[dict[str, Any]]:
     """Validate observation-owned view bounds, never guess a whole-page fallback."""
     if not isinstance(value, list) or len(value) > 16:
@@ -24,14 +43,10 @@ def physical_views(value: Any) -> list[dict[str, Any]]:
     for row in value:
         if not isinstance(row, dict) or set(row) != {"view_id", "region", "extent", "evidence"}:
             raise ValueError("Physical view needs view_id, region, extent and observed evidence")
-        key, box = row["view_id"], row["region"]
+        key, box = row["view_id"], source_box(row["region"])
         if not isinstance(key, str) or not key or len(key) > 80 or key in seen:
             raise ValueError("Physical view identity is missing or duplicated")
         seen.add(key)
-        if (not isinstance(box, list) or len(box) != 4
-                or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in box)
-                or not (box[0] < box[2] and box[1] < box[3])):
-            raise ValueError("Physical view needs normalized left,top,right,bottom bounds")
         if row["extent"] not in {"whole_view", "detail"} or not isinstance(row["evidence"], list) or not row["evidence"]:
             raise ValueError("Physical view needs its visible extent and feature evidence")
         features = set()
@@ -43,9 +58,8 @@ def physical_views(value: Any) -> list[dict[str, Any]]:
                     or item["feature_id"] in features):
                 raise ValueError("View evidence needs unique feature identity, object, visible bounds and physical facts")
             features.add(item["feature_id"])
-            r = item["region"]
-            if (not isinstance(r, list) or len(r) != 4 or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in r)
-                    or not (box[0] <= r[0] < r[2] <= box[2] and box[1] <= r[1] < r[3] <= box[3])):
+            r = source_box(item["region"])
+            if not (box[0] <= r[0] < r[2] <= box[2] and box[1] <= r[1] < r[3] <= box[3]):
                 raise ValueError(f"{key}: crop truncates observed feature {item['feature_id']}; correct its bounds")
     return value
 
@@ -58,10 +72,37 @@ def planning_view_inputs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _view_location(job: Path, source: dict[str, Any], view: dict[str, Any], size: tuple[int, int]) -> tuple[Path, tuple[int, int, int, int]]:
-    l, t, r, b = view["region"]
+    l, t, r, b = source_box(view["region"])
+    # Page callouts belong to the measured view without being inside the product silhouette.
+    for measurement in source.get('measurements', []):
+        if measurement['view_id'] != view['view_id']:
+            continue
+        ml, mt, mr, mb = source_box(measurement['source_region'])
+        l, t, r, b = min(l, ml), min(t, mt), max(r, mr), max(b, mb)
     box = (math.floor(l * size[0]), math.floor(t * size[1]), math.ceil(r * size[0]), math.ceil(b * size[1]))
     key = hashlib.sha256(f"{source['source_sha256']}:{box}".encode()).hexdigest()
     return job / "images" / "evidence_views" / f"{key}.png", box
+
+
+def source_crop_provenance(job: Path, source: dict[str, Any]) -> list[dict[str, Any]]:
+    path = resolve_job_owned_path(job, source['source_path'])
+    if file_sha256(path) != source['source_sha256']:
+        raise ValueError('Source changed before crop binding')
+    rows = []
+    with Image.open(path) as image:
+        for view in physical_views(source['observation']['physical_views']):
+            _, box = _view_location(job, source, view, image.size)
+            with image.crop(box) as crop:
+                buffer = io.BytesIO()
+                if crop.mode in {'CMYK', 'YCbCr', 'HSV'}:
+                    with crop.convert('RGB') as rgb:
+                        rgb.save(buffer, format='PNG')
+                else:
+                    crop.save(buffer, format='PNG')
+                rows.append({'view_id': view['view_id'], 'pixel_size': list(crop.size), 'source_size': list(image.size),
+                             'pixel_area': crop.width * crop.height, 'pixel_box': list(box),
+                             'sha256': hashlib.sha256(buffer.getvalue()).hexdigest()})
+    return rows
 
 
 def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: Path, *, deadline_monotonic: float | None = None) -> list[Path]:
@@ -92,7 +133,8 @@ def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: 
                 paths.append(output)
                 provenance.append({"attachment_number": len(paths), "source_id": source["source_id"],
                                    "view_id": view["view_id"], "original_sha256": source["source_sha256"],
-                                   "original_region": view["region"], "pixel_box": box,
+                                   "original_region": dict(zip(('left', 'top', 'right', 'bottom'),
+                                       (box[0]/image.width, box[1]/image.height, box[2]/image.width, box[3]/image.height))), "pixel_box": box,
                                    "coordinate_frame": "original_source", "derived_path": output.relative_to(job).as_posix(),
                                    "derived_sha256": file_sha256(output)})
     write_json(directory / "manifest.json", {"attachments": provenance})
@@ -103,7 +145,9 @@ def view_reference(source: dict[str, Any], view: dict[str, Any], *, job: Path, c
     """Use the same extraction and identity as the planning attachments."""
     path = resolve_job_owned_path(job, source["source_path"])
     with Image.open(path) as image:
-        crop, _ = _view_location(job, source, view, image.size)
+        crop, box = _view_location(job, source, view, image.size)
+        region = dict(zip(('left', 'top', 'right', 'bottom'),
+                          (box[0]/image.width, box[1]/image.height, box[2]/image.width, box[3]/image.height)))
     if not crop.is_file():
         raise ValueError(f"Missing current observed view: {view['view_id']}")
     return {"kind": kind, "child": child, "source_id": source["source_id"], "view_id": view["view_id"],
@@ -111,7 +155,26 @@ def view_reference(source: dict[str, Any], view: dict[str, Any], *, job: Path, c
             "evidence_ids": [item["feature_id"] for item in view["evidence"]],
             "path": crop.relative_to(job).as_posix(), "sha256": file_sha256(crop),
             "original_path": source["source_path"], "original_sha256": source["source_sha256"],
-            "original_region": view["region"], "extent": view["extent"], "visible_evidence": view["evidence"]}
+            "original_region": region, "extent": view["extent"], "visible_evidence": view["evidence"]}
+
+
+def measurement_attachment_location(row: dict[str, Any], references: list[dict[str, Any]]) -> dict[str, Any]:
+    index, ref = next(((i, ref) for i, ref in enumerate(references, 1)
+                      if ref['source_id'] == row['source_id'] and ref.get('view_id') == row['view_id']), (None, None))
+    if ref is None:
+        raise ValueError('Measurement has no matching source/view attachment')
+    l, t, r, b = source_box(ref['original_region'])
+    ml, mt, mr, mb = source_box(row['source_region'])
+    if not (l <= ml < mr <= r and t <= mt < mb <= b):
+        raise ValueError('Measurement annotation is missing from its actual attachment')
+    label = dict(zip(('left', 'top', 'right', 'bottom'),
+                     ((ml-l)/(r-l), (mt-t)/(b-t), (mr-l)/(r-l), (mb-t)/(b-t))))
+    points = None if row['source_endpoints'] is None else [
+        {'x': (x-l)/(r-l), 'y': (y-t)/(b-t)} for x, y in map(source_point, row['source_endpoints'])]
+    if points is not None:
+        for point in points:
+            source_point(point)
+    return {'attachment': index, 'view': row['view_id'], 'label': label, 'endpoints': points}
 
 
 def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str) -> None:
@@ -148,14 +211,21 @@ def validate_supporting_sources(value: Any, sources: list[dict[str, Any]], prima
     known = {row["source_id"]: row for row in sources}
     seen = {primary_id}
     for row in value:
-        if not isinstance(row, dict) or set(row) != {"source_id", "purpose", "evidence_ids"}:
-            raise ValueError("Supporting source needs source_id, purpose and evidence_ids")
+        if not isinstance(row, dict) or set(row) != {"source_id", "view_id", "purpose", "evidence_ids"}:
+            raise ValueError("Supporting source needs source_id, view_id, purpose and evidence_ids")
         key = row["source_id"]
         if key not in known or key in seen or not isinstance(row["purpose"], str) or not 1 <= len(row["purpose"].strip()) <= 240:
             raise ValueError("Supporting source is unknown, repeated or lacks a bounded purpose")
-        seen.add(key)
+        identity = (key, row['view_id'])
+        if identity in seen:
+            raise ValueError("Supporting view is repeated")
+        seen.add(identity)
+        views = {view['view_id']: view for view in physical_views(known[key]['observation']['physical_views'])}
+        if row['view_id'] not in views:
+            raise ValueError("Supporting view is not observed in that source")
         available = {str(item["evidence_id"]) for item in known[key].get("claims", [])}
-        available.update("object:" + str(item["object_id"]) for item in ((known[key].get("observation") or {}).get("objects") or []))
+        available.update("object:" + str(item["object_id"]) for item in views[row['view_id']]['evidence'])
+        available.update(item['feature_id'] for item in views[row['view_id']]['evidence'])
         ids = row["evidence_ids"]
         if not isinstance(ids, list) or any(not isinstance(item, str) or item not in available for item in ids) or len(ids) != len(set(ids)):
             raise ValueError("Supporting source evidence is not bound to that source")

@@ -34,11 +34,11 @@ def _observed(task: dict) -> dict:
     return {
         "text_coverage": "complete", "measurement_coverage": "not_applicable", "measurements": [],
         "product_coverage": "complete",
-        "texts": [{"text": text, "kind": "marketing", "confidence": 0.99, "region": [0, 0, 1, 1]}
+        "texts": [{"text": text, "kind": "marketing", "confidence": 0.99, "region": dict(left=0, top=0, right=1, bottom=1)}
                   for text in task["renderable_text_contract"]["strings"]],
         "product_comparisons": [{"source_id": row['source_id'], "view_id": row['view_id'], "attachment_index": index,
                                 "status": "consistent", "part": "sold structure", "confidence": 0.99,
-                                "evidence": "Fixture geometry retained", "source_region": [0, 0, 1, 1], "candidate_region": [0, 0, 1, 1]}
+                                "evidence": "Fixture geometry retained", "source_region": dict(left=0, top=0, right=1, bottom=1), "candidate_region": dict(left=0, top=0, right=1, bottom=1)}
                                for index, row in enumerate(candidate_view_targets(task), 2)],
     }
 
@@ -189,7 +189,7 @@ class QaLiteV1Tests(unittest.TestCase):
         task = _task("func_01")
         task["renderable_text_contract"]["strings"] = ["Weight Capacity: 440 lbs"]
         observation = _observed(task)
-        observation["texts"].append({"text": "Goodnight", "kind": "prop", "confidence": .99, "region": [0, 0, 1, 1]})
+        observation["texts"].append({"text": "Goodnight", "kind": "prop", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)})
         self.assertEqual("pass", image_qa._semantic_gates(task, observation)[0]["status"])
         observation["texts"][0]["text"] = "Weight Capacity: 441 lbs"
         self.assertEqual("fail", image_qa._semantic_gates(task, observation)[0]["status"])
@@ -205,7 +205,7 @@ class QaLiteV1Tests(unittest.TestCase):
         observation = _observed(task)
         observation["measurement_coverage"] = "complete"
         measurement = {"object": "cabinet overall width", "source_text": "36 in", "candidate_text": "3 ft",
-                       "relationship": "same", "confidence": .99, "source_region": [0, 0, 1, 1], "candidate_region": [0, 0, 1, 1]}
+                       "relationship": "same", "confidence": .99, "source_region": dict(left=0, top=0, right=1, bottom=1), "candidate_region": dict(left=0, top=0, right=1, bottom=1)}
         observation["measurements"] = [measurement]
         self.assertEqual("pass", image_qa._semantic_gates(task, observation)[1]["status"])
         measurement["relationship"] = "different"
@@ -215,7 +215,7 @@ class QaLiteV1Tests(unittest.TestCase):
         mixed = _task("func_04", "source_image")
         mixed["renderable_text_contract"]["strings"] = ["Ample Space under Bed"]
         observed = _observed(mixed)
-        observed["texts"].append({"text": '12"', "kind": "measurement", "confidence": .99, "region": [0, 0, 1, 1]})
+        observed["texts"].append({"text": '12"', "kind": "measurement", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)})
         observed["measurements"] = [{**measurement, "object": "underbed clearance", "source_text": '12"', "candidate_text": "12 in", "relationship": "same", "confidence": .99}]
         observed["measurement_coverage"] = "complete"
         self.assertEqual(["pass", "pass", "pass"], [row["status"] for row in image_qa._semantic_gates(mixed, observed)])
@@ -228,7 +228,7 @@ class QaLiteV1Tests(unittest.TestCase):
             gate = image_qa._main_background_gate(plugin, _task("main"), Path("candidate.png"))
         self.assertEqual("fail", gate["status"])
         observation = _observed(_task("main"))
-        observation["texts"] = [{"text": "Beautiful Storage", "kind": "marketing", "confidence": .99, "region": [0, 0, 1, 1]}]
+        observation["texts"] = [{"text": "Beautiful Storage", "kind": "marketing", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)}]
         self.assertEqual("fail", image_qa._semantic_gates(_task("main"), observation)[0]["status"])
         observation["texts"][0]["kind"] = "prop"
         self.assertEqual("pass", image_qa._semantic_gates(_task("scene"), observation)[0]["status"])

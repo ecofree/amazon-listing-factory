@@ -17,7 +17,7 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v18-complete-physical-facts"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v20-named-source-evidence"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
 SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant"})
@@ -373,7 +373,7 @@ def _evidence_for_sha(job: Path, sha: str, downloads: list[dict[str, Any]], *, d
         for line_index, line in enumerate(trusted)
         for index, value in enumerate(extract_measurements(line))
     ]
-    measurements = _independent_measurements(raw_measurements)
+    measurements = raw_measurements
     claims = _authored_claims(trusted)
     pixels = _pixel_evidence(source)
     base = {
@@ -395,10 +395,10 @@ def _prepare_source(job: Path, plugin: ProductPlugin, download: dict[str, Any],
         raise FinalSourceIntentError(f"Source path is invalid or changed: {source_path}")
     trusted_text = list(evidence.get("trusted_text") or [])
     visual = dict(evidence.get("visual_evidence") or {})
-    measurements = _measurement_rows(_observed_measurements(evidence, visual), child)
+    measurements = _measurement_rows(_observed_measurements(visual), child)
     identity = visual.get("variant_identity") or {}
     identity_issue = (
-        "source_identity_unverified: " + str(visual.get("error") or "current joint source observation unavailable")
+        "source_observation_unresolved: " + str(visual.get("error") or "current joint source observation unavailable")
         if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY else
         "source_variant_conflict: " + str(identity.get("reason") or "visible product contradicts child facts")
         if identity.get("status") == "contradiction" else ""
@@ -585,7 +585,7 @@ def _signals(source_index: int, evidence: dict[str, Any], measurements: list[dic
     text = " ".join(trusted)
     visual = evidence.get("visual_evidence") or {}
     pixels = evidence.get("pixel_evidence") or {}
-    distinct_measurements = len(_independent_measurements(measurements))
+    distinct_measurements = len(measurements)
     measurement_lines = sum(1 for line in trusted if extract_measurements(line))
     direction_count = len({word.lower() for word in _DIRECTION_WORD.findall(text)})
     textual_dimension_layout = distinct_measurements >= 2 and (
@@ -633,29 +633,21 @@ def _size_strength(row: dict[str, Any]) -> tuple[int, int, int, int]:
         int(signals["measurement_line_count"]),
         -int(row["source_index"]),
     )
-def _observed_measurements(evidence: dict[str, Any], visual: dict[str, Any]) -> list[dict[str, Any]]:
-    """Use joint visual transcription; OCR supplements quantities not observed there."""
-    ocr = list(evidence.get("measurements") or [])
+def _observed_measurements(visual: dict[str, Any]) -> list[dict[str, Any]]:
+    """Only joint observation can authorize an annotation; OCR is input evidence."""
     if visual.get("status") != "success" or visual.get("policy_version") != OBSERVATION_POLICY:
-        return ocr
-    lines = [row["text"] for row in visual.get("text_observations") or []
-             if row.get("kind") == "measurement"]
-    rows = [{**value, "source_label": line, "source_occurrence": f"visual:{i}:{j}"}
-            for i, line in enumerate(lines) for j, value in enumerate(extract_measurements(line))]
-    # Bare numeric inventory is a recovery aid, never a new measured object.
-    pairs = {row["canonical_pair"] for row in rows}
-    for line in visual.get("visible_numbers_or_units") or []:
-        for value in extract_measurements(line):
-            if value["canonical_pair"] not in pairs:
-                rows.append({**value, "source_label": line, "source_occurrence": f"visual-inventory:{len(rows)}"})
-                pairs.add(value["canonical_pair"])
-    return rows + [row for row in ocr if row.get("canonical_pair") not in pairs]
+        return []
+    return [{**extract_measurements(row['text'])[0], 'source_label': row['object'],
+             'source_occurrence': row['measurement_id'], 'axis_hint': row['axis'],
+             'source_region': row['region'], 'source_endpoints': row['endpoints'],
+             'measurement_kind': row['kind'], 'view_id': row['view_id']}
+            for row in visual['measurements']]
 
 
 def _measurement_rows(values: list[dict[str, Any]], child: dict[str, Any]) -> list[dict[str, Any]]:
     spec_pairs = _spec_measurement_pairs(child)
     rows: list[dict[str, Any]] = []
-    for value in _independent_measurements(values):
+    for value in values:
         pair = str(value.get("canonical_pair") or "")
         rows.append(
             {
@@ -666,21 +658,9 @@ def _measurement_rows(values: list[dict[str, Any]], child: dict[str, Any]) -> li
                 "source_occurrence": str(value.get("source_occurrence") or ""),
                 "axis_hint": str(value.get("axis_hint") or ""),
                 "confidence": "confirmed" if pair and pair in spec_pairs else "source_visible",
+                **{key: value[key] for key in ('source_region', 'source_endpoints', 'measurement_kind', 'view_id')},
             }
         )
-    return rows
-def _independent_measurements(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    for value in values:
-        if not isinstance(value, dict):
-            continue
-        pair = str(value.get("canonical_pair") or "").strip().lower()
-        label = normalize_text(value.get("source_label") or value.get("raw_text") or value.get("text") or "").lower()
-        key = (pair, label, str(value.get("axis_hint") or ""), str(value.get("source_occurrence") or ""))
-        if (pair or label) and key not in seen:
-            rows.append(dict(value))
-            seen.add(key)
     return rows
 def _authored_claims(lines: list[str], *, visual: dict[str, Any] | None = None, product_text: str = "") -> list[dict[str, Any]]:
     visual = visual or {}

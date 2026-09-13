@@ -54,6 +54,15 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         memory = patch("core.image_provider_common._system_memory_bytes", return_value=(32 * 1024**3, 20 * 1024**3))
         memory.start()
         self.addCleanup(memory.stop)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for replacement in (patch('core.image_resources._LEDGER', Path(directory.name) / 'leases.json'),
+                            patch('core.image_resources._system_memory_bytes', return_value=(32 * 1024**3, 20 * 1024**3))):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+        local = patch('core.image_generation.finalize_candidate', side_effect=lambda task, **kwargs: task)
+        local.start()
+        self.addCleanup(local.stop)
 
     def tearDown(self) -> None:
         reset_provider_run_circuits()
@@ -78,7 +87,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual(["apimart"], assigned["child_provider_reserve"])
         self.assertEqual("krill_gpt_image_2", assigned["child_provider_primary"])
         self.assertEqual("aicost_gpt_image_2", assigned["child_provider_backup"])
-        self.assertTrue(assigned["child_provider_lock"])
+        self.assertNotIn('child_provider_lock', assigned)
         entries = [SimpleNamespace(name="flare", raw={}), SimpleNamespace(name="sunburst", raw={"role_priority": {"func": 1, "size": 1}})]
         with patch.object(routing, "image_provider_entries", return_value=entries), patch.object(routing, "_provider_scores", return_value={"flare": 0.0, "sunburst": 0.0}):
             self.assertEqual(["sunburst", "flare"], routing._order_by_health({"role": "func_02"}, ["flare", "sunburst"]))
@@ -132,16 +141,16 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             assigned = routing.assign_provider_pool(infographic_tasks)
         self.assertTrue(all(row["child_provider_primary"] == "aicost_gpt_image_2" for row in assigned))
         self.assertEqual(1, len({row["child_provider_primary"] for row in assigned}))
-        self.assertTrue(all(row["child_provider_lock"] for row in assigned))
+        self.assertTrue(all('child_provider_lock' not in row for row in assigned))
         self.assertTrue(all(row["child_provider_role_lane"] == "infographic" for row in assigned))
         self.assertTrue(all("dragoncode_gpt_image_2" in row["child_provider_reserve"] for row in assigned))
 
     def test_auto_generation_admits_three_child_lanes_across_three_providers(self) -> None:
         from core import image_provider_common as common
-        with patch.object(common, "_system_memory_bytes", return_value=(8 * 1024**3, 4 * 1024**3)):
+        from core import image_resources as resources
+        with tempfile.TemporaryDirectory() as tmp, patch.object(resources, '_LEDGER', Path(tmp) / 'leases.json'), patch.object(resources, "_system_memory_bytes", return_value=(8 * 1024**3, 4 * 1024**3)):
             with self.assertRaises(ProviderQueueUnavailable):
-                with common.provider_concurrency_slot("host_image_memory", deadline=time.monotonic() + .1):
-                    self.fail("low memory must not admit generation")
+                resources.reserve_image({'job_dir': tmp, 'generation_references': []})
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.object(common, "_system_memory_bytes", return_value=(8 * 1024**3, 6 * 1024**3)),
@@ -151,10 +160,10 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 "import sys,time; from pathlib import Path; from core import image_provider_common as c; "
                 "c._system_memory_bytes=lambda:(8*1024**3,6*1024**3); "
                 "c._provider_slot_directory=lambda name:Path(sys.argv[1]); "
-                "slot=c.provider_concurrency_slot('host_image_memory',deadline=time.monotonic()+.1); "
+                "slot=c.provider_concurrency_slot('host_gpu_auto',deadline=time.monotonic()+.1); "
                 "slot.__enter__(); slot.__exit__(None,None,None)"
             )
-            with common.provider_concurrency_slot("host_image_memory", deadline=time.monotonic() + 1):
+            with common.provider_concurrency_slot("host_gpu_auto", deadline=time.monotonic() + 1):
                 child = subprocess.run([sys.executable, "-c", code, tmp], capture_output=True, text=True, timeout=10)
                 self.assertNotEqual(0, child.returncode)
                 self.assertIn("ProviderQueueUnavailable", child.stderr)
@@ -257,6 +266,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             output = Path(tmp) / "candidate.png"
             source = Path(tmp) / "source.png"
             source.write_bytes(b"source")
+            receipt = Path(tmp) / 'response.json'
+            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
             task = {
                 "job_dir": tmp, "output_path": str(output), "prompt": "prompt",
                 "providers": ["a", "b"], "child_provider_reserve": ["c", "d"],
@@ -277,13 +288,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor.assert_provider_allowed"),
                  patch(
                      "core.image_generation_executor.generate_with_provider_retries",
-                     side_effect=[ProviderQueueUnavailable("a", "local lane busy"), b"pixels"],
+                     side_effect=[ProviderQueueUnavailable("a", "local lane busy"), receipt],
                  ) as generate,
-                 patch(
-                     "core.image_generation_executor.commit_candidate_output",
-                     side_effect=lambda _job, _task, data: output.write_bytes(data),
-                 ),
-                 patch("core.image_generation_executor._finalize_candidate_bytes", return_value=b"pixels"),
                  patch("core.image_generation_executor._record_generation_progress"),
                  patch("core.image_generation_executor._record_provider_event_audit_only"),
              ):
@@ -300,6 +306,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             mask = job / "mask.png"
             output = job / "candidate.png"
             Image.new("RGB", (32, 32), "white").save(source)
+            receipt = job / 'response.json'
+            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
             Image.new("RGBA", (32, 32), (255, 255, 255, 128)).save(mask)
             support = job / "support.png"
             Image.new("RGB", (32, 32), "blue").save(support)
@@ -326,9 +334,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor.assert_provider_allowed"),
                 patch("core.image_generation_executor.image_provider_supports_mask", side_effect=lambda name: name == "a"),
                 patch("core.image_generation_executor.image_provider_supports_multiple_references", side_effect=lambda name, count: name == "a" and count == 2),
-                patch("core.image_generation_executor.generate_with_provider_retries", return_value=b"pixels") as generate,
-                patch("core.image_generation_executor.commit_candidate_output", side_effect=lambda _job, _task, data: output.write_bytes(data)),
-                patch("core.image_generation_executor._finalize_candidate_bytes", return_value=b"pixels"),
+                patch("core.image_generation_executor.generate_with_provider_retries", return_value=receipt) as generate,
                 patch("core.image_generation_executor._record_generation_progress"),
                 patch("core.image_generation_executor._record_provider_event_audit_only"),
             ):
@@ -363,6 +369,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             output = Path(tmp) / "candidate.png"
             source = Path(tmp) / "source.png"
             source.write_bytes(b"source")
+            receipt = Path(tmp) / 'response.json'
+            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
             task = {
                 "job_dir": tmp, "output_path": str(output), "prompt": "prompt",
                 "providers": ["a", "b"], "child_provider_reserve": ["c"],
@@ -386,14 +394,9 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                     side_effect=[
                         ProviderContentError("a", "solid output"),
                         ProviderContentError("b", "solid output"),
-                        b"pixels",
+                        receipt,
                     ],
                 ) as generate,
-                patch(
-                    "core.image_generation_executor.commit_candidate_output",
-                    side_effect=lambda _job, _task, data: output.write_bytes(data),
-                ),
-                patch("core.image_generation_executor._finalize_candidate_bytes", return_value=b"pixels"),
                 patch("core.image_generation_executor._record_generation_progress"),
                 patch("core.image_generation_executor._record_provider_event_audit_only"),
             ):
@@ -620,6 +623,18 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 self.assertTrue(routing._global_provider_cooldown_active("p"))
 
     def test_single_transient_failure_does_not_collapse_global_provider_pool(self) -> None:
+        from core import model_call_health as health
+        with patch.object(health.time, 'monotonic', return_value=0):
+            health.record_provider_run_result('probe-fixture', 'timeout_failure')
+            health.record_provider_run_result('probe-fixture', 'timeout_failure')
+            self.assertTrue(health.provider_run_circuit_open('probe-fixture'))
+        with patch.object(health.time, 'monotonic', return_value=181):
+            self.assertTrue(health.admit_provider_probe('probe-fixture'))
+            self.assertFalse(health.admit_provider_probe('probe-fixture'))
+            health.record_provider_run_result('probe-fixture', 'success')
+            self.assertFalse(health.provider_run_circuit_open('probe-fixture'))
+            health.open_provider_run_circuit('hard-fixture')
+            self.assertFalse(health.admit_provider_probe('hard-fixture'))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "health.json"
             updated = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

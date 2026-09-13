@@ -25,7 +25,7 @@ from .visual_design_kit import compact_product_claims, read_visual_design_kits, 
 
 
 IMAGE_TASK_SCHEMA_VERSION = "image-task-v10"
-IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v29-complete-display-copy"
+IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v32-attachment-facts"
 IMAGE_TASK_ARTIFACT = "image_tasks_v10.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
 _TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "product_boundary", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
@@ -323,7 +323,8 @@ def _form_task(
     if source_brief is None:
         return _blocked(base, "visual design kit has no matching source brief")
     if source_brief.get("status") != "ready":
-        return _blocked(base, str(source_brief.get("error") or "source brief is pending"))
+        return _blocked(base, str(source_brief.get("error") or "source brief is pending"),
+                        reason_code='source_observation_unresolved' if source_brief.get('failure_owner') == 'observation' else '')
     try:
         measurement = _measurement_authority(family, child, source)
         image_direction = source_brief["image_direction"]
@@ -396,7 +397,8 @@ def _generation_references_for_task(
     for selection in selected:
         support = by_id[selection['source_id']]
         refs.extend({**view_reference(support, view, job=job, child=child, kind='product_evidence'),
-                     'purpose': selection['purpose']} for view in physical_views(support['observation']['physical_views']))
+                     'purpose': selection['purpose']} for view in physical_views(support['observation']['physical_views'])
+                    if view['view_id'] == selection['view_id'])
     available = {row["source_id"]: row for row in kit.get("approved_design_references", [])}
     for transfer in brief["image_direction"]["design_transfer"]:
         key = transfer["reference_id"]
@@ -464,120 +466,31 @@ def _measurement_authority(family: str, child: dict[str, Any], source: dict[str,
     if source.get("role") == "size" or has_func_measurement:
         measurements = [
             {
-                "id": f"source:{index}",
+                "id": row['source_occurrence'],
                 "source_id": f"source_{int(source.get('source_index') or 0):02d}",
                 "source_text": str(row.get("text") or "").strip(),
-                "measured_part": _canonical_source_callout(row.get("source_label")) or "source_visible",
-                "axis": str(row.get("axis_hint") or "source_diagram"),
+                "measured_part": row['source_label'],
+                "axis": row['axis_hint'],
+                **{key: row[key] for key in ('view_id', 'source_region', 'source_endpoints')},
                 "kind": "measurement",
                 "canonical_value": str(row.get("canonical_pair") or ""),
                 "render_text": us_measurement_text(row.get("text"), upper_bound="capacity" in str(row.get("source_label") or "").lower()),
                 "confidence": str(row.get("confidence") or "source_visible"),
-                # A load-capacity callout is factual evidence even when it is
-                # drawn inside an icon/badge rather than on a dimension line.
-                "measurement_role": _measurement_role(str(row.get("source_label") or row.get("text") or "")),
-                "presentation": "source_visible_capacity_callout"
-                if _measurement_role(str(row.get("source_label") or row.get("text") or "")) == "load_capacity"
-                else "source_visible_measurement",
+                "measurement_role": 'load_capacity' if row['measurement_kind'] == 'capacity' else row['measurement_kind'],
             }
             for index, row in enumerate(source.get("measurements") or [], 1)
             if isinstance(row, dict) and str(row.get("text") or "").strip()
         ]
-        source_visible_text_artifacts, source_visible_callouts = _source_visible_factual_text(source, measurements)
         return {
             "mode": "source_image", "source_sha256": str(source.get("source_sha256") or ""),
             "source_intent_revision_id": str(source.get("input_revision_id") or ""),
             "preserve_entire_diagram": True,
             "render_text": list(dict.fromkeys(row["render_text"] for row in measurements)),
             "measurement_groups": measurements,
-            "source_visible_text_artifacts": source_visible_text_artifacts,
-            "source_visible_callouts": source_visible_callouts,
             "ocr_role": "definite_error_warning_only",
             "relationship_policy": "Preserve physical quantities, measured parts, endpoints and product-instance associations; display the authorized US-unit labels.",
         }
     raise ImageTaskError("Size task requires one source image classified as size")
-
-
-def _source_visible_factual_text(
-    source: dict[str, Any], measurements: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Project only source-visible numeric facts into the existing authority.
-
-    OCR is evidence, not a second fact store.  Missing or malformed OCR is
-    intentionally represented by empty lists so a size task keeps the normal
-    generation path and remains available for human comparison.
-    """
-    evidence = source.get("ocr_evidence") if isinstance(source.get("ocr_evidence"), dict) else {}
-    lines = evidence.get("lines") if isinstance(evidence.get("lines"), list) else []
-    measurement_texts = {
-        " ".join(str(row.get(key) or "").casefold().split())
-        for row in measurements
-        for key in ("render_text", "raw_text")
-        if str(row.get(key) or "").strip()
-    }
-    artifacts: list[dict[str, Any]] = []
-    callouts = list(dict.fromkeys(
-        _canonical_source_callout(row.get("text"))
-        for row in (source.get("visual_evidence") or {}).get("text_observations") or []
-        if row.get("kind") == "measurement"
-    ))
-    for line in lines:
-        if not isinstance(line, dict) or float(line.get("confidence") or 0) < 0.68:
-            continue
-        text = " ".join(str(line.get("text") or "").split()).strip()
-        box = line.get("box")
-        if not text or not isinstance(box, list) or len(box) < 4:
-            continue
-        normalized = _canonical_source_callout(text).casefold()
-        is_numeric_fact = (
-            normalized in measurement_texts
-            or bool(re.search(r"\d", normalized) and re.search(r"(?:\"|\b(?:in|inch|inches|lb|lbs|pounds?)\b)", normalized))
-            or bool(re.fullmatch(r"\d+(?:\.\d+)?", normalized))
-        )
-        is_callout = bool(
-            re.search(r"\b(?:capacity|thickness|weight|load)\b", normalized)
-            and re.search(r"\d", normalized)
-        ) or bool(re.search(r":", normalized) and re.search(r"\d", normalized))
-        if not (is_numeric_fact or is_callout):
-            continue
-        artifact = {
-            # Keep OCR exactly as evidence, but expose canonical display copy
-            # to the existing size prompt contract so malformed source spacing
-            # cannot become the text-rendering instruction.
-            "text": text,
-            "display_text": _canonical_source_callout(text),
-            "confidence": line.get("confidence"),
-            "box": box,
-            "kind": "callout" if is_callout else "measurement",
-        }
-        artifacts.append(artifact)
-        display_text = str(artifact["display_text"] or "").strip()
-        if is_callout and display_text and display_text not in callouts:
-            callouts.append(display_text)
-    return artifacts, callouts
-
-
-def _canonical_source_callout(value: Any) -> str:
-    """Normalize buyer-facing spacing without changing the factual value."""
-    text = normalize_text(value)
-    if not text:
-        return ""
-    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
-    text = re.sub(r"Ibs", "lbs", text, flags=re.I)
-    text = re.sub(r"\s*:\s*", ": ", text)
-    text = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", text)
-    text = re.sub(r"(?<=[\"'])\s*(?=\()", " ", text)
-    return us_measurement_text(re.sub(r"\s+", " ", text).strip())
-
-
-def _measurement_role(text: str) -> str:
-    """Classify source-visible numeric evidence without changing its value."""
-    normalized = " ".join(text.casefold().replace("–", "-").split())
-    if re.search(r"\b(?:capacity|load|supports?|holds?)\b", normalized):
-        return "load_capacity"
-    if re.search(r"\b(?:lb|lbs|pounds?|kg|kilograms?)\b", normalized):
-        return "weight" if re.search(r"\b(?:item|product|net|shipping|package)\s+weight\b", normalized) else "mass_callout"
-    return "dimension"
 
 
 def _edit_contract(
@@ -704,7 +617,7 @@ def _task_failure(row: dict[str, Any]) -> dict[str, Any]:
             "logical_task_id": logical_task_id("brief", child=row["child"], role=row["role"]),
             "input_revision_id": row["input_revision_id"], "child": row["child"], "role": row["role"],
         },
-        "failure_owner": "brief",
+        "failure_owner": "classify" if row.get('formation_reason_code') in {'source_evidence_missing', 'source_observation_unresolved'} else "brief",
         "task_status": "blocked",
         "error": row.get("formation_reason") or "image task blocked",
     }

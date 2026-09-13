@@ -33,7 +33,7 @@ from .image_task_inputs import visual_product_color, visual_variation_values
 from .palette_registry import planned_palette_diagnostics
 from .vision_gemini_client import gemini_scope_identity, gemini_stream_generate
 from .visual_context import planner_visual_context_instruction
-from .image_reference_context import physical_views, planning_view_inputs, prepare_planning_views
+from .image_reference_context import physical_views, planning_view_inputs, prepare_planning_views, source_crop_provenance
 from .design_reference_library import approved_design_references, brand_design_brief, design_reference_usage
 from .visual_semantics import review_planning_bindings, source_fact_records
 from .visual_design_kit_compiler import (
@@ -46,11 +46,11 @@ from .visual_design_kit_compiler import (
     DESIGN_FIELD_SCHEMAS, IMAGE_DIRECTION_SCHEMA,
 )
 VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v11"
-VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-child-design-v53-physical-facts-and-display-copy"
+VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-child-design-v56-scoped-reference-repair"
 VISUAL_DESIGN_KIT_ARTIFACT = "visual_design_kits_v11.jsonl"
 
 _ROW_FIELDS = {"schema_version", "policy_version", "category_id", "child", "source_reference", "source_sha256", "source_references", "child_facts_revision_id", "input_revision_id", "family_design_id", "visual_design_kit_id", "family_art_direction", "source_briefs", "planner", "approved_design_references"}
-_SOURCE_FIELDS = {"source_id", "source_index", "role", "source_path", "source_sha256", "input_revision_id", "shopping_intent", "claims", "product_claims", "measurements", "observation"}
+_SOURCE_FIELDS = {"source_id", "source_index", "role", "source_path", "source_sha256", "input_revision_id", "shopping_intent", "claims", "product_claims", "measurements", "observation", "crop_provenance"}
 _PLANNER_FIELDS = {"provider", "model", "request_fingerprint", "response_fingerprint", "attempts", "configured_clients", "prompt_path", "response_path"}
 
 
@@ -94,7 +94,7 @@ def build_visual_design_kits(
                 "final main source intent is unresolved; inspect this child's final_source_intents "
                 "and source_observations, resolve the recorded classification failure, then resume classify,brief",
             )]
-        source_manifest = _source_manifest(sources, child)
+        source_manifest = _source_manifest(sources, child, job=job)
         design_refs = approved_design_references(job, asin)
         prompt = visual_design_kit_prompt(plugin, compact_product_facts(child), policy, source_manifest, design_refs, brand_design_brief(job))
         revision, child_facts_revision = _kit_input_revision(child=child, policy=policy, sources=sources, planner_prompt=prompt)
@@ -329,11 +329,12 @@ def _finish_source_briefs(
     def compile_reviewed(draft: dict[str, Any], attempt: str) -> dict[str, Any]:
         nonlocal review_available
         all_requests = [*claim_review_requests(draft, source_manifest),
-                        *(design_binding_request(brief, draft["family_art_direction"], source=sources[brief["source_id"]], design_references=design_references) for brief in draft["source_briefs"])]
+                        *(design_binding_request(brief, draft["family_art_direction"], source=sources[brief["source_id"]], source_manifest=source_manifest, design_references=design_references) for brief in draft["source_briefs"])]
         requests = list({row["key"]: row for row in all_requests if row["key"] not in reviews}.values())
         try:
             reviews.update(review_planning_bindings(requests, shared_design=draft["family_art_direction"],
                 source_manifest=source_manifest, source_paths=source_originals,
+                view_paths=source_paths[:len(planning_view_inputs(source_manifest))],
                 trace_dir=trace_dir / attempt, deadline_monotonic=deadline_monotonic))
         except Exception as exc:
             review_available = False
@@ -344,7 +345,7 @@ def _finish_source_briefs(
         return compile_visual_design_kit_response(draft, source_manifest=source_manifest, category_id=category_id, claim_reviews=reviews, design_references=design_references)
 
     planned = compile_reviewed(raw, "initial")
-    pending = [row for row in planned["source_briefs"] if row["status"] == "pending"]
+    pending = [row for row in planned["source_briefs"] if row["status"] == "pending" and row['failure_owner'] == 'brief']
     if not pending or not review_available or time.monotonic() >= deadline_monotonic:
         return planned
     pending_ids = {row["source_id"] for row in pending}
@@ -363,13 +364,15 @@ def _finish_source_briefs(
         "Resolve all listed findings together: preserve supported specific features; remove only unsupported qualifiers. "
         "Resolve role color/material/font conflicts by referencing unchanged shared object/graphic names, not new values. "
         "Do not redesign the child or change other source briefs.\n"
-        + json.dumps({"shared_design": planned["family_art_direction"], "pending": pending,
-                      "claim_review_findings": [{**row, "review": reviews.get(row["key"], {})}
+        + json.dumps({"shared_design": planned["family_art_direction"], "pending": [
+                          {key: row[key] for key in ('source_id', 'error', 'draft')} for row in pending],
+                      "claim_review_findings": [{"source_id": row['source_id'], "proposed_text": row['proposed_text'],
+                                                 "review": reviews.get(row["key"], {})}
                           for row in claim_review_requests({"source_briefs": [brief for brief in raw["source_briefs"]
                               if brief["source_id"] in pending_ids]}, source_manifest)],
-                      "design_review_findings": [{**request, "review": reviews.get(request["key"], {})}
+                      "design_review_findings": [{"source_id": brief['source_id'], "review": reviews.get(request["key"], {})}
                           for brief in raw["source_briefs"] if brief["source_id"] in pending_ids
-                          for request in [design_binding_request(brief, planned["family_art_direction"], source=sources[brief["source_id"]], design_references=design_references)]],
+                          for request in [design_binding_request(brief, planned["family_art_direction"], source=sources[brief["source_id"]], source_manifest=source_manifest, design_references=design_references)]],
                       "source_evidence": [_planner_source_view(row) for row in repair_sources],
                       "evidence_attachments": planning_view_inputs(repair_sources),
                       "design_references": _planner_design_refs(design_references or [], len(planning_view_inputs(repair_sources))),
@@ -475,7 +478,7 @@ def visual_design_kit_row_current(
         if not any(source.get("role") == "main" for source in sources):
             return False
         policy = policy or compiled_image_policy(plugin)
-        source_manifest = _source_manifest(sources, child_row)
+        source_manifest = _source_manifest(sources, child_row, job=job)
         prompt = visual_design_kit_prompt(
             plugin, compact_product_facts(child_row), policy, source_manifest, approved_design_references(job, child), brand_design_brief(job),
         )
@@ -599,13 +602,16 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
         "Preserve geometry, finish, physical count, state, perspective and visible extent WITHIN each product view, including visible mattresses in bed main/scene. Redesign canvas positions, view scale, panels, room decor and typography. Use bright, people-free settings.\n\n"
         + (visual_context_guardrail + "\n\n" if visual_context_guardrail else "")
         + "SOURCE BRIEFS\n"
-        "supporting_sources=[{source_id,purpose,evidence_ids}]; IDs are source claims or object:object_id, [] for structure without IDs. Supporting views verify structure, not hidden parts.\n"
+        "supporting_sources=[{source_id,view_id,purpose,evidence_ids}]; select exact observed views and their feature IDs, source claims or object:object_id. Supporting views verify structure, not hidden parts.\n"
         "Return one brief per source_id; display_copy for func and size only. visual_goal identifies the buyer question, not a depicted state. creative_brief arranges the existing physical views, not a reconstructed illustration of the benefit.\n"
         "Main follows category policy; scenes share the object palette. Func hierarchy serves proven features; icons are optional. Partial views stay partial; measurement endpoints stay bound to physical points.\n"
         "Each evidence_usage is {view_id,usage,covered_by}. Non-displayed views may link only to displayed views actually showing the same observed feature_ids and state. Unique joints, slat recesses and measured endpoints remain visible; detail views cannot become whole products. Choose fresh canvas placement, not a mandatory panel per crop. Layout/text_placement may be []; bounds are normalized [left,top,right,bottom]. Text references: title, label:N or measurements; photos use [].\n"
         "design_transfer selects role-approved references within their transfer_principles: inherit only permitted features and explain adaptations. A reference approval is scoped, not permission to copy its whole style. Use [] without suitable references: autonomous, not reference-calibrated.\n"
         "Shared art direction fixes this child's adapted styling. creative_brief owns composition; design_transfer owns reference use. Both reuse shared names, not new colors or copy. The image model integrates layout, text and detail within this direction and product facts.\n"
-        "Resolve one color/material per individual non-product object (sheet, duvet, throw, each major pillow separately, not an ensemble with extra unnamed accent colors). scene_objects selects the shared palette names actually used by each role; bare-frame views exclude bedding. creative_brief positions these objects without repeating their colors. One treatment per graphic role; local backing only for readability, no default capsule.\n"
+        "Choose one color/material per non-product object in the shared palette. scene_objects maps each observed staging object_id to its palette key, "
+        "or null for removable decor omitted from this composition; occluding bedding must be restyled, not removed. Introduced objects use new:descriptive_name keys. "
+        "Include contents in graphic_canvas/source_setting; product-only white mains use an empty map and bare views remain bare. "
+        "creative_brief positions these objects without redefining their appearance. One treatment per graphic role; local backing only for readability, no default capsule.\n"
         "For func/size, display_copy owns all exact titles, group labels and inset captions: title may be null, labels may be empty. Bind each independent string to its local evidence IDs, not a paragraph later split into captions. physical: evidence proves visible structure only, never performance/material specifications; measurement: evidence supports measured-object headings, not new values. Size numeric labels already come from measurement authority: do not repeat them as copy. Prefer specific mechanisms with their counts and qualifiers.\n\n"
         "Source-colored outlines, adjustment ghosts and highlights are diagram notation, not finish or extra physical parts. Size preserves quantities and measurement associations; program-approved US-unit labels replace metric labels.\n\n"
         f"Category: {plugin.category_id}\n"
@@ -726,7 +732,7 @@ def _ordered_sources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: (0 if row.get("role") == "main" else 1, int(row.get("source_index") or 0), str(row.get("source_sha256") or "")))
 
 
-def _source_manifest(rows: list[dict[str, Any]], child: dict[str, Any]) -> list[dict[str, Any]]:
+def _source_manifest(rows: list[dict[str, Any]], child: dict[str, Any], *, job: Path) -> list[dict[str, Any]]:
     manifest = []
     product_claims = compact_product_claims(child)
     product_claims_emitted = False
@@ -754,6 +760,8 @@ def _source_manifest(rows: list[dict[str, Any]], child: dict[str, Any]) -> list[
             "measurements": row.get("measurements") or [],
             "observation": {key: (row.get("visual_evidence") or {}).get(key) for key in ("status", "objects", "physical_views")},
         })
+    for source in manifest:
+        source['crop_provenance'] = source_crop_provenance(job, source)
     _validate_source_manifest(manifest)
     return manifest
 
@@ -825,6 +833,8 @@ def _planner_source_view(row: dict[str, Any]) -> dict[str, Any]:
     view = {
         "source_id": source_id,
         "role": row["role"],
+        "objects": [{key: obj[key] for key in ('object_id', 'kind', 'sale_membership', 'visibility', 'state', 'relations')}
+                    for obj in row.get('observation', {}).get('objects') or []],
         "physical_evidence": {"views": [{**v, 'evidence': [{**f, 'copy_evidence_ids': [
             f"physical:{source_id}:{v['view_id']}:{f['feature_id']}:{i}" for i in range(len(f['physical_facts']))]}
             for f in v['evidence']]} for v in views]},
@@ -925,7 +935,7 @@ def _planner_trace_current(job: Path, row: dict[str, Any]) -> bool:
                 if not path.is_file() or file_sha256(path) != review.get("response_sha256"):
                     return False
                 records = _parse_response(path.read_text(encoding="utf-8")).get("reviews", [])
-                if not any(all(item.get(key) == review.get(key) for key in ("key", "status", "reason")) for item in records):
+                if not any(all(item.get(key) == review.get(key) for key in ("key", "status", "reason", "findings")) for item in records):
                     return False
         return input_revision_id(_parse_response(response.read_text(encoding="utf-8"))) == str(
             planner.get("response_fingerprint") or ""

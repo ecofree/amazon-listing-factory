@@ -162,6 +162,21 @@ class CopyV1ContractTests(unittest.TestCase):
             )
         self.assertEqual(valid["title"], result["title"])
         self.assertEqual(2, post.call_count)
+        import tempfile
+        from pathlib import Path
+        from dataclasses import replace
+        from core.copy_writer import _post_chat_completion
+        with tempfile.TemporaryDirectory() as tmp, patch('core.copy_writer.urllib.request.urlopen') as transport:
+            transport.return_value.__enter__.return_value.read.return_value = _body(invalid).encode()
+            traced = replace(config, trace_dir=Path(tmp), api_key='secret-not-in-diagnostics')
+            request = post.call_args_list[0].args[1]
+            self.assertEqual(_body(invalid), _post_chat_completion(traced, request))
+            recorded = list(Path(tmp).glob('*.response.txt'))
+            self.assertEqual(1, len(recorded))
+            self.assertEqual(_body(invalid), recorded[0].read_text(encoding='utf-8'))
+            self.assertNotIn(traced.api_key, ''.join(p.read_text(encoding='utf-8') for p in Path(tmp).iterdir()))
+            with patch.object(Path, 'write_text', side_effect=OSError('disk error')), self.assertLogs('core.copy_writer', level='WARNING'):
+                self.assertEqual(_body(invalid), _post_chat_completion(traced, request))
         repair = json.loads(post.call_args_list[1].args[1]["messages"][1]["content"])
         error = repair["validation_error"]
         self.assertIn("title exceeds", error)

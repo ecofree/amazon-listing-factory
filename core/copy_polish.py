@@ -136,6 +136,7 @@ def run_copy_polish(
         if fragment is None:
             try:
                 fragment = _rewrite_group(
+                    trace_dir=job_path / 'reports' / 'copy_traces' / model_request_fingerprint,
                     env=env,
                     plugin=plugin,
                     job=job,
@@ -197,6 +198,7 @@ def run_copy_polish(
                 if prior_parent_failure:
                     raise CopyPolishError("terminal copy failure already recorded for this input revision")
                 parent_fragment = _rewrite_group(
+                    trace_dir=job_path / 'reports' / 'copy_traces' / parent_model_fingerprint,
                     env=env, plugin=plugin, job=job, source=parent_source,
                     facts=parent_facts, fingerprint=parent_fingerprint,
                     row_type="Parent",
@@ -501,6 +503,7 @@ def _rewrite_group(
     row_type: str,
     expected_request_fingerprint: str,
     deadline_monotonic: float | None = None,
+    trace_dir: Path | None = None,
 ) -> dict[str, Any]:
     source_copy = _source_copy(source)
     result = rewrite_listing_copy(
@@ -513,6 +516,7 @@ def _rewrite_group(
         source_description=source_copy["description"],
         product_specific=facts,
         deadline_monotonic=deadline_monotonic,
+        trace_dir=trace_dir,
     )
     config = load_copy_writer_config(env)
     if str(result.get("_request_fingerprint") or "") != expected_request_fingerprint:

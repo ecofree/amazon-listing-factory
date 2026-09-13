@@ -45,6 +45,9 @@ class GenerationStateContractTests(unittest.TestCase):
         )
 
     def test_manifest_recovery_owns_currentness_and_repairs_receipt(self) -> None:
+        from tests.current_image_recovery_fixture import verify_paid_response_recovery, verify_scheduler_overlap
+        verify_paid_response_recovery(self)
+        verify_scheduler_overlap(self)
         from io import BytesIO
         from PIL import Image
         from core import image_upscale

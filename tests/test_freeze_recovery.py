@@ -61,17 +61,21 @@ class FreezeRecoveryTests(unittest.TestCase):
             source = Path(tmp) / "source.png"
             source.write_bytes(b"source")
             output = Path(tmp) / "candidate.png"
+            from PIL import Image
+            receipt = Path(tmp) / 'response.json'
+            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
             for count in (1, 2, 3, 7, 10):
                 for remaining in (1000, 45):
                     with self.subTest(count=count, remaining=remaining), contextlib.ExitStack() as stack:
                         providers = [f"provider-{i}" for i in range(count)]
                         task = {"job_dir": tmp, "output_path": str(output), "prompt": "fixture", "child": "B1",
-                            "role": "main", "task_fingerprint": "fixture", "generation_references": [],
+                            "role": "main", "logical_task_id": "generate:B1:main", "task_fingerprint": "fixture", "generation_references": [],
                             "providers": providers[:2], "child_provider_reserve": providers[2:],
                             "execution_profile": "reference_edit_soft_lock", "deadline_monotonic": 100 + remaining}
                         stack.enter_context(patch.dict("os.environ", {"AMAZON_FACTORY_IMAGEGEN_MODE": "", "AMAZON_FACTORY_IMAGEGEN_ROLE_DEADLINE_SECONDS": ""}))
                         stack.enter_context(patch.object(executor.time, "monotonic", return_value=100))
-                        stack.enter_context(patch.object(executor, "provider_concurrency_slot", return_value=contextlib.nullcontext()))
+                        stack.enter_context(patch.object(executor, "reserve_image"))
+                        stack.enter_context(patch.object(executor, "release_image"))
                         stack.enter_context(patch.object(executor, "generation_reference_primary_path", return_value=source))
                         stack.enter_context(patch.object(executor, "generation_reference_sources", return_value=[{
                             "kind": "edit_base", "path": source, "source_id": "source_00", "sha256": "a" * 64,
@@ -81,13 +85,10 @@ class FreezeRecoveryTests(unittest.TestCase):
                         for name in ("assert_imagegen_prompt_preflight", "assert_provider_allowed", "open_provider_run_circuit",
                                      "_record_generation_progress", "_record_provider_event_audit_only"):
                             stack.enter_context(patch.object(executor, name))
-                        stack.enter_context(patch.object(executor, "_finalize_candidate_bytes", side_effect=lambda data: data))
-                        stack.enter_context(patch.object(executor, "commit_candidate_output", side_effect=lambda _job, _task, data: output.write_bytes(data)))
-                        responses = ([ProviderConfigurationError(providers[0], "unavailable")] if count > 1 else []) + [b"image"]
+                        responses = ([ProviderConfigurationError(providers[0], "unavailable")] if count > 1 else []) + [receipt]
                         transport = stack.enter_context(patch.object(executor, "generate_with_provider_retries", side_effect=responses))
                         generate_one(task, plugin=load_plugin("bed_frame"))
                         self.assertTrue(all(call.kwargs["total_timeout_seconds"] == min(420, remaining) for call in transport.call_args_list))
-                        output.unlink()
 
     def test_unknown_state_roundtrip_and_controller_exception_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,14 +153,14 @@ class FreezeRecoveryTests(unittest.TestCase):
         context.Queue.return_value.get.return_value = {"event": "request_prepared", "request_audit": {
             "request_id": "local-id", "provider": "cxk_fixed", "model": "gpt-image-2", "inputs": [{"sent_bytes": 42}]}}
         context.Process.return_value.is_alive.return_value = True
-        audit = {}
-        with patch.object(routing, "assert_imagegen_prompt_contract"), \
+        audit = {'response_binding': 'fixture-binding'}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(routing, "assert_imagegen_prompt_contract"), \
              patch.object(routing, "has_registry_image_provider", return_value=True), \
              patch.object(routing.multiprocessing, "get_context", return_value=context), \
              patch.object(routing.time, "monotonic", side_effect=[0, 0, 2]):
             with self.assertRaises(ProviderTransportError) as raised:
                 routing._generate_with_provider_deadline(provider_name="cxk_fixed", image_input_paths=[],
-                    prompt="fixture", timeout_seconds=1, request_id="local-id", request_audit=audit)
+                    prompt="fixture", timeout_seconds=1, request_id="local-id", request_audit=audit, response_directory=Path(tmp))
         self.assertTrue(raised.exception.ambiguous)
         self.assertEqual("gpt-image-2", audit["model"])
         self.assertEqual(42, audit["inputs"][0]["sent_bytes"])

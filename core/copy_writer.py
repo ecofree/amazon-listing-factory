@@ -6,11 +6,13 @@ import logging
 import os
 import re
 import time
+import uuid
 import urllib.error
 import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from itertools import combinations
+from pathlib import Path
 from typing import Any
 
 from .title_quality import listing_title_quality_issues
@@ -36,6 +38,7 @@ class CopyWriterConfig:
     json_mode: bool = True
     temperature: float = 0.15
     deadline_monotonic: float | None = None
+    trace_dir: Path | None = None
 
 
 COPY_CACHE_MAX_ENTRIES = 256
@@ -211,8 +214,9 @@ def rewrite_listing_copy(
     source_description: str,
     product_specific: dict[str, Any],
     deadline_monotonic: float | None = None,
+    trace_dir: Path | None = None,
 ) -> dict[str, Any]:
-    config = replace(load_copy_writer_config(env), deadline_monotonic=deadline_monotonic)
+    config = replace(load_copy_writer_config(env), deadline_monotonic=deadline_monotonic, trace_dir=trace_dir)
     if not config.enabled:
         raise CopyWriterError("Copy AI is disabled")
     if not config.api_key:
@@ -1315,6 +1319,8 @@ def _post_chat_completion(config: CopyWriterConfig, payload: dict[str, Any]) -> 
     attempts = _copy_retry_attempts(config)
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
+        trace_id = uuid.uuid4().hex
+        _copy_trace(config, trace_id, 'request.json', json.dumps(payload, ensure_ascii=False))
         request = urllib.request.Request(
             _chat_url(config.base_url),
             data=json.dumps(payload).encode("utf-8"),
@@ -1331,7 +1337,9 @@ def _post_chat_completion(config: CopyWriterConfig, payload: dict[str, Any]) -> 
                 raise CopyWriterError("Copy execution deadline exhausted before request", retryable=True)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read().decode("utf-8", errors="replace")
+                body = response.read().decode("utf-8", errors="replace")
+                _copy_trace(config, trace_id, 'response.txt', body)
+                return body
         except urllib.error.HTTPError as exc:
             last_exc = exc
             if exc.code not in COPY_RETRY_STATUS_CODES or attempt >= attempts:
@@ -1350,6 +1358,16 @@ def _post_chat_completion(config: CopyWriterConfig, payload: dict[str, Any]) -> 
     raise CopyWriterError(
         f"Copy AI request failed after {attempts} attempts: {last_exc}", retryable=True
     )
+
+
+def _copy_trace(config: CopyWriterConfig, trace_id: str, suffix: str, text: str) -> None:
+    if config.trace_dir is None:
+        return
+    try:
+        config.trace_dir.mkdir(parents=True, exist_ok=True)
+        (config.trace_dir / f'{trace_id}.{suffix}').write_text(text, encoding='utf-8')
+    except OSError as exc:
+        _LOGGER.warning('Copy diagnostic write failed: %s', exc)
 
 
 def _copy_retry_attempts(config: CopyWriterConfig) -> int:

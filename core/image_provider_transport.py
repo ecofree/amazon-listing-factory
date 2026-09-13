@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from http.client import IncompleteRead
 from dataclasses import dataclass
 from typing import Any
 
@@ -85,6 +86,7 @@ def generate_with_registry_image_provider(
     *, provider_name: str, image_inputs: list[bytes], prompt: str,
     mask_bytes: bytes | None = None, request_id: str = "", request_audit: dict[str, Any] | None = None,
     request_observer: Any | None = None,
+    transport_observer: Any | None = None,
 ) -> bytes:
     if not image_inputs:
         raise ProviderConfigurationError(provider_name, "image provider requires at least one reference image")
@@ -121,6 +123,7 @@ def generate_with_registry_image_provider(
             prompt=prompt,
             mask_bytes=mask_bytes,
             request_audit=request_audit,
+            transport_observer=transport_observer,
         )
     if spec and spec.api_type == "openai_chat_completions_image":
         if mask_bytes is not None:
@@ -152,6 +155,7 @@ def generate_with_registry_image_provider(
 def _generate_with_openai_images_edit(
     *, provider_name: str, image_inputs: list[bytes], prompt: str, mask_bytes: bytes | None,
     request_audit: dict[str, Any] | None = None,
+    transport_observer: Any | None = None,
 ) -> bytes:
     spec = _image_provider_spec(provider_name)
     if spec is None or spec.api_type != "openai_images_edit":
@@ -185,16 +189,29 @@ def _generate_with_openai_images_edit(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            text = response.read().decode("utf-8", errors="replace")
             if request_audit is not None:
                 request_audit["remote_request_id"] = str(response.headers.get("x-request-id") or "")[:200]
+            if transport_observer:
+                transport_observer('headers', b'', request_audit or {})
+            try:
+                raw = response.read()
+            except IncompleteRead as exc:
+                if transport_observer:
+                    transport_observer('partial', exc.partial, request_audit or {})
+                raise
+            if transport_observer:
+                transport_observer('body', raw, request_audit or {})
+            text = raw.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        excerpt = exc.read().decode("utf-8", errors="replace")[:800]
-        if exc.code in {408, 504, 524}:
+        try:
+            excerpt = exc.read(800).decode("utf-8", errors="replace")
+        except Exception as body_error:
+            excerpt = f'Unreadable error body: {type(body_error).__name__}'
+        if exc.code == 408 or exc.code >= 500:
             raise ProviderTransportError(provider_name, f"Remote image result unknown after HTTP {exc.code}: {excerpt}", ambiguous=True) from exc
         raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
-    except urllib.error.URLError as exc:
-        raise ImageGenerationError(f"{provider_name} request failed: {exc}") from exc
+    except Exception as exc:
+        raise ProviderTransportError(provider_name, f"Remote image result unknown after {type(exc).__name__}: {exc}", ambiguous=True) from exc
     if request_audit is not None:
         try:
             payload = json.loads(text)

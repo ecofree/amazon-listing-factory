@@ -16,6 +16,8 @@ _RUN_CIRCUIT_LOCK = threading.RLock()
 _RUN_OPEN_CIRCUITS: set[str] = set()
 _RUN_CIRCUIT_TASKS: dict[str, str] = {}
 _RUN_TRANSIENT_FAILURES: dict[str, int] = {}
+_RUN_RETRY_AT: dict[str, float] = {}
+_RUN_PROBE_USED: set[str] = set()
 
 
 def reset_provider_run_circuits() -> None:
@@ -23,13 +25,32 @@ def reset_provider_run_circuits() -> None:
         _RUN_OPEN_CIRCUITS.clear()
         _RUN_CIRCUIT_TASKS.clear()
         _RUN_TRANSIENT_FAILURES.clear()
+        _RUN_RETRY_AT.clear()
+        _RUN_PROBE_USED.clear()
 
 
 def provider_run_circuit_open(provider: str, *, task_id: str = "") -> bool:
     del task_id
     key = str(provider or "").strip()
     with _RUN_CIRCUIT_LOCK:
-        return key in _RUN_OPEN_CIRCUITS
+        return key in _RUN_OPEN_CIRCUITS and (
+            key not in _RUN_RETRY_AT or key in _RUN_PROBE_USED or time.monotonic() < _RUN_RETRY_AT[key])
+
+
+def admit_provider_probe(provider: str) -> bool:
+    """Reserve at most one post-cooldown request inside the existing health authority."""
+    with _RUN_CIRCUIT_LOCK:
+        if provider_run_circuit_open(provider):
+            return False
+        if provider in _RUN_OPEN_CIRCUITS:
+            _RUN_PROBE_USED.add(provider)
+        return True
+
+
+def release_unused_provider_probe(provider: str) -> None:
+    with _RUN_CIRCUIT_LOCK:
+        if provider in _RUN_RETRY_AT:
+            _RUN_PROBE_USED.discard(provider)
 
 
 def open_provider_run_circuit(provider: str, *, task_id: str = "") -> None:
@@ -37,6 +58,7 @@ def open_provider_run_circuit(provider: str, *, task_id: str = "") -> None:
     if key:
         with _RUN_CIRCUIT_LOCK:
             _RUN_OPEN_CIRCUITS.add(key)
+            _RUN_RETRY_AT.pop(key, None)
             _RUN_CIRCUIT_TASKS[key] = str(task_id or "").strip()
 
 
@@ -48,6 +70,9 @@ def record_provider_run_result(provider: str, status: str, *, threshold: int = 2
     with _RUN_CIRCUIT_LOCK:
         if normalized == "success":
             _RUN_TRANSIENT_FAILURES.pop(key, None)
+            if key in _RUN_RETRY_AT:
+                _RUN_OPEN_CIRCUITS.discard(key)
+                _RUN_RETRY_AT.pop(key, None)
             return key in _RUN_OPEN_CIRCUITS
         if normalized not in {"timeout_failure", "transport_failure"}:
             return key in _RUN_OPEN_CIRCUITS
@@ -55,6 +80,7 @@ def record_provider_run_result(provider: str, status: str, *, threshold: int = 2
         _RUN_TRANSIENT_FAILURES[key] = failures
         if failures >= max(1, int(threshold)):
             _RUN_OPEN_CIRCUITS.add(key)
+            _RUN_RETRY_AT.setdefault(key, time.monotonic() + 180.0)
         return key in _RUN_OPEN_CIRCUITS
 
 

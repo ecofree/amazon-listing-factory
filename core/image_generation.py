@@ -13,7 +13,8 @@ from .api_registry import (
     image_provider_physical_identity,
 )
 from .candidate_state import CandidateStateError, current_candidate
-from .image_generation_executor import generate_one
+from .image_generation_executor import generate_one, finalize_candidate
+from .image_response import recover_response
 from .image_provider_common import (
     _system_memory_bytes,
     ProviderQueueUnavailable,
@@ -150,19 +151,6 @@ def run_image_generation(
                 record_task_successes(job_path, owner_stage="generate", attempt_id=attempt_id, tasks=[recovered])
             continue
         state = task_record_current(job_path, task["logical_task_id"], task["input_revision_id"])
-        if state.get("request_outcome") == "unknown":
-            failures.append(_failure({**task, **state}, owner="generation", error="Remote request outcome is unknown; reconcile the recorded request before explicitly revising this image.", status="review"))
-            continue
-        if (
-            state.get("status") == "blocked"
-            and state.get("execution_revision") == execution_revision
-        ):
-            failures.append(_failure(
-                {**task, **state}, owner="generation",
-                error=str(state.get("error") or "Generation is terminal for the current execution configuration"),
-                status="blocked",
-            ))
-            continue
         try:
             candidate_revision = _next_candidate_revision(
                 job_path,
@@ -189,6 +177,17 @@ def run_image_generation(
                 "provider_attempts": dict(state.get("provider_attempts") or {}),
                 "execution_revision": execution_revision,
             }
+            if recover_response(runtime_task):
+                runtime.append(runtime_task)
+                continue
+            if state.get('status') == 'blocked' and state.get('execution_revision') == execution_revision:
+                failures.append(_failure({**task, **state}, owner='generation',
+                    error=str(state.get('error') or 'Generation contract is blocked'), status='blocked'))
+                continue
+            if state.get('request_outcome') == 'unknown':
+                failures.append(_failure({**task, **state}, owner='generation',
+                    error='Remote request outcome unknown; reconcile before resubmitting', status='review'))
+                continue
             apply_role_provider_policy(runtime_task, plugin)
             if not runtime_task.get("providers"):
                 failures.append(_failure(
@@ -229,7 +228,7 @@ def run_image_generation(
                 {**task, "execution_revision": execution_revision},
                 owner="generation_preflight",
                 error=f"{type(exc).__name__}: {exc}",
-                status="blocked",
+                status="review" if getattr(exc, 'ambiguous', False) else "retryable" if provider_failure_class(exc) == 'candidate_commit' else "blocked",
             ))
 
     persisted_results: dict[str, dict[str, Any]] = {}
@@ -554,15 +553,25 @@ def _execute(
     capacity_requeues: dict[str, int] = {}
     last_batch_progress_at = time.monotonic()
     capacity_errors: dict[str, ProviderQueueUnavailable] = {}
-    with ThreadPoolExecutor(max_workers=_effective_generation_workers(tasks, workers)) as pool:
+    remote_cap = _effective_generation_workers(tasks, workers)
+    with ThreadPoolExecutor(max_workers=remote_cap) as pool, ThreadPoolExecutor(max_workers=1) as local_pool:
         futures: dict[Any, dict[str, Any]] = {}
+        local_futures: set[Any] = set()
         while pending or futures:
-            current, pending = _dispatch_generation_batch(pending, workers, active=list(futures.values()))
+            current, pending = _dispatch_generation_batch(pending, workers,
+                active=[task for future, task in futures.items() if future not in local_futures],
+                occupied={(task.get('logical_task_id') or (task.get('child'), task.get('role')), task.get('candidate_revision', 0))
+                          for task in futures.values()})
+            room = max(0, remote_cap + 1 - len(futures))
+            pending = current[room:] + pending
+            current = current[:room]
             futures.update({pool.submit(generate_one, task, plugin=plugin): task for task in current})
-            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            done, _ = wait(futures, timeout=.25, return_when=FIRST_COMPLETED)
             round_made_progress = False
             for future in done:
                 task = futures.pop(future)
+                is_local = future in local_futures
+                local_futures.discard(future)
                 try:
                     completed_task = future.result()
                 except Exception as exc:
@@ -579,6 +588,7 @@ def _execute(
                                 str(task["job_dir"]), "image_task_capacity_requeued",
                                 logical_task_id=task_id, child=task.get("child"), role=task.get("role"),
                                 capacity_round=capacity_requeues[task_id],
+                                reason=f'{type(exc).__name__}: {exc}'[:500],
                             )
                         continue
                     status = _generation_failure_status(exc)
@@ -596,6 +606,12 @@ def _execute(
                     if on_failure is not None:
                         on_failure(failure)
                 else:
+                    if not is_local:
+                        local_future = local_pool.submit(finalize_candidate, completed_task, plugin=plugin)
+                        futures[local_future] = completed_task
+                        local_futures.add(local_future)
+                        round_made_progress = True
+                        continue
                     if on_success is not None:
                         on_success(completed_task)
                     completed.append(completed_task)
@@ -603,10 +619,10 @@ def _execute(
             if round_made_progress:
                 last_batch_progress_at = time.monotonic()
                 capacity_errors.clear()
-            if pending and not futures and all(
+            if pending and not futures and (not current or all(
                 str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}") in capacity_errors
                 for task in pending
-            ) and time.monotonic() - last_batch_progress_at >= _capacity_stall_budget_seconds():
+            )) and time.monotonic() - last_batch_progress_at >= _capacity_stall_budget_seconds():
                 stalled, pending = pending, []
                 for task in stalled:
                     task_id = str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}")
@@ -630,7 +646,7 @@ def _execute(
                     if on_failure is not None:
                         on_failure(failure)
                 continue
-            if pending and capacity_errors and not round_made_progress:
+            if pending and not round_made_progress:
                 time.sleep(0.25)
     completed.sort(key=lambda row: (row["child"], row["role"]))
     return completed, failures
@@ -639,6 +655,7 @@ def _execute(
 def _dispatch_generation_batch(
     pending: list[dict[str, Any]], requested_workers: int,
     *, active: list[dict[str, Any]] | None = None,
+    occupied: set[tuple[Any, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fill free worker lanes; provider file leases remain cross-process authority."""
     if not pending:
@@ -648,30 +665,39 @@ def _dispatch_generation_batch(
     selected: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     used: dict[str, int] = {}
-    used_lanes: set[str] = {
-        str(task.get("child_provider_lane") or task.get("child_provider_lane_key") or task.get("child") or "default")
-        for task in active
-    }
+    from .api_registry import image_provider_resource_group, image_provider_supports_multiple_references, image_provider_supports_mask
+    identities = {(task.get('logical_task_id') or (task.get('child'), task.get('role')), task.get('candidate_revision', 0)) for task in active}
+    identities.update(occupied or set())
     for task in active:
         primary = _task_primary_provider(task)
-        used[primary] = used.get(primary, 0) + 1
+        group = image_provider_resource_group(primary)
+        used[group] = used.get(group, 0) + 1
     for task in pending:
-        primary = _task_primary_provider(task)
-        lane = str(task.get("child_provider_lane") or task.get("child_provider_lane_key") or task.get("child") or "default")
-        if lane in used_lanes:
+        identity = (task.get('logical_task_id') or (task.get('child'), task.get('role')), task.get('candidate_revision', 0))
+        if identity in identities:
             deferred.append(task)
             continue
-        limit = provider_concurrency_limit(primary) if primary else 0
-        if primary and limit > 0 and used.get(primary, 0) >= limit:
+        routes = list(dict.fromkeys([_task_primary_provider(task), *task.get('providers', []), *task.get('child_provider_reserve', [])]))
+        references = task.get('generation_references', [])
+        routes = [name for name in routes if name and
+                  (len(references) <= 1 or image_provider_supports_multiple_references(name, len(references))) and
+                  (not any(row.get('protected_mask') for row in references) or image_provider_supports_mask(name))]
+        primary = next((name for name in routes if provider_concurrency_limit(name) <= 0 or
+                        used.get(image_provider_resource_group(name), 0) < provider_concurrency_limit(name)), '')
+        if routes and not primary:
             deferred.append(task)
             continue
         if len(selected) >= cap:
             deferred.append(task)
             continue
+        if primary and primary != _task_primary_provider(task):
+            task = {**task, 'providers': [primary, *[name for name in task.get('providers', []) if name != primary]],
+                    'child_provider_primary': primary, 'capacity_reassigned': True}
         selected.append(task)
-        used_lanes.add(lane)
+        identities.add(identity)
         if primary:
-            used[primary] = used.get(primary, 0) + 1
+            group = image_provider_resource_group(primary)
+            used[group] = used.get(group, 0) + 1
     return selected, deferred
 
 
@@ -693,7 +719,8 @@ def _effective_generation_workers(
     provider_cap = 0
     from .api_registry import image_provider_resource_group
     groups = set()
-    for provider in {_task_primary_provider(task) for task in tasks} - {""}:
+    for provider in {name for task in tasks for name in
+                     [_task_primary_provider(task), *task.get('providers', []), *task.get('child_provider_reserve', [])]} - {""}:
         group = image_provider_resource_group(provider)
         if group in groups:
             continue
@@ -827,7 +854,7 @@ def _generation_execution_revision(providers: list[str]) -> str:
         # A task that was blocked under the old single-reference runtime must
         # be eligible for recovery after the current func dual-reference fix.
         "generation_reference_contract": "typed-reference-edit-base-v2",
-        "routing_contract": "role-model-pool-v1-bounded-fallback",
+        "routing_contract": "role-model-pool-v2-durable-group-dispatch",
         "execution_profiles": sorted(EXECUTION_PROFILES),
         "url_safety_policy": URL_SAFETY_POLICY_VERSION,
         "providers": [],

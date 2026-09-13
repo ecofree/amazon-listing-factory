@@ -152,12 +152,15 @@ def _evidence(role: str) -> dict:
             ],
         })
     from core.visual_semantics import OBSERVATION_POLICY, source_fact_records
+    from tests.current_image_contract_fixture import current_observed_measurement
     from core.status import input_revision_id
     base["visual_evidence"] = {
         **base["visual_evidence"], "status": "success", "policy_version": OBSERVATION_POLICY,
         "child_facts_revision_id": input_revision_id(source_fact_records(_child())),
         "variant_identity": {"status": "unknown", "observed_color": "", "conflicts": [], "reason": "Fixture cropped view"},
         "physical_views": [current_physical_view()],
+        "measurements": [current_observed_measurement('24 in', axis='width', key='width'),
+                         {**current_observed_measurement('30 in', axis='height', key='height'), 'region': dict(left=.4, top=.25, right=.5, bottom=.3)}] if role == 'size' else [],
         "text_observations": [{"text": text, "kind": "marketing" if role == "func" else "measurement"} for text in base["trusted_text"]],
     }
     return base
@@ -208,7 +211,9 @@ def _fixture_observation(_job, _child, sources, **kwargs):
 
 def _fixture_reviews(claims, **kwargs):
     from core.visual_semantics import CLAIM_REVIEW_POLICY
-    records = [{"key": row["key"], "status": "supported", "reason": "fixture verified property"} for row in claims]
+    records = [{"key": row["key"], "status": "supported", "reason": "fixture verified property",
+                'findings': [{'kind': 'physical_structure', 'operation': op, 'status': 'supported',
+                              'reason': 'Fixture original/crop pixels retain the measured body'} for op in row.get('physical_operations', [])]} for row in claims]
     path = kwargs["trace_dir"] / "claim_review_response.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"reviews": records}), encoding="utf-8")
@@ -249,8 +254,8 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                     self.assertNotIn("mattress", prompt.casefold())
                 elif role in {"main", "scene"}:
                     self.assertIn("source-visible mattress", prompt)
-            self.assertIn("Non-product object palette:", styles["func"])
-            self.assertNotIn("Non-product object palette:", styles["size"])
+            self.assertIn("Non-product object edits:", styles["func"])
+            self.assertIn("Non-product object edits:", styles["size"])
             self.assertNotIn("Staging intent", styles["size"])
             for prefix in ("Typography:", "Graphic roles:"):
                 self.assertEqual(next(line for line in styles["func"].splitlines() if line.startswith(prefix)),
@@ -280,21 +285,17 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
         self.assertTrue(missing["scene"]["evidence_pending"])
         self.assertTrue(missing["func"]["evidence_pending"])
         self.assertTrue(missing["size"]["evidence_pending"])
-        content = _measurement_content({
-            "mode": "source_image",
-            "measurement_groups": [
-                {"render_text": '28"'},
-                {"render_text": '23.5"'},
-                {"render_text": "44 lbs"},
-            ],
-        })
-        self.assertIn("44 lbs", content)
-        self.assertIn("Render canonical display copy with readable spacing", content)
         from core.image_tasks import _measurement_authority
+        from core.final_source_intents import _observed_measurements, _measurement_rows
+        from core.visual_semantics import OBSERVATION_POLICY
+        from tests.current_image_contract_fixture import current_observed_measurement
+        located = _measurement_rows(_observed_measurements({'status': 'success', 'policy_version': OBSERVATION_POLICY,
+            'measurements': [current_observed_measurement('12 in', 'Underbed clearance', 'height')]}), {})
         mixed = _measurement_authority("func", {}, {"role": "func", "source_sha256": "a" * 64, "input_revision_id": "source",
-            "measurements": [{"text": "12 in", "source_label": "Underbed clearance", "canonical_pair": "length_mm:304.8"}]})
+            "measurements": located})
         self.assertEqual("source_image", mixed["mode"])
-        self.assertIn("Underbed clearance: 12 in", _measurement_content(mixed))
+        refs = [{'source_id': 'source_00', 'view_id': 'view_01', 'original_region': dict(left=.1, top=.2, right=.9, bottom=.8)}]
+        self.assertIn("Underbed clearance / height: 12 in", _measurement_content(mixed, refs))
         with patch("core.run_scope.read_run_scope", return_value={"selected_children": ["B1"], "selected_sources": {"B1": []}}):
             self.assertFalse(row_in_scope("unused", {"child": "B1", "index": 0}))
 
@@ -476,14 +477,14 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 references = task["generation_references"]
                 self.assertEqual(1, len(references))
                 self.assertEqual("edit_base", references[0].get("kind"))
-                self.assertEqual([.1, .2, .9, .8], references[0]['original_region'])
+                self.assertEqual(dict(left=.1, top=.2, right=.9, bottom=.8), references[0]['original_region'])
                 self.assertEqual(task["edit_base_sha256"], file_sha256(job / references[0]["path"]))
                 self.assertEqual(task["source_sha256"], file_sha256(job / task["source_path"]))
                 self.assertNotEqual(task["source_sha256"], task["edit_base_sha256"])
                 self.assertEqual([{"name": "White", "source": references[0]["source_id"]}], task["product_boundary"]["observed_product_colors"])
             func_source = next(row for row in intents if row["role"] == "func")
             func_brief = next(row for row in kit["source_briefs"] if row["role"] == "func")
-            selection = {"source_id": "source_00", "purpose": "Verify the complete cabinet structure", "evidence_ids": []}
+            selection = {"source_id": "source_00", "view_id": "view_01", "purpose": "Verify the complete cabinet structure", "evidence_ids": []}
             typed_refs = _generation_references_for_task(
                 func_source, {**func_brief, "supporting_sources": [selection]}, kit, job=job, child=kit["child"],
             )
@@ -527,7 +528,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertNotIn("Rebuild all non-sold props, background, graphic layout", func_prompt)
             self.assertIn("Remove source people and reflected people", func_prompt)
             self.assertNotIn("Edit the role source in place", func_prompt)
-            self.assertIn("Non-product object palette:", func_prompt)
+            self.assertIn("Non-product object edits:", func_prompt)
             self.assertIn("Named object and graphic assignments are shared across this child's images", func_prompt)
             self.assertNotIn("when it improves hierarchy", func_prompt)
             self.assertIn("readable spacing", func_prompt)
@@ -543,11 +544,11 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertIn("uniform pure-white canvas", main_prompt)
             self.assertIn("Market context:", main_prompt)
             self.assertNotIn("Use the room tokens", main_prompt)
-            self.assertNotIn("Non-product object palette:", main_prompt)
+            self.assertNotIn("Non-product object edits:", main_prompt)
 
     def test_environment_text_does_not_promote_a_scene_to_func(self) -> None:
         from core.visual_semantics import _validate_observations, OBSERVATION_POLICY
-        observed = {"source_id": "source_00", "role_guess": "scene", "view_coverage": "complete", "has_dimension_lines": False,
+        observed = {"measurements": [], "source_id": "source_00", "role_guess": "scene", "view_coverage": "complete", "has_dimension_lines": False,
                     "physical_views": [current_physical_view(object_id='cloth')],
                     "has_callouts_or_panels": False, "confidence": .9, "visible_numbers_or_units": [], "evidence": [],
                     "objects": [{"object_id": "cloth", "kind": "cloth", "sale_membership": "unknown",
@@ -624,9 +625,10 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             recovered = classified[1]
             self.assertEqual("review_required", recovered["role"])
             self.assertEqual([], recovered["claims"])
-            self.assertIn("source_identity_unverified", recovered["classification_reason"])
+            self.assertIn("source_observation_unresolved", recovered["classification_reason"])
             source["visual_evidence"] = {
                 "status": "success",
+                "measurements": [],
                 "policy_version": OBSERVATION_POLICY,
                 "child_facts_revision_id": _evidence("scene")["visual_evidence"]["child_facts_revision_id"],
                 "variant_identity": observed["variant_identity"],
@@ -656,34 +658,23 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertEqual([], recovered["claims"])
 
     def test_measurements_merge_equivalent_units_and_reject_zero_weight(self) -> None:
-        from core.final_source_intents import _independent_measurements, _measurement_rows
+        from core.final_source_intents import _observed_measurements, _measurement_rows
         from core.image_tasks import _measurement_authority
-        from core.text_evidence import extract_measurements
-        observed = []
-        for line_index, line in enumerate(["Overall Width 36 in", "Drawer Width 36 in", "24 W x 24 D x 30 H in"]):
-            observed.extend({**row, "source_label": line, "source_occurrence": f"{line_index}:{index}"}
-                            for index, row in enumerate(extract_measurements(line)))
-        self.assertEqual(5, len(_independent_measurements(observed)))
+        from core.visual_semantics import OBSERVATION_POLICY
+        from tests.current_image_contract_fixture import current_observed_measurement
+        located = [current_observed_measurement(text, obj, axis, key=str(i), kind=kind) for i, (text, obj, axis, kind) in enumerate([
+            ('3 ft', 'Overall', 'height', 'dimension'), ('36 in', 'Drawer', 'height', 'dimension'),
+            ('440 lbs', 'Bed', 'capacity', 'capacity')])]
+        visual = {'status': 'success', 'policy_version': OBSERVATION_POLICY, 'measurements': located}
+        observed = _observed_measurements(visual)
         source = {"role": "size", "measurements": _measurement_rows(observed, {})}
         authority = _measurement_authority("size", {}, source)
-        self.assertEqual(["w", "d", "h"], [r["axis"] for r in authority["measurement_groups"][-3:]])
-        content = _measurement_content(authority)
-        self.assertIn("Overall Width 36 in", content)
-        self.assertIn("Drawer Width 36 in", content)
-        self.assertEqual(1, content.count("24 W x 24 D x 30 H in"))
-        content = _measurement_content({
-            "mode": "source_image",
-            "measurement_groups": [{"measured_part": "Overall Height", "render_text": "3 ft"},
-                                   {"measured_part": "Drawer Height", "render_text": "36 in"}],
-            "source_visible_callouts": ["Weight Capacity: 440 lbs"],
-            "source_visible_text_artifacts": [
-                {"kind": "measurement", "display_text": "Overall Height: 36 in"},
-                {"kind": "callout", "display_text": "Weight Capacity: 440 lbs"},
-                {"kind": "measurement", "text": "440"},
-            ],
-        })
-        self.assertEqual(1, content.count("Overall Height"))
-        self.assertEqual(1, content.count("Drawer Height"))
+        self.assertEqual(['height', 'height', 'capacity'], [r['axis'] for r in authority['measurement_groups']])
+        content = _measurement_content(authority, [{'source_id': 'source_00', 'view_id': 'view_01',
+            'original_region': dict(left=.1, top=.2, right=.9, bottom=.8)}])
+        self.assertEqual(1, content.count('Overall / height'))
+        self.assertEqual(1, content.count('Drawer / height'))
+        self.assertIn('"endpoints":null', content)
         self.assertEqual(1, content.count("440"))
         equivalent = {
             "normalized_facts": {

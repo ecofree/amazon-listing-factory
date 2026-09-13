@@ -96,6 +96,8 @@ def run_image_qa(
             task, candidate = futures[future]
             try:
                 rows.append(future.result())
+                write_qa_evidence(job, list({**existing, **{
+                    (row['child'], row['role'], row['candidate_sha256']): row for row in rows}}.values()))
             except Exception as exc:
                 evaluation_failures.append({
                     "task": {
@@ -107,8 +109,6 @@ def run_image_qa(
                     "error": f"{type(exc).__name__}: {exc}",
                 })
     rows.sort(key=lambda row: (row["child"], row["role"]))
-    kept = {**existing, **{(row["child"], row["role"], row["candidate_sha256"]): row for row in rows}}
-    write_qa_evidence(job, list(kept.values()))
     records = [
         {
             "logical_task_id": logical_task_id("qa", child=row["child"], role=row["role"]),
@@ -227,7 +227,7 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
     marketing = [row["text"] for row in texts if row["kind"] == "marketing" and row["confidence"] >= 0.9]
     has_diagram = (task.get("measurement_authority") or {}).get("mode") == "source_image"
     factual_copy = (task.get("measurement_authority") or {}) if has_diagram else {}
-    permitted = allowed + list(factual_copy.get("render_text") or []) + list(factual_copy.get("source_visible_callouts") or [])
+    permitted = allowed + list(factual_copy.get("render_text") or [])
     unexpected = _unsupported_contract_lines(marketing if has_diagram else authored, permitted)
     observed_phrases = authored + [" ".join(authored[start:stop])
                                   for start in range(len(authored))
