@@ -9,18 +9,18 @@ _TEXT_FIELDS = ("primary_setting", "buyer", "user")
 _LIST_FIELDS = ("required_cues", "allowed_alternates", "avoid")
 
 
-def _text(value: Any, limit: int = 220) -> str:
+def _text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
-    return " ".join(value.split())[:limit].strip()
+    return " ".join(value.split())
 
 
-def _items(value: Any, limit: int = 4, item_limit: int = 150) -> list[str]:
+def _items(value: Any, limit: int = 4) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
     result: list[str] = []
     for item in value:
-        cleaned = _text(item, item_limit)
+        cleaned = _text(item)
         if cleaned:
             result.append(cleaned)
         if len(result) >= limit:
@@ -72,10 +72,10 @@ def format_visual_context(
         value = context.get(field)
         if isinstance(value, list):
             value = ", ".join(value)
-        if value:
-            parts.append(f"{label}={value}")
-    text = "Program visual context: " + "; ".join(parts)
-    return text[:max_chars].rstrip(" ;")
+        part = f"{label}={value}"
+        if value and len("Category context: " + "; ".join([*parts, part])) <= max_chars:
+            parts.append(part)
+    return "Category context: " + "; ".join(parts) if parts else ""
 
 
 def planner_visual_context_instruction(
@@ -85,12 +85,9 @@ def planner_visual_context_instruction(
 ) -> str:
     """Give the planner usable context without duplicating the full policy."""
 
-    context = format_visual_context(policy, max_chars=max_chars - 190)
+    instruction = "Use child facts for age and buyer suitability; category defaults suggest context, not product claims. Design the US setting yourself."
+    heading = "CATEGORY CONTEXT (DESIGN GUIDANCE)\n"
+    context = format_visual_context(policy, max_chars=max_chars - len(instruction) - len(heading) - 1)
     if not context:
         return ""
-    return (
-        "CATEGORY AND AUDIENCE CONTEXT (FACT INPUT)\n"
-        f"{context}\n"
-        "Use this to understand the buyer and plausible setting. Choose the visual expression yourself, "
-        "keep it believable for the US market, and do not turn context into a product claim or copy."
-    )[:max_chars]
+    return heading + context + "\n" + instruction

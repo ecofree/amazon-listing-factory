@@ -5,8 +5,9 @@ import re
 from typing import Any
 
 from .final_source_intents import planning_source_intents, selected_task_source_intents
+from .design_reference_library import design_reference_semantics
 from .image_prompt_compiler import PROMPT_CONTRACT_VERSION
-from .image_reference_context import validate_reference_set, validate_supporting_sources, view_reference, physical_views
+from .image_reference_context import validate_reference_set, view_reference, evidence_view_catalog, view_identity
 from .image_task_inputs import (
     build_display_copy_contract,
     build_renderable_text_contract,
@@ -25,7 +26,7 @@ from .visual_design_kit import compact_product_claims, read_visual_design_kits, 
 
 
 IMAGE_TASK_SCHEMA_VERSION = "image-task-v10"
-IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v32-attachment-facts"
+IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v36-target-components"
 IMAGE_TASK_ARTIFACT = "image_tasks_v10.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
 _TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "product_boundary", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
@@ -188,11 +189,8 @@ def validate_image_task(row: Any) -> None:
             validate_reference_set(references, child=row["child"], edit_base_sha256=row["edit_base_sha256"])
         except ValueError as exc:
             raise ImageTaskError(str(exc)) from exc
-        if (references[0].get("original_sha256") != row["source_sha256"]
-                or references[0].get("original_path") != row["source_path"]):
-            raise ImageTaskError("Edit view provenance disagrees with its original role source")
         boundary = row["product_boundary"]
-        if set(boundary) != {"sold_product_parts", "replaceable_staging", "must_not_change", "product_color_material", "observed_product_colors", "forbidden_additions", "observed_objects"}:
+        if set(boundary) != {"sold_product_parts", "replaceable_staging", "must_not_change", "product_color_material", "observed_product_colors", "forbidden_additions"}:
             raise ImageTaskError("ImageTaskV10 product boundary is not canonical")
         expected = build_renderable_text_contract(row["role_family"], row["measurement_authority"], display_copy=row['display_copy_contract'])
         if row["renderable_text_contract"] != expected:
@@ -316,18 +314,15 @@ def _form_task(
             # indefinitely or invalidate ready roles in the same child/family.
             reason_code="source_evidence_missing" if spec.get("evidence_pending") else "",
         )
-    source_brief = _source_brief(
-        design_kit, source, family,
-        allow_missing=False,
-    )
-    if source_brief is None:
-        return _blocked(base, "visual design kit has no matching source brief")
+    source_brief = _source_brief(design_kit, source, family)
     if source_brief.get("status") != "ready":
         return _blocked(base, str(source_brief.get("error") or "source brief is pending"),
                         reason_code='source_observation_unresolved' if source_brief.get('failure_owner') == 'observation' else '')
     try:
-        measurement = _measurement_authority(family, child, source)
         image_direction = source_brief["image_direction"]
+        catalog = evidence_view_catalog(design_kit['source_references'])
+        selected = [catalog[view_identity(row)] for row in image_direction['evidence_usage'] if row['usage'] != 'verification']
+        measurement = _measurement_authority(family, source, selected)
         story = (
             build_display_copy_contract(
                 source,
@@ -343,10 +338,10 @@ def _form_task(
             image_policy,
             child,
             product_type=product_type,
-            observations=[source.get("visual_evidence") or {}],
+            observations=[source.get('visual_evidence') or {}],
         )
         references = _generation_references_for_task(
-            source, source_brief, design_kit, job=job, child=str(child["asin"]),
+            source_brief, design_kit, job=job, child=str(child["asin"]),
         )
         reference = references[0]
         fields = {
@@ -367,8 +362,7 @@ def _form_task(
             "renderable_text_contract": renderable,
             "image_direction": image_direction,
             "edit_contract": _edit_contract(
-                family, measurement, image_policy, source_brief or {},
-                product_type=product_type,
+                family, measurement, image_policy,
                 reference_completeness=str((source.get("signals") or {}).get("reference_completeness") or ""),
             ),
             "execution_profile": execution_profile(family, measurement),
@@ -383,22 +377,19 @@ def _form_task(
 
 
 def _generation_references_for_task(
-    source: dict[str, Any], brief: dict[str, Any], kit: dict[str, Any], *, job: Path, child: str,
+    brief: dict[str, Any], kit: dict[str, Any], *, job: Path, child: str,
 ) -> list[dict[str, Any]]:
-    manifest = kit["source_references"]
-    primary = _source_reference(kit, source)
-    views = physical_views(primary['observation']['physical_views'])
-    displayed = {row['view_id'] for row in brief['image_direction']['evidence_usage'] if row['usage'] == 'display'}
-    ordered = sorted(views, key=lambda view: view['view_id'] not in displayed)
-    refs = [view_reference(primary, view, job=job, child=child, kind='edit_base' if i == 0 else 'product_evidence')
-            for i, view in enumerate(ordered)]
-    selected = validate_supporting_sources(brief["supporting_sources"], manifest, primary["source_id"])
-    by_id = {row["source_id"]: row for row in manifest}
-    for selection in selected:
-        support = by_id[selection['source_id']]
-        refs.extend({**view_reference(support, view, job=job, child=child, kind='product_evidence'),
-                     'purpose': selection['purpose']} for view in physical_views(support['observation']['physical_views'])
-                    if view['view_id'] == selection['view_id'])
+    catalog = evidence_view_catalog(kit["source_references"])
+    ordered = sorted(brief['image_direction']['evidence_usage'], key=lambda row: row['usage'] != 'display')
+    if not ordered or ordered[0]['usage'] != 'display':
+        raise ImageTaskError('No displayed evidence selected')
+    refs = []
+    for i, selection in enumerate(ordered):
+        key = view_identity(selection)
+        if key not in catalog:
+            raise ImageTaskError('Selected view is not observed in this child: ' + key)
+        owner, view = catalog[key]
+        refs.append(view_reference(owner, view, job=job, child=child, kind='edit_base' if i == 0 else 'product_evidence'))
     available = {row["source_id"]: row for row in kit.get("approved_design_references", [])}
     for transfer in brief["image_direction"]["design_transfer"]:
         key = transfer["reference_id"]
@@ -409,8 +400,8 @@ def _generation_references_for_task(
 
 
 def _source_brief(
-    design_kit: dict[str, Any], source: dict[str, Any], family: str, *, allow_missing: bool,
-) -> dict[str, Any] | None:
+    design_kit: dict[str, Any], source: dict[str, Any], family: str,
+) -> dict[str, Any]:
     revision = str(source.get("input_revision_id") or "")
     sha = str(source.get("source_sha256") or "")
     matches = [
@@ -422,27 +413,7 @@ def _source_brief(
     ]
     if len(matches) == 1:
         return matches[0]
-    if allow_missing and not matches:
-        return None
     raise ImageTaskError("source brief is missing or duplicated")
-
-
-def _source_reference(
-    design_kit: dict[str, Any],
-    source: dict[str, Any],
-) -> dict[str, Any]:
-    revision = str(source.get("input_revision_id") or "")
-    sha = str(source.get("source_sha256") or "")
-    matches = [
-        row
-        for row in design_kit.get("source_references") or []
-        if isinstance(row, dict)
-        and str(row.get("input_revision_id") or "") == revision
-        and str(row.get("source_sha256") or "") == sha
-    ]
-    if len(matches) != 1:
-        raise ImageTaskError("visual design kit source reference is missing or duplicated")
-    return matches[0]
 
 
 def _shared_product_claims(
@@ -458,16 +429,18 @@ def _shared_product_claims(
     return list(unique.values()) or compact_product_claims(child)
 
 
-def _measurement_authority(family: str, child: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
-    del child
-    has_func_measurement = family == "func" and bool(source.get("measurements") or (source.get("visual_evidence") or {}).get("has_dimension_lines"))
+def _measurement_authority(family: str, source: dict[str, Any], selected: list[tuple[dict, dict]]) -> dict[str, Any]:
+    inputs = [(owner, row) for owner, view in selected for row in owner.get('measurements', []) if row['view_id'] == view['view_id']]
+    has_func_measurement = family == "func" and bool(inputs or (source.get("visual_evidence") or {}).get("has_dimension_lines"))
     if family != "size" and not has_func_measurement:
         return {"mode": "none", "render_text": [], "measurement_groups": []}
     if source.get("role") == "size" or has_func_measurement:
+        if source.get('measurements') and not inputs:
+            raise ImageTaskError('The selected views omit the required measured product; repair the size/function brief')
         measurements = [
             {
-                "id": row['source_occurrence'],
-                "source_id": f"source_{int(source.get('source_index') or 0):02d}",
+                "id": owner['source_id'] + ':' + row['source_occurrence'],
+                "source_id": owner['source_id'],
                 "source_text": str(row.get("text") or "").strip(),
                 "measured_part": row['source_label'],
                 "axis": row['axis_hint'],
@@ -478,13 +451,12 @@ def _measurement_authority(family: str, child: dict[str, Any], source: dict[str,
                 "confidence": str(row.get("confidence") or "source_visible"),
                 "measurement_role": 'load_capacity' if row['measurement_kind'] == 'capacity' else row['measurement_kind'],
             }
-            for index, row in enumerate(source.get("measurements") or [], 1)
+            for owner, row in inputs
             if isinstance(row, dict) and str(row.get("text") or "").strip()
         ]
         return {
             "mode": "source_image", "source_sha256": str(source.get("source_sha256") or ""),
             "source_intent_revision_id": str(source.get("input_revision_id") or ""),
-            "preserve_entire_diagram": True,
             "render_text": list(dict.fromkeys(row["render_text"] for row in measurements)),
             "measurement_groups": measurements,
             "ocr_role": "definite_error_warning_only",
@@ -495,10 +467,8 @@ def _measurement_authority(family: str, child: dict[str, Any], source: dict[str,
 
 def _edit_contract(
     family: str, measurement: dict[str, Any], policy: dict[str, Any],
-    brief: dict[str, Any], *, reference_completeness: str = "",
-    product_type: str = "",
+    *, reference_completeness: str = "",
 ) -> dict[str, Any]:
-    del brief
     create = {
         "main": "Create one square Amazon US main image.",
         "scene": "Create one square Amazon US lifestyle image.",
@@ -507,47 +477,38 @@ def _edit_contract(
     }[family]
     reference = "Each product view binds its own physical evidence; the first is only the transport edit base."
     preserve = [
-        "Preserve product geometry, proportions, finish, physical part count, attached parts, demonstrated state and the perspective within each view; retain occlusion and partial-view boundaries without reconstructing unseen surfaces",
+        "Sold-product geometry, proportions, finish, parts and sold quantity. Choose only structures and operating states supported by this child's evidence; never invent hidden joints or mechanisms",
     ]
     replace: list[str] = []
-    if measurement.get("mode") == "source_image":
-        preserve.extend([
-            "Every physical quantity, measured object and both endpoints on that object; use authorized US-unit labels. Repositioning the intact diagram preserves these associations, not absolute canvas coordinates",
-        ])
     if family == "func":
         preserve.append(
-            "Keep every source-supported feature, demonstrated moving-part state, required detail view, and factual relationship; preserve the evidence, not the source graphic framing"
+            "The image's necessary functional evidence and qualifiers, not the source's inset inventory"
         )
     staging = "; ".join(str(value) for value in policy.get("replaceable_staging") or []) or "non-sold room surfaces and loose props"
-    bed = product_type.casefold() == "bed_frame"
     if family == "main":
         if policy.get("main_image_policy") == "white_background":
-            replace.append("Remove non-sold environment, props, inset scenes and graphics; place the complete sold product on a uniform pure-white canvas")
+            replace.append("Replace external environment and source graphics with a uniform pure-white canvas; keep the complete sold product unmistakable")
         else:
             replace.append(
-                "Restyle only non-product room surfaces and staging: " + staging
+                "Redesign non-sold surroundings and staging: " + staging
             )
     elif family == "scene":
         replace.append(
-            "Restyle only non-product room surfaces and staging: " + staging
+            "Redesign non-sold surroundings and staging: " + staging
         )
     elif family == "func":
         replace.append(
-            "Design a new canvas hierarchy around intact source product/detail views: reposition and scale them without changing their internal perspective or visible extent. Replace source panel shapes, title bands, badges and drawn highlights using the child design; source graphics are not a layout template"
-        )
-        replace.append(
-            "Remove source people and reflected people as non-product staging; preserve all sold product surfaces and parts"
+            "Edit the referenced product into the target feature composition; redesign source panels, titles, icons and highlights using the child design"
         )
     elif family == "size":
         replace.append(
-            "Redesign the graphic canvas, typography and measurement styling with the child system; move or scale the intact diagram as a unit, keeping each endpoint attached to the same physical point"
+            "Redesign the measurement composition, labels, lines and typography; retain the correct measured objects, quantities and physical endpoint associations"
         )
-    if bed and family in {"main", "scene"} and policy.get("main_image_policy") != "white_background":
-        preserve.append("Retain the complete source-visible mattress and bed-in-use state while restyling bedding")
+    replace.append("Use the planned target components, not the source prop inventory; remove people and reflected people")
     allowed_props = [str(value) for value in policy.get("allowed_internal_props") or [] if str(value).strip()]
     if allowed_props and family != "size":
         replace.append(
-            "Only where that surface or compartment is already visible/open in the editable reference, "
+            "Where the selected child evidence supports the shown compartment, "
             "non-sold staging may use: " + "; ".join(allowed_props)
         )
     role_rules = [
@@ -562,7 +523,7 @@ def _edit_contract(
         "replace": list(dict.fromkeys(str(value).strip() for value in replace if str(value).strip())),
         "forbid": list(dict.fromkeys(str(value).strip() for value in forbid if str(value).strip())),
         "reference_completeness": (
-            "complete_measurement_diagram"
+            "located_measurement_views"
             if family == "size" and measurement.get("mode") == "source_image"
             else reference_completeness or "partial_feature_view"
         ),
@@ -608,6 +569,9 @@ def _task_fingerprint(row: dict[str, Any]) -> str:
         for key in sorted(_TASK_SEMANTIC_FIELDS)
         if key in row
     }
+    if 'generation_references' in projection:
+        projection['generation_references'] = [design_reference_semantics(ref) if ref['kind'] == 'design_reference' else ref
+                                               for ref in row['generation_references']]
     return input_revision_id(projection)
 
 

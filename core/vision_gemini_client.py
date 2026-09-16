@@ -52,6 +52,8 @@ def gemini_stream_generate(
     preferred_client_name: str = "",
     max_physical_requests: int = 0,
     deadline_monotonic: float | None = None,
+    max_output_tokens: int | None = None,
+    prior_output_limits: list[dict[str, Any]] | None = None,
 ) -> str:
     effective_scope = gemini_client_effective_scope(client_scope)
     max_models = 0
@@ -72,27 +74,40 @@ def gemini_stream_generate(
     external_attempt_observer = attempt_observer
 
     def capture_attempt(event: dict[str, Any]) -> None:
-        attempt_history.append(_attempt_event_summary(event))
+        if event.get('event') != 'request_budget':
+            event['physical_request_count'] = physical_request_count
+            attempt_history.append(_attempt_event_summary(event))
         if external_attempt_observer is not None:
             external_attempt_observer(event)
 
     attempt_observer = capture_attempt
-    clients = gemini_clients(client_scope=client_scope)
+    clients = [{**client, '_output_token_cap': _client_token_limit(client) if client.get('max_output_tokens') else 32768}
+               for client in gemini_clients(client_scope=client_scope)]
+    if max_output_tokens is not None:
+        clients = [{**client, 'max_output_tokens': min(client['_output_token_cap'], max(256, int(max_output_tokens)))} for client in clients]
     if preferred_client_name:
         selected = [
             client for client in clients
             if str(client.get("name") or client.get("provider") or "").strip() == preferred_client_name
         ]
         clients = selected
+    limited = [client for client in clients if any(
+        row.get('provider') == str(client.get('name') or client.get('provider') or client.get('base_url') or '')
+        and row.get('model') == client.get('model')
+        and _client_token_limit(client) <= int(row.get('max_output_tokens') or 0)
+        for row in prior_output_limits or [])]
+    clients = [client for client in clients if client not in limited]
     if not clients:
         raise VisionRequestError(
             effective_scope,
-            "configuration_failure",
+            "output_limit" if limited else "configuration_failure",
             (
+                "No configured provider has unused output capacity for this unchanged observation."
+                if limited else
                 f"Missing vision model endpoint config for {preferred_client_name!r}."
                 if preferred_client_name else
                 "Missing vision model endpoint config. Add the required scope provider to configs/api_registry.json."
-            ),
+            ), metadata={'physical_request_count': 0, 'attempts': [], 'output_limits': []},
         )
     last_exc: Exception | None = None
     last_status = ""
@@ -105,6 +120,11 @@ def gemini_stream_generate(
     transient_failure_domains: set[str] = set()
     recorded_transport_results: set[tuple[str, str]] = set()
     physical_request_count = 0
+
+    def report_request_budget() -> None:
+        attempt_observer({'event': 'request_budget', 'request_id': request_id,
+                          'physical_request_count': physical_request_count})
+
     def client_key(client: dict[str, Any]) -> str:
         return json.dumps(
             model_client_physical_identity(client),
@@ -132,6 +152,7 @@ def gemini_stream_generate(
         if not admit_provider_probe(key):
             return False
         physical_request_count += 1
+        report_request_budget()
         return True
 
     def record_transport_failure(client: dict[str, Any], exc: Exception) -> tuple[str, str, bool]:
@@ -142,6 +163,7 @@ def gemini_stream_generate(
             # No network request was sent.  A busy local concurrency slot must
             # not consume the visual-planning request budget.
             physical_request_count = max(0, physical_request_count - 1)
+            report_request_budget()
             release_unused_provider_probe(key)
             return "queue_unavailable", detail, False
         status = "transport_failure" if isinstance(exc, HTTPException) else model_status_from_exception(exc, detail)
@@ -202,6 +224,7 @@ def gemini_stream_generate(
             ordered_clients, max_models,
         ) if effective_scope == "visual_planning" else ordered_clients[:max_models]
     for client in ordered_clients:
+        client['_request_prompt'] = prompt
         last_provider = client_key(client)
         last_model = str(client.get("model") or "").strip()
         if provider_run_circuit_open(last_provider, task_id=request_id):
@@ -239,24 +262,25 @@ def gemini_stream_generate(
                             text, selected_index, candidate_records, validation_error = _select_response_candidate(
                                 response_candidates,
                                 response_validator,
+                                response_body=body,
                             )
                             if not validation_error:
                                 _record_vision_model_event(client, client_scope, candidate_model, protocol, "success")
                                 _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index, response_body=body)
                                 return text
                             last_exc = VisionQAError(validation_error)
-                            last_status = "validation_failure"
-                            _record_vision_model_event(client, client_scope, candidate_model, protocol, "validation_failure")
+                            last_status = _response_failure_kind(body, validation_error)
+                            _record_vision_model_event(client, client_scope, candidate_model, protocol, last_status)
                             _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error, response_body=body)
                             action = validation_failure_action(
                                 client,
                                 candidate_model,
-                                can_repair=attempt < max(1, attempts),
+                                can_repair=attempt < max(1, attempts) and (last_status != 'output_limit' or _client_token_limit(client) < client['_output_token_cap']),
                             )
                             if action == "repair":
                                 openai_payload = partial(_openai_responses_payload,
                                     candidate_model,
-                                    _validation_repair_prompt(prompt, validation_error, text),
+                                    _response_retry_prompt(client, prompt, validation_error, text, last_status),
                                     _validation_repair_image_paths(effective_scope, image_paths),
                                     client,
                                 )
@@ -274,7 +298,8 @@ def gemini_stream_generate(
                                 status,
                                 error=error_text,
                             )
-                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text)
+                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text,
+                                          response_body=exc.partial.decode('utf-8', errors='replace') if isinstance(exc, IncompleteRead) else '')
                             if terminal or attempt >= max(1, attempts):
                                 break
                             if effective_scope == "visual_planning":
@@ -301,24 +326,25 @@ def gemini_stream_generate(
                             text, selected_index, candidate_records, validation_error = _select_response_candidate(
                                 response_candidates,
                                 response_validator,
+                                response_body=body,
                             )
                             if not validation_error:
                                 _record_vision_model_event(client, client_scope, candidate_model, protocol, "success")
                                 _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index, response_body=body)
                                 return text
                             last_exc = VisionQAError(validation_error)
-                            last_status = "validation_failure"
-                            _record_vision_model_event(client, client_scope, candidate_model, protocol, "validation_failure")
+                            last_status = _response_failure_kind(body, validation_error)
+                            _record_vision_model_event(client, client_scope, candidate_model, protocol, last_status)
                             _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error, response_body=body)
                             action = validation_failure_action(
                                 client,
                                 candidate_model,
-                                can_repair=attempt < max(1, attempts),
+                                can_repair=attempt < max(1, attempts) and (last_status != 'output_limit' or _client_token_limit(client) < client['_output_token_cap']),
                             )
                             if action == "repair":
                                 openai_payload = partial(_openai_chat_payload,
                                     candidate_model,
-                                    _validation_repair_prompt(prompt, validation_error, text),
+                                    _response_retry_prompt(client, prompt, validation_error, text, last_status),
                                     _validation_repair_image_paths(effective_scope, image_paths),
                                     client,
                                 )
@@ -336,7 +362,8 @@ def gemini_stream_generate(
                                 status,
                                 error=error_text,
                             )
-                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text)
+                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text,
+                                          response_body=exc.partial.decode('utf-8', errors='replace') if isinstance(exc, IncompleteRead) else '')
                             if terminal or attempt >= max(1, attempts):
                                 break
                             if effective_scope == "visual_planning":
@@ -367,23 +394,24 @@ def gemini_stream_generate(
                             text, selected_index, candidate_records, validation_error = _select_response_candidate(
                                 response_candidates,
                                 response_validator,
+                                response_body=body,
                             )
                             if not validation_error:
                                 _record_vision_model_event(client, client_scope, candidate_model, protocol, "success")
                                 _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status="success", started=started, response_text=text, response_candidates=candidate_records, selected_candidate_index=selected_index, response_body=body)
                                 return text
                             last_exc = VisionQAError(validation_error)
-                            last_status = "validation_failure"
-                            _record_vision_model_event(client, client_scope, candidate_model, protocol, "validation_failure")
+                            last_status = _response_failure_kind(body, validation_error)
+                            _record_vision_model_event(client, client_scope, candidate_model, protocol, last_status)
                             _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=last_status, started=started, response_text=text, response_candidates=candidate_records, error=validation_error, response_body=body)
                             action = validation_failure_action(
                                 client,
                                 candidate_model,
-                                can_repair=attempt < max(1, attempts),
+                                can_repair=attempt < max(1, attempts) and (last_status != 'output_limit' or _client_token_limit(client) < client['_output_token_cap']),
                             )
                             if action == "repair":
                                 payload = partial(_native_image_payload,
-                                    _validation_repair_prompt(prompt, validation_error, text),
+                                    _response_retry_prompt(client, prompt, validation_error, text, last_status),
                                     _validation_repair_image_paths(effective_scope, image_paths),
                                     client,
                                 )
@@ -401,7 +429,8 @@ def gemini_stream_generate(
                                 status,
                                 error=error_text,
                             )
-                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text)
+                            _emit_attempt(attempt_observer, request_id=request_id, client=client, model=candidate_model, protocol=protocol, attempt=attempt, status=status, started=started, error=error_text,
+                                          response_body=exc.partial.decode('utf-8', errors='replace') if isinstance(exc, IncompleteRead) else '')
                             if terminal or attempt >= max(1, attempts):
                                 break
                             if effective_scope == "visual_planning":
@@ -432,6 +461,8 @@ def gemini_stream_generate(
                 int(item.get("response_candidate_count") or 0) for item in attempt_history
             ),
             "attempts": attempt_history,
+            "output_limits": [{key: row.get(key) for key in ('provider', 'model', 'max_output_tokens', 'output_token_cap')}
+                              for row in attempt_history if row.get('status') == 'output_limit'],
         },
     )
 
@@ -523,17 +554,21 @@ def _response_validation_error(text: str, validator: Any) -> str:
     try:
         return "" if bool(validator(text)) else "model response failed the current stage contract"
     except Exception as exc:
-        return f"model response validation failed: {type(exc).__name__}: {exc}"
+        cause = exc.__cause__ if isinstance(exc.__cause__, json.JSONDecodeError) else exc
+        return f"model response validation failed: {type(cause).__name__}: {exc}"
 
 
 def _select_response_candidate(
     candidates: list[str],
     validator: Any,
+    *, response_body: str = '',
 ) -> tuple[str, int | None, list[dict[str, Any]], str]:
     records: list[dict[str, Any]] = []
     selected_index: int | None = None
+    envelope_error = _response_json_error(response_body)
     for index, candidate in enumerate(candidates):
-        error = _response_validation_error(candidate, validator)
+        error = ('Model output limit reached: ' + ', '.join(_response_finish_reasons(response_body))
+                 if _response_failure_kind(response_body, '') == 'output_limit' else envelope_error or _response_validation_error(candidate, validator))
         selected = not error and selected_index is None
         if selected:
             selected_index = index
@@ -549,7 +584,7 @@ def _select_response_candidate(
     if selected_index is not None:
         return candidates[selected_index], selected_index, records, ""
     if not candidates:
-        return "", None, records, "empty model response"
+        return "", None, records, envelope_error or "empty model response"
     candidate_errors = [str(item.get("validation_error") or "") for item in records]
     return (
         candidates[-1],
@@ -558,6 +593,36 @@ def _select_response_candidate(
         f"all {len(candidates)} model response candidate(s) failed the current stage contract: "
         + " | ".join(candidate_errors),
     )
+
+
+def _response_failure_kind(body: str, error: str) -> str:
+    if {reason.lower() for reason in _response_finish_reasons(body)} & {'max_tokens', 'length', 'max_output_tokens'}:
+        return 'output_limit'
+    return 'json_syntax' if 'JSONDecodeError' in error else 'validation_failure'
+
+
+def _response_json_error(body: str) -> str:
+    if not body.strip():
+        return ''
+    chunks = [line.strip()[5:].strip() for line in body.splitlines() if line.strip().startswith('data:')]
+    for index, chunk in enumerate(chunks or [body]):
+        if chunk in ('', '[DONE]'):
+            continue
+        try:
+            json.loads(chunk)
+        except json.JSONDecodeError as exc:
+            return f'Response envelope JSONDecodeError in chunk {index}: {exc}'
+    return ''
+
+
+def _response_retry_prompt(client: dict[str, Any], prompt: str, error: str, text: str, kind: str) -> str:
+    if kind == 'output_limit':
+        client['max_output_tokens'] = min(client.get('_output_token_cap', 32768), _client_token_limit(client) * 2)
+        revised = prompt
+    else:
+        revised = _validation_repair_prompt(prompt, error, text)
+    client['_request_prompt'] = revised
+    return revised
 
 
 def _emit_attempt(
@@ -578,6 +643,7 @@ def _emit_attempt(
 ) -> dict[str, Any]:
     event = {
         "request_id": request_id,
+        "request_text": client.get('_request_prompt', ''),
         "provider": str(client.get("name") or client.get("provider") or client.get("base_url") or ""),
         "model": model,
         "protocol": protocol,
@@ -587,7 +653,12 @@ def _emit_attempt(
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         "response_text": response_text or None,
         "response_char_count": len(response_text or ""),
+        "response_body_sha256": hashlib.sha256(response_body.encode('utf-8')).hexdigest() if response_body else None,
+        "response_body": response_body or None,
         "finish_reasons": _response_finish_reasons(response_body),
+        "usage": _response_usage(response_body),
+        "max_output_tokens": _client_token_limit(client),
+        "output_token_cap": client.get('_output_token_cap'),
         "response_candidates": list(response_candidates or []),
         "selected_candidate_index": selected_candidate_index,
         "error": error or None,
@@ -627,6 +698,22 @@ def _response_finish_reasons(body: str) -> list[str]:
     return sorted(reasons)
 
 
+def _response_usage(body: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    chunks = [line[5:].strip() for line in body.splitlines() if line.startswith('data:')]
+    for chunk in chunks or [body]:
+        try:
+            value = json.loads(chunk)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, dict):
+            response = value.get('response', value)
+            usage = (response.get('usageMetadata') or response.get('usage') or {}) if isinstance(response, dict) else {}
+            if isinstance(usage, dict):
+                result.update({key: value for key, value in usage.items() if isinstance(value, (int, float))})
+    return result
+
+
 def _attempt_event_summary(event: dict[str, Any]) -> dict[str, Any]:
     candidates = event.get("response_candidates")
     return {
@@ -639,6 +726,10 @@ def _attempt_event_summary(event: dict[str, Any]) -> dict[str, Any]:
         "response_candidate_count": len(candidates) if isinstance(candidates, list) else 0,
         "selected_candidate_index": event.get("selected_candidate_index"),
         "error": str(event.get("error") or ""),
+        "finish_reasons": event.get('finish_reasons', []),
+        "usage": event.get('usage', {}),
+        "max_output_tokens": event.get('max_output_tokens'),
+        "output_token_cap": event.get('output_token_cap'),
     }
 
 

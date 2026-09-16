@@ -126,33 +126,29 @@ image_generation:
     - mattress, bedding, pillows, rugs, wall decor, toys, and loose room props not sold with the frame
   forbidden_additions: []
   visual_context:
-    primary_setting: modern US children's bedroom
-    buyer: parents and caregivers
-    user: child using a transition or Montessori bed
+    primary_setting: contemporary US bedroom suited to the actual bed type
+    buyer: household furnishing the evidenced product type and bed size
+    user: infer intended occupant from child product facts, not the category alone
     required_cues:
-      - child-scale reading, storage, or play element
-      - restrained wooden toys or picture books
-      - soft washable textiles and open circulation around the low bed
+      - believable room scale, accessible storage and circulation
+      - child-scale reading or play cues when the product is a children's bed
     allowed_alternates:
-      - shared sibling bedroom
-      - quiet child reading and sleep corner
+      - guest room or shared bedroom when compatible with product facts
     avoid:
-      - adult primary-bedroom or hotel-bedroom styling
-      - generic neutral room with no child-scale cues
-      - nursery-only baby props, cartoon clutter, or toy-store color blocking
+      - unsupported nursery, Montessori or age-suitability assumptions
   role_visual_direction:
     main:
-      - Keep a product-first lifestyle main image in a bright contemporary US children's bedroom; never convert it to a white-background catalog image.
+      - Keep a product-first lifestyle main image in a bright contemporary US bedroom suited to the actual audience; never convert it to a white-background catalog image.
     scene:
-      - Create a different lifestyle moment through child-focused activities and loose staging, retaining the scene reference's product perspective.
+      - Design a distinct believable room composition and lifestyle moment for the evidenced audience.
     func:
       - Use a photo-led editorial feature composition with the bed frame as the hero and the title in genuine open image space; use sparse annotations, not stacked cards or dashboard grids.
-      - Keep the source-visible bed-frame feature and framing unchanged; redesign only non-product staging and presentation text around it.
+      - Retain the evidenced bed-frame feature and its physical construction within the newly planned presentation.
   role_specific_rules:
     main:
       - Keep the complete bed frame clearly recognizable in a restrained lifestyle room
     scene:
-      - Show room scale and intended audience through child-scale staging within the scene reference's product perspective
+      - Show room scale and intended audience through suitable staging and a supported product viewpoint
     size:
       - Preserve confirmed frame dimensions and dimension endpoints
     func:

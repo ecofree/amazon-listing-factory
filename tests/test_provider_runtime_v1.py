@@ -214,7 +214,9 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             for i, provider in enumerate(("a", "b", "c"), start=1)
         ]
         with (
-            patch("core.image_generation._system_memory_bytes", return_value=(32 * 1024**3, 12 * 1024**3)),
+            tempfile.TemporaryDirectory() as memory_root,
+            patch("core.image_resources._LEDGER", Path(memory_root) / 'memory.json'),
+            patch("core.image_resources._system_memory_bytes", return_value=(32 * 1024**3, 14 * 1024**3)),
             patch("core.image_generation._cpu_worker_cap", return_value=8),
             patch("core.image_generation._policy_parallel_cap", return_value=4),
             patch("core.image_generation.provider_concurrency_limit", return_value=1),
@@ -756,6 +758,20 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
 
     def test_batch_requeues_capacity_without_failing_logical_task(self) -> None:
         task = {"logical_task_id": "generate:B1:scene", "child": "B1", "role": "scene", "providers": ["p"]}
+        saved = {**task, 'raw_response_path': 'paid-receipt.json', 'provider': 'p'}
+        with patch('core.image_generation.generate_one', return_value=saved) as remote, patch(
+                'core.image_generation.finalize_candidate', side_effect=[ProviderQueueUnavailable('host_image_memory', 'busy'), saved]) as local:
+            completed, failures = _execute([task], plugin=_Plugin(), workers=1)
+        self.assertEqual([], failures)
+        self.assertEqual([saved], completed)
+        self.assertEqual(1, remote.call_count)
+        self.assertEqual(2, local.call_count)
+        with patch('core.image_generation.generate_one', return_value=saved) as remote, patch(
+                'core.image_generation.finalize_candidate', side_effect=ProviderQueueUnavailable('host_image_memory', 'busy')), patch(
+                'core.image_generation._capacity_stall_budget_seconds', return_value=0):
+            completed, failures = _execute([task], plugin=_Plugin(), workers=1)
+        self.assertEqual('generation_local_capacity', failures[0]['failure_owner'])
+        self.assertEqual(1, remote.call_count)
         with patch("core.image_generation.generate_one", side_effect=[
             ProviderQueueUnavailable("p", "busy"), ProviderQueueUnavailable("p", "busy"),
             ProviderQueueUnavailable("p", "busy"), {**task, "provider": "p"},

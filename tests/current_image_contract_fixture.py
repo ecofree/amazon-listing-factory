@@ -18,6 +18,21 @@ from core.image_tasks import (
 )
 
 
+def supported_design_reviews(raw, sources, design_references=None):
+    from core.visual_design_kit_compiler import design_binding_request
+    by_id = {row['source_id']: row for row in sources}
+    requests = [design_binding_request(brief, raw['family_art_direction'], source=by_id[brief['source_id']],
+                source_manifest=sources, design_references=design_references) for brief in raw['source_briefs']]
+    return supported_review_results(requests)
+
+
+def supported_review_results(requests, **kwargs):
+    from core.visual_semantics import CLAIM_REVIEW_POLICY
+    return {row['key']: {'key': row['key'], 'policy': CLAIM_REVIEW_POLICY, 'response_sha256': 'a'*64,
+            'status': 'supported', 'findings': [{'operation': op, 'status': 'supported', 'reason': 'Simulated verdict for contract testing only'}
+                                               for op in row.get('physical_operations', [])]} for row in requests}
+
+
 def current_physical_view(view_id: str = 'view_01', region: list[float] | None = None, *, feature: str = 'frame_support', object_id: str = 'frame') -> dict[str, Any]:
     box = dict(zip(('left', 'top', 'right', 'bottom'), region or [0.1, 0.2, 0.9, 0.8]))
     return {'view_id': view_id, 'region': box, 'extent': 'whole_view',
@@ -27,11 +42,11 @@ def current_physical_view(view_id: str = 'view_01', region: list[float] | None =
 def current_art_direction() -> dict[str, Any]:
     return {
         "audience_and_market": "US homeowners seeking calm, practical bathroom storage with a residential rather than commercial impression.",
-        "palette_direction": {"wall": "#F4F2EE matte mineral paint", "floor": "#B9A88D oak", "towels": "#8A999E cotton"},
+        "palette_direction": {"room": {"wall": "#F4F2EE matte mineral paint, solid", "floor": "#B9A88D oak, natural grain"}, "bath": {"towels": "#8A999E cotton, solid"}},
         "photography_direction": "Broad natural side light, soft contact shadows, truthful painted-wood response, and realistic residential depth.",
         "environment_and_staging": "Restrained US bathroom styling with newly selected towels and ceramic containers; do not copy source props.",
         "typography_direction": {"font_family": "Inter", "title_style": "Semibold sentence case", "body_style": "Regular with readable spacing", "numeric_style": "Tabular figures with unit spacing"},
-        "graphic_direction": {"text_color": "#303634", "line_color": "#637470", "icon_color": "#303634", "backing_color": "#F4F2EE", "backed_symbol_color": "#303634", "component_style": "Thin lines, sparse icons, local backing only where needed; no numeric icon duplication"},
+        "graphic_direction": {"text_color": "#303634", "line_color": "#637470", "icon_color": "#303634", "backing_color": "#F4F2EE", "backed_symbol_color": "#303634", "component_style": "Thin leaders and sparse outline icons; no numeric icon duplication"},
         "cohesion_rule": "Repeat the same light behavior, typographic hierarchy, restrained line character, and negative-space rhythm across the family.",
         "negative_visuals": [
             "No dark solid advertising field behind the light cabinet.",
@@ -46,13 +61,13 @@ def current_observed_measurement(text='17 in', object_name='Cabinet', axis='widt
             'endpoints': [{'x': .2, 'y': .4}, {'x': .7, 'y': .4}] if kind == 'dimension' else None}
 
 
-def current_image_direction(*, environment: str = "designed_environment") -> dict[str, Any]:
+def current_image_direction(*, environment: str = "designed_environment", source_id: str = 'source_00') -> dict[str, Any]:
     return {"visual_goal": "Explain the visible physical feature at a glance",
             "creative_brief": "Lead with the intact product view and a restrained asymmetric copy hierarchy; reuse the child graphic roles",
-            "evidence_usage": [{"view_id": "view_01", "usage": "display", "covered_by": []}],
+            "evidence_usage": [{"source_id": source_id, "view_id": "view_01", "usage": "display", "covered_by": []}],
             "design_transfer": [],
-            "layout": [{"view_id": "view_01", "target_region": [0.1, 0.1, 0.9, 0.9]}],
-            "text_placement": [], "scene_objects": {f'new:{key}': key for key in ('wall', 'floor', 'towels')} if environment == 'designed_environment' else {}, "environment_mode": environment}
+            "layout": [{"source_id": source_id, "view_id": "view_01", "target_region": [0.1, 0.1, 0.9, 0.9]}],
+            "text_placement": [], "scene_objects": ['room.wall', 'room.floor', 'bath.towels'] if environment == 'designed_environment' else [], "environment_mode": environment}
 
 
 def current_image_task(
@@ -104,7 +119,6 @@ def current_image_task(
                 "mode": "source_image",
                 "source_sha256": source_sha256,
                 "source_intent_revision_id": "source-intent-revision",
-                "preserve_entire_diagram": True,
                 "render_text": [],
                 "measurement_groups": [],
                 "ocr_role": "definite_error_warning_only",
@@ -141,7 +155,6 @@ def current_image_task(
                 "sold_unit_count": 1,
             },
             "product_boundary": {
-                "observed_objects": [],
                 "sold_product_parts": [
                     "the complete bathroom cabinet visible in the editable reference",
                     "all source-visible structural parts and attached hardware",
@@ -149,7 +162,7 @@ def current_image_task(
                 "replaceable_staging": ["loose toiletries, towels, flowers, and wall decor"],
                 "must_not_change": [
                     "product type, source-visible structure, proportions, quantity, color, finish, and attached parts",
-                    "source-visible open or closed product state",
+                    "evidence-supported product parts and operating mechanisms",
                 ],
                 "product_color_material": "color: soft white; painted engineered wood",
                 "observed_product_colors": [
@@ -168,7 +181,7 @@ def current_image_task(
                 "strings": strings,
             },
             "image_direction": current_image_direction(),
-            "edit_contract": _edit_contract(family, measurement, base["category_image_policy"], {}, product_type=category_id),
+            "edit_contract": _edit_contract(family, measurement, base["category_image_policy"]),
             "execution_profile": (
                 "reference_infographic_design"
                 if family == "func"

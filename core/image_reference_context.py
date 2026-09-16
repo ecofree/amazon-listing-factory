@@ -151,7 +151,7 @@ def view_reference(source: dict[str, Any], view: dict[str, Any], *, job: Path, c
     if not crop.is_file():
         raise ValueError(f"Missing current observed view: {view['view_id']}")
     return {"kind": kind, "child": child, "source_id": source["source_id"], "view_id": view["view_id"],
-            "purpose": "Edit this intact observed view; preserve its perspective, visible extent and physical state.",
+            "purpose": "Same-child product evidence for structure, finish and supported operating state; source decor, camera framing and graphics are not target design.",
             "evidence_ids": [item["feature_id"] for item in view["evidence"]],
             "path": crop.relative_to(job).as_posix(), "sha256": file_sha256(crop),
             "original_path": source["source_path"], "original_sha256": source["source_sha256"],
@@ -205,33 +205,14 @@ def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str
         raise ValueError("Edit-base SHA disagrees with attachment 1")
 
 
-def validate_supporting_sources(value: Any, sources: list[dict[str, Any]], primary_id: str) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        raise ValueError("supporting_sources must be a list")
-    known = {row["source_id"]: row for row in sources}
-    seen = {primary_id}
-    for row in value:
-        if not isinstance(row, dict) or set(row) != {"source_id", "view_id", "purpose", "evidence_ids"}:
-            raise ValueError("Supporting source needs source_id, view_id, purpose and evidence_ids")
-        key = row["source_id"]
-        if key not in known or key in seen or not isinstance(row["purpose"], str) or not 1 <= len(row["purpose"].strip()) <= 240:
-            raise ValueError("Supporting source is unknown, repeated or lacks a bounded purpose")
-        identity = (key, row['view_id'])
-        if identity in seen:
-            raise ValueError("Supporting view is repeated")
-        seen.add(identity)
-        views = {view['view_id']: view for view in physical_views(known[key]['observation']['physical_views'])}
-        if row['view_id'] not in views:
-            raise ValueError("Supporting view is not observed in that source")
-        available = {str(item["evidence_id"]) for item in known[key].get("claims", [])}
-        available.update("object:" + str(item["object_id"]) for item in views[row['view_id']]['evidence'])
-        available.update(item['feature_id'] for item in views[row['view_id']]['evidence'])
-        ids = row["evidence_ids"]
-        if not isinstance(ids, list) or any(not isinstance(item, str) or item not in available for item in ids) or len(ids) != len(set(ids)):
-            raise ValueError("Supporting source evidence is not bound to that source")
-    return value
+def view_identity(row: dict[str, Any]) -> str:
+    """View names are local to a source, never unique across a child."""
+    return row['source_id'] + '/' + row['view_id']
 
 
+def evidence_view_catalog(sources: list[dict[str, Any]]) -> dict[str, tuple[dict, dict]]:
+    return {view_identity({'source_id': source['source_id'], 'view_id': view['view_id']}): (source, view)
+            for source in sources for view in physical_views(source['observation']['physical_views'])}
 
 
 def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[dict[str, Any]], targeted_edit: bool = False) -> str:
@@ -239,7 +220,10 @@ def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[
     actual = {row["source_id"] for row in references if row["kind"] == "design_reference"}
     if actual != set(decisions):
         raise ValueError("Selected design references do not match generation attachments")
-    lines = []
+    lines = [('Original product attachments supply facts, not a replacement composition.' if targeted_edit else
+              'Product attachments follow the evidence assignments in ROLE, not source graphics or styling.')]
+    if actual:
+        lines.append('Design attachments authorize reviewed styling only, never product, branding, copy or dimensions.')
     for index, row in enumerate(references, 1):
         if row["kind"] == "design_reference":
             decision = decisions[row["source_id"]]
@@ -247,11 +231,8 @@ def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[
             purpose = f"Reviewed use: {row['purpose']} Approval boundary: {scope} " + (
                 "Style verification only; retain the candidate's established design except for the requested correction."
                 if targeted_edit else f"Inherit within that scope: {decision['inherit']} Adapt: {decision['adapt']}")
-            purpose += " No reference product, branding, copy or dimension transfer."
-        elif row["kind"] == "product_evidence" and row['source_id'] != references[0]['source_id']:
-            purpose = "Supporting physical evidence only; verify existing structure, never transfer another view's state or replace the edit base."
         elif row["kind"] == "product_evidence" or not targeted_edit:
-            purpose = "Own physical view; follow its assigned evidence use, not source styling."
+            purpose = str(row.get('extent') or 'Observed product view') + '.'
         else:
             purpose = "Selected candidate: retain its design and physical state except for the requested correction."
         identity = row['source_id'] + (f"/{row['view_id']}" if row.get('view_id') else '')

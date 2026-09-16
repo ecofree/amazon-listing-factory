@@ -18,6 +18,9 @@ from core.vision_gemini_client import (
 
 class VisualDesignRemediationTests(unittest.TestCase):
     def test_observed_bounds_preserve_pixels_and_feature_extent(self):
+        from tests.remediation_recheck_fixture import verify_review_projection, verify_observation_feedback
+        verify_review_projection(self)
+        verify_observation_feedback(self)
         from PIL import Image, ImageChops
         from core.io import file_sha256
         from core.image_reference_context import prepare_planning_views, planning_view_inputs, physical_views
@@ -79,13 +82,21 @@ class VisualDesignRemediationTests(unittest.TestCase):
             cropped = {**source, 'role': 'scene', 'input_revision_id': 'crop',
                        'observation': {'physical_views': [current_physical_view(region=[.201, .237, .985, .708])]},
                        'crop_provenance': [{'view_id': 'view_01', 'pixel_size': [784, 471]}]}
-            draft = {'source_id': cropped['source_id'], 'image_direction': current_image_direction()}
+            draft = {'source_id': cropped['source_id'], 'image_direction': current_image_direction(source_id=cropped['source_id'])}
             raw = {'family_art_direction': current_art_direction(), 'source_briefs': [draft]}
             request = design_binding_request(draft, raw['family_art_direction'], source=cropped)
-            self.assertEqual(['view_fidelity:view_01'], request['physical_operations'])
-            self.assertEqual('pending', compile_visual_design_kit_response(raw, source_manifest=[cropped])['source_briefs'][0]['status'])
+            self.assertEqual(['target_consistency:source_02'], request['physical_operations'])
+            from copy import deepcopy
+            detail = deepcopy(cropped)
+            detail['observation']['physical_views'][0]['extent'] = 'detail'
+            detail['crop_provenance'] = [{'view_id': 'view_01', 'pixel_box': [0, 0, 800, 800], 'source_size': [800, 800]}]
+            detail_request = design_binding_request(draft, raw['family_art_direction'], source=detail)
+            self.assertEqual(['target_consistency:source_02'], detail_request['physical_operations'])
+            from tests.current_image_contract_fixture import supported_review_results
+            self.assertEqual('ready', compile_visual_design_kit_response(raw, source_manifest=[cropped],
+                claim_reviews=supported_review_results([request]))['source_briefs'][0]['status'])
             review = {'key': request['key'], 'policy': CLAIM_REVIEW_POLICY, 'response_sha256': 'b' * 64,
-                      'status': 'supported', 'findings': [{'kind': 'physical_structure', 'operation': 'view_fidelity:view_01',
+                      'status': 'contradiction', 'findings': [{'operation': 'source_product:source_02/view_01',
                           'status': 'contradiction', 'reason': 'Actual crop cuts the cabinet feet visible in original'}]}
             blocked = compile_visual_design_kit_response(raw, source_manifest=[cropped], claim_reviews={request['key']: review})
             self.assertIn('cuts the cabinet feet', blocked['source_briefs'][0]['error'])
@@ -97,16 +108,16 @@ class VisualDesignRemediationTests(unittest.TestCase):
                     source_paths=[], source_originals=[], trace_dir=job, deadline_monotonic=time.monotonic()+10, cached=None)
                 self.assertEqual('observation', result['source_briefs'][0]['failure_owner'])
                 repair.assert_not_called()
-            # Full-size fixtures do not acquire a second mandatory aesthetic approval.
+            # Ordinary source props do not create planning or observation obligations.
             cropped['crop_provenance'] = []
             cropped['observation']['objects'] = [{'object_id': 'pillow', 'sale_membership': 'staging', 'visibility': 'visible',
                                                  'kind': 'pillow', 'state': 'one pillow partially covering the frame',
                                                  'relations': [{'predicate': 'occludes', 'target_id': 'frame'}]}]
-            self.assertEqual(cropped['observation']['objects'], _planner_source_view(cropped)['objects'])
-            missing = compile_visual_design_kit_response(raw, source_manifest=[cropped])
-            self.assertIn('pillow', missing['source_briefs'][0]['error'])
-            draft['image_direction']['scene_objects']['pillow'] = 'towels'
-            self.assertEqual('ready', compile_visual_design_kit_response(raw, source_manifest=[cropped])['source_briefs'][0]['status'])
+            self.assertEqual([], _planner_source_view(cropped)['objects'])
+            request = design_binding_request(draft, raw['family_art_direction'], source=cropped)
+            self.assertEqual(['target_consistency:source_02'], request['physical_operations'])
+            missing = compile_visual_design_kit_response(raw, source_manifest=[cropped], claim_reviews=supported_review_results([request]))
+            self.assertEqual('ready', missing['source_briefs'][0]['status'])
             source["observation"]["physical_views"] = []
             with self.assertRaisesRegex(ValueError, "no observed physical views"):
                 prepare_planning_views(job, [source], job / "empty")
@@ -115,7 +126,9 @@ class VisualDesignRemediationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source changed"):
                 prepare_planning_views(job, [source], job / "changed")
 
-    def test_local_repair_keeps_view_inventory_and_rejects_uncovered_feature_ids(self):
+    def test_local_repair_preserves_facts_without_source_panel_obligations(self):
+        from tests.remediation_recheck_fixture import verify_shared_repair
+        verify_shared_repair(self)
         import time
         from core.visual_design_kit import _finish_source_briefs
         from core.visual_design_kit_compiler import compile_visual_design_kit_response
@@ -125,8 +138,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
         source = {"source_id": "source_00", "role": "size", "source_sha256": "a" * 64,
                   "input_revision_id": "r", "measurements": [], "observation": {"physical_views": views}}
         direction = current_image_direction(environment="graphic_canvas")
-        direction["layout"].append({"view_id": "view_02", "target_region": [.1, .6, .5, .9]})
-        direction["evidence_usage"].append({"view_id": "view_02", "usage": "display", "covered_by": []})
+        direction["layout"].append({"source_id": "source_00", "view_id": "view_02", "target_region": [.1, .6, .5, .9]})
+        direction["evidence_usage"].append({"source_id": "source_00", "view_id": "view_02", "usage": "display", "covered_by": []})
         direction["visual_goal"] = ""
         raw = {"family_art_direction": current_art_direction(), "source_briefs": [{
             "source_id": "source_00", "image_direction": direction, "display_copy": {"title": None, "labels": []}}]}
@@ -134,6 +147,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
             trace = Path(tmp)
             paths = [trace / "view_001.png", trace / "view_002.png"]
             def repair(prompt, attachments, **kwargs):
+                self.assertEqual(0, reviewer.call_count)
                 self.assertEqual(paths, attachments)
                 self.assertNotIn('total_timeout_seconds', kwargs)
                 self.assertEqual(1, kwargs['max_physical_requests'])
@@ -143,17 +157,19 @@ class VisualDesignRemediationTests(unittest.TestCase):
                 self.assertIn('"feature_id": "edge_joint"', prompt)
                 return json.dumps({"source_briefs": [{**raw["source_briefs"][0],
                     "image_direction": {**direction, "visual_goal": "Show both measured views clearly."}}]})
-            with patch("core.visual_design_kit.review_planning_bindings", return_value={}), patch(
+            from tests.current_image_contract_fixture import supported_review_results
+            with patch("core.visual_design_kit.review_planning_bindings", side_effect=supported_review_results) as reviewer, patch(
                 "core.visual_design_kit.gemini_stream_generate", side_effect=repair) as call:
                 result = _finish_source_briefs(raw, source_manifest=[source], category_id="bed_frame",
                     source_paths=paths, source_originals=[], trace_dir=trace, deadline_monotonic=time.monotonic() + 10, cached=None)
             self.assertEqual(1, call.call_count)
             self.assertEqual("ready", result["source_briefs"][0]["status"])
+            self.assertEqual(1, reviewer.call_count)
         direction["visual_goal"] = "Show both measured views clearly."
         direction["layout"].pop()
-        direction["evidence_usage"][1].update(usage="integrated", covered_by=["view_01"])
+        direction["evidence_usage"][1].update(usage="integrated", covered_by=["source_00/view_01"])
         denied = compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]
-        self.assertIn('unique physical evidence is not covered', denied['error'])
+        self.assertIn('bound review', denied['error'])
         views[0]['evidence'].append({**views[1]['evidence'][0], 'region': views[0]['region'].copy()})
         self.assertEqual("pending", compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]["status"])
         from core.visual_design_kit_compiler import design_binding_request
@@ -163,20 +179,27 @@ class VisualDesignRemediationTests(unittest.TestCase):
                    'status': 'inconclusive', 'reason': 'Cannot verify merged corner', 'findings': []}
         self.assertEqual('pending', compile_visual_design_kit_response(raw, source_manifest=[source],
             claim_reviews={request['key']: verdict})['source_briefs'][0]['status'])
-        verdict.update(status='supported', findings=[{'kind': 'physical_structure', 'operation': 'coverage_transfer:view_02',
-                       'status': 'supported', 'reason': 'Reviewer compared both actual corner views'}])
+        verdict.update(status='supported', findings=[{'operation': 'coverage_transfer:source_00/view_02',
+                       'status': 'supported', 'reason': 'Reviewer compared both actual corner views'},
+                       {'operation': 'product_coverage:source_00', 'status': 'supported', 'reason': 'Simulated complete fact coverage'},
+                       {'operation': 'target_consistency:source_00', 'status': 'supported', 'reason': 'Simulated target consistency'}])
         self.assertEqual('ready', compile_visual_design_kit_response(raw, source_manifest=[source],
             claim_reviews={request['key']: verdict})['source_briefs'][0]['status'])
         support = {**source, 'source_id': 'source_01', 'source_sha256': 'b' * 64}
-        draft_with_support = {**raw['source_briefs'][0], 'supporting_sources': [
-            {'source_id': 'source_01', 'view_id': 'view_01', 'purpose': 'Verify corner', 'evidence_ids': []}]}
+        draft_with_support = {**raw['source_briefs'][0], 'image_direction': {**direction, 'evidence_usage': [
+            *direction['evidence_usage'], {'source_id': 'source_01', 'view_id': 'view_01', 'usage': 'display', 'covered_by': []}]}}
         before = design_binding_request(draft_with_support, raw['family_art_direction'], source=source, source_manifest=[source, support])
-        draft_with_support['supporting_sources'][0]['view_id'] = 'view_02'
+        draft_with_support['image_direction']['evidence_usage'][-1]['view_id'] = 'view_02'
         after = design_binding_request(draft_with_support, raw['family_art_direction'], source=source, source_manifest=[source, support])
         self.assertNotEqual(before['key'], after['key'])
         direction["evidence_usage"].pop()
         rejected = compile_visual_design_kit_response(raw, source_manifest=[source])
-        self.assertIn("Every observed view", rejected["source_briefs"][0]["error"])
+        self.assertIn('product_coverage', rejected['source_briefs'][0]['error'])
+        direction['evidence_usage'].append({'source_id': 'source_00', 'view_id': 'view_02', 'usage': 'verification', 'covered_by': []})
+        from core.visual_semantics import candidate_view_targets
+        self.assertEqual(['view_01'], [row['view_id'] for row in candidate_view_targets({'image_direction': direction})])
+        request = design_binding_request(raw['source_briefs'][0], raw['family_art_direction'], source=source)
+        self.assertEqual(['product_coverage:source_00', 'target_consistency:source_00'], request['physical_operations'])
 
         from core.visual_semantics import CLAIM_REVIEW_POLICY
         from core.visual_design_kit_compiler import design_binding_request
@@ -194,7 +217,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
             return {row["key"]: {"key": row["key"], "policy": CLAIM_REVIEW_POLICY, "response_sha256": "b" * 64,
                 "status": "contradiction" if row["kind"] == "design_binding" else "inconclusive",
                 "reason": "towels conflicts with shared palette" if row["kind"] == "design_binding" else row["proposed_text"],
-                'findings': [{'kind': 'design_binding', 'operation': 'target:towels', 'status': 'contradiction',
+                'findings': [{'operation': 'shared_prose:environment_and_staging', 'status': 'contradiction',
                               'reason': 'towels conflicts with shared palette'}] if row['kind'] == 'design_binding' else []}
                 for row in requests}
         def repair_all(prompt, attachments, **kwargs):
@@ -210,8 +233,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
             calls.append(requests)
             if len(calls) == 1:
                 return review(requests, **kwargs)
-            return {row["key"]: {"key": row["key"], "policy": CLAIM_REVIEW_POLICY,
-                "response_sha256": "c" * 64, "status": "supported", "reason": "Shared role reused"} for row in requests}
+            return supported_review_results(requests)
         with tempfile.TemporaryDirectory() as tmp, patch("core.visual_design_kit.review_planning_bindings", side_effect=review_once), patch(
                 "core.visual_design_kit.gemini_stream_generate", side_effect=repair_all) as repair_call:
             result = _finish_source_briefs(raw, source_manifest=[source], category_id="bed_frame", source_paths=[], source_originals=[],
@@ -223,10 +245,30 @@ class VisualDesignRemediationTests(unittest.TestCase):
         self.assertEqual(raw["family_art_direction"]["graphic_direction"], result["family_art_direction"]["graphic_direction"])
         self.assertEqual(3, len(calls[0]))
         self.assertEqual(1, len(calls[1]))
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=TimeoutError('review clock')):
+        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=TimeoutError('review clock')), patch('core.visual_design_kit.gemini_stream_generate') as unnecessary_repair:
             unavailable = _finish_source_briefs(raw, source_manifest=[source], category_id='bed_frame', source_paths=[], source_originals=[],
                 trace_dir=Path(tmp), deadline_monotonic=time.monotonic() + 10, cached=None)
+            with patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results):
+                recovered = _finish_source_briefs(raw, source_manifest=[source], category_id='bed_frame', source_paths=[], source_originals=[],
+                    trace_dir=Path(tmp), deadline_monotonic=time.monotonic() + 10, cached=unavailable)
+            self.assertEqual('ready', recovered['source_briefs'][0]['status'])
         self.assertIn('Planning review unavailable: TimeoutError', unavailable['source_briefs'][0]['error'])
+        self.assertEqual('review', unavailable['source_briefs'][0]['failure_owner'])
+        unnecessary_repair.assert_not_called()
+
+        product_review = {"key": "claim", "kind": "product_claim", "status": "supported",
+                          "reason": "Directly supported by supplied source facts.", "findings": []}
+        design_review = {"key": "design", "kind": "design_binding", "status": "supported",
+                         "reason": "Simulated review.", "findings": [], 'physical_operations': ['product_coverage:source_00']}
+        from core.visual_semantics import review_planning_bindings
+        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', side_effect=[
+                json.dumps({"reviews": [product_review]}),
+                json.dumps({"reviews": [design_review]}),
+            ]):
+            result = review_planning_bindings([product_review], trace_dir=Path(tmp), shared_design={}, deadline_monotonic=time.monotonic() + 10)
+            self.assertIn('claim', result)
+            with self.assertRaisesRegex(ValueError, 'Design review needs'):
+                review_planning_bindings([design_review], trace_dir=Path(tmp), shared_design={}, deadline_monotonic=time.monotonic() + 10)
         exact = deepcopy(draft)
         exact["display_copy"]["labels"] = [{"text": "Drawers on wheels", "evidence_ids": ["drawer"]}]
         request = design_binding_request(exact, raw["family_art_direction"], source=source)
@@ -236,7 +278,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
         conflict[request["key"]]["status"] = "inconclusive"
         conflict[request['key']]['findings'] = []
         checked = compile_visual_design_kit_response({**raw, "source_briefs": [exact]}, source_manifest=[source], claim_reviews=conflict)
-        self.assertEqual("ready", checked["source_briefs"][0]["status"])
+        self.assertEqual("pending", checked["source_briefs"][0]["status"])
+        self.assertEqual("review", checked["source_briefs"][0]["failure_owner"])
 
     def test_independent_canvas_uses_one_design_contract_without_source_style(self):
         from core.visual_design_kit import visual_design_kit_prompt
@@ -256,7 +299,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
         rejected = compile_visual_design_kit_response(raw, source_manifest=[source])
         self.assertEqual("pending", rejected["source_briefs"][0]["status"])
         raw["source_briefs"][0]["image_direction"] = current_image_direction()
-        self.assertEqual("ready", compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]["status"])
+        from tests.current_image_contract_fixture import supported_design_reviews
+        self.assertEqual("ready", compile_visual_design_kit_response(raw, source_manifest=[source], claim_reviews=supported_design_reviews(raw, [source]))["source_briefs"][0]["status"])
         raw["source_briefs"][0]["image_direction"]["layout"] = "Use sage bedding and show 8 slats"
         self.assertEqual("pending", compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]["status"])
         raw["source_briefs"][0]["image_direction"] = current_image_direction()
@@ -266,8 +310,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
         source['claims'] = [{'evidence_id': 'heading', 'text': 'Product Dimensions'}]
         raw['source_briefs'][0]['display_copy'] = {'title': {'evidence_ids': ['heading'], 'text': 'Product Dimensions'}, 'labels': []}
         raw["source_briefs"][0]["image_direction"] = current_image_direction(environment="graphic_canvas")
-        raw["source_briefs"][0]["image_direction"]["text_placement"] = [{"text_ref": "title", "target_region": [0, 0, 1, .1]}]
-        size_brief = compile_visual_design_kit_response(raw, source_manifest=[source])["source_briefs"][0]
+        raw["source_briefs"][0]["image_direction"]["text_placement"] = [{"text_ref": "title", "target_region": [0, 0, 1, .1], "backing": "none"}]
+        size_brief = compile_visual_design_kit_response(raw, source_manifest=[source], claim_reviews=supported_design_reviews(raw, [source]))["source_briefs"][0]
         self.assertEqual("ready", size_brief["status"])
         self.assertEqual('title', size_brief['image_direction']['text_placement'][0]['text_ref'])
         self.assertEqual('Product Dimensions', size_brief['display_copy_contract']['title'])
@@ -276,27 +320,31 @@ class VisualDesignRemediationTests(unittest.TestCase):
         task["image_direction"]["environment_mode"] = "graphic_canvas"
         compiled = compile_task_prompt(task=task)
         self.assertIn('towels = #8A999E', compiled)
-        task['product_boundary']['observed_objects'] = [{'object_id': 'towel', 'relations': [{'predicate': 'contained_in', 'target_id': 'drawer_1'}]}]
-        before = compile_task_prompt(task=task)
-        task['product_boundary']['observed_objects'][0]['relations'][0]['target_id'] = 'drawer_2'
-        self.assertNotEqual(before, compile_task_prompt(task=task))
+        task['image_direction']['text_placement'] = [{'text_ref': 'title', 'target_region': [0, 0, 1, .1], 'backing': 'none'}]
+        self.assertIn('backing=none', compile_task_prompt(task=task))
+        task['image_direction']['text_placement'][0]['backing'] = 'local'
+        self.assertIn('backing=local', compile_task_prompt(task=task))
+        task['image_direction']['text_placement'] = []
         for old in ("Shopping purpose:", "Staging intent:"):
             self.assertNotIn(old, compiled)
         self.assertEqual(1, compiled.count("text_color = #303634"))
         self.assertEqual(1, compiled.count("Adjustable Shelf"))
-        task["product_boundary"]["observed_objects"] = [
-            {"object_id": "frame", "kind": "bed frame", "state": "four visible legs", "sale_membership": "product", "visibility": "visible", "relations": []},
-            {"object_id": "quilt", "kind": "quilt", "state": "SOURCE_SAGE_PRINT", "sale_membership": "staging", "visibility": "visible",
-             "relations": [{"predicate": "occludes", "target_id": "frame"}]},
-            {"object_id": "book", "kind": "book", "state": "SOURCE_BRAND_STYLE", "sale_membership": "staging", "visibility": "visible", "relations": []}]
+        from core.image_generation import _compose_revision_prompt
+        base = 'x' * 7394
+        revised = _compose_revision_prompt(base_prompt=base, request_heading='full redraw', request_intro='Redraw the same task.', reason='Preserve the original joint.')
+        self.assertTrue(revised.startswith(base))
+        self.assertLessEqual(len(revised), 8000)
+        with self.assertRaisesRegex(RuntimeError, 'maximum executable length'):
+            _compose_revision_prompt(base_prompt=base, request_heading='full redraw', request_intro='Same task.', reason='x'*1000)
+        task['image_direction']['scene_objects'] = ['bath.towels']
+        shared = compile_task_prompt(task=task)
+        self.assertEqual(1, shared.count('#8A999E cotton'))
+        self.assertEqual(1, shared.count('bath.towels ='))
         task['generation_references'][0]['visible_evidence'] = [dict(current_physical_view()['evidence'][0], physical_facts=['Platform frame without headboard'])]
         projected = compile_task_prompt(task=task)
-        self.assertNotIn("SOURCE_SAGE_PRINT", projected)
-        self.assertNotIn("SOURCE_BRAND_STYLE", projected)
-        self.assertIn("four visible legs", projected)
         self.assertEqual(1, projected.count('Platform frame without headboard'))
         self.assertNotIn("cyan dashed outline", projected)
-        self.assertIn("occludes", projected)
+        self.assertNotIn("occludes", projected)
         from copy import deepcopy
         support = deepcopy(task['generation_references'][0])
         support.update(kind='product_evidence', source_id='source_99')
@@ -317,10 +365,10 @@ class VisualDesignRemediationTests(unittest.TestCase):
                   'measurements': [current_observed_measurement(), current_observed_measurement('300 lbs', 'Bed capacity', 'capacity', key='load', kind='capacity')],
                   "text_observations": [{"text": "Dimensions", "kind": "marketing"},
                                         {"text": "300 lbs", "kind": "measurement"}]}
-        source = {"role": "size", "visual_evidence": visual,
+        source = {"source_id": "source_00", "role": "size", "visual_evidence": visual,
                   "ocr_evidence": {"lines": [{"text": "17'", "confidence": .93, "box": [0, 0, 1, 1]}]},
                   "measurements": _measurement_rows(_observed_measurements(visual), {})}
-        authority = _measurement_authority("size", {}, source)
+        authority = _measurement_authority("size", source, [(source, current_physical_view())])
         self.assertEqual(2, len(authority["measurement_groups"]))
         self.assertEqual(['17 in', '300 lb'], authority['render_text'])
         self.assertEqual('load_capacity', authority['measurement_groups'][1]['measurement_role'])
@@ -331,6 +379,24 @@ class VisualDesignRemediationTests(unittest.TestCase):
         from core.visual_semantics import _validate_source_measurements, _validate_candidate_observation
         from copy import deepcopy
         repeated = deepcopy(visual['measurements'])
+        from core.image_prompt_compiler import _measurement_content
+        from core.image_reference_context import measurement_attachment_location
+        before = deepcopy(authority)
+        refs = [{'source_id': 'source_00', 'view_id': 'view_01', 'original_region': current_physical_view()['region']}]
+        content = _measurement_content(authority, refs)
+        self.assertEqual(before, authority)
+        self.assertEqual(1, content.count('17 in'))
+        for encoded, measurement in zip(content.split(' @ ')[1:], authority['measurement_groups']):
+            location = json.loads(encoded.split('; ', 1)[0])
+            precise = measurement_attachment_location(measurement, refs)
+            for axis, value in location['label'].items():
+                self.assertLessEqual(abs(value - precise['label'][axis]), .000000500001)
+            if precise['endpoints'] is None:
+                self.assertIsNone(location['endpoints'])
+            else:
+                for point, exact in zip(location['endpoints'], precise['endpoints']):
+                    for axis in ('x', 'y'):
+                        self.assertLessEqual(abs(point[axis] - exact[axis]), .000000500001)
         repeated[1] = {**repeated[0], 'measurement_id': 'ocr-read', 'text': '17 ft'}
         with self.assertRaisesRegex(ValueError, 'competing readings'):
             _validate_source_measurements(repeated, [current_physical_view()])
@@ -387,14 +453,29 @@ class VisualDesignRemediationTests(unittest.TestCase):
         from tests.current_image_contract_fixture import current_art_direction
         deadline = time.monotonic() + 80
         response = json.dumps({'reviews': [{'key': requests[0]['key'], 'status': 'supported', 'reason': 'Visible local structure',
-            'findings': [{'kind': 'copy_fact', 'operation': 'source_00', 'status': 'supported', 'reason': 'Visible frame joints'}]}]})
+            'findings': [{'operation': 'source_00', 'status': 'supported', 'reason': 'Visible frame joints'}]}]})
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', return_value=response) as remote:
             review_planning_bindings(requests, trace_dir=Path(tmp), shared_design=current_art_direction(), deadline_monotonic=deadline)
         self.assertEqual(deadline, remote.call_args.kwargs['deadline_monotonic'])
         self.assertEqual(1, remote.call_args.kwargs['max_physical_requests'])
         self.assertNotIn('total_timeout_seconds', remote.call_args.kwargs)
+        from core.visual_design_kit import _planner_evidence
+        source['claims'] = [{'evidence_id': 'source_00:wheel', 'text': 'Drawers on wheels'}]
+        source['product_claims'] = [{'evidence_id': 'product:wheel', 'text': 'Drawers on wheels'}]
+        second = {**source, 'source_id': 'source_01', 'claims': [
+            {'evidence_id': 'source_01:wheel', 'text': 'Drawers on wheels'},
+            {'evidence_id': 'source_01:placement', 'text': 'Drawers can be placed on either side of the bed'}]}
+        views, texts = _planner_evidence([source, second])
+        self.assertTrue(all('source_supported_claims' not in view for view in views))
+        wheel = [row for row in texts if row['text'] == 'Drawers on wheels']
+        self.assertEqual(1, len(wheel))
+        self.assertEqual({'product:wheel', 'source_00:wheel', 'source_01:wheel'}, set(wheel[0]['evidence_ids']))
+        self.assertIn('source_01:placement', views[1]['source_supported_claim_ids'])
+        self.assertEqual('Drawers can be placed on either side of the bed', texts[-1]['text'])
 
     def test_native_json_ignores_thoughts_and_keeps_failed_response_evidence(self):
+        from tests.remediation_recheck_fixture import verify_output_capacity_and_raw_trace
+        verify_output_capacity_and_raw_trace(self)
         payload = {"candidates": [{"content": {"parts": [
             {"thought": True, "text": '{"draft": 1}'}, {"text": '{"sources": []}'}]}, "finishReason": "STOP"}]}
         body = json.dumps(payload)
@@ -405,6 +486,15 @@ class VisualDesignRemediationTests(unittest.TestCase):
         config = _gemini_native_payload([], {"protocol": "google_gemini", "max_output_tokens": "12000"})
         self.assertEqual("application/json", config["generationConfig"]["responseMimeType"])
         self.assertEqual(12000, config["generationConfig"]["maxOutputTokens"])
+        from core.vision_gemini_client import _select_response_candidate, _response_failure_kind, _response_retry_prompt, _response_usage
+        limited = json.dumps({'candidates': [{'finishReason': 'MAX_TOKENS'}], 'usageMetadata': {'candidatesTokenCount': 8192}})
+        self.assertIsNone(_select_response_candidate(['{}'], lambda text: True, response_body=limited)[1])
+        self.assertEqual('output_limit', _response_failure_kind(limited, 'JSONDecodeError'))
+        self.assertEqual('json_syntax', _response_failure_kind(body, 'JSONDecodeError: bad JSON at char 18'))
+        client = {'max_output_tokens': 8192}
+        self.assertEqual('original', _response_retry_prompt(client, 'original', 'cut', 'partial', 'output_limit'))
+        self.assertEqual(16384, client['max_output_tokens'])
+        self.assertEqual({'candidatesTokenCount': 8192}, _response_usage(limited))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "attempts.json"
             _, record = _attempt_trace(path)
@@ -413,8 +503,14 @@ class VisualDesignRemediationTests(unittest.TestCase):
             event = read_json(path)[0]
             self.assertEqual('{"sources": [', (path.parent / event["response_path"]).read_text())
             self.assertEqual(["incomplete object"], event["validation_errors"])
+            _, next_record = _attempt_trace(path)
+            next_record({'status': 'success', 'response_text': '{}'})
+            self.assertEqual(2, len(read_json(path)))
+            self.assertNotEqual(read_json(path)[0]['response_path'], read_json(path)[1]['response_path'])
 
     def test_color_tools_measure_gemini_choices_without_selecting_or_mutating(self):
+        from tests.child_palette_regression_fixture import check_child_components
+        check_child_components(self)
         from copy import deepcopy
         from core.palette_registry import planned_palette_diagnostics
         from tests.current_image_contract_fixture import current_art_direction
@@ -422,7 +518,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
         before = deepcopy(direction)
         report = planned_palette_diagnostics(direction)
         self.assertEqual(before, direction)
-        self.assertIn("palette_direction.wall", report["colors"])
+        self.assertIn("palette_direction.room.wall", report["colors"])
         self.assertTrue(report["pairs"])
         self.assertEqual("diagnostics_only_no_design_or_qa_decision", report["authority"])
         self.assertNotIn("score", report)
@@ -508,7 +604,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
             raw = {"family_art_direction": current_art_direction(), "source_briefs": [{
                 "source_id": "source_00", "image_direction": direction,
                 "display_copy": {"title": None, "labels": []}}]}
-            compiled = compile_visual_design_kit_response(raw, source_manifest=[source], design_references=refs)
+            from tests.current_image_contract_fixture import supported_design_reviews
+            compiled = compile_visual_design_kit_response(raw, source_manifest=[source], design_references=refs, claim_reviews=supported_design_reviews(raw, [source], refs))
             brief = compiled["source_briefs"][0]
             self.assertEqual("ready", brief["status"])
             from core.visual_design_kit_compiler import design_binding_request, validate_compiled_visual_design_kit
@@ -516,7 +613,6 @@ class VisualDesignRemediationTests(unittest.TestCase):
             request = design_binding_request(raw['source_briefs'][0], compiled['family_art_direction'], source=source, design_references=refs)
             self.assertEqual(refs[0]['purpose'], request['reference_scopes'][0]['purpose'])
             self.assertEqual(refs[0]['visual_review']['transfer_scope'], request['reference_scopes'][0]['approval_boundary'])
-            brief['design_review'] = {'key': request['key'], 'policy': CLAIM_REVIEW_POLICY, 'status': 'supported', 'response_sha256': 'a' * 64}
             changed_refs = deepcopy(refs)
             changed_refs[0]['purpose'] = 'Lighting only; no typography transfer'
             with self.assertRaisesRegex(ValueError, 'no longer matches'):
@@ -526,7 +622,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
             changed_refs[0]['visual_review']['transfer_scope'] = 'Color only'
             with self.assertRaisesRegex(ValueError, 'no longer matches'):
                 validate_compiled_visual_design_kit(compiled, source_manifest=[source], design_references=changed_refs)
-            generation = _generation_references_for_task(source, brief, {"source_references": [source], "approved_design_references": refs}, job=job, child="B1")
+            generation = _generation_references_for_task(brief, {"source_references": [source], "approved_design_references": refs}, job=job, child="B1")
             self.assertEqual(["edit_base", "design_reference"], [row["kind"] for row in generation])
             task = current_image_task("func")
             task["image_direction"]["design_transfer"] = deepcopy(direction["design_transfer"])
@@ -566,7 +662,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
             source["role"] = "scene"
             self.assertEqual("pending", compile_visual_design_kit_response(raw, source_manifest=[source], design_references=refs)["source_briefs"][0]["status"])
             direction["design_transfer"] = []
-            self.assertEqual("ready", compile_visual_design_kit_response(raw, source_manifest=[source], design_references=refs)["source_briefs"][0]["status"])
+            self.assertEqual("ready", compile_visual_design_kit_response(raw, source_manifest=[source], design_references=refs,
+                claim_reviews=supported_design_reviews(raw, [source], refs))["source_briefs"][0]["status"])
             for changed in ({"production_ready": False}, {"compatibility": {"categories": ["artificial_tree"]}}, {"schema_version": "design-pack-v2"}):
                 write_json(root / "pack.json", {**pack, **changed})
                 with self.assertRaises(ValueError):
@@ -579,6 +676,23 @@ class VisualDesignRemediationTests(unittest.TestCase):
             limited = create_job(**kwargs, design_pack_path=str(root / 'pack.json'))
             self.assertEqual('evaluation', approved_design_references(limited, 'B1')[0]['approval_scope'])
             self.assertFalse(load_job(limited)['design_inputs']['pack']['production_ready'])
+            from core.design_reference_library import production_reference_error
+            from core.image_tasks import _task_fingerprint
+            limited_task = {'child': 'B1', 'role': 'func', 'role_family': 'func',
+                            'generation_references': approved_design_references(limited, 'B1')}
+            self.assertIn('production usage approval', production_reference_error(limited, limited_task))
+            self.assertEqual('', production_reference_error(limited, {**limited_task, 'generation_references': []}))
+            before = _task_fingerprint(limited_task)
+            updated = load_job(limited)
+            updated['design_inputs']['pack'].update(approval_scope='production', production_ready=True)
+            for ref in updated['design_inputs']['references']:
+                ref.update(approval_scope='production', approved_at='new authorized review date')
+            write_json(limited / 'job.json', updated)
+            self.assertEqual('', production_reference_error(limited, limited_task))
+            limited_task['generation_references'] = approved_design_references(limited, 'B1')
+            self.assertEqual(before, _task_fingerprint(limited_task))
+            limited_task['generation_references'][0]['visual_review']['transfer_scope'] += ' Changed design scope'
+            self.assertNotEqual(before, _task_fingerprint(limited_task))
             evaluation['assets'][0]['children'] = ['*']
             write_json(root / 'pack.json', evaluation)
             with self.assertRaisesRegex(ValueError, 'explicit child scope'):
@@ -679,23 +793,39 @@ class VisualDesignRemediationTests(unittest.TestCase):
                  "has_callouts_or_panels": False, "visible_numbers_or_units": [], "confidence": .95, "evidence": [],
                  "measurements": [], "objects": [{'object_id': 'frame', 'kind': 'frame', 'state': 'visible frame', 'sale_membership': 'unknown', 'visibility': 'visible', 'relations': []}], "text_observations": [], "physical_views": [current_physical_view('v1', [0, 0, 1, 1])],
                  "variant_identity": {"status": "unknown", "observed_color": "", "reason": "Occluded", "conflicts": []}}
+        from core.visual_semantics import _validate_observations
+        mixed = {**deepcopy(valid), 'view_coverage': 'complete; all product photos accounted for',
+                 'visible_numbers_or_units': [{'raw_text': '34.5 inches'}]}
+        rejected = _validate_observations([mixed], ['source_00'], {})['source_00']['error']
+        self.assertIn('view_coverage', rejected)
+        self.assertIn('visible_numbers_or_units', rejected)
         bad = {**deepcopy(valid), "source_id": "source_01", "physical_views": []}
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
             sources = [{"source_id": f"source_0{i}", "sha256": str(i) * 64, "ocr": [], "path": job / f"source{i}.png"} for i in range(2)]
             with patch("core.visual_semantics.gemini_stream_generate", return_value=json.dumps({"schema": {"sources": [valid, bad]}})):
-                with self.assertRaisesRegex(ValueError, "top-level sources"):
-                    observe_child_sources(job, {"asin": "B1"}, sources)
+                invalid = observe_child_sources(job, {"asin": "INVALID"}, sources)
+                self.assertIn('top-level sources', invalid['source_00']['error'])
             with patch("core.visual_semantics.gemini_stream_generate", side_effect=[json.dumps({"sources": [valid, bad]}), TimeoutError('fixture timeout')]) as partial:
                 result = observe_child_sources(job, {"asin": "B1"}, sources)
             self.assertEqual(2, partial.call_count)
             self.assertEqual([sources[1]['path']], partial.call_args.args[1])
             self.assertEqual(["success", "failed"], [result[row["source_id"]]["status"] for row in sources])
-            with patch("core.visual_semantics.gemini_stream_generate", side_effect=TimeoutError("fixture timeout")) as retry:
-                result = observe_child_sources(job, {"asin": "B1"}, sources)
-            self.assertEqual([sources[1]["path"]], retry.call_args.args[1])
-            self.assertEqual("success", result["source_00"]["status"])
-            self.assertEqual("failed", result["source_01"]["status"])
+            bad['physical_views'] = valid['physical_views']
+            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps({'sources': [bad]})) as retry:
+                result = observe_child_sources(job, {'asin': 'B1'}, sources)
+            self.assertEqual([sources[1]['path']], retry.call_args.args[1])
+            self.assertTrue(all(row['status'] == 'success' for row in result.values()))
+            correction = {'source_00': {'revision': 'operator-correction-1', 'reason': 'Source annotation is not a product finish'}}
+            corrected = deepcopy(valid)
+            corrected['physical_views'][0]['evidence'][0]['physical_facts'] = ['Visible frame without a colored outline']
+            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps({'sources': [corrected]})) as reread:
+                result = observe_child_sources(job, {'asin': 'B1'}, sources, corrections=correction)
+                self.assertEqual([sources[0]['path']], reread.call_args.args[1])
+                self.assertEqual('operator-correction-1', result['source_00']['correction_revision'])
+                self.assertEqual('success', result['source_01']['status'])
+                observe_child_sources(job, {'asin': 'B1'}, sources, corrections=correction)
+                self.assertEqual(1, reread.call_count)
             malformed = deepcopy(bad)
             malformed['physical_views'] = [current_physical_view('v1', [0.034, .86, .463, .507])]
             bad["physical_views"] = valid["physical_views"]
@@ -703,6 +833,9 @@ class VisualDesignRemediationTests(unittest.TestCase):
                 result = observe_child_sources(job, {"asin": "B2"}, sources[1:])
             self.assertEqual(2, repaired.call_count)
             self.assertIn('"left"', repaired.call_args.args[0])
+            self.assertIn('"view_coverage": "complete"', repaired.call_args.args[0])
+            self.assertIn('"endpoints": null', repaired.call_args.args[0])
+            self.assertNotIn('complete|partial;', repaired.call_args.args[0])
             self.assertNotIn('"region": [', repaired.call_args.args[0])
             self.assertTrue(all(row["status"] == "success" for row in result.values()))
 

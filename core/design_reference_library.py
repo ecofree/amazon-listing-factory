@@ -133,7 +133,7 @@ def brand_design_brief(job: Path) -> dict[str, Any]:
     return _brief(metadata.get("design_inputs", {}).get("brand_brief", {}))
 
 
-def approved_design_references(job: Path, child: str) -> list[dict[str, Any]]:
+def approved_design_references(job: Path, child: str, *, source_ids: set[str] | None = None) -> list[dict[str, Any]]:
     metadata = read_json(job / "job.json") if (job / "job.json").is_file() else {}
     if "approved_design_references" in metadata:
         raise ValueError("Retired ad-hoc reference input; create a job with an approved design pack")
@@ -143,6 +143,8 @@ def approved_design_references(job: Path, child: str) -> list[dict[str, Any]]:
         raise ValueError("Design input references must be a list")
     selected = []
     for row in rows:
+        if source_ids is not None and row.get('source_id') not in source_ids:
+            continue
         if child not in row.get("children", []) and "*" not in row.get("children", []):
             continue
         _approved_asset(row)
@@ -163,6 +165,30 @@ def approved_design_references(job: Path, child: str) -> list[dict[str, Any]]:
     if len({row["source_id"] for row in selected}) != len(selected):
         raise ValueError("Duplicate design reference identity")
     return selected
+
+
+def production_reference_error(job: Path, task: dict[str, Any]) -> str:
+    used = {row['source_id']: row for row in task.get('generation_references', []) if row['kind'] == 'design_reference'}
+    if not used:
+        return ''
+    try:
+        metadata = read_json(job / 'job.json')
+        pack = metadata.get('design_inputs', {}).get('pack', {})
+        current = {row['source_id']: row for row in approved_design_references(job, task['child'], source_ids=set(used))}
+        invalid = [key for key, ref in used.items() if key not in current
+                   or current[key]['sha256'] != ref['sha256']
+                   or current[key]['approval_scope'] != 'production'
+                   or pack.get('approval_scope') != 'production' or pack.get('production_ready') is not True
+                   or task['role_family'] not in current[key]['roles']]
+        return 'Design reference lacks production usage approval: ' + ', '.join(invalid) if invalid else ''
+    except (OSError, ValueError) as exc:
+        return f'Design reference usage cannot be verified: {exc}'
+
+
+def design_reference_semantics(row: dict[str, Any]) -> dict[str, Any]:
+    """Image-affecting input, separate from approval history checked at release."""
+    return {**{key: row[key] for key in ('kind', 'source_id', 'sha256', 'roles', 'purpose', 'design_system', 'input_policy')},
+            'transfer_scope': row['visual_review']['transfer_scope']}
 
 
 def design_reference_usage(job: Path, references: list[dict[str, Any]], briefs: list[dict[str, Any]]) -> dict[str, Any]:

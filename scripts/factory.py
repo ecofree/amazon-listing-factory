@@ -243,6 +243,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         config_path=config_path,
         workers=args.workers,
         limit=args.limit,
+        child_ids=tuple(value.strip().upper() for value in (getattr(args, 'children', '') or '').split(',') if value.strip()),
         upload=args.upload,
         write_excel=write_excel,
         template_mode=getattr(args, "template_mode", "") or ("submit_ready" if args.production else "draft"),
@@ -426,9 +427,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         and row.get("status") == "retryable"
         and str(logical_id).startswith("generate:")
     ]
+    try:
+        physical_files = sum(path.is_file() for path in (job_path / 'images' / 'generated').glob('*/*/*.candidate*.png'))
+    except OSError:
+        physical_files = None
     payload = {
         **state,
         "release_diagnostics": (release.get("diagnostics") or {}) if isinstance(release, dict) else {},
+        "physical_candidate_file_count": physical_files,
+        "candidate_count_scope": "Files on disk include old revisions; release diagnostics are the last evaluated snapshot, not a new acceptance.",
+        "release_snapshot_at": release.get('updated_at', '') if isinstance(release, dict) else '',
         "provider_waiting": retryable_generation,
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -555,6 +563,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stages", default="", help="Comma-separated debug stages handled by the canonical production controller.")
     p.add_argument("--workers", type=int, default=0, help="Generation concurrency cap; 0 selects a hardware/provider-aware limit.")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument('--children', default='', help='Explicit comma-separated child ASINs for a new frozen debug scope; all source images are selected')
     p.add_argument("--upload", action="store_true")
     p.add_argument("--write-excel", action="store_true", help="Write XLSM; enabled automatically whenever the selected stages include template.")
     p.add_argument("--resume", action="store_true", help="Resume from the current job_state.json stage state.")
@@ -588,12 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "review-source-role",
-        help="Record a SHA-bound human role decision for one ambiguous downloaded source.",
+        help="Review one SHA-bound source role, or request its factual re-observation on resume.",
     )
     p.add_argument("--job", required=True)
     p.add_argument("--child", required=True)
     p.add_argument("--source-index", required=True, type=int)
-    p.add_argument("--role", required=True, choices=["scene", "func", "size", "excluded_wrong_variant"])
+    p.add_argument("--role", required=True, choices=["scene", "func", "size", "excluded_wrong_variant", "reobserve"])
     p.add_argument("--reason", required=True)
     p.set_defaults(func=cmd_review_source)
 

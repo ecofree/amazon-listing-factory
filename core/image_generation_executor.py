@@ -14,6 +14,7 @@ from .image_provider_common import (
     PromptCompileError,
     ProviderConfigurationError,
     ProviderTransportError,
+    ProviderQueueUnavailable,
     provider_failure_class,
     provider_failure_code,
     provider_failure_status,
@@ -321,6 +322,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
 def finalize_candidate(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
     del plugin
     started = time.monotonic()
+    waiting = False
     try:
         from .candidate_state import current_candidate
         if not current_candidate(task['job_dir'], task):
@@ -340,11 +342,12 @@ def finalize_candidate(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             local_finalize_seconds=round(time.monotonic() - started, 3))
         return {**task, 'bytes': Path(task['output_path']).stat().st_size}
     except Exception as exc:
-        if isinstance(exc, CandidateCommitError):
+        waiting = isinstance(exc, ProviderQueueUnavailable)
+        if isinstance(exc, (CandidateCommitError, ProviderQueueUnavailable)):
             raise
         raise CandidateCommitError(f'Local finalization failed; saved response retained: {type(exc).__name__}: {exc}') from exc
     finally:
-        release_image(task)
+        release_image(task, buffered=waiting)
 
 
 def _record_provider_event_audit_only(**event: Any) -> None:

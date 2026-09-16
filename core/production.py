@@ -56,6 +56,7 @@ class JobRunRequest:
     config_path: str = ""
     workers: int = 0
     limit: int = 0
+    child_ids: tuple[str, ...] = ()
     upload: bool = False
     write_excel: bool = False
     template_mode: str = "submit_ready"
@@ -84,8 +85,8 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
     selected = _selected_stages(stages)
     if request.production and not request.upload and _production_upload_required(selected):
         raise ProductionPipelineError("Production requires --upload")
-    if request.production and request.limit:
-        raise ProductionPipelineError("Production forbids --limit because partial families cannot produce a final template")
+    if request.production and (request.limit or request.child_ids):
+        raise ProductionPipelineError('Production requires the full family, not --limit or --children')
     if request.production:
         _assert_production_entry_requirements(request, selected)
     load_status(request.job_dir)
@@ -102,7 +103,7 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
         from .run_scope import ensure_run_scope
 
         ensure_run_scope(
-            job_dir=request.job_dir, limit=request.limit, production=request.production,
+            job_dir=request.job_dir, limit=request.limit, production=request.production, child_ids=request.child_ids,
         )
     mark_interrupted_running(
         request.job_dir,
@@ -371,13 +372,13 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
 
         if request.resume and _fetch_current(job, plugin):
             ensure_run_scope(
-                job_dir=job, limit=request.limit, production=request.production,
+                job_dir=job, limit=request.limit, production=request.production, child_ids=request.child_ids,
             )
             return {"reused": True, "output_path": str(job / "source" / "product_family_v3.json")}
         result = fetch_family(job_dir=job, plugin=plugin, config_path=request.config_path, limit_children=0, deadline_monotonic=request.deadline_monotonic)
         assert_family_matches_plugin(job, plugin)
         ensure_run_scope(
-            job_dir=job, limit=request.limit, production=request.production,
+            job_dir=job, limit=request.limit, production=request.production, child_ids=request.child_ids,
         )
         return result
     if stage == "copy":
@@ -410,6 +411,7 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
         from .image_tasks import build_image_tasks, image_tasks_current, read_image_tasks
         from .visual_design_kit import (
             build_visual_design_kits,
+            observation_corrections,
             read_visual_design_kits,
             visual_design_kits_current,
         )
@@ -432,6 +434,14 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
                 deadline_monotonic=request.deadline_monotonic,
             )
         )
+        corrections = observation_corrections(design_kits)
+        if corrections and (request.deadline_monotonic is None or time.monotonic() < request.deadline_monotonic):
+            from .final_source_intents import build_final_source_intents
+            corrected = build_final_source_intents(job_dir=job, plugin=plugin, workers=request.workers,
+                deadline_monotonic=request.deadline_monotonic, observation_corrections=corrections)
+            if corrected['corrected_children']:
+                design_kits = build_visual_design_kits(job_dir=job, plugin=plugin, config_path=request.config_path,
+                    workers=request.workers, deadline_monotonic=request.deadline_monotonic)
         if image_tasks_current(job, plugin, limit=0, include_optional=True):
             image_tasks = read_image_tasks(job, category_id=plugin.category_id)
             image_tasks["failures"] = _formation_failures(image_tasks.get("tasks") or [], owner="brief")
@@ -485,14 +495,12 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
             "template_preflight": preflight,
             "subtask_diagnostics": {
                 "visual_design": {
-                    "ready_children": sorted((design_kits.get("children") or {}).keys()),
+                    "ready_children": sorted(key for key, kit in (design_kits.get("children") or {}).items()
+                        if kit.get('source_briefs') and all(row['status'] == 'ready' for row in kit['source_briefs'])),
                     "failure_count": len(design_kits.get("failures") or []),
                 },
                 "image_task": {
-                    "ready_count": sum(
-                        row.get("formation_status") == "ready"
-                        for row in image_tasks.get("tasks") or []
-                    ),
+                    "ready_count": sum(row.get("formation_status") == "ready" for row in image_tasks.get("tasks") or []),
                     "blocked_count": sum(
                         row.get("formation_status") == "blocked"
                         for row in image_tasks.get("tasks") or []

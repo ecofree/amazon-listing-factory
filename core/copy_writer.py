@@ -44,7 +44,7 @@ class CopyWriterConfig:
 COPY_CACHE_MAX_ENTRIES = 256
 _LOGGER = logging.getLogger(__name__)
 COPY_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
-COPY_WRITER_PROMPT_VERSION = "copy-writer-v25-us-measurements"
+COPY_WRITER_PROMPT_VERSION = "copy-writer-v26-scoped-capacity"
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TITLE_PREFERRED_CHARS = 68
 TITLE_MAX_CHARS = 75
@@ -584,6 +584,8 @@ def _rewrite_listing_copy_with_openai(
         payload["thinking"] = {"type": "disabled"}
     if config.json_mode:
         payload["response_format"] = {"type": "json_object"}
+    # Validate against the same source statements supplied to the writer.
+    product_specific = {**product_specific, 'source_description': source_for_model['description']}
     result: dict[str, Any] | None = None
     parse_attempts = 3
     for attempt in range(1, parse_attempts + 1):
@@ -1675,29 +1677,48 @@ def _validate_copy_compliance(
         violations.append("unsupported weight capacity")
     if capacity_claim and capacity_fact:
         capacity_terms = r"(?:weight[_ ]capacity|load[_ ]capacity|maximum[_ ]weight|max[_ ]weight|capacity of|supports up to|holds up to|up to)"
-        def capacity_values(value: Any, context: str = "") -> list[str]:
+        def capacity_values(value: Any, context: str = "") -> list[tuple[str, str]]:
             if isinstance(value, dict):
                 numbers = []
                 for key, item in value.items():
+                    if str(key).endswith('_unit'):
+                        continue
                     unit = value.get(f'{key}_unit')
                     if unit and not isinstance(item, (dict, list)) and not extract_measurements(item):
                         item = f'{item} {unit}'
-                    numbers.extend(capacity_values(item, context + ' ' + str(key)))
+                    numbers.extend(capacity_values(item, str(key).replace('_', ' ')))
                 return numbers
             if isinstance(value, list):
                 return [number for item in value for number in capacity_values(item, context)]
             content = str(value)
-            if re.search(capacity_terms, context, re.I):
-                return [row["text"] for row in extract_measurements(content)
-                        if row["kind"] == "weight_g"]
-            return [row["text"]
-                    for match in re.finditer(capacity_terms + r"[^;\n]{0,65}", content, re.I)
-                    for row in extract_measurements(match.group()) if row["kind"] == "weight_g"]
+            matches = list(re.finditer(r'\d+(?:\.\d+)?\s*-?\s*(?:pounds?|lbs?|kg|kilograms?)(?=$|[^A-Za-z]|Weight|Load|Total)', content, re.I))
+            numbers = []
+            for index, match in enumerate(matches):
+                before = content[matches[index-1].end() if index else 0:match.start()]
+                after = content[match.end():matches[index+1].start() if index+1 < len(matches) else len(content)]
+                before = re.split(r'[,;\n.!?]|\bwith\b', before, flags=re.I)[-1]
+                after = re.split(r'[,;\n.!?]|\bwith\b', after, flags=re.I)[0]
+                post_object = re.search(r'\b(?:for (?:the |each )?|per )(shel(?:f|ves)|drawers?|top|tabletop)\b', after, re.I)
+                anchor = re.search(capacity_terms, before, re.I)
+                scope_text = before[anchor.start():] if anchor else before.rsplit(':', 1)[-1]
+                pre_object = re.search(r'\b(shel(?:f|ves)|drawers?|top|tabletop)\b', scope_text + ' ' + context, re.I)
+                if pre_object is None and anchor:
+                    pre_object = re.search(r'\b(shel(?:f|ves)|drawers?|top|tabletop)\s*$', before[:anchor.start()], re.I)
+                if re.search(r'\b(?:weighs?|item weight|product weight|shipping weight)\b', before + ' ' + context, re.I) and not re.search(capacity_terms, before + ' ' + context, re.I):
+                    continue
+                if not (re.search(capacity_terms, before + ' ' + context, re.I)
+                        or re.match(r'\s*(?:total )?(?:load|weight) capacity\b', after, re.I) or post_object):
+                    continue
+                owner = (post_object or pre_object)
+                scope = owner[1].lower() if owner else 'whole product'
+                scope = 'shelf' if scope in {'shelf', 'shelves'} else 'drawer' if scope.startswith('drawer') else 'top' if scope in {'top', 'tabletop'} else scope
+                numbers.append((scope, match[0]))
+            return numbers
 
         known_capacities = capacity_values(product_specific)
-        claimed_capacities = capacity_values(text)
-        if known_capacities and any(not any(measurement_values_match('Capacity: ' + known, value)
-                       for known in known_capacities) for value in claimed_capacities):
+        claimed_capacities = capacity_values([title, *result.get('bullets', []), *result.get('item_highlights', []), result.get('description', '')])
+        if known_capacities and any(not any(owner == scope and measurement_values_match('Capacity: ' + known, value)
+                       for owner, known in known_capacities) for scope, value in claimed_capacities):
             violations.append("weight capacity value contradicts product facts")
     if re.search(r"\bergonomic\b", text, re.I) and not re.search(r"\b(?:ergonomic|ansi|bifma)\b", fact_text, re.I):
         violations.append("unsupported ergonomic")

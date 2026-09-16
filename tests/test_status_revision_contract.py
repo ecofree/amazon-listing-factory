@@ -63,6 +63,7 @@ class StatusRevisionContractTests(unittest.TestCase):
         }
         self.assertIn(("brief:B1:design_kit", "kit-revision"), identities)
         self.assertIn(("brief:B1:main", "prompt-revision"), identities)
+        self.assertEqual([], result['subtask_diagnostics']['visual_design']['ready_children'])
 
     def test_terminal_run_state_is_not_rewritten_by_unrelated_active_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,6 +87,18 @@ class StatusRevisionContractTests(unittest.TestCase):
                 with self.assertRaises(status.JobLockError):
                     cmd_status(argparse.Namespace(job=str(job), repair_running=True))
                 repair.assert_not_called()
+            image = job / 'images/generated/B1/main/fixture.candidate0.png'
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b'physical file, not a validated image')
+            write_json(job / 'reports/release_manifest_v6.json', {'updated_at': 'snapshot',
+                'diagnostics': {'current_candidate_count': 0, 'image_branch_error': 'stale branch'}})
+            with patch('builtins.print') as printed:
+                cmd_status(argparse.Namespace(job=str(job), repair_running=False))
+            import json
+            snapshot = json.loads(printed.call_args.args[0])
+            self.assertEqual(1, snapshot['physical_candidate_file_count'])
+            self.assertEqual(0, snapshot['release_diagnostics']['current_candidate_count'])
+            self.assertEqual('snapshot', snapshot['release_snapshot_at'])
 
         for mode, expected in (("draft", ["qa", "template"]), ("submit_ready", ["qa"])):
             with self.subTest(template_mode=mode), tempfile.TemporaryDirectory() as tmp:

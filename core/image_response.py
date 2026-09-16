@@ -14,8 +14,10 @@ RESPONSE_SCHEMA = 'image-response-v1'
 
 
 def response_binding(task: dict[str, Any]) -> str:
-    return input_revision_id({key: task.get(key) for key in (
-        'logical_task_id', 'task_fingerprint', 'candidate_revision', 'prompt', 'generation_references')})
+    return input_revision_id({**{key: task.get(key) for key in (
+        'logical_task_id', 'task_fingerprint', 'candidate_revision', 'prompt')},
+        'attachments': [{key: row.get(key) for key in ('kind', 'source_id', 'view_id', 'sha256', 'protected_mask')}
+                        for row in task.get('generation_references', [])]})
 
 
 def response_directory(task: dict[str, Any]) -> Path:

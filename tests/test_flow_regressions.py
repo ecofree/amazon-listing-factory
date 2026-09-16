@@ -312,6 +312,10 @@ class FlowRegressionTests(unittest.TestCase):
         self.assertEqual("failed", incomplete_release["status"])
         self.assertEqual("incomplete", incomplete_release["production_task_completion"]["status"])
         self.assertEqual("FinalSourceIntent inventory mismatch", incomplete_release["production_task_completion"]["image_branch_error"])
+        self.assertEqual(0, incomplete_release['diagnostics']['current_candidate_count'])
+        self.assertEqual('FinalSourceIntent inventory mismatch', incomplete_release['diagnostics']['image_branch_error'])
+        self.assertIn('repair_current_image_branch_before_generation', incomplete_release['diagnostics']['next_actions'])
+        self.assertNotIn('complete_required_generation_qa_or_review', incomplete_release['diagnostics']['next_actions'])
         self.assertEqual(coverage, incomplete_release["source_inventory_coverage"])
 
     def test_release_missing_candidate_takes_precedence_over_other_review(self) -> None:

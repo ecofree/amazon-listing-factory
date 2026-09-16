@@ -17,10 +17,10 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v20-named-source-evidence"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v21-product-evidence"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
-SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant"})
+SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant", "reobserve"})
 PLANNING_SOURCE_ROLES = frozenset({"main", "scene", "func", "size"})
 _DIMENSION_WORD = re.compile(r"\b(size|dimensions?|width|height|depth|length|overall|tall|wide|inch(?:es)?|cm|mm|ft|feet)\b", re.I)
 _DIRECTION_WORD = re.compile(r"\b(width|height|depth|length|overall|tall|wide)\b", re.I)
@@ -31,7 +31,8 @@ _NOISE_TEXT = re.compile(r"^[^A-Za-z0-9]*$|^[A-Za-z]{1,2}$|^\d{1,3}$")
 class FinalSourceIntentError(RuntimeError):
     pass
 def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, workers: int = 0, limit: int = 0,
-                               deadline_monotonic: float | None = None) -> dict[str, Any]:
+                               deadline_monotonic: float | None = None,
+                               observation_corrections: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Build one immutable, final role decision for every scoped downloaded source."""
     job = Path(job_dir).resolve()
     ensure_run_scope(job_dir=job, limit=limit)
@@ -47,6 +48,19 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
         if row.get("status") == "ok" and row_in_scope(job, row)
     ]
     source_reviews = _current_source_intent_reviews(job, downloads)
+    previous = read_final_source_intents(job, plugin=plugin) if observation_corrections is not None else []
+    correction_inputs = {}
+    for row in previous:
+        child, index = row['child'], row['source_index']
+        source_id = f'source_{index:02d}'
+        finding = (observation_corrections or {}).get(child, {}).get(source_id)
+        visual = row.get('visual_evidence') or {}
+        if (finding and finding['source_sha256'] == row['source_sha256']
+                and finding['source_revision'] == row['input_revision_id']
+                and (visual.get('planning_correction') != finding or visual.get('status') != 'success')):
+            correction_inputs.setdefault(child, {})[source_id] = finding
+    if observation_corrections is not None:
+        downloads = [row for row in downloads if row['child'] in correction_inputs]
     family = read_product_family(job)
     children = {str(row["asin"]): row for row in family["family"]["children"]}
     evidence_by_sha = _collect_evidence_by_sha(job, downloads, workers=_classification_workers(workers, len(downloads)), deadline_monotonic=deadline_monotonic)
@@ -60,7 +74,14 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
             "ocr": evidence_by_sha[row["source_sha256"]].get("trusted_text") or [],
         } for row in child_downloads]
         try:
-            observed = observe_child_sources(job, children.get(asin, {}), observation_sources, deadline_monotonic=deadline_monotonic)
+            corrections = {f'source_{index:02d}': {'revision': review['review_fingerprint'], 'reason': review['reason']}
+                           for (owner, index, _sha), review in source_reviews.items() if owner == asin and review['role'] == 'reobserve'}
+            for source_id, finding in correction_inputs.get(asin, {}).items():
+                prior = corrections.get(source_id, {})
+                corrections[source_id] = {**prior, 'revision': prior.get('revision', ''),
+                    'reason': {'source': finding, 'operator_request': prior.get('reason')}, 'planning_correction': finding}
+            observed = observe_child_sources(job, children.get(asin, {}), observation_sources,
+                deadline_monotonic=deadline_monotonic, **({'corrections': corrections} if corrections else {}))
         except Exception as exc:
             observed = {row["source_id"]: {"status": "failed", "error": f"{type(exc).__name__}: {exc}"} for row in observation_sources}
         for row in child_downloads:
@@ -83,11 +104,13 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
                     str(download.get("source_sha256") or ""),
                 )
             )
+            if (prepared['source_review'] or {}).get('role') == 'reobserve':
+                prepared['source_review'] = None
             prepared_by_child.setdefault(str(download.get("child") or ""), []).append(prepared)
         except Exception as exc:
             row = _failure_row(plugin, download, exc)
             prepared_by_child.setdefault(str(download.get("child") or ""), []).append({"final_row": row})
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = [row for row in previous if row['child'] not in correction_inputs]
     for child in sorted(prepared_by_child):
         rows.extend(_finalize_child(prepared_by_child[child]))
     rows.sort(key=lambda row: (str(row.get("child") or ""), int(row.get("source_index") or 0)))
@@ -100,6 +123,7 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
         _validate_row(row)
     return {
         "schema_version": FINAL_SOURCE_INTENT_SCHEMA_VERSION,
+        "corrected_children": sorted(correction_inputs),
         "tasks": rows,
         "failures": [
             _stage_failure(row)
@@ -156,6 +180,11 @@ def read_final_source_intents(job_dir: str | Path, *, plugin: ProductPlugin | No
         reviews = _current_source_intent_reviews(job, list(downloads.values()))
         for (child, source_index, _sha), review in reviews.items():
             row = by_key.get((child, source_index), {})
+            if review['role'] == 'reobserve':
+                if ((row.get('visual_evidence') or {}).get('correction_revision') != review['review_fingerprint']
+                        and (row.get('visual_evidence') or {}).get('status') == 'success'):
+                    raise FinalSourceIntentError(f'Source observation correction not applied: {child}/{source_index}')
+                continue
             if review.get('role') != 'excluded_wrong_variant' and row.get("role") == "review_required" and str(row.get("classification_reason") or "").startswith("source_"):
                 continue  # A role-only review cannot waive a source identity conflict.
             if (
@@ -165,7 +194,7 @@ def read_final_source_intents(job_dir: str | Path, *, plugin: ProductPlugin | No
                 raise FinalSourceIntentError(
                     f"FinalSourceIntentV2 has not applied current source review: {child}/{source_index}"
                 )
-        reviewed_keys = {(child, source_index) for child, source_index, _sha in reviews}
+        reviewed_keys = {(child, source_index) for (child, source_index, _sha), review in reviews.items() if review['role'] != 'reobserve'}
         stale_embedded = [
             key for key, row in by_key.items()
             if str(row.get("classification_reason") or "").startswith("human_source_role_review=")
@@ -204,8 +233,6 @@ def record_source_intent_review(
     )
     if not isinstance(download, dict):
         raise FinalSourceIntentError(f"Current downloaded source not found: {child}/{source_index}")
-    if int(source_index) == 0:
-        raise FinalSourceIntentError("source_00 is the immutable main source and cannot be reassigned")
     # A manual decision is still part of the same child-level role contract:
     # one size authority, no duplicate source key, and no stale decision from
     # a different downloaded SHA may remain active.
@@ -447,13 +474,21 @@ def _finalize_child(prepared_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     size_winner = reviewed_sizes[0] if reviewed_sizes else (
         max(candidates, key=_size_strength) if candidates else None
     )
+    reliable = [row for row in prepared_rows if not row.get('final_row') and not row.get('identity_issue')
+                and row.get('visual_evidence', {}).get('status') == 'success'
+                and (row.get('source_review') or {}).get('role') != 'excluded_wrong_variant'
+                and any(view.get('extent') == 'whole_view' for view in row['visual_evidence'].get('physical_views', []))]
+    primary = next((row for row in reliable if row['source_index'] == 0 and not row.get('source_review')), None)
+    if primary is None:
+        primary = next((row for row in sorted(reliable, key=lambda row: row['source_index'])
+                        if row is not size_winner and not row.get('source_review') and _non_size_role(row) == 'scene'), None)
     final: list[dict[str, Any]] = []
     for prepared in sorted(prepared_rows, key=lambda row: int(row.get("source_index") or 0)):
         if prepared.get("final_row"):
             final.append(prepared["final_row"])
             continue
         review = prepared.get("source_review") if isinstance(prepared.get("source_review"), dict) else None
-        role = "main" if prepared["source_index"] == 0 else (
+        role = "main" if prepared is primary else (
             str(review["role"]) if review else (
                 "size" if prepared is size_winner else _non_size_role(prepared)
             )
@@ -863,8 +898,8 @@ def _validate_row(row: Any) -> None:
     roles = {"main", "scene", "func", "size", "review_required", "excluded_wrong_variant"} if row.get("status") == "success" else {"failed"}
     if row.get("role") not in roles:
         raise FinalSourceIntentError("Invalid FinalSourceIntentV2 role")
-    if row.get('role') == 'excluded_wrong_variant' and (row['source_index'] == 0 or not str(row.get('classification_reason') or '').startswith('human_source_role_review=')):
-        raise FinalSourceIntentError('Source exclusion requires an explicit SHA-bound source review and cannot replace the main source')
+    if row.get('role') == 'excluded_wrong_variant' and not str(row.get('classification_reason') or '').startswith('human_source_role_review='):
+        raise FinalSourceIntentError('Source exclusion requires an explicit SHA-bound source review')
     for key in ("evidence_flags", "signals", "ocr_evidence", "pixel_evidence", "visual_evidence"):
         if not isinstance(row.get(key), dict):
             raise FinalSourceIntentError(f"Invalid FinalSourceIntentV2 {key}")

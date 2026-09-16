@@ -191,6 +191,11 @@ class QaLiteV1Tests(unittest.TestCase):
         observation = _observed(task)
         observation["texts"].append({"text": "Goodnight", "kind": "prop", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)})
         self.assertEqual("pass", image_qa._semantic_gates(task, observation)[0]["status"])
+        observation['texts'][0]['confidence'] = .7
+        uncertain = image_qa._semantic_gates(task, observation)[0]
+        self.assertEqual('inconclusive', uncertain['status'])
+        self.assertIn('low-confidence reading (not proof of a brand)', uncertain['evidence'])
+        observation['texts'][0]['confidence'] = .99
         observation["texts"][0]["text"] = "Weight Capacity: 441 lbs"
         self.assertEqual("fail", image_qa._semantic_gates(task, observation)[0]["status"])
         observation["texts"][0]["kind"] = "unknown"
@@ -238,7 +243,7 @@ class QaLiteV1Tests(unittest.TestCase):
         from core.visual_semantics import _validate_candidate_observation
         task = _task('func')
         task['generation_references'].append({'source_id': 'source_00', 'view_id': 'view_02'})
-        task['image_direction']['evidence_usage'].append({'view_id': 'view_02', 'usage': 'display', 'covered_by': []})
+        task['image_direction']['evidence_usage'].append({'source_id': 'source_00', 'view_id': 'view_02', 'usage': 'display', 'covered_by': []})
         complete = _observed(task)
         _validate_candidate_observation(complete)
         self.assertEqual('pass', image_qa._semantic_gates(task, complete)[2]['status'])
@@ -251,7 +256,7 @@ class QaLiteV1Tests(unittest.TestCase):
         _validate_candidate_observation(extra)
         self.assertEqual('fail', image_qa._semantic_gates(task, extra)[2]['status'])
         wrong = deepcopy(complete)
-        wrong['product_comparisons'][1].update(status='contradiction', part='corner', evidence='Mattress added to bare corner')
+        wrong['product_comparisons'][1].update(status='contradiction', part='corner', evidence='Product corner joint replaced by a different construction')
         self.assertEqual('fail', image_qa._semantic_gates(task, wrong)[2]['status'])
         wrong['product_comparisons'][1]['confidence'] = .4
         self.assertEqual('inconclusive', image_qa._semantic_gates(task, wrong)[2]['status'])

@@ -202,12 +202,15 @@ class ModelRouterTests(unittest.TestCase):
         good = json.dumps({"choices": [{"message": {"content": "good"}}]})
         events = []
         with patch("core.vision_gemini_client.gemini_clients", return_value=[client, fallback]), patch(
-            "core.vision_gemini_client._post_vision_request", side_effect=[IncompleteRead(b""), good],
+            "core.vision_gemini_client._post_vision_request", side_effect=[IncompleteRead(b'{"choices": [', 100), good],
         ) as truncated, patch("core.vision_gemini_client._deadline_sleep"):
             self.assertEqual("good", gemini_stream_generate("prompt", [], client_scope="visual_planning",
                 total_timeout_seconds=10, max_physical_requests=2, request_id="truncated-response-test", attempt_observer=events.append))
         self.assertEqual(2, truncated.call_count)
-        self.assertEqual(["transport_failure", "success"], [event["status"] for event in events])
+        self.assertEqual(["transport_failure", "success"], [event['status'] for event in events if event.get('event') != 'request_budget'])
+        self.assertEqual([1, 2], [event['physical_request_count'] for event in events if event.get('event') == 'request_budget'])
+        self.assertEqual('{"choices": [', next(event['response_body'] for event in events if event.get('status') == 'transport_failure'))
+        events.clear()
         with (
             patch("core.vision_gemini_client.gemini_clients", return_value=[client, fallback]),
             patch(
@@ -221,9 +224,11 @@ class ModelRouterTests(unittest.TestCase):
                 total_timeout_seconds=10, max_physical_requests=1,
                 response_validator=lambda text: text == "good",
                 request_id="queue-budget-test",
+                attempt_observer=events.append,
             )
         self.assertEqual("good", result)
         self.assertEqual(2, request.call_count)
+        self.assertEqual([1, 0, 1], [event['physical_request_count'] for event in events if event.get('event') == 'request_budget'])
 
 
 if __name__ == "__main__":

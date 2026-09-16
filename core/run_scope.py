@@ -17,7 +17,7 @@ class RunScopeError(RuntimeError):
 
 
 def ensure_run_scope(
-    *, job_dir: str | Path, limit: int = 0, production: bool = False,
+    *, job_dir: str | Path, limit: int = 0, production: bool = False, child_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     job_path = Path(job_dir).resolve()
     reports = job_path / "reports"
@@ -26,15 +26,21 @@ def ensure_run_scope(
     if not path.is_file() and legacy.is_file():
         raise RunScopeError("RunScopeV4 is retired; create a new job for RunScopeV5")
     family = read_product_family(job_path)
+    if child_ids and (production or limit):
+        raise RunScopeError('Explicit child selection cannot be combined with production or limit')
     if path.is_file():
         scope = read_run_scope(job_path)
+        if child_ids and set(child_ids) != set(scope['selected_children']):
+            raise RunScopeError('Selected child IDs differ from the frozen scope; create a new job')
         if production and scope.get("mode") != "production":
             raise RunScopeError("Production requires a full-family RunScopeV5; create a new production job")
         return scope
     if production and (family.get("source") or {}).get("child_fetch_errors"):
         raise RunScopeError("Production requires a complete ProductFamilyV3; rerun fetch before creating RunScopeV5")
     children = [str(row["asin"]) for row in family["family"]["children"]]
-    selected = children if production or limit <= 0 else children[:limit]
+    if len(child_ids) != len(set(child_ids)) or set(child_ids) - set(children):
+        raise RunScopeError('Selected child IDs must be unique members of this product family')
+    selected = list(child_ids) if child_ids else children if production or limit <= 0 else children[:limit]
     if not selected:
         raise RunScopeError("RunScopeV5 has no selected children")
     inventory = _family_inventory(family, selected_children=set(selected))

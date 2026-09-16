@@ -6,6 +6,8 @@ import io
 import json
 import os
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -199,30 +201,53 @@ def _generate_with_openai_images_edit(
                 if transport_observer:
                     transport_observer('partial', exc.partial, request_audit or {})
                 raise
+            text = raw.decode("utf-8", errors="replace")
+            payload = _raise_image_rejection(provider_name, text, 200)
             if transport_observer:
                 transport_observer('body', raw, request_audit or {})
-            text = raw.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         try:
             excerpt = exc.read(800).decode("utf-8", errors="replace")
         except Exception as body_error:
             excerpt = f'Unreadable error body: {type(body_error).__name__}'
-        if exc.code == 408 or exc.code >= 500:
-            raise ProviderTransportError(provider_name, f"Remote image result unknown after HTTP {exc.code}: {excerpt}", ambiguous=True) from exc
+        _raise_image_rejection(provider_name, excerpt, exc.code)
         raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
+    except (ProviderConfigurationError, ProviderTransportError):
+        raise
     except Exception as exc:
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            raise ProviderConfigurationError(provider_name, f'TLS certificate rejected before image submission: {reason}') from exc
+        if isinstance(reason, (socket.gaierror, ConnectionRefusedError)):
+            raise ProviderTransportError(provider_name, f'Connection failed before image submission: {reason}') from exc
         raise ProviderTransportError(provider_name, f"Remote image result unknown after {type(exc).__name__}: {exc}", ambiguous=True) from exc
     if request_audit is not None:
-        try:
-            payload = json.loads(text)
-        except (ValueError, TypeError):
-            payload = None
         if isinstance(payload, dict):
             request_audit["response_metadata"] = {key: value for key in ("model", "id", "created")
                 if isinstance((value := payload.get(key)), (str, int, float)) and len(str(value)) <= 200}
             if request_audit["response_metadata"].get("model"):
                 request_audit["model_identity_verification"] = "gateway_reported_not_independently_verified"
     return _decode_image_response(text)
+
+
+def _raise_image_rejection(provider_name: str, text: str, status: int) -> Any:
+    """A complete rejection is not a recoverable paid-image body, even on HTTP 200."""
+    try:
+        payload = json.loads(text)
+        error = payload.get('error') if isinstance(payload, dict) else None
+        has_result = isinstance(payload, dict) and any(payload.get(key) for key in (
+            'data', 'images', 'output', 'result', 'choices', 'content', 'image', 'url', 'b64_json'))
+        code = (error.get('code') or error.get('type')) if isinstance(error, dict) and not has_result else ''
+    except ValueError:
+        payload, code = None, ''
+    code = code if isinstance(code, str) else ''
+    if code in {'model_not_found', 'invalid_api_key', 'insufficient_quota', 'permission_denied'}:
+        raise ProviderConfigurationError(provider_name, f'Image request rejected: {code}')
+    if status == 429 or code in {'rate_limit_exceeded', 'no_available_channel'}:
+        raise ProviderTransportError(provider_name, f'Image request rejected before generation: HTTP {status}: {code}')
+    if status == 408 or status >= 500:
+        raise ProviderTransportError(provider_name, f'Remote image result unknown after HTTP {status}: {text[:800]}', ambiguous=True)
+    return payload
 
 
 def _generate_with_openai_chat_completions_image(

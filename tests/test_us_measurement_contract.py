@@ -101,6 +101,42 @@ class UsMeasurementContractTests(unittest.TestCase):
                 self.assertIn('Fix title spacing only', request.call_args.args[0])
                 self.assertEqual(parent_path, request.call_args.args[1][-1])
                 self.assertEqual('fail', _semantic_gates(task, observed)[-1]['status'])
+        task = {**_task('size', 'source_image'), 'product_facts': {}}
+        task['generation_references'][0].update(kind='edit_base', path='source.png', sha256='a'*64,
+            purpose='Measured view', original_region=dict(left=.1, top=.1, right=.9, bottom=.9))
+        task['generation_references'].append({**task['generation_references'][0], 'kind': 'product_evidence', 'view_id': 'drawer'})
+        task['measurement_authority']['measurement_groups'] = [{'id': 'width', 'source_id': 'source_00', 'view_id': 'view_01',
+            'measured_part': 'Cabinet', 'axis': 'width', 'source_region': dict(left=.2, top=.2, right=.4, bottom=.4),
+            'source_endpoints': [dict(x=.2, y=.5), dict(x=.8, y=.5)]}]
+        response = _observed(task)
+        response.update(measurement_coverage='complete', measurements=[{'measurement_id': 'width', 'object': 'Cabinet width',
+            'source_id': 'source_00', 'attachment_index': 3, 'source_text': '17 in', 'candidate_text': '17 in',
+            'relationship': 'same', 'confidence': .99, 'source_region': dict(left=.125, top=.125, right=.375, bottom=.375),
+            'candidate_region': dict(left=.1, top=.1, right=.3, bottom=.3),
+            'source_endpoints': [dict(x=.125, y=.5), dict(x=.875, y=.5)], 'candidate_endpoints': [dict(x=.1, y=.5), dict(x=.9, y=.5)]}])
+        candidate = {'candidate_path': 'image.png', 'candidate_sha256': 'c'*64}
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)):
+                with self.assertRaisesRegex(ValueError, 'different view attachment'):
+                    observe_candidate(job, task, candidate)
+            response['measurements'][0]['attachment_index'] = 2
+            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)) as request:
+                observe_candidate(job, task, candidate)
+                context = json.loads(request.call_args.args[0].split('INPUT CONTEXT:\n')[1].split('\nOUTPUT OBJECT')[0])
+                binding = context['measurement_sources'][0]
+                self.assertEqual(2, binding['attachment_index'])
+                self.assertAlmostEqual(.125, binding['source_region']['left'])
+                self.assertEqual(2, context['required_views'][0]['attachment_index'])
+                self.assertNotIn('source_text', binding)
+            path = next((job / 'reports/candidate_observations').glob('*.json'))
+            corrupted = json.loads(path.read_text(encoding='utf-8'))
+            corrupted['measurements'][0]['attachment_index'] = 3
+            path.write_text(json.dumps(corrupted), encoding='utf-8')
+            with patch('core.visual_semantics.gemini_stream_generate') as remote:
+                with self.assertRaisesRegex(ValueError, 'different view attachment'):
+                    observe_candidate(job, task, candidate)
+                remote.assert_not_called()
 
     def test_local_failure_is_current_evidence_without_remote_observation(self):
         from core.image_qa import _evaluate
@@ -119,6 +155,8 @@ class UsMeasurementContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch('core.final_source_intents.ensure_run_scope'), patch('core.final_source_intents.row_in_scope', return_value=True), patch('core.final_source_intents.read_download_manifest', return_value={'rows': downloads}):
             record_source_intent_review(tmp, child='B1', source_index=1, role='excluded_wrong_variant', reason='Human confirmed natural wood in white child')
             self.assertEqual(1, len(_current_source_intent_reviews(Path(tmp), downloads)))
+            record_source_intent_review(tmp, child='B1', source_index=1, role='reobserve', reason='Recheck drawn markings versus product finish')
+            self.assertEqual('reobserve', next(iter(_current_source_intent_reviews(Path(tmp), downloads).values()))['role'])
             downloads[0]['source_sha256'] = 'b' * 64
             self.assertEqual({}, _current_source_intent_reviews(Path(tmp), downloads))
 

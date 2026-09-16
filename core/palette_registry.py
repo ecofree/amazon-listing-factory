@@ -92,7 +92,10 @@ def planned_palette_diagnostics(direction: dict[str, Any]) -> dict[str, Any]:
     """Measure the actual Gemini choices for audit only; never select or veto design."""
     colors, alpha, unresolved = {}, {}, []
     for section in ("palette_direction", "graphic_direction"):
-        for role, value in direction.get(section, {}).items():
+        values = direction.get(section, {})
+        if section == 'palette_direction':
+            values = {group + '.' + component: value for group, parts in values.items() for component, value in parts.items()}
+        for role, value in values.items():
             matches = re.findall(r"#(?:[0-9A-Fa-f]{8}|[0-9A-Fa-f]{6})\b", str(value))
             if len(matches) == 1:
                 name, token = f"{section}.{role}", matches[0]

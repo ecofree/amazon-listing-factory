@@ -116,10 +116,7 @@ image_generation:
   replaceable_staging:
     - room or landscape background, furniture, wall decor, and loose decorative props not attached to the tree
   forbidden_additions:
-    - {part: decorative planter, unless_source_visible: true}
-    - {part: flower pot, unless_source_visible: true}
-    - {part: plant pot, unless_source_visible: true}
-    - {part: container base, unless_source_visible: true}
+    - Do not replace or invent the sold base, stand, stake, spike, or its attachment to the trunk
   visual_context:
     primary_setting: real US front entry, porch, garden, or bright sunroom
     buyer: homeowners and renters styling an everyday residential space
@@ -133,13 +130,13 @@ image_generation:
       - bright living area only when the source supports indoor placement
     avoid:
       - random bedroom decor or a generic studio void
-      - invented planter or support hardware not visible in the source
+      - invented sold support hardware or misleading inclusion of a decorative container
       - clutter that hides the trunk, branches, or base
   role_specific_rules:
     main:
       - Preserve branch density, trunk count, and the exact source-visible support type
     scene:
-      - Place the tree naturally without replacing, covering, or reinterpreting its source-visible support
+      - Preserve the evidenced sold support and installation; a separate non-sold decorative container may be restyled without implying it is included or concealing a required support demonstration
     size:
       - Preserve confirmed height and width dimensions
     func:

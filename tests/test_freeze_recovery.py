@@ -148,27 +148,33 @@ class FreezeRecoveryTests(unittest.TestCase):
             self.assertEqual("validation_failure", raised.exception.failure_kind)
             self.assertTrue(read_json(path)[-1]["validation_errors"])
 
-    def test_parent_keeps_prepared_request_audit_when_worker_times_out(self):
+    def test_submitted_worker_timeout_preserves_audit_and_unknown_receipt(self):
         context = MagicMock()
         context.Queue.return_value.get.return_value = {"event": "request_prepared", "request_audit": {
             "request_id": "local-id", "provider": "cxk_fixed", "model": "gpt-image-2", "inputs": [{"sent_bytes": 42}]}}
         context.Process.return_value.is_alive.return_value = True
+        context.Process.return_value.terminate.side_effect = lambda: setattr(context.Process.return_value.is_alive, 'return_value', False)
         audit = {'response_binding': 'fixture-binding'}
         with tempfile.TemporaryDirectory() as tmp, patch.object(routing, "assert_imagegen_prompt_contract"), \
              patch.object(routing, "has_registry_image_provider", return_value=True), \
              patch.object(routing.multiprocessing, "get_context", return_value=context), \
              patch.object(routing.time, "monotonic", side_effect=[0, 0, 2]):
+            def submit():
+                receipt = next(Path(tmp).glob('*.json'))
+                write_json(receipt, {**read_json(receipt), 'status': 'submitted'})
+            context.Process.return_value.start.side_effect = submit
             with self.assertRaises(ProviderTransportError) as raised:
                 routing._generate_with_provider_deadline(provider_name="cxk_fixed", image_input_paths=[],
                     prompt="fixture", timeout_seconds=1, request_id="local-id", request_audit=audit, response_directory=Path(tmp))
+            self.assertEqual('submitted', read_json(next(Path(tmp).glob('*.json')))['status'])
         self.assertTrue(raised.exception.ambiguous)
         self.assertEqual("gpt-image-2", audit["model"])
         self.assertEqual(42, audit["inputs"][0]["sent_bytes"])
-        context.Process.return_value.terminate.assert_called_once()
+        self.assertFalse(context.Process.return_value.is_alive())
 
     def test_multi_stage_template_command_writes_excel(self):
         from scripts import factory
-        args = factory.build_parser().parse_args(["run", "--job", "fixture", "--stages", "generate,qa,template", "--limit", "2"])
+        args = factory.build_parser().parse_args(["run", "--job", "fixture", "--stages", "generate,qa,template", "--children", "B2,B1"])
         with patch.object(factory, "_assert_runtime_dependencies"), patch.object(factory, "load_job", return_value={}), \
              patch.object(factory, "_load_plugin_for_job", return_value=load_plugin("bed_frame")), \
              patch.object(factory, "load_env"), patch.object(production, "run_job", return_value={"workflow_status": "success"}) as run, \
@@ -176,6 +182,15 @@ class FreezeRecoveryTests(unittest.TestCase):
             self.assertEqual(0, factory.cmd_run(args))
         self.assertTrue(run.call_args.args[0].write_excel)
         self.assertEqual("draft", run.call_args.args[0].template_mode)
+        self.assertEqual(('B2', 'B1'), run.call_args.args[0].child_ids)
+        from core.run_scope import ensure_run_scope, RunScopeError
+        family = {'family': {'children': [{'asin': key, 'reference_images': ['first', 'second']} for key in ('B1', 'B2', 'B3')]}}
+        with tempfile.TemporaryDirectory() as tmp, patch('core.run_scope.read_product_family', return_value=family):
+            scope = ensure_run_scope(job_dir=tmp, child_ids=('B2', 'B1'))
+            self.assertEqual(['B2', 'B1'], scope['selected_children'])
+            self.assertEqual({'B2': [0, 1], 'B1': [0, 1]}, scope['selected_sources'])
+            with self.assertRaises(RunScopeError):
+                ensure_run_scope(job_dir=tmp, child_ids=('B3',))
 
 
 if __name__ == "__main__":

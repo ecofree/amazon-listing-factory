@@ -5,6 +5,7 @@ from typing import Any
 
 from .asset_manager import read_download_manifest
 from .candidate_state import CandidateStateError, current_candidate, candidate_by_sha
+from .design_reference_library import production_reference_error
 from .final_source_intents import read_final_source_intents
 from .image_prompt_compiler import image_branch_currentness, read_image_prompts
 from .image_task_inputs import release_candidate_fingerprint
@@ -111,6 +112,7 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
         review = reviews.get((*key, candidate.get("candidate_sha256", "")))
         review_current = _review_is_current(review, task=task, candidate=candidate, evidence=evidence if evidence_current else {})
         human = str(review.get("decision") or "") if review_current else ""
+        reference_error = production_reference_error(job_path, task)
         generation_state = task_record_current(job_path, task["logical_task_id"], task["input_revision_id"])
         if task["formation_status"] == "blocked":
             final = "blocked_task"
@@ -122,6 +124,8 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
             final = "awaiting_qa"
         elif automatic == "fail":
             final = "blocked_auto"
+        elif reference_error:
+            final = "blocked_reference"
         elif human == "approve":
             final = "approved"
         elif human == "reject":
@@ -155,6 +159,7 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
             "task_error": (
                 task.get("formation_reason")
                 or candidate_error
+                or reference_error
                 or ("candidate prompt is stale" if stale_candidate_prompt else "")
                 or generation_state.get("error")
                 or ""
@@ -580,7 +585,7 @@ def _assign_required_slots(rows: list[dict[str, Any]], required: dict[str, int])
     rank = {
         "approved": 0, "awaiting_review": 1, "awaiting_qa": 2,
         "awaiting_generation": 3, "blocked_auto": 4,
-        "rejected_human": 5, "blocked_candidate": 6, "blocked_task": 7,
+        "rejected_human": 5, "blocked_candidate": 6, "blocked_task": 7, "blocked_reference": 8,
     }
     children = sorted({str(row.get("child") or "") for row in rows})
     for child in children:
@@ -712,7 +717,10 @@ def _with_release_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
         and row.get("status") not in {"covered", "classified_not_selected"}
     ]
     next_actions: list[str] = []
-    if required_blockers:
+    branch_error = str((payload.get('production_task_completion') or {}).get('image_branch_error') or '')
+    if branch_error:
+        next_actions.append('repair_current_image_branch_before_generation')
+    elif required_blockers:
         next_actions.append("complete_required_generation_qa_or_review")
     if not required_blockers and payload.get("status") == "success":
         next_actions.append("publish_required_candidates")
@@ -721,6 +729,11 @@ def _with_release_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
     if coverage_warnings:
         next_actions.append("inspect_source_coverage_warnings")
     payload["diagnostics"] = {
+        "image_branch_error": branch_error,
+        "current_candidate_count": sum(bool(row.get('candidate_sha256')) for row in payload.get('rows') or []),
+        "qa_counts": {status: sum(row.get('automatic_decision') == status for row in payload.get('rows') or [])
+                      for status in ('pass', 'fail', 'inconclusive', 'not_run', 'stale')},
+        "template_readiness": payload.get('template_readiness', payload.get('status', 'unknown')),
         "blocking_required": required_blockers,
         "pending_optional": pending_optional,
         "coverage_warnings": coverage_warnings,

@@ -16,7 +16,6 @@ from .candidate_state import CandidateStateError, current_candidate
 from .image_generation_executor import generate_one, finalize_candidate
 from .image_response import recover_response
 from .image_provider_common import (
-    _system_memory_bytes,
     ProviderQueueUnavailable,
     provider_attempts,
     provider_concurrency_limit,
@@ -28,7 +27,6 @@ from .image_prompt_compiler import (
     IMAGE_PROMPT_SCHEMA_VERSION,
     PROMPT_CONTRACT_VERSION,
     PROMPT_HARD_LIMIT_CHARS,
-    PROMPT_REVISION_RESERVE_CHARS,
     prompt_for_task,
     read_image_prompts,
     require_current_image_branch,
@@ -500,17 +498,14 @@ def _compose_revision_prompt(
         f"Instruction: {' '.join(str(request_intro or '').split())} "
         "Address only this reason while preserving the task facts and family art direction: "
     )
-    suffix = "\nDo not add new facts, new dimensions, new claims, or a different product configuration."
-    if len(base_prompt) > int(target_chars) - PROMPT_REVISION_RESERVE_CHARS:
-        raise RuntimeError("Base ImagePromptV2 did not reserve space for an explicit revision request")
-    available = int(target_chars) - len(base_prompt) - len(prefix) - len(suffix)
-    if available < 64:
+    available = int(target_chars) - len(base_prompt) - len(prefix)
+    if available < 1:
         raise RuntimeError("Revision reason cannot fit without discarding the immutable base prompt")
     if len(cleaned_reason) > available:
         raise RuntimeError(
             f"Revision reason is {len(cleaned_reason)} characters; maximum executable length is {available}"
         )
-    return base_prompt + prefix + cleaned_reason + suffix
+    return base_prompt + prefix + cleaned_reason
 
 
 def _next_candidate_revision(
@@ -551,20 +546,32 @@ def _execute(
         return completed, failures
     pending = list(tasks)
     capacity_requeues: dict[str, int] = {}
+    recovery_attempts: set[str] = set()
     last_batch_progress_at = time.monotonic()
     capacity_errors: dict[str, ProviderQueueUnavailable] = {}
     remote_cap = _effective_generation_workers(tasks, workers)
-    with ThreadPoolExecutor(max_workers=remote_cap) as pool, ThreadPoolExecutor(max_workers=1) as local_pool:
+    with ThreadPoolExecutor(max_workers=max(1, remote_cap)) as pool, ThreadPoolExecutor(max_workers=1) as local_pool:
         futures: dict[Any, dict[str, Any]] = {}
         local_futures: set[Any] = set()
+        local_ready: set[int] = set()
         while pending or futures:
+            # A saved response waiting for local capacity must never re-enter remote dispatch.
+            waiting_local = [task for task in pending if id(task) in local_ready]
+            pending = [task for task in pending if id(task) not in local_ready]
+            if waiting_local and not local_futures:
+                task = waiting_local.pop(0)
+                local_future = local_pool.submit(finalize_candidate, task, plugin=plugin)
+                futures[local_future] = task
+                local_futures.add(local_future)
+                local_ready.discard(id(task))
             current, pending = _dispatch_generation_batch(pending, workers,
                 active=[task for future, task in futures.items() if future not in local_futures],
                 occupied={(task.get('logical_task_id') or (task.get('child'), task.get('role')), task.get('candidate_revision', 0))
                           for task in futures.values()})
-            room = max(0, remote_cap + 1 - len(futures))
+            room = max(0, remote_cap + 1 - len(futures) - len(waiting_local))
             pending = current[room:] + pending
             current = current[:room]
+            pending.extend(waiting_local)
             futures.update({pool.submit(generate_one, task, plugin=plugin): task for task in current})
             done, _ = wait(futures, timeout=.25, return_when=FIRST_COMPLETED)
             round_made_progress = False
@@ -576,10 +583,25 @@ def _execute(
                     completed_task = future.result()
                 except Exception as exc:
                     task_id = str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}")
+                    if provider_failure_class(exc) == 'candidate_commit' and task_id not in recovery_attempts:
+                        try:
+                            saved = recover_response(task)
+                        except Exception:
+                            saved = {}
+                        if saved:
+                            recovery_attempts.add(task_id)
+                            recovered = {**task, 'provider': saved['provider'], 'request_audit': saved['request_audit'],
+                                         'raw_response_path': saved['receipt_path']}
+                            pending.append(recovered)
+                            local_ready.add(id(recovered))
+                            record_progress(task['job_dir'], 'image_saved_response_local_retry', child=task.get('child'), role=task.get('role'))
+                            continue
                     if isinstance(exc, ProviderQueueUnavailable):
                         capacity_requeues[task_id] = capacity_requeues.get(task_id, 0) + 1
                         capacity_errors[task_id] = exc
                         pending.append(task)
+                        if is_local:
+                            local_ready.add(id(task))
                         if task.get("job_dir") and (
                             capacity_requeues[task_id] == 1
                             or capacity_requeues[task_id] % 20 == 0
@@ -588,6 +610,7 @@ def _execute(
                                 str(task["job_dir"]), "image_task_capacity_requeued",
                                 logical_task_id=task_id, child=task.get("child"), role=task.get("role"),
                                 capacity_round=capacity_requeues[task_id],
+                                phase='local_finalize' if is_local else 'remote_admission',
                                 reason=f'{type(exc).__name__}: {exc}'[:500],
                             )
                         continue
@@ -607,9 +630,8 @@ def _execute(
                         on_failure(failure)
                 else:
                     if not is_local:
-                        local_future = local_pool.submit(finalize_candidate, completed_task, plugin=plugin)
-                        futures[local_future] = completed_task
-                        local_futures.add(local_future)
+                        pending.append(completed_task)
+                        local_ready.add(id(completed_task))
                         round_made_progress = True
                         continue
                     if on_success is not None:
@@ -619,7 +641,7 @@ def _execute(
             if round_made_progress:
                 last_batch_progress_at = time.monotonic()
                 capacity_errors.clear()
-            if pending and not futures and (not current or all(
+            if pending and not futures and not round_made_progress and (not current or all(
                 str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}") in capacity_errors
                 for task in pending
             )) and time.monotonic() - last_batch_progress_at >= _capacity_stall_budget_seconds():
@@ -635,10 +657,10 @@ def _execute(
                     }
                     failure = _failure(
                         failed_task,
-                        owner="generation_provider_capacity",
+                        owner="generation_local_capacity" if id(task) in local_ready else "generation_provider_capacity",
                         error=(
-                            "ProviderQueueUnavailable: no image task completed or failed while local provider "
-                            f"capacity remained unavailable for {_capacity_stall_budget_seconds():g} seconds"
+                            f"ProviderQueueUnavailable: capacity unavailable for {_capacity_stall_budget_seconds():g} seconds; "
+                            f"{exc or 'no dispatch capacity'}"
                         ),
                         status="retryable",
                     )
@@ -728,7 +750,7 @@ def _effective_generation_workers(
         limit = provider_concurrency_limit(provider)
         provider_cap += limit if limit > 0 else task_count
     provider_cap = provider_cap or 1
-    return max(1, min(
+    return max(0, min(
         task_count,
         requested_cap,
         policy_cap,
@@ -753,28 +775,8 @@ def _cpu_worker_cap() -> int:
 
 
 def _memory_worker_cap(tasks: list[dict[str, Any]] | None = None) -> int:
-    total, available = _system_memory_bytes()
-    if total <= 0 or available <= 0:
-        return 1
-    reserve = max(4 * 1024**3, int(total * 0.20))
-    # Multi-reference edits hold the complete input set, not only its largest file.
-    largest_reference = 0
-    for task in tasks or []:
-        task_bytes = 0
-        for row in task.get("generation_references") or []:
-            path = row.get("path") if isinstance(row, dict) else row
-            try:
-                task_bytes += Path(str(path)).stat().st_size
-            except (OSError, TypeError, ValueError):
-                continue
-        largest_reference = max(largest_reference, task_bytes)
-    estimated_task_peak = max(768 * 1024**2, min(1536 * 1024**2, int(total * 0.04)))
-    estimated_task_peak = max(
-        estimated_task_peak,
-        min(1536 * 1024**2, largest_reference * 8 + 512 * 1024**2),
-    )
-    usable = max(0, available - reserve)
-    return max(1, min(8, usable // estimated_task_peak or 1))
+    from .image_resources import image_memory_capacity
+    return image_memory_capacity(tasks or [])
 
 
 def _capacity_stall_budget_seconds() -> float:

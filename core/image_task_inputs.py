@@ -210,7 +210,6 @@ def product_boundary(
         if value
     )
     return {
-        "observed_objects": [obj for observation in observations or [] for obj in observation.get("objects") or []],
         "sold_product_parts": [
             f"the complete {product_type.lower().replace('_', ' ')} visible in the editable reference",
             "all structural parts, attached supports, and product surfaces visible in that reference",
@@ -218,7 +217,7 @@ def product_boundary(
         "replaceable_staging": _unique_text(image_policy.get("replaceable_staging") or []),
         "must_not_change": [
             "the product type, source-visible structure, proportions, quantity, color, finish, and attached parts",
-            "the source-visible open, closed, installed, assembled, or demonstrated product state",
+            "the sold parts and mechanisms required for an evidence-supported operating or installed state",
         ],
         "product_color_material": color_material or "preserve the source-visible product color, finish, and material",
         "observed_product_colors": [

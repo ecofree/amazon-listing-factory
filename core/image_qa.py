@@ -223,7 +223,8 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
     allowed = task_renderable_text(task)
     texts = observation["texts"]
     authored = [row["text"] for row in texts if row["kind"] in {"marketing", "measurement"} and row["confidence"] >= 0.9]
-    unknown = [row["text"] for row in texts if row["kind"] in {"unknown", "brand", "product_label"} or row["confidence"] < 0.9]
+    unknown = [row["text"] for row in texts if row["kind"] in {"unknown", "brand", "product_label"}]
+    uncertain = [row['text'] for row in texts if row['confidence'] < 0.9]
     marketing = [row["text"] for row in texts if row["kind"] == "marketing" and row["confidence"] >= 0.9]
     has_diagram = (task.get("measurement_authority") or {}).get("mode") == "source_image"
     factual_copy = (task.get("measurement_authority") or {}) if has_diagram else {}
@@ -235,8 +236,8 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
     missing = _unsupported_contract_lines(allowed, observed_phrases)
     if unexpected:
         text_gate = _gate("unauthorized_text", "fail", f"Located unapproved authored copy: {unexpected}")
-    elif unknown or observation["text_coverage"] != "complete" or missing:
-        text_gate = _gate("unauthorized_text", "inconclusive", f"Unverified text/brand ownership: {unknown}; approved strings not fully observed: {missing}")
+    elif unknown or uncertain or observation["text_coverage"] != "complete" or missing:
+        text_gate = _gate("unauthorized_text", "inconclusive", f"Unresolved text kind/ownership: {unknown}; low-confidence reading (not proof of a brand): {uncertain}; approved strings not fully observed: {missing}")
     else:
         text_gate = _gate("unauthorized_text", "pass", "Located approved copy matches; ordinary prop text is not an authored product claim")
 
@@ -352,12 +353,12 @@ def _compact_edit_distance_at_most_one(left: str, right: str) -> bool:
 
 def _human_checklist(task: dict[str, Any]) -> list[str]:
     checks = [
-        "exact product type, color, structure, count, moving-part state, and key parts",
+        "exact sold-product type, color, structure, count and key parts; operating states supported by same-child evidence",
         "composition, props, US-market context, and family art-direction consistency",
-        "provider preserved the sold product from the one editable role reference and did not reconstruct hidden parts",
+        "provider preserved the sold product against the selected same-child evidence without inventing hidden parts",
     ]
     if task["role_family"] == "size":
-        checks.append("every source-visible measurement, line direction, endpoint, measured part, badge, and label relationship")
+        checks.append("required measurement values, US units, measured objects and physical endpoints; layout and graphic styles may change")
     if task["role_family"] == "func":
         checks.append("specific shopping story, readable labels, and source-supported feature relationship")
     return checks

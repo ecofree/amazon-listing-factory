@@ -115,6 +115,16 @@ class CopyV1ContractTests(unittest.TestCase):
             _parse_copy_response(_body(payload), brand="safeplus", product_specific={"weight_capacity": "300 lbs", "shipping_weight": "900 lbs"})
         payload["bullets"][0] = "Weight Capacity: Supports up to 300 lbs"
         _parse_copy_response(_body(payload), brand="safeplus", product_specific={"weight_capacity": "300 lbs"})
+        # Real canary: total and component capacities are distinct source-backed facts.
+        facts = {'load_capacity': '120 lbs', 'item_weight': '22 lbs', 'source_description':
+                 'Weight Capacity of Each Shelf: 22lbsWeight Capacity of Drawer: 11 lbs'
+                 'Weight Capacity of Top: 66 lbsTotal Weight Capacity: 120 lbs'}
+        payload['bullets'][0] = 'Load Capacity: Supports up to 120 lbs'
+        payload['description'] = 'Total load capacity is 120 pounds, with 66 pounds for the top, 22 pounds per shelf, and 11 pounds for the drawer. The cabinet weighs 22 pounds.'
+        _parse_copy_response(_body(payload), product_specific=facts)
+        for wrong in ('Total load capacity is 66 pounds.', 'Load capacity is 120 pounds, with 11 pounds per shelf and 22 pounds for the drawer.'):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(CopyWriterError, 'capacity value'):
+                _parse_copy_response(_body({**payload, 'description': wrong}), product_specific=facts)
 
     def test_model_repairs_all_reported_copy_errors_in_one_followup(self) -> None:
         invalid = {

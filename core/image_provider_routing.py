@@ -352,15 +352,32 @@ def _generate_with_provider_deadline(
                 ambiguous=bool(result.get("ambiguous")),
             )
         raise ProviderContentError(provider_name, message)
+    except Exception as exc:
+        _stop_provider_process(process)
+        record = read_json(receipt)
+        if record.get('status') == 'received' or record.get('body_sha256'):
+            if request_audit is not None:
+                request_audit.update(record.get('request_audit') or {})
+            return receipt
+        if not process.is_alive() and record.get('status') == 'prepared':
+            finish_response(receipt, 'known_failure')
+            raise ProviderTransportError(provider_name, f'Worker failed before transport submission: {exc}') from exc
+        if record.get('status') == 'submitted' and not getattr(exc, 'ambiguous', False):
+            raise ProviderTransportError(provider_name, f'Submitted request has no confirmed result: {exc}', ambiguous=True) from exc
+        raise
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=2)
-        if process.is_alive() and hasattr(process, "kill"):
-            process.kill()
-            process.join(timeout=1)
+        _stop_provider_process(process)
         result_queue.cancel_join_thread()
         result_queue.close()
+
+
+def _stop_provider_process(process: Any) -> None:
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+    if process.is_alive() and hasattr(process, 'kill'):
+        process.kill()
+        process.join(timeout=1)
 
 
 def _provider_worker(
