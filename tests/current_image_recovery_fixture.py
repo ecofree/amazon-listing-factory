@@ -204,6 +204,26 @@ def verify_scheduler_overlap(test):
         test.assertEqual([], failures)
         test.assertEqual(3, len(completed))
         test.assertEqual([True], overlaps)
+    from itertools import chain, repeat
+    tasks = [dict(child='same', role=role, providers=[provider]) for role, provider in [('main', 'a1'), ('scene', 'b')]]
+    overlapped = threading.Event()
+    def remote_after_capacity_returns(task, **kwargs):
+        if task['role'] == 'main':
+            test.assertTrue(overlapped.wait(2), 'Initial low memory permanently pinned the executor to one lane')
+        else:
+            overlapped.set()
+        return task
+    with patch('core.api_registry.image_provider_entries', return_value=entries), patch(
+            'core.image_generation.provider_concurrency_limit', return_value=1), patch(
+            'core.image_generation._policy_parallel_cap', return_value=2), patch(
+            'core.image_generation._cpu_worker_cap', return_value=2), patch(
+            'core.image_generation._memory_worker_cap', side_effect=chain([1], repeat(2))), patch(
+            'core.image_generation.generate_one', side_effect=remote_after_capacity_returns), patch(
+            'core.image_generation.finalize_candidate', side_effect=lambda task, **kwargs: task):
+        completed, failures = _execute(tasks, plugin=None, workers=0)
+    test.assertEqual([], failures)
+    test.assertEqual(2, len(completed))
+    test.assertTrue(overlapped.is_set())
 
 
 def verify_local_retry_in_same_run(test):
@@ -224,6 +244,8 @@ def verify_local_retry_in_same_run(test):
             test.assertEqual(0 if still_broken else 1, len(completed))
             test.assertEqual(1 if still_broken else 0, len(failures))
             test.assertEqual(saved['receipt_path'], local.call_args.args[0]['raw_response_path'])
+            if still_broken:
+                test.assertEqual('generation_finalize', failures[0]['failure_owner'])
 
 
 def verify_safe_transport_retry(test):

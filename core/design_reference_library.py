@@ -8,7 +8,7 @@ from typing import Any
 
 from PIL import Image
 
-from .io import file_sha256, read_json, write_bytes_atomic
+from .io import file_sha256, read_json, write_bytes_atomic, write_json
 from .paths import resolve_job_owned_path
 
 
@@ -16,6 +16,10 @@ ROLES = {"main", "scene", "func", "size"}
 BRIEF_FIELDS = {"audience", "positioning", "design_priorities", "avoid"}
 VISUAL_REVIEW_FIELDS = {"product_clarity", "information_hierarchy", "evidence_fit", "series_cohesion", "transfer_scope"}
 REFERENCE_INPUT_POLICY = "reviewed-reference-region-v2-scoped-approval"
+DEFAULT_BRAND_BRIEF = {
+    'design_priorities': 'Photo-led product communication with coherent flat text ink, icon strokes and leaders within each child; the image model designs the layout.',
+    'avoid': 'Large pill-shaped title backgrounds, capsule label systems and preset card rows. Small local backing is acceptable only for text legibility over busy pixels.',
+}
 
 
 def _brief(value: Any) -> dict[str, Any]:
@@ -130,7 +134,25 @@ def import_design_inputs(job: Path, *, category: str, pack_path: str = "", brief
 
 def brand_design_brief(job: Path) -> dict[str, Any]:
     metadata = read_json(job / "job.json") if (job / "job.json").is_file() else {}
-    return _brief(metadata.get("design_inputs", {}).get("brand_brief", {}))
+    return {**DEFAULT_BRAND_BRIEF, **_brief(metadata.get("design_inputs", {}).get("brand_brief", {}))}
+
+
+def update_brand_design_brief(job: Path, *, brief_path: str) -> None:
+    from .job import load_job
+    from .progress_trace import record_progress
+    from .status import input_revision_id, job_run_lock
+
+    brief = _brief(read_json(Path(brief_path).resolve()))
+    with job_run_lock(job):
+        metadata = load_job(job)
+        inputs = metadata.get("design_inputs", {})
+        old_fingerprint = input_revision_id(inputs.get("brand_brief", {}))
+        new_fingerprint = input_revision_id(brief)
+        if old_fingerprint == new_fingerprint:
+            return
+        metadata["design_inputs"] = {**inputs, "brand_brief": brief}
+        write_json(job / "job.json", metadata)
+        record_progress(job, "brand_brief_updated", old_fingerprint=old_fingerprint, new_fingerprint=new_fingerprint)
 
 
 def approved_design_references(job: Path, child: str, *, source_ids: set[str] | None = None) -> list[dict[str, Any]]:
@@ -197,7 +219,7 @@ def design_reference_usage(job: Path, references: list[dict[str, Any]], briefs: 
     requested = bool(metadata.get("design_inputs", {}).get("pack"))
     rows = []
     for brief in briefs:
-        available = [row["source_id"] for row in references if brief["role"] in row["roles"]]
+        available = [row["source_id"] for row in references if brief["role"].split("_", 1)[0] in row["roles"]]
         selected = [row["reference_id"] for row in brief.get("image_direction", {}).get("design_transfer", [])]
         state = ("planning_pending" if brief.get("status") != "ready" else "external_reference_selected" if selected
                  else "available_not_selected" if available else "requested_no_matching_reference" if requested

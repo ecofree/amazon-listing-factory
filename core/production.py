@@ -495,8 +495,7 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
             "template_preflight": preflight,
             "subtask_diagnostics": {
                 "visual_design": {
-                    "ready_children": sorted(key for key, kit in (design_kits.get("children") or {}).items()
-                        if kit.get('source_briefs') and all(row['status'] == 'ready' for row in kit['source_briefs'])),
+                    "ready_children": sorted(key for key, kit in (design_kits.get("children") or {}).items() if kit.get('image_briefs') and all(row['status'] == 'ready' for row in kit['image_briefs'])),
                     "failure_count": len(design_kits.get("failures") or []),
                 },
                 "image_task": {
@@ -584,7 +583,7 @@ def _formation_failures(rows: Iterable[dict[str, Any]], *, owner: str) -> list[d
         failures.append({
             "task": task,
             "failure_owner": owner,
-            # Formation is a current ImageTaskV10 contract result. Retryability
+            # Formation is a current ImageTask contract result. Retryability
             # belongs to the owning brief/planner attempt, not to a stale task
             # field that can silently change generation semantics.
             "task_status": "blocked",
@@ -1056,7 +1055,10 @@ def _write_summary(
         "planned_image_unresolved_count": missing_candidate_count,
         "publish_mode": publish_mode,
         "template_status": template_status,
-        "workflow_reason": _summary_status_reason(workflow_status, effective_release, error),
+        "workflow_reason": ('selected_stages_completed_downstream_not_requested'
+                            if not error and not active_failure_count and completed_stages
+                            and not any(stage in stage_rows for stage in ('download', 'classify', 'brief', 'generate', 'qa', 'publish', 'template'))
+                            else _summary_status_reason(workflow_status, effective_release, error)),
         "candidate_count": candidate_count,
         "qa_decision_counts": qa_decision_counts,
         **source_scope,
@@ -1097,7 +1099,7 @@ def _cumulative_progress(job_dir: Path) -> dict[str, Any]:
     return {
         "cumulative_stage_seconds": {name: round(value, 3) for name, value in stage_seconds.items()},
         "stage_attempt_counts": stage_attempt_counts,
-        "provider_request_count": counts.get("image_provider_transport_attempt_started", 0),
+        "image_provider_request_count": counts.get("image_provider_transport_attempt_started", 0),
         "candidate_commit_count": counts.get("generate_candidate_committed", 0),
         "candidate_reuse_count": counts.get("generate_candidate_reused", 0),
         "candidate_revision_commit_count": counts.get("generate_revision_committed", 0),
@@ -1122,22 +1124,21 @@ def _publish_mode(job_dir: Path, *, publish_ran: bool) -> str:
 
 def _source_scope_counts(request: JobRunRequest) -> dict[str, Any]:
     try:
-        from .final_source_intents import read_final_source_intents, PLANNING_SOURCE_ROLES
         from .image_tasks import read_image_tasks
-
-        tasks = read_image_tasks(
-            request.job_dir, category_id=request.plugin.category_id,
-        ).get("tasks") or []
-        selected = {
-            (str(row.get("child") or ""), str(row.get("source_path") or ""))
-            for row in tasks if row.get("source_path")
-        }
-        rows = read_final_source_intents(request.job_dir, plugin=request.plugin)
-        unselected = [row for row in rows if (str(row.get('child') or ''), str(row.get('source_path') or '')) not in selected]
-        return {'source_scope_status': 'current', 'source_input_count': len(rows),
-                'source_excluded_count': sum(row.get('role') == 'excluded_wrong_variant' for row in rows),
-                'source_unresolved_count': sum(row.get('role') != 'excluded_wrong_variant' for row in unselected),
-                'classified_not_selected_count': sum(row.get('role') in PLANNING_SOURCE_ROLES for row in unselected)}
+        from .release_manifest import source_inventory_coverage
+        task_error = ''
+        try:
+            tasks = read_image_tasks(request.job_dir, category_id=request.plugin.category_id).get("tasks") or []
+        except Exception as exc:
+            tasks, task_error = [], str(exc)[:300]
+        coverage = source_inventory_coverage(job_path=request.job_dir, plugin=request.plugin, tasks=tasks)
+        if coverage['authority_errors']:
+            raise ValueError('; '.join(coverage['authority_errors']))
+        return {'source_scope_status': 'classified_tasks_unavailable' if task_error else 'current',
+                'source_task_error': task_error, 'source_input_count': coverage['source_count'],
+                'source_excluded_count': coverage['excluded_count'],
+                'source_unresolved_count': coverage['unresolved_count'],
+                'classified_not_selected_count': sum(row['status'] == 'classified_not_selected' for row in coverage['rows'])}
     except Exception as exc:
         return {'source_scope_status': 'unavailable', 'source_scope_error': str(exc)[:300],
                 'source_input_count': None, 'source_excluded_count': None,

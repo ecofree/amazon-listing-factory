@@ -150,7 +150,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 150,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "aicost_gpt_image_25",
@@ -172,7 +172,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 150,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "aicost_gpt_image_25_flare",
@@ -195,7 +195,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 150,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "aicost_gpt_image_25_sunburst",
@@ -219,7 +219,7 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 150,
-      "enabled": true
+      "enabled": false
     },
     {
       "name": "lz_token_gpt_image_2",
@@ -244,6 +244,7 @@
     },
     {
       "name": "qc_yc_fixed",
+      "allowed_roles": ["main", "scene"],
       "display": "qc-yc-fixed",
       "family": "image_generation",
       "scope": "image_generation",
@@ -261,7 +262,54 @@
       },
       "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
       "priority": 160,
-      "enabled": false
+      "enabled": true
+    },
+    {
+      "name": "qc_yc_fixed_gpt_image_25_flare",
+      "allowed_roles": ["main", "scene", "func", "size"],
+      "resource_group": "qc_yc_fixed",
+      "display": "qc-yc-fixed-gpt-image-2.5-flare",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "QC_YC_FIXED_API_KEY",
+      "model": "gpt-image-2.5-flare",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 160,
+      "enabled": true
+    },
+    {
+      "name": "qc_yc_fixed_gpt_image_25_sunburst",
+      "allowed_roles": ["func", "size"],
+      "role_priority": {"func": 30, "size": 30},
+      "resource_group": "qc_yc_fixed",
+      "display": "qc-yc-fixed-gpt-image-2.5-sunburst",
+      "family": "image_generation",
+      "scope": "image_generation",
+      "api_type": "openai_images_edit",
+      "base_url": "https://subrouter.ai/v1",
+      "base_url_env": "SUBROUTER_BASE_URL",
+      "key_env": "QC_YC_FIXED_API_KEY",
+      "model": "gpt-image-2.5-sunburst",
+      "prompt_max_chars": 12000,
+      "protocol_profile": {
+        "image_endpoint": "images_edits",
+        "request_size": "1024x1024",
+        "output_contract": "square",
+        "quality": "high"
+      },
+      "capabilities": ["image_edit", "reference_image", "multiple_reference_images", "protected_mask", "square_output"],
+      "priority": 160,
+      "enabled": true
     },
     {
       "name": "laoliu-fixed",
@@ -356,6 +404,7 @@
     {
       "name": "cxk_gpt_image_25_sunburst",
       "allowed_roles": ["func", "size"],
+      "role_priority": {"func": 30, "size": 30},
       "resource_group": "cxk_fixed",
       "display": "cxk-gpt-image-2.5-sunburst",
       "family": "image_generation",

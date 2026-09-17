@@ -205,12 +205,16 @@ class FlowRegressionTests(unittest.TestCase):
                 {"child": "B1", "index": 1, "status": "failed", "error": "invalid image"},
                 {"child": "B1", "index": 2, "status": "ok", "source_sha256": "review-sha"},
                 {"child": "B1", "index": 3, "status": "ok", "source_sha256": "classify-sha"},
+                {"child": "B1", "index": 4, "status": "ok", "source_sha256": "reference-sha"},
+                {"child": "B1", "index": 5, "status": "ok", "source_sha256": "reference-sha"},
             ],
         }
         intents = [
             {"child": "B1", "source_index": 0, "status": "success", "role": "main", "source_sha256": "main-sha", "input_revision_id": "main-rev"},
             {"child": "B1", "source_index": 2, "status": "success", "role": "review_required", "source_sha256": "review-sha", "input_revision_id": "review-rev", "classification_reason": "ambiguous authored content"},
             {"child": "B1", "source_index": 3, "status": "failed", "role": "failed", "source_sha256": "classify-sha", "input_revision_id": "classify-rev", "error": "image evidence unavailable"},
+            *[{"child": "B1", "source_index": index, "status": "success", "role": "reference_only", "source_sha256": "reference-sha",
+               "input_revision_id": f"reference-{index}", "classification_reason": "No separate output needed"} for index in (4, 5)],
         ]
         from core import production
         from core.final_source_intents import _stage_failure
@@ -222,8 +226,12 @@ class FlowRegressionTests(unittest.TestCase):
         self.assertEqual(current["failures"], resumed["failures"])
         self.assertFalse(production._stage_has_usable_output("classify", {"tasks": [conflict]}))
         self.assertEqual("retryable", _stage_failure({**conflict, "visual_evidence": {"status": "failed"}})["task_status"])
+        reference = dict(kind='product_evidence', source_id='source_04', original_sha256='reference-sha')
         tasks = [
-            {"child": "B1", "role": "main", "source_sha256": "main-sha", "source_intent_revision_id": "main-rev"},
+            {"child": "B1", "role": "main", "source_sha256": "main-sha", "source_intent_revision_id": "main-rev", 'generation_references': [reference]},
+            {'child': 'B1', 'role': 'func', 'generation_references': [reference]},
+            {'child': 'B2', 'role': 'scene', 'generation_references': [reference]},
+            {'child': 'B1', 'role': 'scene', 'generation_references': [{**reference, 'kind': 'design_reference'}]},
         ]
         with (
             patch("core.release_manifest.read_download_manifest", return_value=downloads),
@@ -233,9 +241,12 @@ class FlowRegressionTests(unittest.TestCase):
             coverage = source_inventory_coverage(job_path=Path("unused"), plugin=SimpleNamespace(), tasks=tasks)
         self.assertEqual("warnings", coverage["status"])
         self.assertEqual(
-            ["covered", "download_failed", "review_required", "source_intent_failed"],
+            ["covered", "download_failed", "review_required", "source_intent_failed", "reference_only", "reference_only"],
             [row["status"] for row in coverage["rows"]],
         )
+        self.assertEqual(['main', 'func'], coverage['rows'][4]['image_task_roles'])
+        self.assertEqual('No separate output needed', coverage['rows'][4]['disposition_reason'])
+        self.assertEqual([], coverage['rows'][5]['image_task_roles'])
         selected = [{"child": "B1", "role": role} for role in ("main", "scene", "scene", "func", "func", "func", "size")]
         with patch("core.final_source_intents.planning_source_intents", return_value=selected):
             self.assertEqual(selected, selected_task_source_intents("unused", plugin=SimpleNamespace()))

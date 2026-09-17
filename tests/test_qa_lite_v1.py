@@ -18,7 +18,7 @@ def _task(role: str, mode: str = "none") -> dict:
     return {
         "child": "B1", "role": role, "role_family": family,
         "policy_version": IMAGE_TASK_POLICY_VERSION, "task_fingerprint": "task",
-        "category_image_policy": {}, "product_boundary": {},
+        "category_image_policy": {},
         "measurement_authority": {"mode": mode, "render_text": []},
         "renderable_text_contract": {
             "mode": "exact" if family in {"func", "size"} else "none",

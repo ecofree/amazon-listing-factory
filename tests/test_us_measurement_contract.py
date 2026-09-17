@@ -34,6 +34,13 @@ class UsMeasurementContractTests(unittest.TestCase):
         self.assertFalse(measurement_values_match('-1.2 kg', '1.2 kg'))
         self.assertTrue(measurement_values_match('2-4 cm', '0.79-1.57 in'))
         self.assertEqual('39.37 L x 19.69 W x 15.75 H in', us_measurement_text('100 L x 50 W x 40 H cm'))
+        for source, candidate, matches in [('\u2264 6"', '6 in', False), ('\u2264 6"', 'up to 6 in', True),
+                                            ('>= 6 in', 'at least 6 in', True), ('no more than 6 in', '<=6 in', True),
+                                            ('6-8 in', '6 x 8 in', False), ('<6 in', '\u2264 6"', False),
+                                            ('Under Bed 6 in', 'Under-bed 6 in', True)]:
+            with self.subTest(source=source, candidate=candidate):
+                self.assertEqual(matches, measurement_values_match(source, candidate))
+        self.assertFalse(_line_matches_any('6 in', ['\u2264 6 in']))
 
     def test_template_accepts_inline_and_separate_units(self):
         from products.generic_extractors import extract_specs_by_fields
@@ -105,6 +112,8 @@ class UsMeasurementContractTests(unittest.TestCase):
         task['generation_references'][0].update(kind='edit_base', path='source.png', sha256='a'*64,
             purpose='Measured view', original_region=dict(left=.1, top=.1, right=.9, bottom=.9))
         task['generation_references'].append({**task['generation_references'][0], 'kind': 'product_evidence', 'view_id': 'drawer'})
+        task['generation_references'].append({**task['generation_references'][0], 'kind': 'measurement_evidence',
+                                             'path': 'measurement.png', 'purpose': 'Measure only, not appearance'})
         task['measurement_authority']['measurement_groups'] = [{'id': 'width', 'source_id': 'source_00', 'view_id': 'view_01',
             'measured_part': 'Cabinet', 'axis': 'width', 'source_region': dict(left=.2, top=.2, right=.4, bottom=.4),
             'source_endpoints': [dict(x=.2, y=.5), dict(x=.8, y=.5)]}]
@@ -120,12 +129,12 @@ class UsMeasurementContractTests(unittest.TestCase):
             with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)):
                 with self.assertRaisesRegex(ValueError, 'different view attachment'):
                     observe_candidate(job, task, candidate)
-            response['measurements'][0]['attachment_index'] = 2
+            response['measurements'][0]['attachment_index'] = 4
             with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)) as request:
                 observe_candidate(job, task, candidate)
                 context = json.loads(request.call_args.args[0].split('INPUT CONTEXT:\n')[1].split('\nOUTPUT OBJECT')[0])
                 binding = context['measurement_sources'][0]
-                self.assertEqual(2, binding['attachment_index'])
+                self.assertEqual(4, binding['attachment_index'])
                 self.assertAlmostEqual(.125, binding['source_region']['left'])
                 self.assertEqual(2, context['required_views'][0]['attachment_index'])
                 self.assertNotIn('source_text', binding)
@@ -160,22 +169,25 @@ class UsMeasurementContractTests(unittest.TestCase):
             downloads[0]['source_sha256'] = 'b' * 64
             self.assertEqual({}, _current_source_intent_reviews(Path(tmp), downloads))
 
-    def test_object_membership_conflict_is_isolated_to_affected_sources(self):
+    def test_unsupported_included_accessory_is_isolated_to_affected_source(self):
         from core.visual_semantics import _validate_observations
-        row = {'source_id': 'a', 'role_guess': 'scene', 'view_coverage': 'complete', 'has_dimension_lines': False, 'has_callouts_or_panels': False,
+        row = {'source_id': 'a', 'role_guess': 'scene', 'evidence_gaps': [], 'text_gaps': [],
+               'reference_views': [{'view_id': 'view_01', 'purposes': ['appearance']}], 'has_dimension_lines': False, 'has_callouts_or_panels': False,
                'physical_views': [current_physical_view(region=[.1, .1, .9, .9], object_id='drawer')],
                'confidence': .9, 'visible_numbers_or_units': [], 'evidence': [], 'text_observations': [], 'measurements': [],
                'variant_identity': {'status': 'unknown', 'observed_color': '', 'reason': 'Occluded', 'conflicts': []},
                'objects': [{'object_id': 'drawer', 'kind': 'drawer', 'state': 'open', 'visibility': 'visible',
-                            'sale_membership': 'product', 'membership_evidence': [{'fact_id': 'product.specs.drawers', 'quote': '2 drawers'}], 'relations': []}]}
+                            'sale_membership': 'product', 'membership_evidence': [{'fact_id': 'product.specs.drawers', 'quote': '2 drawers'}]}]}
         other, clear = copy.deepcopy(row), copy.deepcopy(row)
-        other['source_id'], other['objects'][0]['sale_membership'] = 'b', 'staging'
+        other['source_id'], other['objects'][0]['sale_membership'] = 'b', 'included_accessory'
+        other['objects'][0]['membership_evidence'] = []
         clear['source_id'], clear['objects'][0]['object_id'] = 'c', 'frame'
         clear['physical_views'][0]['evidence'][0]['object_id'] = 'frame'
         rows = _validate_observations([row, other, clear], ['a', 'b', 'c'], {'product.specs.drawers': '2 drawers'})
-        self.assertEqual(['drawer'], rows['a']['object_identity_conflicts'])
-        self.assertEqual(['drawer'], rows['b']['object_identity_conflicts'])
-        self.assertEqual([], rows['c']['object_identity_conflicts'])
+        self.assertEqual('success', rows['a']['status'])
+        self.assertEqual('failed', rows['b']['status'])
+        self.assertIn('sales membership requires product evidence', rows['b']['error'])
+        self.assertEqual('success', rows['c']['status'])
 
 
 if __name__ == '__main__':

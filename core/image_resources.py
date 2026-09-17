@@ -15,6 +15,7 @@ from .image_provider_common import ProviderQueueUnavailable, _system_memory_byte
 from .image_response import response_binding, response_directory
 from .io import read_json, write_json
 from .process_lock import process_file_lock
+from .progress_trace import record_progress
 
 _LOCK = threading.RLock()
 _LEDGER = Path(__file__).resolve().parents[1] / 'runtime/image_reservations.json'
@@ -81,7 +82,7 @@ def _estimated_peak(task: dict[str, Any]) -> int:
     return max(_MIN_PEAK, _input_bytes(task) * 12, decoded * 3 + 512 * 1024**2)
 
 
-def _memory_budget(rows: dict[str, Any], *, exclude: str = '', local: bool = False) -> tuple[int, int]:
+def _memory_budget(rows: dict[str, Any], *, exclude: str = '', local: bool = False) -> dict[str, int]:
     total, available = _system_memory_bytes()
     per_process: dict[int, dict[str, int]] = {}
     for identity, row in rows.items():
@@ -98,18 +99,20 @@ def _memory_budget(rows: dict[str, Any], *, exclude: str = '', local: bool = Fal
             group['baseline'] = min(group['baseline'], row['rss'])
     promised = sum(max(0, row['peak'] - max(0, row['rss'] - row['baseline'])) for row in per_process.values())
     floor = max(4 * _GIB, int(total * .2))
-    return total, max(0, available - promised - floor - (0 if local else _MIN_PEAK))
+    finalize = 0 if local else _MIN_PEAK
+    return dict(total=total, available=available, promised=promised, floor=floor, finalize=finalize,
+                usable=max(0, available - promised - floor - finalize))
 
 
 def image_memory_capacity(tasks: list[dict[str, Any]]) -> int:
     """Estimate lanes with exactly the budget used by atomic admission."""
     with _LOCK, process_file_lock(_LEDGER.with_suffix('.lock')):
         rows = _reservations()
-        total, usable = _memory_budget(rows)
+        budget = _memory_budget(rows)
         keys = {response_binding(task) for task in tasks if task.get('job_dir')}
         own = sum(identity in keys and row['peak'] > 0 and row['pid'] == os.getpid() for identity, row in rows.items())
         peak = max([_MIN_PEAK, *(_estimated_peak(task) for task in tasks)])
-        return max(0, min(8, total // (8 * _GIB), own + usable // peak))
+        return max(0, min(8, budget['total'] // (8 * _GIB), own + budget['usable'] // peak))
 
 
 def reserve_image(task: dict[str, Any], *, local: bool = False) -> None:
@@ -119,11 +122,13 @@ def reserve_image(task: dict[str, Any], *, local: bool = False) -> None:
         current = rows.get(key)
         if current and _process(current) and not (local and current['pid'] == os.getpid()):
             raise ProviderQueueUnavailable('host_image_memory', 'This image request is already in flight')
-        total, usable = _memory_budget(rows, exclude=key, local=local)
+        budget = _memory_budget(rows, exclude=key, local=local)
         input_bytes = _input_bytes(task)
         peak = _estimated_peak(task)
-        if usable < peak:
-            raise ProviderQueueUnavailable('host_image_memory', 'Host memory reserved for in-flight work and finalization')
+        if budget['usable'] < peak:
+            raise ProviderQueueUnavailable('host_image_memory',
+                'Host memory reserved: ' + ', '.join(f'{name}={value // 1024**2}MiB' for name, value in
+                                                    {**budget, 'estimated_peak': peak}.items()))
         directory = response_directory(task)
         directory.mkdir(parents=True, exist_ok=True)
         volume = directory.anchor.casefold()
@@ -133,7 +138,7 @@ def reserve_image(task: dict[str, Any], *, local: bool = False) -> None:
             raise ProviderQueueUnavailable('host_image_storage', 'Insufficient response-volume headroom')
         if local and shutil.disk_usage(tempfile.gettempdir()).free < _GIB:
             raise ProviderQueueUnavailable('host_image_storage', 'Insufficient upscale temporary-volume headroom')
-        capacity = max(1, min(8, total // (8 * _GIB)))
+        capacity = max(1, min(8, budget['total'] // (8 * _GIB)))
         active_count = sum(_process(row) is not None for row in rows.values())
         if not local and key not in rows and active_count >= capacity:
             raise ProviderQueueUnavailable('host_image_storage', 'In-flight and saved responses occupy the bounded host backlog')
@@ -141,6 +146,11 @@ def reserve_image(task: dict[str, Any], *, local: bool = False) -> None:
         rows[key] = {'pid': process.pid, 'process_start': process.create_time(), 'rss': _rss(process),
                      'peak': peak, 'disk': disk, 'volume': volume, 'directory': str(directory)}
         write_json(_LEDGER, rows)
+        try:
+            record_progress(task['job_dir'], 'image_memory_admitted', child=task.get('child'), role=task.get('role'),
+                            phase='local_finalize' if local else 'remote', estimated_peak=peak, **budget)
+        except OSError:
+            pass  # Diagnostic output must not invalidate the acquired resource lease.
 
 
 def release_image(task: dict[str, Any], *, buffered: bool = False) -> None:

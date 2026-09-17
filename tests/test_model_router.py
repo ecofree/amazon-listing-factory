@@ -75,7 +75,10 @@ class ModelRouterTests(unittest.TestCase):
         self.assertTrue(sunburst["enabled"])
         self.assertEqual(rows["cxk_fixed"]["resource_group"], sunburst["resource_group"])
         self.assertEqual(rows["cxk_fixed"]["key_env"], sunburst["key_env"])
-        self.assertFalse(rows["qc_yc_fixed"]["enabled"])
+        self.assertTrue(rows["qc_yc_fixed"]["enabled"])
+        self.assertNotIn("qc_yc_fixed_gpt_image_25", rows)
+        self.assertEqual({"gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"},
+                         {row['model'] for name, row in rows.items() if name.startswith('qc_yc_fixed') and row['enabled']})
         self.assertFalse(rows["lz_token_gpt_image_2"]["enabled"])
         import io
         from email import policy

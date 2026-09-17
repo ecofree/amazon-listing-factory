@@ -540,7 +540,7 @@ def record_provider_quality_score(
         and str(row.get("role") or "") == str(role)
     ), None)
     if not isinstance(task, dict):
-        raise ValueError(f"No current ImageTaskV10 for provider quality score: {child}/{role}")
+        raise ValueError(f"No current ImageTask for provider quality score: {child}/{role}")
     candidate = current_candidate(job, task, required=True)
     try:
         output = resolve_job_owned_path(job, str(candidate.get("output_path") or candidate.get("candidate_path") or ""))

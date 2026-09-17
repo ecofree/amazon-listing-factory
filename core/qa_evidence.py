@@ -11,7 +11,7 @@ from .status import input_revision_id
 
 QA_EVIDENCE_SCHEMA_VERSION = "qa-evidence-v5"
 QA_EVIDENCE_ARTIFACT = "qa_evidence_v5.jsonl"
-QA_POLICY_VERSION = "observed-facts-three-state-v47-whole-candidate-coverage"
+QA_POLICY_VERSION = "observed-facts-three-state-v48-purpose-bound-references"
 
 
 class QaEvidenceError(RuntimeError):
@@ -30,7 +30,6 @@ def qa_policy_id(task: dict[str, Any]) -> str:
         "task_policy": task.get("policy_version") or "",
         "task_fingerprint": task.get("task_fingerprint") or "",
         "category_image_policy": task.get("category_image_policy") or {},
-        "product_boundary": task.get("product_boundary") or {},
         "measurement_authority": task.get("measurement_authority") or {},
         "ocr_policy": ROLE_OCR_EVIDENCE_CACHE_VERSION,
         "pixel_policy": PIXEL_EVIDENCE_VERSION,

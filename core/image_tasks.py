@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 from typing import Any
 
 from .final_source_intents import planning_source_intents, selected_task_source_intents
-from .design_reference_library import design_reference_semantics
-from .image_prompt_compiler import PROMPT_CONTRACT_VERSION
-from .image_reference_context import validate_reference_set, view_reference, evidence_view_catalog, view_identity
+from .image_prompt_compiler import PROMPT_CONTRACT_VERSION, compile_task_prompt
+from .image_reference_context import validate_reference_set, resolve_edit_references, evidence_view_catalog, view_identity, reference_semantics
 from .image_task_inputs import (
     build_display_copy_contract,
     build_renderable_text_contract,
     execution_profile,
-    product_boundary,
+    task_specs,
     task_facts,
 )
 from .io import read_jsonl, write_jsonl
@@ -21,15 +19,15 @@ from .product_family import read_product_family
 from .required_role_policy import compiled_image_policy, required_role_policy
 from .run_scope import read_run_scope
 from .status import input_revision_id, logical_task_id
-from .text_evidence import normalize_text, us_measurement_text
-from .visual_design_kit import compact_product_claims, read_visual_design_kits, visual_design_kit_row_current
+from .text_evidence import us_measurement_text
+from .visual_design_kit import read_visual_design_kits, visual_design_kit_row_current
 
 
-IMAGE_TASK_SCHEMA_VERSION = "image-task-v10"
-IMAGE_TASK_POLICY_VERSION = "typed-evidence-faithful-design-v36-target-components"
-IMAGE_TASK_ARTIFACT = "image_tasks_v10.jsonl"
+IMAGE_TASK_SCHEMA_VERSION = "image-task-v12"
+IMAGE_TASK_POLICY_VERSION = "output-evidence-child-direction-v41-fact-scope"
+IMAGE_TASK_ARTIFACT = "image_tasks_v12.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
-_TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "product_boundary", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
+_TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
 _TASK_BLOCKED_FIELDS = _TASK_BASE_FIELDS | {"formation_reason_code"}
 
 
@@ -75,16 +73,16 @@ def build_image_tasks(
 def read_image_tasks(job_dir: str | Path, *, category_id: str = "") -> dict[str, Any]:
     path = Path(job_dir) / "reports" / IMAGE_TASK_ARTIFACT
     if not path.is_file():
-        raise ImageTaskError(f"ImageTaskV10 is missing: {path}")
+        raise ImageTaskError(f"ImageTaskV11 is missing: {path}")
     rows = read_jsonl(path)
     seen: set[tuple[str, str]] = set()
     for row in rows:
         validate_image_task(row)
         if category_id and row["category_id"] != category_id:
-            raise ImageTaskError("ImageTaskV10 category does not match the active plugin")
+            raise ImageTaskError("ImageTaskV11 category does not match the active plugin")
         key = (str(row["child"]), str(row["role"]))
         if key in seen:
-            raise ImageTaskError(f"ImageTaskV10 has a duplicate row: {key[0]}/{key[1]}")
+            raise ImageTaskError(f"ImageTaskV11 has a duplicate row: {key[0]}/{key[1]}")
         seen.add(key)
     return {"schema_version": IMAGE_TASK_SCHEMA_VERSION, "task_count": len(rows), "tasks": rows}
 
@@ -97,10 +95,11 @@ def image_tasks_current(
     try:
         actual = read_image_tasks(job_dir, category_id=plugin.category_id)["tasks"]
         expected = _expected_rows(Path(job_dir).resolve(), plugin, include_optional=include_optional)
+        # Candidate reuse is semantic; artifact currentness also refreshes paths and approvals.
         return {
-            (row["child"], row["role"]): row["task_fingerprint"] for row in actual
+            (row["child"], row["role"]): row for row in actual
         } == {
-            (row["child"], row["role"]): row["task_fingerprint"] for row in expected
+            (row["child"], row["role"]): row for row in expected
         }
     except Exception:
         return False
@@ -117,7 +116,7 @@ def validate_task_inventory(tasks: list[dict[str, Any]], expected_children: list
     for task in tasks:
         key = (str(task.get("child") or ""), str(task.get("role") or ""))
         if key in seen or key[0] not in expected or role_prefix(key[1]) not in required:
-            raise ImageTaskError(f"Invalid ImageTaskV10 inventory row: {key}")
+            raise ImageTaskError(f"Invalid ImageTaskV11 inventory row: {key}")
         seen.add(key)
 
 
@@ -149,10 +148,10 @@ def executable_coverage(
 
 def validate_image_task(row: Any) -> None:
     if not isinstance(row, dict) or row.get("schema_version") != IMAGE_TASK_SCHEMA_VERSION:
-        raise ImageTaskError("Invalid ImageTaskV10")
+        raise ImageTaskError("Invalid ImageTaskV11")
     expected = _TASK_READY_FIELDS if row.get("formation_status") == "ready" else _TASK_BLOCKED_FIELDS
     if set(row) != expected:
-        raise ImageTaskError(f"ImageTaskV10 has unknown or missing fields: {sorted(set(row) ^ expected)}")
+        raise ImageTaskError(f"ImageTaskV11 has unknown or missing fields: {sorted(set(row) ^ expected)}")
     required = (
         "policy_version", "category_id", "child", "role", "role_family",
         "formation_status", "logical_task_id", "input_revision_id", "task_fingerprint",
@@ -167,15 +166,15 @@ def validate_image_task(row: Any) -> None:
                 f"expected={IMAGE_TASK_POLICY_VERSION!r}; task_fingerprint={row.get('task_fingerprint')!r}"
             )
         raise ImageTaskError(
-            f"ImageTaskV10 is incomplete: missing={missing};{mismatch} "
+            f"ImageTaskV11 is incomplete: missing={missing};{mismatch} "
             "regenerate the current ImageTask artifact from the active brief contract"
         )
     if row["formation_status"] not in {"ready", "blocked"}:
-        raise ImageTaskError("ImageTaskV10 formation status is invalid")
+        raise ImageTaskError("ImageTaskV11 formation status is invalid")
     if row["formation_status"] == "ready":
         needed = (
             "family_design_id", "family_art_direction", "source_path", "source_sha256",
-            "source_intent_revision_id", "generation_references", "product_boundary",
+            "source_intent_revision_id", "generation_references",
             "measurement_authority", "display_copy_contract", "renderable_text_contract",
             "edit_contract", "execution_profile",
         )
@@ -183,23 +182,20 @@ def validate_image_task(row: Any) -> None:
             needed += ("image_direction",)
         absent = [key for key in needed if row.get(key) in (None, "", [], {})]
         if absent:
-            raise ImageTaskError(f"Ready ImageTaskV10 is incomplete: {absent}")
+            raise ImageTaskError(f"Ready ImageTaskV11 is incomplete: {absent}")
         references = row["generation_references"]
         try:
             validate_reference_set(references, child=row["child"], edit_base_sha256=row["edit_base_sha256"])
         except ValueError as exc:
             raise ImageTaskError(str(exc)) from exc
-        boundary = row["product_boundary"]
-        if set(boundary) != {"sold_product_parts", "replaceable_staging", "must_not_change", "product_color_material", "observed_product_colors", "forbidden_additions"}:
-            raise ImageTaskError("ImageTaskV10 product boundary is not canonical")
         expected = build_renderable_text_contract(row["role_family"], row["measurement_authority"], display_copy=row['display_copy_contract'])
         if row["renderable_text_contract"] != expected:
-                raise ImageTaskError("ImageTaskV10 renderable text changed after formation")
+                raise ImageTaskError("ImageTaskV11 renderable text changed after formation")
         edit = row.get("edit_contract")
         if not isinstance(edit, dict) or set(edit) != {"create", "reference_authority", "preserve", "replace", "forbid", "reference_completeness"}:
-            raise ImageTaskError("ImageTaskV10 edit contract is not canonical")
+            raise ImageTaskError("ImageTaskV11 edit contract is not canonical")
     if row.get("task_fingerprint") != _task_fingerprint(row):
-        raise ImageTaskError("ImageTaskV10 content changed")
+        raise ImageTaskError("ImageTaskV11 content changed")
 
 
 def _expected_rows(job: Path, plugin: ProductPlugin, *, include_optional: bool = False) -> list[dict[str, Any]]:
@@ -227,7 +223,7 @@ def _expected_rows(job: Path, plugin: ProductPlugin, *, include_optional: bool =
             # failure.  Do not fan one upstream failure out into a blocked
             # ImageTask for every expected role.
             continue
-        specs = _task_specs(
+        specs = task_specs(
             children[asin], sources_by_child.get(asin, []), include_optional=include_optional,
         )
         for spec in specs:
@@ -237,45 +233,6 @@ def _expected_rows(job: Path, plugin: ProductPlugin, *, include_optional: bool =
                 product_type=product_type,
             ))
     return sorted(rows, key=lambda row: (row["child"], _role_sort_key(row["role"])))
-
-
-def _task_specs(
-    child: dict[str, Any], sources: list[dict[str, Any]], *, include_optional: bool = False,
-) -> list[dict[str, Any]]:
-    ordered = sorted(sources, key=lambda row: int(row.get("source_index") or 0))
-    by_role = {role: [row for row in ordered if row.get("role") == role] for role in ("main", "scene", "func", "size")}
-    specs: list[dict[str, Any]] = []
-    mains = by_role["main"]
-    main = mains[0] if len(mains) == 1 else None
-    specs.append({
-        "role": "main", "source": main, "main": main,
-        "reason": "" if main else "FinalSourceIntent must contain exactly one main authority",
-        "evidence_pending": main is None,
-    })
-    for family in ("scene", "func"):
-        matches = by_role[family]
-        if not include_optional:
-            matches = matches[:1]
-        if matches:
-            for index, source in enumerate(matches, 1):
-                specs.append({"role": _numbered(family, index), "source": source, "main": main, "reason": "", "evidence_pending": False})
-        else:
-            specs.append({"role": family, "source": None, "main": main, "reason": f"no final source intent is classified as {family}", "evidence_pending": True})
-    sizes = by_role["size"]
-    if len(sizes) == 1:
-        specs.append({"role": "size", "source": sizes[0], "main": main, "reason": "", "evidence_pending": False})
-    elif len(sizes) > 1:
-        specs.append({"role": "size", "source": None, "main": main, "reason": "FinalSourceIntent contains multiple size authorities", "evidence_pending": True})
-    else:
-        specs.append({"role": "size", "source": None, "main": main, "reason": "no final source intent is classified as size", "evidence_pending": True})
-    counts = {family: sum(role_prefix(row["role"]) == family for row in specs) for family in ("main", "scene", "func", "size")}
-    seen: dict[str, int] = {}
-    for spec in specs:
-        family = role_prefix(spec["role"])
-        seen[family] = seen.get(family, 0) + 1
-        spec["instance_index"] = seen[family]
-        spec["instance_count"] = counts[family]
-    return specs
 
 
 def _form_task(
@@ -314,34 +271,30 @@ def _form_task(
             # indefinitely or invalidate ready roles in the same child/family.
             reason_code="source_evidence_missing" if spec.get("evidence_pending") else "",
         )
-    source_brief = _source_brief(design_kit, source, family)
-    if source_brief.get("status") != "ready":
-        return _blocked(base, str(source_brief.get("error") or "source brief is pending"),
-                        reason_code='source_observation_unresolved' if source_brief.get('failure_owner') == 'observation' else '')
+    image_brief = _image_brief(design_kit, source, role)
+    if image_brief.get("status") != "ready":
+        return _blocked(base, str(image_brief.get("error") or "source brief is pending"),
+                        reason_code='source_observation_unresolved' if image_brief.get('failure_owner') == 'observation' else '',
+                        failure_owner=image_brief.get('failure_owner', 'brief'))
     try:
-        image_direction = source_brief["image_direction"]
+        image_direction = image_brief["image_direction"]
         catalog = evidence_view_catalog(design_kit['source_references'])
         selected = [catalog[view_identity(row)] for row in image_direction['evidence_usage'] if row['usage'] != 'verification']
         measurement = _measurement_authority(family, source, selected)
         story = (
             build_display_copy_contract(
-                source,
-                source_brief or {},
-                product_claims=_shared_product_claims(design_kit, child),
+                design_kit['source_references'],
+                image_brief or {},
+                product_claims=design_kit['product_claims'],
             )
             if family in {"func", "size"} else {
                 "mode": "none", "title": "", "labels": [], "bindings": [],
             }
         )
         renderable = build_renderable_text_contract(family, measurement, display_copy=story)
-        boundary = product_boundary(
-            image_policy,
-            child,
-            product_type=product_type,
-            observations=[source.get('visual_evidence') or {}],
-        )
-        references = _generation_references_for_task(
-            source_brief, design_kit, job=job, child=str(child["asin"]),
+        references = resolve_edit_references(
+            image_brief, design_kit['source_references'], job=job, child=str(child["asin"]),
+            design_references=design_kit['approved_design_references'],
         )
         reference = references[0]
         fields = {
@@ -356,7 +309,6 @@ def _form_task(
             "edit_base_sha256": reference["sha256"],
             "reference_mode": f"{family}_source_edit",
             "product_facts": task_facts(child, product_type=product_type),
-            "product_boundary": boundary,
             "measurement_authority": measurement,
             "display_copy_contract": story,
             "renderable_text_contract": renderable,
@@ -369,64 +321,28 @@ def _form_task(
             "formation_status": "ready",
             "formation_reason": "",
         }
+        fields["task_fingerprint"] = _task_fingerprint(fields)
+        fields["input_revision_id"] = fields["task_fingerprint"]
     except Exception as exc:
         return _blocked(base, f"{type(exc).__name__}: {exc}")
-    fields["task_fingerprint"] = _task_fingerprint(fields)
-    fields["input_revision_id"] = fields["task_fingerprint"]
     return fields
 
 
-def _generation_references_for_task(
-    brief: dict[str, Any], kit: dict[str, Any], *, job: Path, child: str,
-) -> list[dict[str, Any]]:
-    catalog = evidence_view_catalog(kit["source_references"])
-    ordered = sorted(brief['image_direction']['evidence_usage'], key=lambda row: row['usage'] != 'display')
-    if not ordered or ordered[0]['usage'] != 'display':
-        raise ImageTaskError('No displayed evidence selected')
-    refs = []
-    for i, selection in enumerate(ordered):
-        key = view_identity(selection)
-        if key not in catalog:
-            raise ImageTaskError('Selected view is not observed in this child: ' + key)
-        owner, view = catalog[key]
-        refs.append(view_reference(owner, view, job=job, child=child, kind='edit_base' if i == 0 else 'product_evidence'))
-    available = {row["source_id"]: row for row in kit.get("approved_design_references", [])}
-    for transfer in brief["image_direction"]["design_transfer"]:
-        key = transfer["reference_id"]
-        if key not in available or brief["role"] not in available[key]["roles"]:
-            raise ImageTaskError("Selected design reference is not approved for this role")
-        refs.append(available[key])
-    return refs
-
-
-def _source_brief(
-    design_kit: dict[str, Any], source: dict[str, Any], family: str,
+def _image_brief(
+    design_kit: dict[str, Any], source: dict[str, Any], role: str,
 ) -> dict[str, Any]:
     revision = str(source.get("input_revision_id") or "")
     sha = str(source.get("source_sha256") or "")
     matches = [
-        row for row in design_kit.get("source_briefs") or []
+        row for row in design_kit.get("image_briefs") or []
         if isinstance(row, dict)
-        and str(row.get("role") or "") == family
+        and str(row.get("role") or "") == role
         and str(row.get("source_intent_revision_id") or "") == revision
         and str(row.get("source_sha256") or "") == sha
     ]
     if len(matches) == 1:
         return matches[0]
     raise ImageTaskError("source brief is missing or duplicated")
-
-
-def _shared_product_claims(
-    design_kit: dict[str, Any],
-    child: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Resolve child-level product facts once, independent of source role."""
-    unique: dict[str, dict[str, Any]] = {}
-    for source in design_kit.get("source_references") or []:
-        for claim in source.get("product_claims") or []:
-            if isinstance(claim, dict) and str(claim.get("evidence_id") or ""):
-                unique.setdefault(str(claim["evidence_id"]), claim)
-    return list(unique.values()) or compact_product_claims(child)
 
 
 def _measurement_authority(family: str, source: dict[str, Any], selected: list[tuple[dict, dict]]) -> dict[str, Any]:
@@ -477,7 +393,7 @@ def _edit_contract(
     }[family]
     reference = "Each product view binds its own physical evidence; the first is only the transport edit base."
     preserve = [
-        "Sold-product geometry, proportions, finish, parts and sold quantity. Choose only structures and operating states supported by this child's evidence; never invent hidden joints or mechanisms",
+        "Sold-product geometry, proportions, finish and parts, using this child's evidenced structures and operating states",
     ]
     replace: list[str] = []
     if family == "func":
@@ -530,48 +446,29 @@ def _edit_contract(
     }
 
 
-def _blocked(base: dict[str, Any], reason: str, *, reason_code: str = "") -> dict[str, Any]:
+def _blocked(base: dict[str, Any], reason: str, *, reason_code: str = "", failure_owner: str = 'brief') -> dict[str, Any]:
     row = {
         **base, "formation_status": "blocked", "formation_reason": reason,
         "formation_reason_code": reason_code or "deterministic_block",
+        "formation_failure_owner": failure_owner,
     }
     row["task_fingerprint"] = _task_fingerprint(row)
     row["input_revision_id"] = row["task_fingerprint"]
     return row
 
 
-_TASK_SEMANTIC_FIELDS = frozenset({
-    "category_id", "child", "role", "role_family", "category_image_policy",
-    "family_design_id", "family_art_direction", "source_intent_revision_id",
-    "source_index", "source_path", "source_sha256", "generation_references",
-    "edit_base_sha256", "reference_mode", "product_facts",
-    "product_boundary", "measurement_authority", "display_copy_contract",
-    "renderable_text_contract", "image_direction",
-    "edit_contract", "execution_profile", "prompt_contract_version",
-})
-
-
 def _task_fingerprint(row: dict[str, Any]) -> str:
-    """Hash only facts that change the requested image.
-
-    The prompt contract is part of the image semantics: changing the
-    compiler contract must not silently reuse an old candidate.  Runtime
-    state, output paths and schema labels remain non-semantic.
-    """
-    def strip(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {key: strip(item) for key, item in value.items() if key not in {"task_fingerprint", "input_revision_id"}}
-        if isinstance(value, list):
-            return [strip(item) for item in value]
-        return value
-    projection = {
-        key: strip(row[key])
-        for key in sorted(_TASK_SEMANTIC_FIELDS)
-        if key in row
-    }
-    if 'generation_references' in projection:
-        projection['generation_references'] = [design_reference_semantics(ref) if ref['kind'] == 'design_reference' else ref
-                                               for ref in row['generation_references']]
+    """Bind the actual compiled brief, reference pixels and factual execution inputs."""
+    projection = {key: row.get(key) for key in ('category_id', 'child', 'role', 'role_family',
+        'formation_status', 'policy_version', 'prompt_contract_version', 'execution_profile')}
+    if row.get('formation_status') == 'ready':
+        projection['compiled_brief'] = compile_task_prompt(task=row)
+        projection['product_facts'] = row['product_facts']
+        projection['generation_references'] = [reference_semantics(ref) for ref in row['generation_references']]
+        projection['measurements'] = [{key: value for key, value in measurement.items() if key != 'confidence'}
+                                      for measurement in row['measurement_authority'].get('measurement_groups', [])]
+    else:
+        projection.update({key: row.get(key) for key in ('formation_reason', 'formation_reason_code', 'formation_failure_owner', 'source_sha256')})
     return input_revision_id(projection)
 
 
@@ -581,14 +478,10 @@ def _task_failure(row: dict[str, Any]) -> dict[str, Any]:
             "logical_task_id": logical_task_id("brief", child=row["child"], role=row["role"]),
             "input_revision_id": row["input_revision_id"], "child": row["child"], "role": row["role"],
         },
-        "failure_owner": "classify" if row.get('formation_reason_code') in {'source_evidence_missing', 'source_observation_unresolved'} else "brief",
-        "task_status": "blocked",
+        "failure_owner": "classify" if row.get('formation_reason_code') in {'source_evidence_missing', 'source_observation_unresolved'} else row['formation_failure_owner'],
+        "task_status": "retryable" if row['formation_failure_owner'] == 'review' else "blocked",
         "error": row.get("formation_reason") or "image task blocked",
     }
-
-
-def _numbered(role: str, index: int) -> str:
-    return role if index == 1 else f"{role}_{index:02d}"
 
 
 def _role_sort_key(role: str) -> tuple[int, str]:

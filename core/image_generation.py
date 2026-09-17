@@ -184,7 +184,7 @@ def run_image_generation(
                 continue
             if state.get('request_outcome') == 'unknown':
                 failures.append(_failure({**task, **state}, owner='generation',
-                    error='Remote request outcome unknown; reconcile before resubmitting', status='review'))
+                    error='Remote request outcome unknown; obtain provider confirmation or explicit resend approval before another paid request', status='review'))
                 continue
             apply_role_provider_policy(runtime_task, plugin)
             if not runtime_task.get("providers"):
@@ -363,7 +363,7 @@ def run_image_revision(
                        "initial": "EXPLICIT MISSING CANDIDATE REQUEST"}[mode]
     request_intro = {
         "targeted_edit": "Edit attachment 1 only for the listed issue. Preserve other correct product pixels, approved copy, composition and staging.",
-        "full_redraw": "Generate a complete new candidate because a human reviewer requested a full-image redraw; this is not a localized text repair.",
+        "full_redraw": "Redraw a complete candidate within the current child design. Change design direction through the existing brand brief and brief stage, never by overriding that design here.",
         "initial": "Generate the first candidate for this ready role because no current candidate exists.",
     }[mode]
     prompt = _compose_revision_prompt(
@@ -495,8 +495,7 @@ def _compose_revision_prompt(
     prefix = (
         "\n\n# Revision request\n"
         f"Request type: {request_heading}.\n"
-        f"Instruction: {' '.join(str(request_intro or '').split())} "
-        "Address only this reason while preserving the task facts and family art direction: "
+        f"Instruction: {' '.join(str(request_intro or '').split())} Address this reason within the task facts and family art direction: "
     )
     available = int(target_chars) - len(base_prompt) - len(prefix)
     if available < 1:
@@ -549,7 +548,7 @@ def _execute(
     recovery_attempts: set[str] = set()
     last_batch_progress_at = time.monotonic()
     capacity_errors: dict[str, ProviderQueueUnavailable] = {}
-    remote_cap = _effective_generation_workers(tasks, workers)
+    remote_cap = _generation_worker_limit(tasks, workers)
     with ThreadPoolExecutor(max_workers=max(1, remote_cap)) as pool, ThreadPoolExecutor(max_workers=1) as local_pool:
         futures: dict[Any, dict[str, Any]] = {}
         local_futures: set[Any] = set()
@@ -622,7 +621,7 @@ def _execute(
                             task, selected="", attempted=getattr(exc, "attempted_providers", []),
                         ),
                     }
-                    failure = _failure(failed_task, owner="generation", error=f"{type(exc).__name__}: {exc}", status=status)
+                    failure = _failure(failed_task, owner="generation_finalize" if is_local else "generation", error=f"{type(exc).__name__}: {exc}", status=status)
                     if status == "blocked":
                         failure["task_status"] = failure_task_status(failure)
                     failures.append(failure)
@@ -734,6 +733,11 @@ def _task_primary_provider(task: dict[str, Any]) -> str:
 def _effective_generation_workers(
     tasks: list[dict[str, Any]], requested_workers: int,
 ) -> int:
+    return min(_generation_worker_limit(tasks, requested_workers), _memory_worker_cap(tasks))
+
+
+def _generation_worker_limit(tasks: list[dict[str, Any]], requested_workers: int) -> int:
+    """Stable executor ceiling; dispatch and leases own live resource admission."""
     task_count = max(1, len(tasks))
     requested = int(requested_workers or 0)
     requested_cap = requested if requested > 0 else task_count
@@ -755,7 +759,6 @@ def _effective_generation_workers(
         requested_cap,
         policy_cap,
         provider_cap,
-        _memory_worker_cap(tasks),
         _cpu_worker_cap(),
     ))
 

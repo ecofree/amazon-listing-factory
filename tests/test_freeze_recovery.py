@@ -29,7 +29,7 @@ class FreezeRecoveryTests(unittest.TestCase):
 
     def test_production_registry_enforces_role_models_and_disabled_routes(self):
         with (
-            patch.dict("os.environ", {"CXK_FIXED_API_KEY": "fixture", "AICOST_API_KEY": "fixture"}, clear=True),
+            patch.dict("os.environ", {"CXK_FIXED_API_KEY": "fixture", "QC_YC_FIXED_API_KEY": "fixture", "AICOST_API_KEY": "fixture"}, clear=True),
             patch.object(routing, "_persistently_unhealthy_providers", return_value=set()),
             patch.object(routing, "_global_provider_cooldown_active", return_value=False),
             patch.object(routing, "_order_by_health", side_effect=lambda _task, providers: providers),
@@ -37,9 +37,9 @@ class FreezeRecoveryTests(unittest.TestCase):
         ):
             plugin = load_plugin("bed_frame")
             registry = {entry.name: entry for entry in api_registry.image_provider_entries()}
-            self.assertNotIn("qc_yc_fixed", registry)
+            self.assertIn("qc_yc_fixed", registry)
             self.assertNotIn("lz_token_gpt_image_2", registry)
-            self.assertIn("aicost_gpt_image_25", registry)
+            self.assertFalse(any(name.startswith('aicost_') for name in registry))
             roles = ("main", "scene_03", "func_04", "size")
             tasks = [routing.apply_role_provider_policy({"child": "B1", "role": role}, plugin) for role in roles]
             for role, task in zip(roles, tasks):

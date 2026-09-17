@@ -70,7 +70,9 @@ def recover_response(task: dict[str, Any]) -> dict[str, Any]:
         except (KeyError, OSError, ValueError) as exc:
             raise CandidateCommitError(f'Paid response requires local reconciliation: {path}: {exc}') from exc
     if unknown:
-        raise ProviderTransportError(unknown[0]['provider'], 'Submitted response has no durable outcome; do not resubmit', ambiguous=True)
+        raise ProviderTransportError(unknown[0]['provider'],
+            f'Submitted response has no durable outcome; do not resubmit. Receipt directory: {directory}. '
+            'No verified remote lookup or idempotent replay is available for this receipt; provider confirmation or explicit resend approval is required.', ambiguous=True)
     if len(received) > 1:
         raise CandidateCommitError('Multiple paid responses require explicit selection')
     return received[0] if received else {}

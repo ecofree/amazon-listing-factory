@@ -31,6 +31,8 @@ _UNIT_RE = (
     r"meters|meter|m|lbs|lb|pounds|pound|kilograms|kilogram|kg|grams|gram|g|ounces|ounce|oz|[\"']"
 )
 _MEASURE_RE = re.compile(rf"(?<![\w./])({_NUMBER_RE})\s*-?\s*({_UNIT_RE})(?![A-Za-z])", re.I)
+_RANGE_MEASURE_RE = re.compile(
+    rf"(?<![\w./])({_NUMBER_RE})\s*({_UNIT_RE})?\s*(?:\bto\b|-)\s*({_NUMBER_RE})\s*({_UNIT_RE})(?![A-Za-z])", re.I)
 _QUOTE_MEASURE_RE = re.compile(rf"\b({_NUMBER_RE})\s*([\"'])(?!\s*[,:\]\}}\n\r])", re.I)
 _DIMENSION_CHAIN_RE = re.compile(
     rf"\b({_NUMBER_RE}(?:\s*(?:x|\*)\s*{_NUMBER_RE}){{1,5}})\s*-?\s*({_UNIT_RE})\b",
@@ -209,9 +211,9 @@ def extract_measurements(value: Any) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     occupied: list[range] = []
-    for match in re.finditer(rf"(?<![\w./])({_NUMBER_RE})\s*(?:to|-)\s*({_NUMBER_RE})\s*({_UNIT_RE})(?![A-Za-z])", text, re.I):
-        for number in (match[1], match[2]):
-            _append_measurement(results, seen, number, _UNIT_ALIASES[match[3].casefold()], match[0], allow_duplicate=True)
+    for match in _RANGE_MEASURE_RE.finditer(text):
+        for number, unit in ((match[1], match[2] or match[4]), (match[3], match[4])):
+            _append_measurement(results, seen, number, _UNIT_ALIASES[unit.casefold()], match[0], allow_duplicate=True)
         occupied.append(range(match.start(), match.end()))
     for match in re.finditer(rf"\b({_NUMBER_RE})\s*(?:ft|feet|foot|')\s*({_NUMBER_RE})\s*(?:inches|inch|in|\")", text, re.I):
         inches = _number_value(match[1]) * 12 + _number_value(match[2])
@@ -277,8 +279,25 @@ def us_measurement_text(value: Any, *, upper_bound: bool = False, length_unit: s
     return pattern.sub(convert, text)
 
 
+def measurement_qualifiers(value: str) -> tuple[str, ...]:
+    """Retain bounds and range meaning that numeric/OCR normalization discards."""
+    text = normalize_text(value).casefold()
+    relations = ((r'<=|\u2264|\b(?:at most|up to|no more than|maximum|max)\b', 'upper_inclusive'),
+                 (r'>=|\u2265|\b(?:at least|no less than|minimum|min)\b', 'lower_inclusive'),
+                 (r'(?<![<>=])<(?![=])|\b(?:less than|under)\b', 'upper_exclusive'),
+                 (r'(?<![<>=])>(?![=])|\b(?:more than|over)\b', 'lower_exclusive'),
+                 (r'\b(?:recommended|recommendation)\b', 'recommended'),
+                 (r'\b(?:approx(?:imately)?\.?|about)\b|[~\u2248]', 'approximate'))
+    pattern = '|'.join(f'(?P<{label}>{pattern})' for pattern, label in relations)
+    found = [(m.start(), m.lastgroup) for m in re.finditer('(?:' + pattern + rf')(?=\s*:?\s*{_NUMBER_RE})', text)]
+    found.extend((m.start(), 'range') for m in _RANGE_MEASURE_RE.finditer(text))
+    return tuple(label for _, label in sorted(found))
+
+
 def measurement_values_match(source: str, candidate: str) -> bool:
-    """Allow exact physical equivalence or the single approved US display value."""
+    """Match physical values and qualifiers, including the approved US display."""
+    if measurement_qualifiers(source) != measurement_qualifiers(candidate):
+        return False
     original, actual = extract_measurements(source), extract_measurements(candidate)
     approved = extract_measurements(us_measurement_text(source))
     if not original or len(original) != len(actual) or len(approved) != len(actual):

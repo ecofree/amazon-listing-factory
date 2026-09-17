@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import hashlib
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +22,11 @@ class _Plugin:
 
 class GenerationStateContractTests(unittest.TestCase):
     def test_formation_block_is_owned_by_brief_not_duplicated_by_generate(self) -> None:
+        from core.image_tasks import _blocked, _task_failure
+        for owner in ('review', 'brief', 'shared_design'):
+            failure = _task_failure(_blocked(dict(child='B1', role='func'), 'review clock', failure_owner=owner))
+            self.assertEqual(owner, failure['failure_owner'])
+            self.assertEqual('retryable' if owner == 'review' else 'blocked', failure['task_status'])
         task = current_image_task("func_01", blocked_reason="missing role plan")
         with tempfile.TemporaryDirectory() as tmp:
             prompt_artifact = current_prompt_artifact(tmp, task)
@@ -89,7 +95,14 @@ class GenerationStateContractTests(unittest.TestCase):
             edit_sha = file_sha256(edit_view)
             refs = [{"kind": "edit_base", "child": "B1", "source_id": "source_00",
                      "path": "images/view.png", "sha256": edit_sha, "purpose": "Edit reference", "evidence_ids": [],
+                     "view_id": "view_01", "extent": "whole_view", "original_region": dict(left=0, top=0, right=1, bottom=1),
+                     "visible_evidence": [{'physical_facts': ['Two doors']}],
                      "original_path": "images/source.png", "original_sha256": source_sha}]
+            mask = job / 'images/mask.png'
+            mask.write_bytes(b'immutable mask')
+            refs[0]['protected_mask'] = dict(path='images/mask.png', sha256=file_sha256(mask))
+            refs.append(dict(kind='design_reference', child='B1', source_id='style', path='images/view.png',
+                sha256=edit_sha, purpose='Approved style', evidence_ids=[], approved_by='reviewer', approved_at='original approval'))
             task.update(source_sha256=source_sha, edit_base_sha256=edit_sha, generation_references=refs)
             prompt_path = job / "reports/image_prompts/B1/main/revision.prompt.txt"
             prompt_path.parent.mkdir(parents=True)
@@ -131,6 +144,47 @@ class GenerationStateContractTests(unittest.TestCase):
             ):
                 self.assertEqual("manifest_recovered", current_candidate(job, task)["state"])
                 self.assertEqual("copy", read_json(imagegen_output_marker(output))["provider"])
+                moved = deepcopy(task)
+                for name in ('source', 'view', 'mask'):
+                    (job / f'images/current-{name}.png').write_bytes((job / f'images/{name}.png').read_bytes())
+                moved['source_path'] = 'images/current-source.png'
+                for ref in moved['generation_references']:
+                    ref['path'] = 'images/current-view.png'
+                    ref['approved_at'] = 'new approval audit date'
+                    if ref.get('original_path'):
+                        ref['original_path'] = moved['source_path']
+                moved['generation_references'][0]['protected_mask']['path'] = 'images/current-mask.png'
+                before = manifest_path.read_bytes()
+                self.assertEqual(candidate_sha, current_candidate(job, moved)['candidate_sha256'])
+                self.assertEqual(before, manifest_path.read_bytes())
+                altered = job / 'images/altered.png'
+                altered.write_bytes(b'different input bytes')
+                semantic_changes = []
+                for change in ('pixels', 'facts', 'crop', 'mask'):
+                    changed = deepcopy(moved)
+                    ref = changed['generation_references'][0]
+                    if change == 'pixels':
+                        ref.update(path='images/altered.png', sha256=file_sha256(altered))
+                        changed['edit_base_sha256'] = ref['sha256']
+                    elif change == 'facts':
+                        ref['visible_evidence'][0]['physical_facts'] = ['Three doors']
+                    elif change == 'crop':
+                        ref['original_region']['left'] = .1
+                    else:
+                        ref['protected_mask'] = dict(path='images/altered.png', sha256=file_sha256(altered))
+                    semantic_changes.append(changed)
+                    with self.subTest(change=change), self.assertRaises(CandidateStateError):
+                        current_candidate(job, changed)
+                for path in (source, edit_view, mask, job / moved['generation_references'][0]['path']):
+                    original_bytes = path.read_bytes()
+                    path.write_bytes(b'tampered history or current input')
+                    with self.assertRaises(CandidateStateError):
+                        current_candidate(job, moved)
+                    path.write_bytes(original_bytes)
+                unapproved = deepcopy(moved)
+                unapproved['generation_references'][1]['approved_by'] = ''
+                with self.assertRaises(CandidateStateError):
+                    current_candidate(job, unapproved)
                 staging = staged_imagegen_output(output)
                 output.replace(staging)
                 imagegen_output_marker(output).unlink()
@@ -159,12 +213,13 @@ class GenerationStateContractTests(unittest.TestCase):
                 edited_output = output.with_name("task.candidate2.png")
                 edited_output.write_bytes(b"edited-candidate")
                 evidence_ref = {**refs[0], "kind": "product_evidence", "purpose": "Original product structure and state evidence"}
+                evidence_ref.pop('protected_mask')
                 edit_ref = {**refs[0], "path": output.relative_to(job).as_posix(), "sha256": candidate_sha,
                             "source_id": "candidate_0", "purpose": "Edit approved image"}
                 runtime = {**task, "provider": "copy", "candidate_revision": 2,
                            "output_path": str(edited_output), "candidate_path": str(edited_output),
                            "revision_mode": "targeted_edit", "edit_parent_candidate_sha256": candidate_sha,
-                           "edit_base_sha256": candidate_sha, "generation_references": [edit_ref, evidence_ref],
+                           "edit_base_sha256": candidate_sha, "generation_references": [edit_ref, evidence_ref, *refs[1:]],
                            "task_prompt_fingerprint": "task-prompt", "request_prompt_fingerprint": request_sha,
                            "prompt_path": str(prompt_path)}
                 with patch("core.image_tasks.read_image_tasks", return_value={"tasks": [task]}):
@@ -172,6 +227,13 @@ class GenerationStateContractTests(unittest.TestCase):
                     self.assertEqual(candidate_sha, saved["edit_parent_candidate_sha256"])
                     self.assertEqual(file_sha256(edited_output), current_candidate(job, runtime)["candidate_sha256"])
                 self.assertEqual(file_sha256(edited_output), current_candidate(job, task)["candidate_sha256"])
+                edited_manifest_path = manifest_path.with_name('candidate2.json')
+                before = edited_manifest_path.read_bytes()
+                self.assertEqual(file_sha256(edited_output), current_candidate(job, moved)['candidate_sha256'])
+                self.assertEqual(before, edited_manifest_path.read_bytes())
+                for changed in semantic_changes:
+                    with self.assertRaises(CandidateStateError):
+                        current_candidate(job, changed)
                 self.assertEqual(candidate_sha, candidate_by_sha(job, task, candidate_sha)["candidate_sha256"])
                 write_json(manifest_path.with_name("candidate-latest.json"), manifest)
                 with self.assertRaisesRegex(CandidateStateError, "filename is invalid"):

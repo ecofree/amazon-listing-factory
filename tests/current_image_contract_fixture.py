@@ -18,12 +18,12 @@ from core.image_tasks import (
 )
 
 
-def supported_design_reviews(raw, sources, design_references=None):
+def supported_design_reviews(raw, sources, design_references=None, product_claims=()):
     from core.visual_design_kit_compiler import design_binding_request
     by_id = {row['source_id']: row for row in sources}
     requests = [design_binding_request(brief, raw['family_art_direction'], source=by_id[brief['source_id']],
-                source_manifest=sources, design_references=design_references) for brief in raw['source_briefs']]
-    return supported_review_results(requests)
+                source_manifest=sources, product_claims=product_claims, design_references=design_references) for brief in raw['image_briefs']]
+    return supported_review_results([row for row in requests if row['physical_operations']])
 
 
 def supported_review_results(requests, **kwargs):
@@ -43,15 +43,10 @@ def current_art_direction() -> dict[str, Any]:
     return {
         "audience_and_market": "US homeowners seeking calm, practical bathroom storage with a residential rather than commercial impression.",
         "palette_direction": {"room": {"wall": "#F4F2EE matte mineral paint, solid", "floor": "#B9A88D oak, natural grain"}, "bath": {"towels": "#8A999E cotton, solid"}},
-        "photography_direction": "Broad natural side light, soft contact shadows, truthful painted-wood response, and realistic residential depth.",
+        "photography_direction": "Bright clear exposure, neutral white balance, soft contrast and truthful painted-wood response.",
         "environment_and_staging": "Restrained US bathroom styling with newly selected towels and ceramic containers; do not copy source props.",
         "typography_direction": {"font_family": "Inter", "title_style": "Semibold sentence case", "body_style": "Regular with readable spacing", "numeric_style": "Tabular figures with unit spacing"},
-        "graphic_direction": {"text_color": "#303634", "line_color": "#637470", "icon_color": "#303634", "backing_color": "#F4F2EE", "backed_symbol_color": "#303634", "component_style": "Thin leaders and sparse outline icons; no numeric icon duplication"},
-        "cohesion_rule": "Repeat the same light behavior, typographic hierarchy, restrained line character, and negative-space rhythm across the family.",
-        "negative_visuals": [
-            "No dark solid advertising field behind the light cabinet.",
-            "No floating UI cards, copied toiletries, unrelated saturated accents, or invented cabinet parts.",
-        ],
+        "graphic_direction": {"text_color": "#303634", "line_color": "#637470", "icon_color": "#303634", "backing_color": "#F4F2EE", "backed_symbol_color": "#303634", "icon_style": "outline", "line_style": "fine"},
     }
 
 
@@ -63,11 +58,11 @@ def current_observed_measurement(text='17 in', object_name='Cabinet', axis='widt
 
 def current_image_direction(*, environment: str = "designed_environment", source_id: str = 'source_00') -> dict[str, Any]:
     return {"visual_goal": "Explain the visible physical feature at a glance",
-            "creative_brief": "Lead with the intact product view and a restrained asymmetric copy hierarchy; reuse the child graphic roles",
+            "presentation": {"scope": "whole_product", "state": "Show the complete product with its functional parts visible",
+                             "components": ['room.wall', 'room.floor', 'bath.towels'] if environment == 'designed_environment' else []},
             "evidence_usage": [{"source_id": source_id, "view_id": "view_01", "usage": "display", "covered_by": []}],
             "design_transfer": [],
-            "layout": [{"source_id": source_id, "view_id": "view_01", "target_region": [0.1, 0.1, 0.9, 0.9]}],
-            "text_placement": [], "scene_objects": ['room.wall', 'room.floor', 'bath.towels'] if environment == 'designed_environment' else [], "environment_mode": environment}
+            "environment_mode": environment}
 
 
 def current_image_task(
@@ -154,22 +149,6 @@ def current_image_task(
                 "variation": {},
                 "sold_unit_count": 1,
             },
-            "product_boundary": {
-                "sold_product_parts": [
-                    "the complete bathroom cabinet visible in the editable reference",
-                    "all source-visible structural parts and attached hardware",
-                ],
-                "replaceable_staging": ["loose toiletries, towels, flowers, and wall decor"],
-                "must_not_change": [
-                    "product type, source-visible structure, proportions, quantity, color, finish, and attached parts",
-                    "evidence-supported product parts and operating mechanisms",
-                ],
-                "product_color_material": "color: soft white; painted engineered wood",
-                "observed_product_colors": [
-                    {"name": "soft white", "source": "ProductFamilyV3"}
-                ],
-                "forbidden_additions": [],
-            },
             "measurement_authority": measurement,
             "display_copy_contract": story,
             "renderable_text_contract": {
@@ -190,6 +169,8 @@ def current_image_task(
                 else "reference_edit_soft_lock"
             ),
         })
+        if family == 'size':
+            base['image_direction'] = current_image_direction(environment='graphic_canvas')
     base["task_fingerprint"] = _task_fingerprint(base)
     base["input_revision_id"] = base["task_fingerprint"]
     validate_image_task(base)

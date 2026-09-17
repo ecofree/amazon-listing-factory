@@ -175,6 +175,10 @@ class StatusRevisionContractTests(unittest.TestCase):
             record_progress(job, "generate_candidate_committed")
             plugin = type("Plugin", (), {"category_id": "test"})()
             request = production.JobRunRequest(job_dir=job, plugin=plugin)
+            with patch.object(production, 'load_status', return_value={'stages': {'fetch': {'status': 'success'}}, 'tasks': {}}):
+                fetched = production._write_summary(request, status='partial_success', timings={}, started=time.monotonic(), release={})
+            self.assertEqual('selected_stages_completed_downstream_not_requested', fetched['workflow_reason'])
+            self.assertEqual(0, fetched['active_task_failure_count'])
             summary = production._write_summary(
                 request,
                 status="partial_success",
@@ -198,7 +202,7 @@ class StatusRevisionContractTests(unittest.TestCase):
             self.assertEqual(1, summary["planned_image_unresolved_count"])
             self.assertEqual({"generate": 1}, summary["stage_attempt_counts"])
             self.assertEqual({"generate": 12.5}, summary["cumulative_stage_seconds"])
-            self.assertEqual(1, summary["provider_request_count"])
+            self.assertEqual(1, summary["image_provider_request_count"])
             self.assertEqual(1, summary["candidate_commit_count"])
             review_summary = production._write_summary(
                 request,
@@ -213,17 +217,24 @@ class StatusRevisionContractTests(unittest.TestCase):
             )
             self.assertEqual("success", review_summary["planned_image_completion_status"])
             self.assertEqual(0, review_summary["planned_image_unresolved_count"])
-            source_rows = [{'child': 'B1', 'source_path': f'source{i}.jpg', 'role': 'func'} for i in range(18)]
-            source_rows[15]['role'] = source_rows[16]['role'] = source_rows[17]['role'] = 'review_required'
-            with patch('core.image_tasks.read_image_tasks', return_value={'tasks': source_rows[:15]}), patch(
-                    'core.final_source_intents.read_final_source_intents', return_value=source_rows):
+            coverage = {'source_count': 18, 'excluded_count': 0, 'unresolved_count': 3,
+                        'authority_errors': [], 'rows': [{'status': 'classified_not_selected'}]}
+            with patch('core.image_tasks.read_image_tasks', return_value={'tasks': []}), patch(
+                    'core.release_manifest.source_inventory_coverage', return_value=coverage):
                 counts = production._source_scope_counts(request)
                 self.assertEqual(18, counts['source_input_count'])
                 self.assertEqual(3, counts['source_unresolved_count'])
-                source_rows[-1]['role'] = 'excluded_wrong_variant'
+                self.assertEqual(1, counts['classified_not_selected_count'])
+                coverage.update(excluded_count=1, unresolved_count=2)
                 counts = production._source_scope_counts(request)
                 self.assertEqual(1, counts['source_excluded_count'])
                 self.assertEqual(2, counts['source_unresolved_count'])
+                with patch('core.image_tasks.read_image_tasks', side_effect=FileNotFoundError('ImageTask not formed')):
+                    classified = production._source_scope_counts(request)
+                    self.assertEqual('classified_tasks_unavailable', classified['source_scope_status'])
+                    self.assertEqual(18, classified['source_input_count'])
+                    self.assertEqual(1, classified['source_excluded_count'])
+                    self.assertEqual(2, classified['source_unresolved_count'])
             self.assertEqual('', review_summary['completed_through_stage'])
             self.assertEqual({"pass": 1}, review_summary["qa_decision_counts"])
             self.assertEqual("local_export_only", summary["publish_mode"])

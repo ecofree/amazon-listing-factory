@@ -52,13 +52,16 @@ _MAX_OCR_BLOCKS = 2000
 _MAX_OCR_DEPTH = 8
 
 
-def scan_image(image_path: str | Path) -> OcrResult:
+def scan_image(image_path: str | Path, *, deadline_monotonic: float | None = None) -> OcrResult:
     """Return OCR text evidence for an image.
 
     Disabled, unconfigured, low-confidence, and failed OCR return explicit
     errors so QA can emit a human-review warning instead of guessing.
+    An optional monotonic deadline caps each request and wait.
     """
 
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        return OcrResult(error="timeout")
     path = Path(image_path)
     if not _ocr_enabled() or not _api_token() or not path.exists():
         return EMPTY_OCR_RESULT
@@ -69,7 +72,8 @@ def scan_image(image_path: str | Path) -> OcrResult:
             _CACHE.move_to_end(cache_key)
             return cached
     try:
-        result = _scan_image_uncached(path)
+        result = _scan_image_uncached(path, deadline_monotonic=deadline_monotonic)
+        _remaining_seconds(0.0, deadline_monotonic)
     except Exception as exc:
         result = OcrResult(error=f"{type(exc).__name__}: {exc}")
     if result.error:
@@ -81,43 +85,50 @@ def scan_image(image_path: str | Path) -> OcrResult:
     return result
 
 
-def _scan_image_uncached(path: Path) -> OcrResult:
+def _scan_image_uncached(path: Path, *, deadline_monotonic: float | None = None) -> OcrResult:
     headers = {"Authorization": f"Bearer {_api_token()}"}
     optional_payload = json.dumps(_optional_payload(), separators=(",", ":"), sort_keys=True)
     with path.open("rb") as handle:
         response = _request_with_retries(
-            lambda: (
+            lambda timeout: (
                 handle.seek(0)
                 or requests.post(
                     _api_url(),
                     headers=headers,
                     data={"model": _model(), "optionalPayload": optional_payload},
                     files={"file": (path.name, handle, _content_type(path))},
-                    timeout=_submit_timeout(),
+                    timeout=timeout,
                 )
-            )
+            ),
+            timeout=_submit_timeout(),
+            deadline_monotonic=deadline_monotonic,
         )
     payload = response.json()
     job_id = str((payload.get("data") or {}).get("jobId") or payload.get("jobId") or "").strip()
     if not job_id:
-        return _parse_result_payload(payload)
-    return _poll_result(job_id, headers)
+        return _parse_result_payload(payload, deadline_monotonic=deadline_monotonic)
+    return _poll_result(job_id, headers, deadline_monotonic=deadline_monotonic)
 
 
-def _poll_result(job_id: str, headers: dict[str, str]) -> OcrResult:
-    deadline = time.time() + _timeout_seconds()
+def _poll_result(
+    job_id: str, headers: dict[str, str], *, deadline_monotonic: float | None = None,
+) -> OcrResult:
+    deadline = time.monotonic() + _timeout_seconds()
+    if deadline_monotonic is not None:
+        deadline = min(deadline, deadline_monotonic)
     interval = _poll_interval()
     max_interval = _poll_max_interval()
-    while time.time() < deadline:
-        remaining = deadline - time.time()
-        time.sleep(min(interval, max(0.0, remaining)))
+    while time.monotonic() < deadline:
+        time.sleep(_remaining_seconds(interval, deadline))
         response = _request_with_retries(
-            lambda: request_public_url(
+            lambda timeout: request_public_url(
                 "GET",
                 f"{_api_url().rstrip('/')}/{job_id}",
                 headers=headers,
-                timeout=_request_timeout(),
-            )
+                timeout=timeout,
+            ),
+            timeout=_request_timeout(),
+            deadline_monotonic=deadline,
         )
         try:
             assert_response_peer_public(response, hostname=urlparse(_api_url()).hostname or "")
@@ -128,21 +139,25 @@ def _poll_result(job_id: str, headers: dict[str, str]) -> OcrResult:
         data = data if isinstance(data, dict) else payload
         state = str(data.get("state") or data.get("status") or "").strip().lower()
         if state in {"done", "completed", "succeeded", "success"}:
-            return _parse_result_payload(data)
+            return _parse_result_payload(data, deadline_monotonic=deadline)
         if state in {"failed", "error", "canceled", "cancelled"}:
             return OcrResult(error=str(data.get("errorMsg") or data.get("error") or state))
         interval = min(max_interval, interval * 1.5)
     return OcrResult(error="timeout")
 
 
-def _parse_result_payload(payload: dict[str, Any]) -> OcrResult:
+def _parse_result_payload(
+    payload: dict[str, Any], *, deadline_monotonic: float | None = None,
+) -> OcrResult:
     blocks: list[OcrBlock] = []
     blocks.extend(_extract_blocks(payload))
     result_url = _result_json_url(payload)
     if result_url:
         try:
             response = _request_with_retries(
-                lambda: request_public_url("GET", result_url, timeout=_request_timeout())
+                lambda timeout: request_public_url("GET", result_url, timeout=timeout),
+                timeout=_request_timeout(),
+                deadline_monotonic=deadline_monotonic,
             )
             try:
                 assert_response_peer_public(response, hostname=urlparse(result_url).hostname or "")
@@ -155,19 +170,35 @@ def _parse_result_payload(payload: dict[str, Any]) -> OcrResult:
                 blocks.extend(_extract_blocks_from_jsonl(body.decode("utf-8", errors="replace")))
             finally:
                 response.close()
+        except TimeoutError:
+            raise
         except Exception as exc:
             if not blocks:
                 return OcrResult(error=f"{type(exc).__name__}: {exc}")
     return _analyze_blocks(blocks)
 
 
-def _request_with_retries(request_fn):
+def _remaining_seconds(limit: float, deadline_monotonic: float | None) -> float:
+    if deadline_monotonic is None:
+        return limit
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("OCR deadline exceeded")
+    return min(limit, remaining)
+
+
+def _request_with_retries(request_fn, *, timeout: float, deadline_monotonic: float | None = None):
     attempts = _retry_attempts()
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
-            response = request_fn()
-            response.raise_for_status()
+            response = request_fn(_remaining_seconds(timeout, deadline_monotonic))
+            try:
+                _remaining_seconds(0.0, deadline_monotonic)
+                response.raise_for_status()
+            except Exception:
+                response.close()
+                raise
             return response
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
@@ -175,8 +206,9 @@ def _request_with_retries(request_fn):
             last_exc = exc
             if not _retryable_http_error(exc):
                 raise
+        _remaining_seconds(0.0, deadline_monotonic)
         if attempt < attempts - 1:
-            time.sleep(_retry_delay_seconds(attempt))
+            time.sleep(_remaining_seconds(_retry_delay_seconds(attempt), deadline_monotonic))
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("OCR request failed without an exception")

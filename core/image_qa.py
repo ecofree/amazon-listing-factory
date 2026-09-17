@@ -33,7 +33,7 @@ from .image_task_inputs import release_candidate_fingerprint
 from .image_tasks import read_image_tasks
 from .run_scope import scoped_child_set
 from .status import input_revision_id, logical_task_id
-from .text_evidence import extract_measurements, normalize_text, measurement_values_match, numeric_signature
+from .text_evidence import extract_measurements, normalize_text, measurement_values_match, measurement_qualifiers, numeric_signature
 
 
 def run_image_qa(
@@ -291,7 +291,7 @@ def _line_matches_any(line: str, allowed: list[str]) -> bool:
     if not tokens:
         return True
     for value in allowed:
-        if numeric_signature(line) != numeric_signature(value):
+        if numeric_signature(line) != numeric_signature(value) or measurement_qualifiers(line) != measurement_qualifiers(value):
             continue
         permitted = _ocr_match_tokens(value)
         if tokens == permitted or _compact_edit_distance_at_most_one(

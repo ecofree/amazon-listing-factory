@@ -252,6 +252,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         dry_run=bool(args.dry_run),
         retry_copy=bool(getattr(args, "retry_copy", False)),
     )
+    if getattr(args, "brand_brief", "") and not args.dry_run:
+        from core.design_reference_library import update_brand_design_brief
+
+        update_brand_design_brief(job_dir, brief_path=args.brand_brief)
     summary = run_job(request, stages=stages)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return {"success": 0, "pending": 1, "awaiting_review": 3, "partial_success": 4, "dry_run": 0}.get(
@@ -560,6 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--job", required=True)
     p.add_argument("--category", default="")
     p.add_argument("--config", default="")
+    p.add_argument("--brand-brief", default="", help="Replace the brand design brief from JSON before running; include brief to change design direction. Dry runs do not apply it.")
     p.add_argument("--stages", default="", help="Comma-separated debug stages handled by the canonical production controller.")
     p.add_argument("--workers", type=int, default=0, help="Generation concurrency cap; 0 selects a hardware/provider-aware limit.")
     p.add_argument("--limit", type=int, default=0)

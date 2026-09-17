@@ -82,10 +82,10 @@ class RootCauseRemediationTests(unittest.TestCase):
             self.assertEqual("SUCCEEDED", client._wait_for_run("run", token="token")["status"])
 
     def test_download_authority_invalidates_policy_and_unsafe_paths(self) -> None:
-        from core.final_source_intents import _classification_workers
-        self.assertEqual(1, _classification_workers(1, 12))
-        self.assertEqual(2, _classification_workers(0, 12))
-        self.assertEqual(3, _classification_workers(8, 12))
+        from core.ocr_scanner import scan_image
+        with patch('core.ocr_scanner.requests.post') as submitted:
+            self.assertEqual('timeout', scan_image('unused', deadline_monotonic=0).error)
+            submitted.assert_not_called()
         from core.asset_manager import _download_input_revision, read_download_manifest
         from core.asset_manager import download_artifacts_current, _inventory_fingerprint
         from core.status import input_revision_id

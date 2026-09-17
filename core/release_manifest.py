@@ -401,9 +401,21 @@ def source_inventory_coverage(
                 "blocking_reason": str(intent.get("error") or "source purpose classification failed"),
             })
             continue
-        if role == "excluded_wrong_variant":
+        matches = [
+            task for task in tasks
+            if str(task.get("child") or "") == child
+            and (
+                (str(task.get("source_sha256") or "") == str(intent.get("source_sha256") or "")
+                 and str(task.get("source_intent_revision_id") or "") == revision)
+                or any(ref.get('source_id') == base['source_id']
+                       and ref.get('original_sha256') == intent.get('source_sha256')
+                       for ref in task.get('generation_references', []) if ref.get('kind') != 'design_reference')
+            )
+        ]
+        if role in {"excluded_wrong_variant", "reference_only"}:
             coverage_rows.append({**base, "final_role": role, "source_intent_revision_id": revision,
-                                  "image_task_roles": [], "status": role, "blocking_reason": "",
+                                  "image_task_roles": [str(task.get('role') or '') for task in matches] if role == 'reference_only' else [],
+                                  "status": role, "blocking_reason": "",
                                   "disposition_reason": intent.get("classification_reason")})
             continue
         if role == "review_required":
@@ -426,20 +438,7 @@ def source_inventory_coverage(
                 "blocking_reason": "source purpose has no production role",
             })
             continue
-        matches = [
-            task for task in tasks
-            if str(task.get("child") or "") == child
-            and role_prefix(task.get("role")) == role
-            and str(task.get("source_sha256") or "") == str(intent.get("source_sha256") or "")
-            and (
-                str(task.get("source_intent_revision_id") or "") == revision
-                or (
-                    task.get("formation_status") == "blocked"
-                    and str(task.get("source_path") or "") == str(intent.get("source_path") or "")
-                )
-            )
-        ]
-        if not matches and role in {"scene", "func"}:
+        if not matches:
             coverage_rows.append({
                 **base,
                 "final_role": role,
@@ -449,25 +448,15 @@ def source_inventory_coverage(
                 "blocking_reason": "",
             })
             continue
-        if len(matches) != 1:
-            coverage_rows.append({
-                **base,
-                "final_role": role,
-                "source_intent_revision_id": revision,
-                "image_task_roles": [str(task.get("role") or "") for task in matches],
-                "status": "image_task_missing" if not matches else "image_task_ambiguous",
-                "blocking_reason": "final source intent must map to exactly one ImageTaskV10 row",
-            })
-            continue
         coverage_rows.append({
             **base,
             "final_role": role,
             "source_intent_revision_id": revision,
-            "image_task_roles": [str(matches[0].get("role") or "")],
+            "image_task_roles": [str(task.get('role') or '') for task in matches],
             "status": "covered",
             "blocking_reason": "",
         })
-    accounted_statuses = {"covered", "classified_not_selected", "excluded_wrong_variant"}
+    accounted_statuses = {"covered", "classified_not_selected", "excluded_wrong_variant", "reference_only"}
     issues = [row for row in coverage_rows if row["status"] not in accounted_statuses]
     return {
         "status": (
@@ -628,7 +617,7 @@ def _production_task_completion(
         }
         for row in (source_coverage or {}).get("rows") or []
         if isinstance(row, dict)
-        and row.get("status") not in {"covered", "classified_not_selected"}
+        and row.get("status") not in {"covered", "classified_not_selected", "excluded_wrong_variant", "reference_only"}
     ]
     return {
         "status": "incomplete" if image_branch_error else required["status"],
@@ -714,7 +703,7 @@ def _with_release_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
         }
         for row in (payload.get("source_inventory_coverage") or {}).get("rows") or []
         if isinstance(row, dict)
-        and row.get("status") not in {"covered", "classified_not_selected"}
+        and row.get("status") not in {"covered", "classified_not_selected", "excluded_wrong_variant", "reference_only"}
     ]
     next_actions: list[str] = []
     branch_error = str((payload.get('production_task_completion') or {}).get('image_branch_error') or '')

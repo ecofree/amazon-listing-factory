@@ -4,7 +4,6 @@ from pathlib import Path
 import math
 import hashlib
 import time
-import io
 from typing import Any
 
 from PIL import Image
@@ -14,7 +13,7 @@ from .paths import resolve_job_owned_path
 from .plugin import ProductPlugin
 
 
-REFERENCE_KINDS = {"edit_base", "product_evidence", "design_reference"}
+REFERENCE_KINDS = {"edit_base", "product_evidence", "measurement_evidence", "design_reference"}
 
 
 def source_box(value: Any) -> tuple[float, float, float, float]:
@@ -24,14 +23,15 @@ def source_box(value: Any) -> tuple[float, float, float, float]:
     box = tuple(value[key] for key in ('left', 'top', 'right', 'bottom'))
     if (any(type(n) not in (int, float) or not 0 <= n <= 1 for n in box)
             or not (box[0] < box[2] and box[1] < box[3])):
-        raise ValueError('Source region must be nonempty normalized original-image bounds')
+        raise ValueError(f'Source region must be nonempty normalized original-image bounds: {value}; '
+                         '0 <= left < right <= 1 and 0 <= top < bottom <= 1')
     return box
 
 
 def source_point(value: Any) -> tuple[float, float]:
     if (not isinstance(value, dict) or set(value) != {'x', 'y'}
             or any(type(n) not in (int, float) or not 0 <= n <= 1 for n in value.values())):
-        raise ValueError('Source endpoint needs normalized original-image x and y')
+        raise ValueError(f'Source endpoint needs normalized original-image x and y in [0,1]: {value}')
     return value['x'], value['y']
 
 
@@ -43,11 +43,15 @@ def physical_views(value: Any) -> list[dict[str, Any]]:
     for row in value:
         if not isinstance(row, dict) or set(row) != {"view_id", "region", "extent", "evidence"}:
             raise ValueError("Physical view needs view_id, region, extent and observed evidence")
-        key, box = row["view_id"], source_box(row["region"])
+        key = row["view_id"]
+        try:
+            box = source_box(row["region"])
+        except ValueError as exc:
+            raise ValueError(f'physical_views[{key}].region: {exc}') from exc
         if not isinstance(key, str) or not key or len(key) > 80 or key in seen:
             raise ValueError("Physical view identity is missing or duplicated")
         seen.add(key)
-        if row["extent"] not in {"whole_view", "detail"} or not isinstance(row["evidence"], list) or not row["evidence"]:
+        if row["extent"] not in ("whole_view", "detail") or not isinstance(row["evidence"], list) or not row["evidence"]:
             raise ValueError("Physical view needs its visible extent and feature evidence")
         features = set()
         for item in row["evidence"]:
@@ -58,26 +62,56 @@ def physical_views(value: Any) -> list[dict[str, Any]]:
                     or item["feature_id"] in features):
                 raise ValueError("View evidence needs unique feature identity, object, visible bounds and physical facts")
             features.add(item["feature_id"])
-            r = source_box(item["region"])
+            try:
+                r = source_box(item["region"])
+            except ValueError as exc:
+                raise ValueError(f'physical_views[{key}].evidence[{item["feature_id"]}].region: {exc}') from exc
             if not (box[0] <= r[0] < r[2] <= box[2] and box[1] <= r[1] < r[3] <= box[3]):
                 raise ValueError(f"{key}: crop truncates observed feature {item['feature_id']}; correct its bounds")
     return value
 
 
+def selected_reference_views(observation: dict[str, Any], purposes: set[str] | None = None) -> list[dict[str, Any]]:
+    """Use observation's product-reference selection, not an entire source-page census."""
+    catalog = {view['view_id']: view for view in physical_views(observation.get('physical_views'))}
+    selections = observation.get('reference_views')
+    if not isinstance(selections, list):
+        raise ValueError('Observation needs explicit reference_views selection')
+    seen, views = set(), []
+    for selection in selections:
+        if (not isinstance(selection, dict) or set(selection) != {'view_id', 'purposes'}
+                or not isinstance(selection['view_id'], str)
+                or selection['view_id'] not in catalog or selection['view_id'] in seen
+                or not isinstance(selection['purposes'], list) or not selection['purposes']
+                or any(value not in ('appearance', 'feature', 'measurement') for value in selection['purposes'])):
+            raise ValueError('Reference selection needs a unique observed view and explicit product purpose')
+        seen.add(selection['view_id'])
+        if purposes is None or purposes.intersection(selection['purposes']):
+            views.append(catalog[selection['view_id']])
+    measured = {row['view_id'] for row in observation.get('measurements', [])}
+    if not measured <= {row['view_id'] for row in selections if 'measurement' in row['purposes']}:
+        raise ValueError('Located measurements need their selected measurement reference')
+    return views
+
+
 def planning_view_inputs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Only observation-selected appearance views condition the child design."""
     return [{"attachment_number": index + 1, "source_id": source_id, "view_id": view['view_id']}
             for index, (source_id, view) in enumerate(
                 (source["source_id"], view) for source in sources
-                for view in physical_views((source.get("observation") or {}).get("physical_views")))]
+                for view in selected_reference_views(source['observation'], {'appearance'}))]
 
 
-def _view_location(job: Path, source: dict[str, Any], view: dict[str, Any], size: tuple[int, int]) -> tuple[Path, tuple[int, int, int, int]]:
+def _view_location(job: Path, source: dict[str, Any], view: dict[str, Any], size: tuple[int, int], *, measurement: bool = False) -> tuple[Path, tuple[int, int, int, int]]:
     l, t, r, b = source_box(view["region"])
-    # Page callouts belong to the measured view without being inside the product silhouette.
-    for measurement in source.get('measurements', []):
-        if measurement['view_id'] != view['view_id']:
+    if view['extent'] == 'detail' and not measurement:
+        bounds = [source_box(feature['region']) for feature in view['evidence']]
+        l, t = min(box[0] for box in bounds), min(box[1] for box in bounds)
+        r, b = max(box[2] for box in bounds), max(box[3] for box in bounds)
+    for annotation in source.get('measurements', []) if measurement else []:
+        if annotation['view_id'] != view['view_id']:
             continue
-        ml, mt, mr, mb = source_box(measurement['source_region'])
+        ml, mt, mr, mb = source_box(annotation['source_region'])
         l, t, r, b = min(l, ml), min(t, mt), max(r, mr), max(b, mb)
     box = (math.floor(l * size[0]), math.floor(t * size[1]), math.ceil(r * size[0]), math.ceil(b * size[1]))
     key = hashlib.sha256(f"{source['source_sha256']}:{box}".encode()).hexdigest()
@@ -85,71 +119,61 @@ def _view_location(job: Path, source: dict[str, Any], view: dict[str, Any], size
 
 
 def source_crop_provenance(job: Path, source: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_extract_view(job, source, view)[1]
+            for view in physical_views(source['observation']['physical_views'])]
+
+
+def _extract_view(job: Path, source: dict[str, Any], view: dict[str, Any], *, measurement: bool = False) -> tuple[Path, dict[str, Any]]:
     path = resolve_job_owned_path(job, source['source_path'])
     if file_sha256(path) != source['source_sha256']:
-        raise ValueError('Source changed before crop binding')
-    rows = []
+        raise ValueError('Source changed before reference extraction')
     with Image.open(path) as image:
-        for view in physical_views(source['observation']['physical_views']):
-            _, box = _view_location(job, source, view, image.size)
+        output, box = _view_location(job, source, view, image.size, measurement=measurement)
+        expected = next((row for row in source.get('crop_provenance', [])
+                         if row['view_id'] == view['view_id'] and row['pixel_box'] == list(box)), None)
+        if not (expected and output.is_file() and file_sha256(output) == expected['sha256']):
+            output.parent.mkdir(parents=True, exist_ok=True)
             with image.crop(box) as crop:
-                buffer = io.BytesIO()
                 if crop.mode in {'CMYK', 'YCbCr', 'HSV'}:
                     with crop.convert('RGB') as rgb:
-                        rgb.save(buffer, format='PNG')
+                        rgb.save(output, format='PNG')
                 else:
-                    crop.save(buffer, format='PNG')
-                rows.append({'view_id': view['view_id'], 'pixel_size': list(crop.size), 'source_size': list(image.size),
-                             'pixel_area': crop.width * crop.height, 'pixel_box': list(box),
-                             'sha256': hashlib.sha256(buffer.getvalue()).hexdigest()})
-    return rows
+                    crop.save(output, format='PNG')
+        size = [box[2] - box[0], box[3] - box[1]]
+        return output, {'view_id': view['view_id'], 'pixel_size': size, 'source_size': list(image.size),
+                        'pixel_area': size[0] * size[1], 'pixel_box': list(box), 'sha256': file_sha256(output)}
 
 
 def prepare_planning_views(job: Path, sources: list[dict[str, Any]], directory: Path, *, deadline_monotonic: float | None = None) -> list[Path]:
-    """Extract immutable physical views shared by planning and image editing."""
+    """Extract the exact appearance attachments declared in the planning request."""
     paths = []
     provenance = []
     directory.mkdir(parents=True, exist_ok=True)
-    for source in sources:
-        views = physical_views((source.get("observation") or {}).get("physical_views"))
-        if not views:
-            raise ValueError(f"{source['source_id']}: no observed physical views; resolve source observation")
-        path = resolve_job_owned_path(job, source["source_path"])
-        if file_sha256(path) != source["source_sha256"]:
-            raise ValueError(f"{source['source_id']}: source changed before planning")
-        with Image.open(path) as image:
-            image.load()
-            for view in views:
-                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                    raise TimeoutError("Child planning deadline exhausted while preparing evidence")
-                output, box = _view_location(job, source, view, image.size)
-                output.parent.mkdir(parents=True, exist_ok=True)
-                with image.crop(box) as crop:
-                    if crop.mode in {"CMYK", "YCbCr", "HSV"}:
-                        with crop.convert("RGB") as rgb:
-                            rgb.save(output, format="PNG")
-                    else:
-                        crop.save(output, format="PNG")
-                paths.append(output)
-                provenance.append({"attachment_number": len(paths), "source_id": source["source_id"],
-                                   "view_id": view["view_id"], "original_sha256": source["source_sha256"],
-                                   "original_region": dict(zip(('left', 'top', 'right', 'bottom'),
-                                       (box[0]/image.width, box[1]/image.height, box[2]/image.width, box[3]/image.height))), "pixel_box": box,
-                                   "coordinate_frame": "original_source", "derived_path": output.relative_to(job).as_posix(),
-                                   "derived_sha256": file_sha256(output)})
-    write_json(directory / "manifest.json", {"attachments": provenance})
+    catalog = evidence_view_catalog(sources)
+    for attachment in planning_view_inputs(sources):
+        source, view = catalog[view_identity(attachment)]
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise TimeoutError('Child planning deadline exhausted while preparing selected evidence')
+        output, crop = _extract_view(job, source, view)
+        box, (width, height) = crop['pixel_box'], crop['source_size']
+        paths.append(output)
+        provenance.append({**attachment, 'original_sha256': source['source_sha256'],
+            'original_region': dict(zip(('left', 'top', 'right', 'bottom'),
+                (box[0]/width, box[1]/height, box[2]/width, box[3]/height))), 'pixel_box': box,
+            'coordinate_frame': 'original_source', 'derived_path': output.relative_to(job).as_posix(),
+            'derived_sha256': crop['sha256']})
+    write_json(directory / "manifest.json", {"attachments": provenance,
+        "selection": "observed_appearance_only",
+        "context_limit": "Original pixels are intact; source styling may remain inside selected views."})
     return paths
 
 
 def view_reference(source: dict[str, Any], view: dict[str, Any], *, job: Path, child: str, kind: str) -> dict[str, Any]:
     """Use the same extraction and identity as the planning attachments."""
-    path = resolve_job_owned_path(job, source["source_path"])
-    with Image.open(path) as image:
-        crop, box = _view_location(job, source, view, image.size)
-        region = dict(zip(('left', 'top', 'right', 'bottom'),
-                          (box[0]/image.width, box[1]/image.height, box[2]/image.width, box[3]/image.height)))
-    if not crop.is_file():
-        raise ValueError(f"Missing current observed view: {view['view_id']}")
+    crop, metadata = _extract_view(job, source, view, measurement=kind == 'measurement_evidence')
+    box, (width, height) = metadata['pixel_box'], metadata['source_size']
+    region = dict(zip(('left', 'top', 'right', 'bottom'),
+                      (box[0]/width, box[1]/height, box[2]/width, box[3]/height)))
     return {"kind": kind, "child": child, "source_id": source["source_id"], "view_id": view["view_id"],
             "purpose": "Same-child product evidence for structure, finish and supported operating state; source decor, camera framing and graphics are not target design.",
             "evidence_ids": [item["feature_id"] for item in view["evidence"]],
@@ -158,15 +182,22 @@ def view_reference(source: dict[str, Any], view: dict[str, Any], *, job: Path, c
             "original_region": region, "extent": view["extent"], "visible_evidence": view["evidence"]}
 
 
+def measurement_reference(source: dict[str, Any], view: dict[str, Any], *, job: Path, child: str) -> dict[str, Any]:
+    reference = view_reference(source, view, job=job, child=child, kind='measurement_evidence')
+    reference['purpose'] = 'Verify measured objects, quantities and endpoint associations only; not color, composition or graphic styling.'
+    return reference
+
+
 def measurement_attachment_location(row: dict[str, Any], references: list[dict[str, Any]]) -> dict[str, Any]:
-    index, ref = next(((i, ref) for i, ref in enumerate(references, 1)
-                      if ref['source_id'] == row['source_id'] and ref.get('view_id') == row['view_id']), (None, None))
-    if ref is None:
-        raise ValueError('Measurement has no matching source/view attachment')
-    l, t, r, b = source_box(ref['original_region'])
     ml, mt, mr, mb = source_box(row['source_region'])
-    if not (l <= ml < mr <= r and t <= mt < mb <= b):
-        raise ValueError('Measurement annotation is missing from its actual attachment')
+    matching = [(i, ref) for i, ref in enumerate(references, 1)
+                if ref['source_id'] == row['source_id'] and ref.get('view_id') == row['view_id']
+                and ref['kind'] != 'design_reference'
+                and (lambda b: b[0] <= ml < mr <= b[2] and b[1] <= mt < mb <= b[3])(source_box(ref['original_region']))]
+    index, ref = matching[-1] if matching else (None, None)
+    if ref is None:
+        raise ValueError('Measurement annotation is missing from its actual source/view attachments')
+    l, t, r, b = source_box(ref['original_region'])
     label = dict(zip(('left', 'top', 'right', 'bottom'),
                      ((ml-l)/(r-l), (mt-t)/(b-t), (mr-l)/(r-l), (mb-t)/(b-t))))
     points = None if row['source_endpoints'] is None else [
@@ -175,6 +206,13 @@ def measurement_attachment_location(row: dict[str, Any], references: list[dict[s
         for point in points:
             source_point(point)
     return {'attachment': index, 'view': row['view_id'], 'label': label, 'endpoints': points}
+
+
+def reference_semantics(reference: dict[str, Any]) -> dict[str, Any]:
+    """Consumed reference evidence, independent of paths and approval history."""
+    return {**{key: reference[key] for key in ('kind', 'sha256', 'source_id', 'view_id',
+        'original_region', 'extent', 'visible_evidence') if key in reference},
+        'mask_sha256': (reference.get('protected_mask') or {}).get('sha256')}
 
 
 def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str) -> None:
@@ -215,6 +253,36 @@ def evidence_view_catalog(sources: list[dict[str, Any]]) -> dict[str, tuple[dict
             for source in sources for view in physical_views(source['observation']['physical_views'])}
 
 
+def resolve_edit_references(brief: dict[str, Any], sources: list[dict[str, Any]], *, job: Path, child: str,
+                            design_references: list[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+    """One ordered physical input projection for planning review and generation."""
+    catalog = evidence_view_catalog(sources)
+    direction = brief['image_direction']
+    ordered = sorted(direction['evidence_usage'], key=lambda row: row['usage'] != 'display')
+    if not ordered or ordered[0]['usage'] != 'display':
+        raise ValueError('No displayed evidence selected')
+    refs = []
+    for i, selection in enumerate(ordered):
+        if view_identity(selection) not in catalog:
+            raise ValueError('Selected product view is not observed in this child: ' + view_identity(selection))
+        owner, view = catalog[view_identity(selection)]
+        refs.append(view_reference(owner, view, job=job, child=child, kind='edit_base' if i == 0 else 'product_evidence'))
+    if brief['role'].split('_', 1)[0] in {'func', 'size'}:
+        for selection in ordered:
+            owner, view = catalog[view_identity(selection)]
+            if selection['usage'] != 'verification' and any(row['view_id'] == view['view_id'] for row in owner.get('measurements', [])):
+                measured = measurement_reference(owner, view, job=job, child=child)
+                if not any(all(ref[key] == measured[key] for key in ('source_id', 'view_id', 'sha256', 'original_region')) for ref in refs):
+                    refs.append(measured)
+    available = {row['source_id']: row for row in design_references}
+    for transfer in direction['design_transfer']:
+        key = transfer['reference_id']
+        if key not in available or brief['role'].split('_', 1)[0] not in available[key]['roles']:
+            raise ValueError('Selected design reference is not approved for this role')
+        refs.append(available[key])
+    return refs
+
+
 def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[dict[str, Any]], targeted_edit: bool = False) -> str:
     decisions = {row["reference_id"]: row for row in design_transfer}
     actual = {row["source_id"] for row in references if row["kind"] == "design_reference"}
@@ -231,6 +299,8 @@ def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[
             purpose = f"Reviewed use: {row['purpose']} Approval boundary: {scope} " + (
                 "Style verification only; retain the candidate's established design except for the requested correction."
                 if targeted_edit else f"Inherit within that scope: {decision['inherit']} Adapt: {decision['adapt']}")
+        elif row['kind'] == 'measurement_evidence':
+            purpose = 'Measurement verification only: quantities, measured objects and endpoints; not styling or an extra output panel.'
         elif row["kind"] == "product_evidence" or not targeted_edit:
             purpose = str(row.get('extent') or 'Observed product view') + '.'
         else:

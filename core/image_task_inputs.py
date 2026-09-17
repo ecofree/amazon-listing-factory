@@ -6,6 +6,31 @@ from typing import Any
 from .status import input_revision_id
 from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding, us_measurement_text, measurement_values_match
 
+
+def shared_design_values(value: Any, prefix: str = '') -> dict[str, Any]:
+    """Address existing shared design leaves without granting container replacements."""
+    if isinstance(value, (dict, list)):
+        entries = value.items() if isinstance(value, dict) else enumerate(value)
+        return {path: leaf for key, item in entries
+                for path, leaf in shared_design_values(item, f'{prefix}.{key}' if prefix else str(key)).items()}
+    return {prefix: value}
+
+
+def role_art_direction(art: dict[str, Any], direction: dict[str, Any], role: str, *, main_policy: str = '') -> dict[str, Any]:
+    """The shared design values actually consumed by this role, without overrides."""
+    result = {key: art[key] for key in ('audience_and_market', 'photography_direction')}
+    environment = direction['environment_mode'] == 'designed_environment' and not (role == 'main' and main_policy == 'white_background')
+    selected = set(direction['presentation']['components'])
+    result['palette_direction'] = {
+        group: chosen for group, parts in art['palette_direction'].items()
+        if (chosen := {part: value for part, value in parts.items()
+                       if environment or (group != 'room' and f'{group}.{part}' in selected)})}
+    if environment:
+        result['environment_and_staging'] = art['environment_and_staging']
+    if role.split('_', 1)[0] in {'func', 'size'}:
+        result.update({key: art[key] for key in ('typography_direction', 'graphic_direction')})
+    return result
+
 def build_renderable_text_contract(family: str, measurement: dict[str, Any], *, display_copy: dict[str, Any]) -> dict[str, Any]:
     """Return the only strings an image provider may render as pixels."""
     if family in {"main", "scene"}:
@@ -18,16 +43,15 @@ def build_renderable_text_contract(family: str, measurement: dict[str, Any], *, 
 
 
 def build_display_copy_contract(
-    source: dict[str, Any],
-    source_brief: dict[str, Any],
+    sources: list[dict[str, Any]],
+    image_brief: dict[str, Any],
     *,
     product_claims: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Verify and copy the one immutable DisplayCopyContract chosen upstream."""
-    from .visual_design_kit_compiler import _available_claims
-    claims = _available_claims({**source, 'source_id': source_brief['source_id'],
-                               'observation': source.get('visual_evidence') or {}}, product_claims)
-    selected = source_brief.get("display_copy_contract")
+    from .visual_design_kit_compiler import _available_claims, _copy_binding
+    claims = _available_claims(sources, product_claims)
+    selected = image_brief.get("display_copy_contract")
     if (
         not isinstance(selected, dict)
         or set(selected) != {"mode", "title", "labels", "bindings"}
@@ -45,15 +69,7 @@ def build_display_copy_contract(
         or sum(len(value) for value in strings) > 1200
         or len(strings) != len(bindings)
         or len(strings) != len(set(value.casefold() for value in strings))
-        or any(
-            not isinstance(row, dict)
-            or set(row) != {"evidence_ids", "text"}
-            or not isinstance(row.get("evidence_ids"), list)
-            or not row.get("evidence_ids")
-            or any(str(value or "") not in claims for value in row.get("evidence_ids") or [])
-            or str(row.get("text") or "") != strings[index]
-            for index, row in enumerate(bindings)
-        )
+        or any(_copy_binding(row, claims)['text'] != strings[index] for index, row in enumerate(bindings))
     ):
         raise ValueError("immutable DisplayCopyContract or its evidence binding changed")
     return {
@@ -188,45 +204,39 @@ def measurement_contract(child: dict[str, Any]) -> dict[str, Any]:
         "evidence": evidence,
     }
 
-def product_boundary(
-    image_policy: dict[str, Any],
-    child: dict[str, Any],
-    *,
-    product_type: str,
-    observations: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Build the sold-product boundary from program facts and the editable reference."""
-    normalized = child.get("normalized_facts") if isinstance(child.get("normalized_facts"), dict) else {}
-    specs = child.get("specs") if isinstance(child.get("specs"), dict) else {}
-    color = visual_product_color(child)
-    materials = [
-        str(value).strip()
-        for key, value in specs.items()
-        if any(token in str(key).casefold() for token in ("material", "finish"))
-        and str(value or "").strip()
-    ]
-    color_material = "; ".join(
-        value for value in [f"color: {color}" if color else "", *materials[:4]]
-        if value
-    )
-    return {
-        "sold_product_parts": [
-            f"the complete {product_type.lower().replace('_', ' ')} visible in the editable reference",
-            "all structural parts, attached supports, and product surfaces visible in that reference",
-        ],
-        "replaceable_staging": _unique_text(image_policy.get("replaceable_staging") or []),
-        "must_not_change": [
-            "the product type, source-visible structure, proportions, quantity, color, finish, and attached parts",
-            "the sold parts and mechanisms required for an evidence-supported operating or installed state",
-        ],
-        "product_color_material": color_material or "preserve the source-visible product color, finish, and material",
-        "observed_product_colors": [
-            {"name": observation["variant_identity"]["observed_color"], "source": observation["source_id"]}
-            for observation in observations or []
-            if (observation.get("variant_identity") or {}).get("observed_color") and observation.get("source_id")
-        ],
-        "forbidden_additions": _forbidden_addition_rules(image_policy.get("forbidden_additions") or []),
-    }
+def task_specs(
+    child: dict[str, Any], sources: list[dict[str, Any]], *, include_optional: bool = False,
+) -> list[dict[str, Any]]:
+    """One output inventory for planning, task formation and delivery accounting."""
+    ordered = sorted(sources, key=lambda row: int(row.get("source_index") or 0))
+    appearances = []
+    for source in ordered:
+        if child.get('asin') and source.get('child') not in (None, child['asin']):
+            continue
+        observation = source.get('observation', source.get('visual_evidence')) or {}
+        selected = {row['view_id'] for row in observation.get('reference_views', [])
+                    if 'appearance' in row['purposes']}
+        if any(view['view_id'] in selected and view.get('extent') == 'whole_view'
+               for view in observation.get('physical_views', [])):
+            appearances.append(source)
+    main = min(appearances, key=lambda row: (row.get('role') != 'main', int(row.get('source_index') or 0))) if appearances else None
+    specs = [{'role': 'main', 'source': main, 'reason': '' if main else 'No selected whole-product appearance evidence'}]
+    for family in ('scene', 'func', 'size'):
+        matches = [row for row in ordered if row.get('role') == family]
+        if family != 'size' and not include_optional:
+            matches = matches[:1]
+        if family == 'size' and len(matches) > 1:
+            specs.append({'role': family, 'source': None, 'reason': 'Multiple size authorities require resolution'})
+        elif matches:
+            specs.extend({'role': family if i == 1 else f'{family}_{i:02d}', 'source': row, 'reason': ''}
+                         for i, row in enumerate(matches, 1))
+        else:
+            specs.append({'role': family, 'source': None, 'reason': f'No final source intent is classified as {family}'})
+    for spec in specs:
+        family = spec['role'].split('_', 1)[0]
+        peers = [row for row in specs if row['role'].split('_', 1)[0] == family]
+        spec.update(instance_index=peers.index(spec) + 1, instance_count=len(peers), evidence_pending=spec['source'] is None)
+    return specs
 
 
 def task_facts(child: dict[str, Any], *, product_type: str) -> dict[str, Any]:
@@ -326,20 +336,3 @@ def _measurement_render_text(value: Any) -> str:
     text = " ".join(str(value or "").split()).strip()
     parsed = extract_measurements(text)
     return "" if not parsed or has_bad_encoding(text) else str(parsed[0].get("text") or text).strip()
-
-
-def _unique_text(values: Any) -> list[str]:
-    return list(dict.fromkeys(" ".join(str(value or "").split()) for value in values if str(value or "").strip()))
-
-
-def _forbidden_addition_rules(values: Any) -> list[str]:
-    result: list[str] = []
-    for value in values if isinstance(values, list) else []:
-        if isinstance(value, dict):
-            part = " ".join(str(value.get("part") or "").split())
-            if not part: continue
-            text = f"Do not add {part}" + (" unless it is visible in the editable reference" if value.get("unless_source_visible") else "")
-        else:
-            text = " ".join(str(value or "").split())
-        if text and text not in result: result.append(text)
-    return result

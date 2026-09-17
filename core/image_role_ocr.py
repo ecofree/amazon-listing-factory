@@ -22,7 +22,9 @@ def cached_ocr_evidence_for_image(image_path: Path, *, cache_root: Path) -> dict
     return _read_ocr_evidence_cache(cache_path, image_path=image_path, fingerprint=fingerprint)
 
 
-def ocr_evidence_for_image(image_path: Path, *, cache_root: Path | None = None) -> dict[str, Any]:
+def ocr_evidence_for_image(
+    image_path: Path, *, cache_root: Path | None = None, deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
     from .ocr_scanner import ocr_request_fingerprint
 
     fingerprint = ocr_request_fingerprint(image_path)
@@ -34,7 +36,7 @@ def ocr_evidence_for_image(image_path: Path, *, cache_root: Path | None = None) 
     try:
         from .ocr_scanner import scan_image
 
-        ocr = scan_image(image_path)
+        ocr = scan_image(image_path, deadline_monotonic=deadline_monotonic)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         evidence = {"available": False, "error": error, "raw_text": "", "retryable": _ocr_error_retryable(error)}
