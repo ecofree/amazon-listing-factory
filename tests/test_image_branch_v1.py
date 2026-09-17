@@ -172,8 +172,9 @@ def _fixture_reviews(claims, **kwargs):
     path = kwargs["trace_dir"] / "claim_review_response.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"reviews": records}), encoding="utf-8")
-    return {row["key"]: {**row, "policy": CLAIM_REVIEW_POLICY, "response_path": str(path.resolve()),
-                         "response_sha256": file_sha256(path)} for row in records}
+    provenance = {'policy': CLAIM_REVIEW_POLICY, 'response_path': str(path.resolve()), 'response_sha256': file_sha256(path)}
+    return {row['key']: {**row, **provenance, 'findings': [{**finding, **provenance} for finding in row['findings']]}
+            for row in records}
 
 
 class ImageBranchCurrentBehaviorTests(unittest.TestCase):
@@ -263,7 +264,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
         task['generation_references'][0]['visible_evidence'] = [dict(current_physical_view()['evidence'][0], physical_facts=['Platform frame without headboard'])]
         task['measurement_authority'] = {'mode': 'source_image', 'measurement_groups': [{
             'source_id': 'source_00', 'view_id': 'view_01', 'measured_part': 'Underbed clearance',
-            'axis': 'height', 'render_text': '12 in', 'source_region': dict(left=.2, top=.25, right=.3, bottom=.3),
+            'axis': 'height', 'render_text': '12 in', 'evidence_type': 'dimension_line', 'source_region': dict(left=.2, top=.25, right=.3, bottom=.3),
             'source_endpoints': [{'x': .2, 'y': .4}, {'x': .7, 'y': .4}]}]}
         task['generation_references'][0]['original_region'] = dict(left=.1, top=.2, right=.9, bottom=.8)
         self.assertIn('"attachment":1', compile_task_prompt(task=task))
@@ -441,7 +442,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             from core.visual_design_kit import _planner_trace_current
             import shutil
             for brief in kit['image_briefs']:
-                self.assertEqual('supported', brief['design_review']['status'])
+                self.assertEqual({}, brief['design_review'])
                 for review in brief.get('claim_reviews', {}).values():
                     self.assertFalse(Path(review['response_path']).is_absolute())
             with tempfile.TemporaryDirectory() as moved:

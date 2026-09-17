@@ -444,7 +444,6 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
                     workers=request.workers, deadline_monotonic=request.deadline_monotonic)
         if image_tasks_current(job, plugin, limit=0, include_optional=True):
             image_tasks = read_image_tasks(job, category_id=plugin.category_id)
-            image_tasks["failures"] = _formation_failures(image_tasks.get("tasks") or [], owner="brief")
             image_tasks["reused"] = True
         else:
             image_tasks = build_image_tasks(
@@ -563,33 +562,6 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
             template_mode="submit_ready" if request.production else request.template_mode,
         )
     raise AssertionError(stage)
-
-
-def _formation_failures(rows: Iterable[dict[str, Any]], *, owner: str) -> list[dict[str, Any]]:
-    failures: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict) or row.get("formation_status") != "blocked":
-            continue
-        if row.get("formation_reason_code") == "upstream_design_kit_missing":
-            continue
-        child = str(row.get("child") or "")
-        role = str(row.get("role") or "")
-        task = {
-            "logical_task_id": logical_task_id(owner, child=child, role=role),
-            "input_revision_id": row["input_revision_id"],
-            "child": child,
-            "role": role,
-        }
-        failures.append({
-            "task": task,
-            "failure_owner": owner,
-            # Formation is a current ImageTask contract result. Retryability
-            # belongs to the owning brief/planner attempt, not to a stale task
-            # field that can silently change generation semantics.
-            "task_status": "blocked",
-            "error": str(row.get("formation_reason") or row.get("formation_reason_code") or "task formation blocked"),
-        })
-    return failures
 
 
 def _selected_stages(stages: Iterable[str] | None) -> list[str]:

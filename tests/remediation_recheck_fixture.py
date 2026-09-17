@@ -78,7 +78,7 @@ def verify_review_projection(test):
                 'core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as review:
             result = _finish_image_briefs(malformed, job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame',
                 source_paths=[], source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
-        test.assertEqual(2, review.call_count)
+        review.assert_not_called()
         test.assertEqual({'main': 'ready', 'scene': 'ready', 'func': 'ready', 'size': 'pending'},
                          {row['role']: row['status'] for row in result['image_briefs']})
         test.assertEqual('observation', _brief(result, 'size')['failure_owner'])
@@ -104,7 +104,7 @@ def verify_shared_repair(test):
         result = _finish_image_briefs(raw, job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame', source_paths=[],
             source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
     test.assertEqual(1, remote.call_count)
-    test.assertEqual(2, review.call_count)
+    review.assert_not_called()
     test.assertEqual('ready', _brief(result, 'func')['status'])
     test.assertEqual(raw['family_art_direction'], result['family_art_direction'])
     for sibling in ('main', 'scene', 'func_02', 'size'):
@@ -116,16 +116,20 @@ def verify_shared_repair(test):
         result = _finish_image_briefs(raw, job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame', source_paths=[],
             source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
         test.assertIn('outside the current repair contract', (Path(tmp) / 'brief_repair_error.txt').read_text())
-    test.assertEqual(1, review.call_count)
+    review.assert_not_called()
     test.assertEqual(before, result)
     alternate = deepcopy(valid_raw)
     _brief(alternate, 'func')['image_direction'] = current_image_direction(source_id='source_01')
+    detail = current_physical_view('detail', feature='local_support')
+    detail['extent'] = 'detail'
+    sources[0]['observation']['physical_views'].append(detail)
+    _brief(valid_raw, 'func')['image_direction']['evidence_usage'][0]['view_id'] = 'detail'
     sources[1]['observation']['reference_views'][0]['purposes'] = ['feature']
     def missing_reference(requests, **kwargs):
         result = supported_review_results(requests)
         for row in requests:
             if row.get('role_design', {}).get('role') == 'func' and row['role_design']['evidence_usage'][0]['source_id'] == 'source_00':
-                result[row['key']]['findings'] = [dict(operation='presentation_state:func', status='inconclusive',
+                result[row['key']]['findings'] = [dict(operation='whole_product_transfer:func', status='inconclusive', resolution='revise_plan',
                                                      reason='Another child view is needed to prove the support')]
         return result
     def switch_reference(prompt, paths, **kwargs):
@@ -162,7 +166,7 @@ def verify_observation_feedback(test):
     test.assertEqual({'source_00'}, set(corrections['B1']))
     test.assertEqual(source['source_sha256'], corrections['B1']['source_00']['source_sha256'])
     test.assertEqual(review['key'], corrections['B1']['source_00']['findings'][0]['review_key'])
-    for extra in ('presentation_state:func', 'shared_design:photography_direction'):
+    for extra in ('sold_membership:source_00/view_01', 'shared_design:photography_direction'):
         mixed = deepcopy(reviews)
         mixed[request['key']]['findings'].append({'operation': extra, 'status': 'contradiction',
                                                 'reason': 'Requested depiction also conflicts with the clipped evidence'})
@@ -187,7 +191,7 @@ def verify_partial_review_rows(test):
     from core.image_task_inputs import shared_design_values
     from core.visual_design_kit import _finish_image_briefs
     from core.visual_semantics import _planning_review_rows
-    sources = [_source(), _source('source_01', 'scene')]
+    sources = [_source(disputed=True), _source('source_01', 'scene', disputed=True)]
     raw = _plan(sources)
     _brief(raw, 'func')['display_copy']['labels'][0]['text'] = 'Shelf height adjusts'
     _brief(raw, 'func')['image_direction']['environment_mode'] = 'graphic_canvas'
@@ -472,9 +476,14 @@ def _verify_bound_artifact_repair(test):
                     result[request['key']]['findings'].append({'operation': 'source_product:source_02/view_01',
                         'status': 'contradiction', 'reason': 'The visible shelf joint is missing from product evidence'})
             path = Path(next(iter(result.values()))['response_path'])
-            write_json(path, {'reviews': [{key: row[key] for key in ('key', 'status', 'reason', 'findings')}
-                                         for row in result.values()]})
-            return {key: dict(row, response_sha256=file_sha256(path)) for key, row in result.items()}
+            write_json(path, {'reviews': [{**{key: row[key] for key in ('key', 'status', 'reason')},
+                'findings': [{key: finding[key] for key in ('operation', 'status', 'reason')} for finding in row['findings']]}
+                for row in result.values()]})
+            for row in result.values():
+                row['response_sha256'] = file_sha256(path)
+                for finding in row['findings']:
+                    finding.update({key: row[key] for key in ('policy', 'response_path', 'response_sha256')})
+            return result
         stack.enter_context(patch.object(design, 'review_planning_bindings', side_effect=review))
         request = production.JobRunRequest(job_dir=job, plugin=_Plugin(), workers=1, deadline_monotonic=time.monotonic()+20)
         result = production._run_stage('brief', request=request)

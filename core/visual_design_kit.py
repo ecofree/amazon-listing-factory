@@ -33,7 +33,7 @@ from .status import input_revision_id, logical_task_id
 from .text_evidence import clean_evidence_text, has_bad_encoding, us_measurement_text
 from .image_task_inputs import visual_product_color, visual_variation_values, task_specs, shared_design_values
 from .palette_registry import planned_palette_diagnostics
-from .vision_gemini_client import gemini_scope_identity, gemini_stream_generate
+from .vision_gemini_client import gemini_scope_identity, gemini_stream_generate, VisionRequestError
 from .visual_context import planner_visual_context_instruction
 from .image_reference_context import physical_views, planning_view_inputs, prepare_planning_views, source_crop_provenance
 from .design_reference_library import approved_design_references, brand_design_brief, design_reference_usage, design_reference_semantics
@@ -43,13 +43,14 @@ from .visual_design_kit_compiler import (
     _available_claims,
     claim_review_requests,
     design_binding_request,
+    review_failure_owner,
     compile_visual_design_kit_response,
     validate_compiled_visual_design_kit,
     validate_image_brief_draft,
     DESIGN_FIELD_SCHEMAS, IMAGE_DIRECTION_SCHEMA,
 )
 VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v15"
-VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v70-child-fact-scope"
+VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v71-evidence-recovery"
 VISUAL_DESIGN_KIT_ARTIFACT = "visual_design_kits_v15.jsonl"
 
 _ROW_FIELDS = {"schema_version", "policy_version", "category_id", "main_image_policy", "child", "source_reference", "source_sha256", "source_references", "product_claims", "child_facts_revision_id", "input_revision_id", "family_design_id", "visual_design_kit_id", "family_art_direction", "image_briefs", "planner", "approved_design_references"}
@@ -222,6 +223,7 @@ def build_visual_design_kits(
             )
             for brief in planned['image_briefs']:
                 bound = [*brief.get('claim_reviews', {}).values(), brief.get('design_review', {})]
+                bound += [finding for review in bound for finding in review.get('findings', [])]
                 for review in bound:
                     if review.get('response_path'):
                         review['response_path'] = resolve_job_owned_path(job, review['response_path']).relative_to(job).as_posix()
@@ -345,14 +347,14 @@ def observation_corrections(design_kits: dict[str, Any]) -> dict[str, dict[str, 
                 continue
             for finding in review.get('findings', []):
                 operation = str(finding.get('operation', ''))
-                if (finding.get('status') != 'contradiction' or not operation.startswith('source_product:')
+                if (finding.get('status') not in {'contradiction', 'inconclusive'} or review_failure_owner(finding) != 'observation' or not operation.startswith('source_product:')
                         or operation.split(':', 1)[1] not in {item['source_id'] + '/' + item['view']['view_id'] for item in request['selected_evidence']}):
                     continue
                 source_id = operation.split(':', 1)[1].split('/', 1)[0]
                 source = sources[source_id]
                 row = corrections.setdefault(child, {}).setdefault(source_id, {
                     'source_sha256': source['source_sha256'], 'source_revision': source['input_revision_id'], 'findings': []})
-                bound = {**finding, 'review_key': review['key'], 'response_sha256': review['response_sha256']}
+                bound = {**finding, 'review_key': review['key']}
                 if bound not in row['findings']:
                     row['findings'].append(bound)
     return corrections
@@ -424,8 +426,6 @@ def _finish_image_briefs(
                for key, value in brief.get("claim_reviews", {}).items()}
     reviews.update({brief["design_review"]["key"]: brief["design_review"]
                     for brief in (cached or {}).get("image_briefs", []) if brief.get("design_review")})
-    reviews = {key: value for key, value in reviews.items() if value.get('status') != 'inconclusive'
-               and not any(row.get('status') == 'inconclusive' for row in value.get('findings', []))}
     sources = {source["source_id"]: source for source in source_manifest}
 
     def compile_reviewed(draft: dict[str, Any], attempt: str) -> dict[str, Any]:
@@ -443,22 +443,43 @@ def _finish_image_briefs(
         all_requests = [*claim_review_requests({**draft, 'image_briefs': valid}, source_manifest, product_claims),
                         *(design_binding_request(brief, draft["family_art_direction"], main_policy=main_policy, source=sources[brief["source_id"]], source_manifest=source_manifest, product_claims=product_claims, design_references=design_references) for brief in valid)]
         for review_attempt in range(2):
-            requests = list({row['key']: row for row in all_requests if row['key'] not in reviews
-                             and (row['kind'] != 'design_binding' or row['physical_operations'])}.values())
+            requests = {}
+            for row in all_requests:
+                previous = reviews.get(row['key'], {})
+                if row['kind'] == 'design_binding':
+                    findings = {finding['operation']: finding for finding in previous.get('findings', [])}
+                    if any(finding['status'] != 'supported' and review_failure_owner(finding) != 'review' for finding in findings.values()):
+                        continue
+                    missing = [op for op in row['physical_operations'] if op not in findings or (
+                        findings[op]['status'] == 'inconclusive' and review_failure_owner(findings[op]) == 'review')]
+                    if missing:
+                        requests[row['key']] = {**row, 'physical_operations': missing}
+                elif not previous or (previous.get('status') == 'inconclusive' and review_failure_owner(previous) == 'review'):
+                    requests[row['key']] = row
+            requests = list(requests.values())
             if not requests or time.monotonic() >= deadline_monotonic:
                 break
+            if budget.get('review', 0) >= 4:
+                break
             try:
-                if budget.get('review', 0) >= 4:
-                    raise VisualDesignKitError('Planning review attempt budget exhausted for this input revision; no request sent')
-                reviews.update(review_planning_bindings(requests,
+                received = review_planning_bindings(requests,
                     source_manifest=source_manifest, source_paths=source_originals,
                     job=job, child=child, design_references=design_references or [],
                     trace_dir=trace_dir / (attempt if review_attempt == 0 else attempt + '_unresolved'), deadline_monotonic=deadline_monotonic,
                     attempt_observer=settlement('review'),
-                    prior_output_limits=budget.get('output_limits', {}).get(f'claim-review:{input_revision_id(requests)}', [])))
-            except Exception as exc:
+                    prior_output_limits=budget.get('output_limits', {}).get(f'claim-review:{input_revision_id(requests)}', []))
+                for key, value in received.items():
+                    findings = {finding['operation']: finding for finding in reviews.get(key, {}).get('findings', [])}
+                    findings.update({finding['operation']: finding for finding in value.get('findings', [])})
+                    reviews[key] = {**value, 'findings': list(findings.values())}
+            except (VisionRequestError, TimeoutError, ConnectionError) as exc:
                 (trace_dir / 'planning_review_error.txt').write_text(f'Planning review unavailable: {type(exc).__name__}: {exc}', encoding='utf-8')
-                break
+                transient = not isinstance(exc, VisionRequestError) or exc.failure_kind in {
+                    'timeout_failure', 'transport_failure', 'server_failure', 'queue_unavailable',
+                    'rate_limit_failure', 'output_limit', 'json_syntax'}
+                if not transient or review_attempt == 1 or time.monotonic() >= deadline_monotonic:
+                    break
+                time.sleep(min(.25, max(0, deadline_monotonic - time.monotonic())))
         return compile_visual_design_kit_response(draft, source_manifest=source_manifest, category_id=category_id, main_policy=main_policy, product_claims=product_claims, claim_reviews=reviews, design_references=design_references)
 
     planned = compile_reviewed(raw, "initial")
@@ -470,7 +491,8 @@ def _finish_image_briefs(
     shared_values = shared_design_values(planned['family_art_direction'])
     shared_paths = sorted({finding['operation'].split(':', 1)[1] for row in pending
                             for finding in row['design_review'].get('findings', [])
-                            if finding.get('status') == 'contradiction' and str(finding.get('operation', '')).startswith('shared_design:')
+                            if finding.get('status') in {'contradiction', 'inconclusive'} and review_failure_owner(finding) == 'shared_design'
+                            and str(finding.get('operation', '')).startswith('shared_design:')
                             and finding['operation'].split(':', 1)[1] in shared_values})
     pending_drafts = [{**row['draft'], 'role': row['role'], 'source_id': row['source_id']} for row in pending]
     # Scope edits to pending roles, not evidence to the references that caused the failure.
@@ -934,7 +956,7 @@ def _source_manifest(rows: list[dict[str, Any]], *, job: Path) -> list[dict[str,
             "shopping_intent": row.get("shopping_intent") or "",
             "claims": row.get("claims") or [],
             "measurements": row.get("measurements") or [],
-            "observation": {key: (row.get("visual_evidence") or {}).get(key) for key in ("status", "objects", "physical_views", "reference_views", "evidence_gaps", "text_gaps")},
+            "observation": {key: (row.get("visual_evidence") or {}).get(key) for key in ("status", "objects", "physical_views", "reference_views", "evidence_gaps", "text_gaps", "measurement_issues")},
         })
     for source in manifest:
         source['crop_provenance'] = source_crop_provenance(job, source)
@@ -1087,6 +1109,17 @@ def _read_previous(job: Path, category_id: str) -> dict[str, dict[str, Any]]:
 
 def _planner_trace_current(job: Path, row: dict[str, Any]) -> bool:
     planner = row.get("planner") if isinstance(row.get("planner"), dict) else {}
+    def response_record(evidence: dict[str, Any], key: str) -> dict[str, Any]:
+        if Path(str(evidence.get('response_path') or '')).is_absolute():
+            raise ValueError('Review trace must be job-relative')
+        path = resolve_job_owned_path(job, str(evidence.get('response_path') or ''))
+        if not path.is_file() or file_sha256(path) != evidence.get('response_sha256'):
+            raise ValueError('Review trace is missing or changed')
+        records = [item for item in _parse_response(path.read_text(encoding='utf-8')).get('reviews', [])
+                   if isinstance(item, dict) and item.get('key') == key]
+        if len(records) != 1:
+            raise ValueError('Review trace identity is ambiguous')
+        return records[0]
     try:
         request = resolve_job_owned_path(job, str(planner.get("prompt_path") or ""))
         response = resolve_job_owned_path(job, str(planner.get("response_path") or ""))
@@ -1099,14 +1132,16 @@ def _planner_trace_current(job: Path, row: dict[str, Any]) -> bool:
             if brief.get("design_review"):
                 checks.append(brief["design_review"])
             for review in checks:
-                if Path(str(review.get('response_path') or '')).is_absolute():
+                original = response_record(review, review['key'])
+                fields = ('reason',) if review is brief.get('design_review') else ('reason', 'status', 'resolution')
+                if any(original.get(key) != review.get(key) for key in fields):
                     return False
-                path = resolve_job_owned_path(job, str(review.get("response_path") or ""))
-                if not path.is_file() or file_sha256(path) != review.get("response_sha256"):
-                    return False
-                records = _parse_response(path.read_text(encoding="utf-8")).get("reviews", [])
-                if not any(isinstance(item, dict) and all(item.get(key) == review.get(key) for key in ("key", "status", "reason", "findings")) for item in records):
-                    return False
+                for finding in review.get('findings', []):
+                    original = response_record(finding, review['key'])
+                    matches = [item for item in original.get('findings', []) if isinstance(item, dict)
+                               and item.get('operation') == finding.get('operation')]
+                    if len(matches) != 1 or any(matches[0].get(key) != finding.get(key) for key in ('status', 'reason', 'resolution')):
+                        return False
         return input_revision_id(_parse_response(response.read_text(encoding="utf-8"))) == str(
             planner.get("response_fingerprint") or ""
         )

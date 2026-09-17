@@ -50,10 +50,12 @@ def current_art_direction() -> dict[str, Any]:
     }
 
 
-def current_observed_measurement(text='17 in', object_name='Cabinet', axis='width', *, key='width', kind='dimension'):
+def current_observed_measurement(text='17 in', object_name='Cabinet', axis='width', *, key='width', kind='dimension', evidence_type=None):
+    evidence_type = evidence_type or ('dimension_line' if kind == 'dimension' else 'text_spec')
     return {'measurement_id': key, 'text': text, 'object': object_name, 'axis': axis,
             'view_id': 'view_01', 'region': {'left': .2, 'top': .25, 'right': .3, 'bottom': .3}, 'kind': kind,
-            'endpoints': [{'x': .2, 'y': .4}, {'x': .7, 'y': .4}] if kind == 'dimension' else None}
+            'evidence_type': evidence_type,
+            'endpoints': [{'x': .2, 'y': .4}, {'x': .7, 'y': .4}] if evidence_type == 'dimension_line' else None}
 
 
 def current_image_direction(*, environment: str = "designed_environment", source_id: str = 'source_00') -> dict[str, Any]:
@@ -93,6 +95,7 @@ def current_image_task(
     }
     if blocked_reason:
         base["formation_reason_code"] = reason_code or "deterministic_block"
+        base['formation_failure_owner'] = 'review' if retryable else 'brief'
     else:
         story = (
             {

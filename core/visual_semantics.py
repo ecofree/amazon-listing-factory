@@ -14,8 +14,8 @@ from .image_task_inputs import shared_design_values
 from .image_reference_context import physical_views, selected_reference_views, source_box, source_point, measurement_attachment_location, view_identity, resolve_edit_references, reference_semantics
 
 
-OBSERVATION_POLICY = "child-joint-observation-v25-complete-quantities"
-CLAIM_REVIEW_POLICY = "planning-binding-review-v22-child-facts-scoped-risks"
+OBSERVATION_POLICY = "child-joint-observation-v26-located-specifications"
+CLAIM_REVIEW_POLICY = "planning-binding-review-v23-evidence-operations"
 CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v16-presentation-and-quantifiers"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "unknown"}
@@ -102,7 +102,7 @@ def observe_child_sources(
                 applied = (bool(row.get('planning_correction')) and revision_matches
                            and (not correction or row['planning_correction'] == correction.get('planning_correction')))
                 if (revision_matches and (not correction or not correction.get('planning_correction') or applied)
-                        and observed[row['source_id']]['status'] == 'success'):
+                        and observed[row['source_id']]['status'] == 'success' and not observed[row['source_id']].get('measurement_issues')):
                     retained.append(row)
             if len(retained) == len(sources):
                 return observed
@@ -141,10 +141,10 @@ def observe_child_sources(
                 "axis": "width",
                 "region": {"left": 0.15, "top": 0.07, "right": 0.25, "bottom": 0.12},
                 "endpoints": [{"x": 0.12, "y": 0.3}, {"x": 0.87, "y": 0.3}],
-                "kind": "dimension", "view_id": "view_01"},
+                "kind": "dimension", "evidence_type": "dimension_line", "view_id": "view_01"},
                 {"measurement_id": "load_01", "text": "120 lbs", "object": "whole cabinet", "axis": "capacity",
                  "region": {"left": 0.15, "top": 0.07, "right": 0.25, "bottom": 0.12},
-                 "endpoints": None, "kind": "capacity", "view_id": "view_01"}],
+                 "endpoints": None, "kind": "capacity", "evidence_type": "text_spec", "view_id": "view_01"}],
             "objects": [{
                 "object_id": "stable child-local identity across views",
                 "kind": "sold product or specific disputed included part, never ordinary staging",
@@ -183,10 +183,11 @@ def observe_child_sources(
         "Use whole_view for a complete visible product view, detail for a partial close-up. "
         "Crop each photo independently, excluding separable title bands, neighboring insets and room decor. "
         "Overlapping graphics stay in the evidence crop; never erase or clip a product part or occluding bedding to remove them. "
-        "Each physical view encloses its complete measured product and both physical endpoints. Record each annotation once in measurements: "
+        "Each physical view encloses its complete measured product and, for dimension_line evidence, both physical endpoints. Record each annotation once in measurements: "
         "the measured part/property (clearance is not overall height), axis, full quantity including bounds, ranges and qualifiers, and its original-page label region. "
         "A dimension label or capacity badge can lie OUTSIDE the product view; bind it to the measured view without moving its coordinates. "
-        "Measurement kind is dimension, capacity or weight; capacity/weight badges have null endpoints, not an empty array. "
+        "Measurement kind is dimension, capacity or weight. evidence_type is dimension_line for an actual two-endpoint measurement, "
+        "or text_spec for a written specification of any property, including length or recommended thickness; text_spec has null endpoints. "
         "Resolve OCR against pixels at the same annotation; inches and feet readings of one mark are alternatives, not two facts. "
         "Never promote unlocated OCR or a bare number into measurements; report unreadable annotations in evidence. "
         "physical_views and reference_views may be empty for an unselected source; keep its role and relevant text evidence. "
@@ -223,13 +224,13 @@ def observe_child_sources(
     cache.parent.mkdir(parents=True, exist_ok=True)
     result = observed if cache.is_file() and value.get('input_revision_id') == revision else _validate_observations(retained, source_ids, facts)
     for row in requested:
-        if result[row['source_id']]['status'] == 'success':
+        if result[row['source_id']]['status'] == 'success' and (not result[row['source_id']].get('measurement_issues') or row['source_id'] in correction_rows):
             result[row['source_id']] = correction_rows.get(row['source_id'], {
                 'source_id': row['source_id'], 'status': 'failed', 'error': 'Requested product observation revision is unresolved'})
     # Spend the existing two-request budget on unresolved rows, never successful attachments.
     for attempt in range(2):
         for row in requested:
-            if attempts_used.get(row['source_id'], 0) >= 4:
+            if attempts_used.get(row['source_id'], 0) >= 4 and result[row['source_id']]['status'] != 'success':
                 result[row['source_id']]['error'] = 'Source observation request budget exhausted for this input revision; no request sent'
         requested = [row for row in requested if attempts_used.get(row['source_id'], 0) < 4]
         if not requested or time.monotonic() >= deadline:
@@ -247,7 +248,8 @@ def observe_child_sources(
             elif event.get('status') == 'success' and event.get('response_text'):
                 checked = _validate_observations(parse_json_object_response(event['response_text'])['sources'],
                                                 [row['source_id'] for row in requested], facts)
-                errors = {key: row['error'] for key, row in checked.items() if row['status'] == 'failed'}
+                errors = {key: row.get('error') or row['measurement_issues'] for key, row in checked.items()
+                          if row['status'] == 'failed' or row.get('measurement_issues')}
                 event.update(semantic_valid_rows=len(checked) - len(errors), semantic_failed_rows=len(errors), semantic_errors=errors)
 
         _events, record = _attempt_trace(trace.with_name(trace.name + '.attempts.json'), observer=settle)
@@ -259,7 +261,7 @@ def observe_child_sources(
             "facts": facts,
             "attachments": [{k: row[k] for k in ('source_id', 'sha256', 'ocr')} for row in requested],
             "already_observed_read_only": [{"source_id": row['source_id'], "objects": row.get('objects', [])} for row in retained],
-            "repair_findings": {row['source_id']: result[row['source_id']].get('error') for row in requested} if attempt else {},
+            "repair_findings": {row['source_id']: result[row['source_id']].get('error') or result[row['source_id']].get('measurement_issues') for row in requested},
             'correction_requests': {row['source_id']: corrections[row['source_id']]['reason'] for row in requested if row['source_id'] in corrections},
         }, ensure_ascii=False)
         trace.with_name(trace.name + f".{attempt + 1}.request.txt").write_text(request, encoding="utf-8")
@@ -279,18 +281,22 @@ def observe_child_sources(
                                 **({'planning_correction': corrections[row['source_id']]['planning_correction']}
                                    if corrections.get(row['source_id'], {}).get('planning_correction') else {})}
                                for row in parse_json_object_response(response)['sources'])]
-            result = _validate_observations(raw, source_ids, facts)
-            retained = [row for row in raw if result[row['source_id']]['status'] == 'success' or row['source_id'] in retained_ids]
+            checked = _validate_observations(raw, source_ids, facts)
+            result = {key: result[key] if value['status'] == 'failed' and result[key].get('measurement_issues') else value
+                      for key, value in checked.items()}
+            retained = [row for row in result.values() if row['status'] == 'success' and not row.get('measurement_issues')]
         except Exception as exc:
             failure = ({'kind': exc.failure_kind, 'request_scope': request_scope,
                         'output_limits': [*limits, *exc.metadata.get('output_limits', [])]}
                        if isinstance(exc, VisionRequestError) else {})
             for row in requested:
-                result[row['source_id']] = {'source_id': row['source_id'], 'status': 'failed',
-                    'error': f'{type(exc).__name__}: {exc}'[:1200], 'request_failure': failure}
+                if not result[row['source_id']].get('measurement_issues'):
+                    result[row['source_id']] = {'source_id': row['source_id'], 'status': 'failed',
+                        'error': f'{type(exc).__name__}: {exc}'[:1200], 'request_failure': failure}
         for source_id, correction_row in correction_rows.items():
             result[source_id] = {**correction_row, **result[source_id]}
-        requested = [row for row in sources if row['source_id'] not in retained_ids and result[row['source_id']]['status'] != 'success']
+        requested = [row for row in sources if row['source_id'] not in retained_ids and (
+            result[row['source_id']]['status'] != 'success' or result[row['source_id']].get('measurement_issues'))]
         write_json(cache, {"input_revision_id": revision, "policy": OBSERVATION_POLICY, "attempts_used": attempts_used, "sources": [
             *retained, *(result[row['source_id']] for row in requested)]})
     for source_id, correction in corrections.items():
@@ -358,7 +364,7 @@ def _validate_observation_rows(
         allowed = {'source_id', 'role_guess', 'has_dimension_lines', 'has_callouts_or_panels',
                    'visible_numbers_or_units', 'evidence_gaps', 'text_gaps', 'reference_views', 'physical_views',
                    'confidence', 'evidence', 'variant_identity', 'text_observations', 'measurements', 'objects',
-                   'status', 'policy_version', 'child_facts_revision_id', 'correction_revision', 'planning_correction'}
+                   'status', 'policy_version', 'child_facts_revision_id', 'correction_revision', 'planning_correction', 'measurement_issues'}
         if set(row) - allowed:
             errors.append('Unknown product observation fields: ' + ', '.join(sorted(set(row) - allowed)))
         if row['role_guess'] == 'reference_only' and (row.get('text_gaps') or row.get('measurements')
@@ -368,16 +374,22 @@ def _validate_observation_rows(
         views = []
         try:
             views = physical_views(row.get('physical_views'))
-            _validate_source_measurements(row.get('measurements'), views)
+            if not isinstance(row.get('measurements'), list) or not isinstance(row.get('measurement_issues', []), list):
+                raise ValueError('Observation needs a measurement list and a local issue inventory')
+            if any(not isinstance(issue, dict) or set(issue) != {'measurement', 'error'} for issue in row.get('measurement_issues', [])):
+                raise ValueError('Invalid local measurement issue')
+            measurements, measurement_issues = _validate_source_measurements(
+                [*row.get('measurements', []), *(issue['measurement'] for issue in row.get('measurement_issues', []))], views)
             selected_reference_views(row)
         except ValueError as exc:
             errors.append(str(exc))
         if errors:
             raise ValueError(key + ': ' + '; '.join(errors))
-        if row['has_dimension_lines'] and not row['text_gaps'] and not any(item['kind'] == 'dimension' for item in row['measurements']):
+        if row['has_dimension_lines'] and not row['text_gaps'] and not measurement_issues and not any(item['kind'] == 'dimension' for item in measurements):
             raise ValueError('Visible dimension lines need located measurements, not an empty inventory')
         transcribed = {m['canonical_pair'] for item in texts if item['kind'] == 'measurement' for m in extract_measurements(item['text'])}
-        located = {m['canonical_pair'] for item in row['measurements'] for m in extract_measurements(item['text'])}
+        located = {m['canonical_pair'] for item in [*measurements, *(issue['measurement'] for issue in measurement_issues)]
+                   if isinstance(item, dict) for m in extract_measurements(item.get('text', ''))}
         if not transcribed <= located:
             raise ValueError('Locate every transcribed measurement; do not omit badges or invent a second reading')
         seen_objects: set[str] = set()
@@ -400,46 +412,54 @@ def _validate_observation_rows(
                 raise ValueError("sales membership requires product evidence; otherwise use unknown")
         if any(item['object_id'] not in seen_objects for view in views for item in view['evidence']):
             raise ValueError("Physical view evidence refers to an unobserved object")
-        result[key] = {**row, "status": "success", "policy_version": OBSERVATION_POLICY,
+        result[key] = {**row, 'measurements': measurements, 'measurement_issues': measurement_issues,
+                       "status": "success", "policy_version": OBSERVATION_POLICY,
                        "child_facts_revision_id": input_revision_id(facts)}
     if set(result) != set(source_ids):
         raise ValueError("joint observation omitted sources")
     return result
 
 
-def _validate_source_measurements(rows: Any, views: list[dict[str, Any]]) -> None:
+def _validate_source_measurements(rows: Any, views: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
     if not isinstance(rows, list):
         raise ValueError('Observation needs a located measurement inventory, empty when not applicable')
     by_view = {view['view_id']: source_box(view['region']) for view in views}
     identities, locations = set(), set()
-    errors = []
+    valid, issues = [], []
+    ids = [row['measurement_id'] for row in rows if isinstance(row, dict) and isinstance(row.get('measurement_id'), str) and row['measurement_id']]
+    if len(ids) != len(set(ids)):
+        raise ValueError('One annotation has competing readings; resolve its original pixels')
     for index, row in enumerate(rows):
         try:
             _validate_measurement(row, by_view, identities, locations)
+            valid.append(row)
         except ValueError as exc:
-            errors.append(f'measurements[{index}]: {exc}')
-    if errors:
-        raise ValueError('; '.join(errors))
+            if 'competing readings' in str(exc):
+                raise
+            identity = row.get('measurement_id', index) if isinstance(row, dict) else index
+            issues.append({'measurement': row, 'error': f'measurements[{identity}]: {exc}'})
+    return valid, issues
 
 
 def _validate_measurement(row: Any, by_view: dict, identities: set, locations: set) -> None:
     quantities = extract_measurements(row.get('text')) if isinstance(row, dict) else []
     quantity_count = len(quantities) == 1 or (len(quantities) == 2 and 'range' in measurement_qualifiers(row['text'])
                                            and len({(m['kind'], m['raw_text']) for m in quantities}) == 1)
-    if (not isinstance(row, dict) or set(row) != {'measurement_id', 'text', 'object', 'axis', 'region', 'endpoints', 'kind', 'view_id'}
+    if (not isinstance(row, dict) or set(row) != {'measurement_id', 'text', 'object', 'axis', 'region', 'endpoints', 'kind', 'evidence_type', 'view_id'}
             or not all(isinstance(row[k], str) and row[k].strip() for k in ('measurement_id', 'text', 'object', 'axis', 'view_id'))
             or row['measurement_id'] in identities or row['view_id'] not in by_view
             or row['kind'] not in ('dimension', 'capacity', 'weight')
+            or row['evidence_type'] not in ('dimension_line', 'text_spec')
+            or (row['evidence_type'] == 'dimension_line' and row['kind'] != 'dimension')
             or not quantity_count or not re_has_object_name(row['object'])):
         raise ValueError('Measurement needs one located quantity or range and an actual measured object')
     box, region = by_view[row['view_id']], source_box(row['region'])
     location = (row['view_id'], tuple(region))
     if location in locations:
         raise ValueError('One annotation has competing readings; resolve its original pixels')
-    identities.add(row['measurement_id'])
     locations.add(location)
     points = row['endpoints']
-    if row['kind'] == 'dimension':
+    if row['evidence_type'] == 'dimension_line':
         try:
             valid = isinstance(points, list) and len(points) == 2 and points[0] != points[1] and all(
                 box[0] <= x <= box[2] and box[1] <= y <= box[3] for x, y in map(source_point, points))
@@ -448,7 +468,8 @@ def _validate_measurement(row: Any, by_view: dict, identities: set, locations: s
         if not valid:
             raise ValueError(f"Dimension needs both physical endpoints inside its view {box}; received {points!r}")
     elif points is not None:
-        raise ValueError(f"endpoints: capacity/weight needs null, received {points!r}")
+        raise ValueError(f"endpoints: text specifications need null, received {points!r}")
+    identities.add(row['measurement_id'])
 
 
 def re_has_object_name(text: str) -> bool:
@@ -484,26 +505,46 @@ def _planning_review_rows(rows: Any, requests: list[dict[str, Any]]) -> tuple[di
             findings = row.get('findings')
             if not isinstance(findings, list) or (not findings and request.get('physical_operations')):
                 raise ValueError('Review needs typed findings for required operations')
-            operations = set()
+            operations, checked_findings, broken_operations = set(), {}, set()
             for finding in findings:
-                if (not isinstance(finding, dict) or set(finding) != {'operation', 'status', 'reason'}
+                if (not isinstance(finding, dict) or not {'operation', 'status', 'reason'} <= set(finding)
+                        or set(finding) - {'operation', 'status', 'reason', 'resolution'}
                         or not isinstance(finding.get('operation'), str)
                         or finding.get('status') not in ('supported', 'contradiction', 'inconclusive')
                         or not isinstance(finding.get('reason'), str) or not finding['reason'].strip()
-                        or finding['operation'] in operations):
-                    raise ValueError('Malformed or repeated typed review finding')
+                        ):
+                    errors[key] = 'Malformed typed review finding'
+                    continue
                 operation = finding['operation']
+                if operation in operations:
+                    checked_findings.pop(operation, None)
+                    broken_operations.add(operation)
+                    errors[key] = 'Repeated typed review finding'
+                    continue
                 operations.add(operation)
                 if operation.startswith('source_product:') and operation.split(':', 1)[1] not in {
                         item['source_id'] + '/' + item['view']['view_id'] for item in request.get('selected_evidence', [])}:
-                    raise ValueError('Source correction must cite a selected source/view')
+                    errors[key] = 'Source correction must cite a selected source/view'
+                    continue
                 if operation.startswith('shared_design:') and operation.split(':', 1)[1] not in shared_design_values(request.get('shared_design', {})):
-                    raise ValueError('Shared correction must name an existing leaf path, not a container')
+                    errors[key] = 'Shared correction must name an existing leaf path, not a container'
+                    continue
                 if request['kind'] == 'design_binding' and not operation.startswith(('source_product:', 'shared_design:')) and operation not in request['physical_operations']:
-                    raise ValueError('Unknown planning operation')
-            if set(request.get('physical_operations', [])) - operations and not any(row['status'] == 'contradiction' for row in findings):
-                raise ValueError('Review omitted required operations')
-            result[key] = row
+                    errors[key] = 'Unknown planning operation'
+                    continue
+                if operation not in broken_operations:
+                    checked_findings[operation] = finding
+            if request['kind'] == 'design_binding':
+                missing = set(request.get('physical_operations', [])) - checked_findings.keys()
+                if missing and not any(item['status'] == 'contradiction' for item in checked_findings.values()):
+                    errors[key] = 'Review omitted required operations: ' + ', '.join(sorted(missing))
+                statuses = {item['status'] for item in checked_findings.values()}
+                status = 'contradiction' if 'contradiction' in statuses else 'inconclusive' if missing or 'inconclusive' in statuses or key in errors else 'supported'
+                result[key] = {**row, 'status': status, 'findings': list(checked_findings.values())}
+            else:
+                if key in errors:
+                    raise ValueError(errors[key])
+                result[key] = row
         except ValueError as exc:
             errors[key] = str(exc)
     for key in expected.keys() - result.keys() - errors.keys():
@@ -552,7 +593,7 @@ def review_planning_bindings(
             images.append(path)
             attachment_numbers[source['source_sha256']] = len(images)
         source_views.append({'attachment_number': attachment_numbers[source['source_sha256']], 'source_id': source['source_id'],
-                             'views': [view for view in source['observation']['physical_views']
+                             'views': [{key: view[key] for key in ('view_id', 'region', 'extent')} for view in source['observation']['physical_views']
                                        if (source['source_id'], view['view_id']) in needed_views]})
     # Serialize shared facts and design once; binding keys still cover each role's consumed values.
     fact_catalog, shared_design, evidence_catalog, bindings = {}, {}, {}, []
@@ -585,10 +626,11 @@ def review_planning_bindings(
         "verify proposed text against its supplied typed evidence and corresponding source pixels. "
         "physical: IDs prove only the observed geometry, local parts or state, never material specifications, load or performance. "
         "measurement: IDs support truthful group headings without asserting new measurements. Other IDs are quoted source statements. "
-        "Return JSON {reviews:[{key,status,reason,findings:[{operation,status,reason}]}]}; "
+        "Return JSON {reviews:[{key,status,reason,resolution,findings:[{operation,status,reason,resolution}]}]}; "
         "Status is supported, contradiction or inconclusive. The supplied operation ID owns its review category. "
+        "For inconclusive results, resolution is retry_review for incomplete evaluation, correct_evidence for a cited source_product defect, "
+        "or revise_plan for an unsupported proposed depiction or claim requiring a local change. Other results may omit resolution. "
         "For design entries, report each supplied operation using its exact ID. "
-        "presentation_state checks intended state, necessary parts and physical support against ACTUAL execution_inputs. "
         "whole_product_transfer checks whether detail edits plus verification views support the proposed whole product. "
         "Detail-only output depicts selected parts, not a new whole hero; sold quantity does not require full units in a detail image. "
         "Original source_views verify provenance only: a feature visible only on an original page does not prove it is in the generation attachments. "
@@ -628,7 +670,8 @@ def review_planning_bindings(
     def observe(event: dict[str, Any]) -> None:
         if event.get('status') == 'success' and event.get('response_text'):
             valid, errors = _planning_review_rows(parse_json_object_response(event['response_text']).get('reviews'), claims)
-            event.update(semantic_valid_rows=len(valid), semantic_failed_rows=len(claims)-len(valid), semantic_errors=errors)
+            complete = len(valid.keys() - errors.keys())
+            event.update(semantic_valid_rows=complete, semantic_failed_rows=len(claims)-complete, semantic_errors=errors)
         if attempt_observer is not None:
             attempt_observer(event)
     _events, record = _attempt_trace(trace_dir / "planning_review_attempts.json", observer=observe)
@@ -643,8 +686,10 @@ def review_planning_bindings(
     )
     (trace_dir / "planning_review_response.txt").write_text(response, encoding="utf-8")
     checked, _errors = _planning_review_rows(parse_json_object_response(response).get('reviews'), claims)
-    return {row["key"]: {**row, "policy": CLAIM_REVIEW_POLICY, "response_path": str((trace_dir / "planning_review_response.txt").resolve()),
-                         "response_sha256": file_sha256(trace_dir / "planning_review_response.txt")} for row in checked.values()}
+    provenance = {'policy': CLAIM_REVIEW_POLICY, 'response_path': str((trace_dir / 'planning_review_response.txt').resolve()),
+                  'response_sha256': file_sha256(trace_dir / 'planning_review_response.txt')}
+    return {row['key']: {**row, **provenance, 'findings': [{**finding, **provenance} for finding in row['findings']]}
+            for row in checked.values()}
 
 
 def candidate_view_targets(task: dict[str, Any]) -> list[dict[str, Any]]:
@@ -678,7 +723,7 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
     measurement_sources = []
     for row in (task.get('measurement_authority') or {}).get('measurement_groups', []):
         location = measurement_attachment_location(row, product_refs)
-        measurement_sources.append({**{key: row[key] for key in ('id', 'source_id', 'measured_part', 'axis', 'view_id')},
+        measurement_sources.append({**{key: row[key] for key in ('id', 'source_id', 'measured_part', 'axis', 'view_id', 'evidence_type')},
             'attachment_index': location['attachment'] + 1, 'coordinate_frame': 'specified_attachment',
             'source_region': location['label'], 'source_endpoints': location['endpoints']})
     edit_scope = {}

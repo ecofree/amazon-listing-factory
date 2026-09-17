@@ -22,6 +22,8 @@ class _Plugin:
 
 class GenerationStateContractTests(unittest.TestCase):
     def test_formation_block_is_owned_by_brief_not_duplicated_by_generate(self) -> None:
+        from tests.failure_boundary_regression_fixture import verify_failure_boundaries
+        verify_failure_boundaries(self)
         from core.image_tasks import _blocked, _task_failure
         for owner in ('review', 'brief', 'shared_design'):
             failure = _task_failure(_blocked(dict(child='B1', role='func'), 'review clock', failure_owner=owner))

@@ -189,6 +189,15 @@ def validate_image_brief_draft(draft: dict[str, Any], source: dict[str, Any], ar
     role = str(draft.get('role', '')).split('_', 1)[0]
     if role in {'func', 'size'} and (source.get('observation') or {}).get('text_gaps'):
         raise VisualDesignKitCompileError('Required product text is unresolved: ' + '; '.join(source['observation']['text_gaps']), failure_owner='observation')
+    if role in {'func', 'size'}:
+        direction = draft.get('image_direction')
+        usages = direction.get('evidence_usage', []) if isinstance(direction, dict) else []
+        selected_views = {view_identity(row) for row in usages if isinstance(row, dict) and {'source_id', 'view_id'} <= set(row)} if isinstance(usages, list) else set()
+        unresolved = [issue['error'] for owner in sources for issue in (owner.get('observation') or {}).get('measurement_issues') or []
+                      if owner['source_id'] == source['source_id'] or (isinstance(issue['measurement'], dict)
+                      and owner['source_id'] + '/' + str(issue['measurement'].get('view_id')) in selected_views)]
+        if unresolved:
+            raise VisualDesignKitCompileError('Required measurement evidence is unresolved: ' + '; '.join(unresolved), failure_owner='observation')
     if set(draft) - {'role', 'source_id', 'image_direction', 'display_copy'}:
         errors.append('Brief contains fields outside the current response schema')
     try:
@@ -276,11 +285,6 @@ def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source
                  'crops': [crop for crop in owner.get('crop_provenance', []) if crop['view_id'] == view['view_id']]}
                 for key, (owner, view) in catalog.items() if key in selected]
     risks = ['coverage_transfer:' + view_identity(row) for row in usage if row.get('usage') == 'integrated']
-    observed_states = {str(obj['state']).strip().casefold() for key, (owner, view) in catalog.items() if key in selected
-                       for obj in owner['observation'].get('objects', [])
-                       if any(item['object_id'] == obj['object_id'] for item in view['evidence'])}
-    if observed_states != {str(text['presentation']['state']).strip().casefold()}:
-        risks.append('presentation_state:' + brief['role'])
     if text['presentation']['scope'] == 'whole_product' and not any(
             catalog[view_identity(row)][1]['extent'] == 'whole_view' for row in usage if row['usage'] == 'display'):
         risks.append('whole_product_transfer:' + brief['role'])
@@ -316,6 +320,15 @@ def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source
             'required_facts': required_facts, 'shared_design': shared}
 
 
+def review_failure_owner(record: dict[str, Any]) -> str:
+    operation = str(record.get('operation', ''))
+    if record.get('status') == 'contradiction' or record.get('resolution') == 'revise_plan':
+        return 'observation' if operation.startswith('source_product:') else 'shared_design' if operation.startswith('shared_design:') else 'brief'
+    if record.get('resolution') == 'correct_evidence' and operation.startswith('source_product:'):
+        return 'observation'
+    return 'review'
+
+
 def _validate_physical_review(request: dict[str, Any], review: dict[str, Any]) -> None:
     findings = review.get('findings', [])
     allowed = set(request['physical_operations']) | {'source_product:' + row['source_id'] + '/' + row['view']['view_id']
@@ -327,9 +340,11 @@ def _validate_physical_review(request: dict[str, Any], review: dict[str, Any]) -
         shared_error = any(str(row.get('operation', '')).startswith('shared_design:') for row in conflicts)
         raise VisualDesignKitCompileError('planning evidence conflict: ' + '; '.join(str(row['reason']) for row in conflicts),
                                          failure_owner='observation' if source_error else 'shared_design' if shared_error else 'brief')
-    unsupported = [row for row in findings if row.get('status') == 'inconclusive' and row.get('operation') in request['physical_operations']]
+    unsupported = [row for row in findings if row.get('status') == 'inconclusive' and row.get('operation') in allowed]
     if unsupported:
-        raise VisualDesignKitCompileError('Planning evidence unresolved: ' + '; '.join(str(row['reason']) for row in unsupported))
+        owners = {review_failure_owner(row) for row in unsupported}
+        owner = next(key for key in ('observation', 'shared_design', 'brief', 'review') if key in owners)
+        raise VisualDesignKitCompileError('Planning evidence unresolved: ' + '; '.join(str(row['reason']) for row in unsupported), failure_owner=owner)
     supported = {row.get('operation') for row in findings if row.get('status') == 'supported'}
     missing = set(request['physical_operations']) - supported
     if missing:
@@ -484,7 +499,7 @@ def _bind_display_text(
     review = (claim_reviews or {}).get(key) or {}
     if review.get("status") != "supported" or review.get("policy") != CLAIM_REVIEW_POLICY or review.get("key") != key or not review.get("response_sha256"):
         reason = str(review.get('reason') or bound['text'])
-        owner = 'review' if not review else 'brief'
+        owner = review_failure_owner(review)
         raise VisualDesignKitCompileError("display claim requires independent evidence review: " + reason, failure_owner=owner)
     return bound
 

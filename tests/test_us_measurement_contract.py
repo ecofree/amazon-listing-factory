@@ -115,7 +115,7 @@ class UsMeasurementContractTests(unittest.TestCase):
         task['generation_references'].append({**task['generation_references'][0], 'kind': 'measurement_evidence',
                                              'path': 'measurement.png', 'purpose': 'Measure only, not appearance'})
         task['measurement_authority']['measurement_groups'] = [{'id': 'width', 'source_id': 'source_00', 'view_id': 'view_01',
-            'measured_part': 'Cabinet', 'axis': 'width', 'source_region': dict(left=.2, top=.2, right=.4, bottom=.4),
+            'measured_part': 'Cabinet', 'axis': 'width', 'evidence_type': 'dimension_line', 'source_region': dict(left=.2, top=.2, right=.4, bottom=.4),
             'source_endpoints': [dict(x=.2, y=.5), dict(x=.8, y=.5)]}]
         response = _observed(task)
         response.update(measurement_coverage='complete', measurements=[{'measurement_id': 'width', 'object': 'Cabinet width',

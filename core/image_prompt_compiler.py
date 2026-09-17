@@ -15,10 +15,10 @@ from .status import input_revision_id, logical_task_id
 from .text_evidence import extract_measurements, normalize_text
 
 
-PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v91-scoped-fact-execution"
+PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v92-located-specifications"
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v73-scoped-fact-execution"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v74-located-specifications"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -411,16 +411,16 @@ def _family_art_direction(
 def _presentation_system(direction: dict[str, Any], *, role: str) -> str:
     """Emit Gemini's one child-wide palette and component system once."""
     assignments = []
-    for group, parts in direction['palette_direction'].items():
-        assignments.extend(f'{group}.{part} = {value}' for part, value in parts.items())
+    for group, parts in sorted(direction['palette_direction'].items()):
+        assignments.extend(f'{group}.{part} = {value}' for part, value in sorted(parts.items()))
     palette = 'Target components: ' + '; '.join(assignments) if assignments else ''
     rows = [palette]
     if palette:
         rows.append("Apply these core appearances where depicted; they do not add objects or change the product presentation. Design secondary decor freely.")
     if role in {"func", "size"}:
         rows += [
-            "Typography: " + "; ".join(f"{key} = {value}" for key, value in direction["typography_direction"].items()),
-            "Graphic roles: " + "; ".join(f"{key} = {value}" for key, value in direction["graphic_direction"].items())
+            "Typography: " + "; ".join(f"{key} = {value}" for key, value in sorted(direction["typography_direction"].items())),
+            "Graphic roles: " + "; ".join(f"{key} = {value}" for key, value in sorted(direction["graphic_direction"].items()))
             + ". Use the same flat text ink for every title, caption and dimension; icon/line inks belong to symbols/leaders, not substitute text colors. "
             "Design hierarchy and line breaks freely. Text sits in open space; only small local legibility backing is permitted, not large pill titles or capsule label systems.",
         ]
@@ -449,10 +449,11 @@ def _measurement_content(value: Any, references: list[dict[str, Any]], *, author
     for row in value.get('measurement_groups', []):
         location = measurement_attachment_location(row, references)
         label = f"TEXT item {authored_text.index(row['render_text']) + 1}" if row['render_text'] in authored_text else row['render_text']
-        rows.append(f"{row['measured_part']} / {row['axis']}: {label} @ " + json.dumps(coordinates(location), separators=(',', ':')))
+        rows.append(f"{row['measured_part']} / {row['axis']}: {label} @ " + json.dumps(coordinates(location), sort_keys=True, separators=(',', ':')))
     return ('Measurement copy: replace each located source label once with its US-unit text; retain its measured object and endpoints. '
             'Equal values on different objects remain separate; do not duplicate a label on one association. '
-            'Named coordinates locate evidence within the numbered ATTACHMENT, not the output canvas. Null endpoints identify capacity/weight badges. '
+            'Coordinates locate evidence in the numbered ATTACHMENT, not the output canvas. dimension_line binds two physical endpoints; '
+            'text_spec binds a written property or limit to its object without a measurement arrow. '
             + '; '.join(rows))
 
 

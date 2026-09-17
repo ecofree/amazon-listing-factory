@@ -14,7 +14,7 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v26-complete-measurement-meaning"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v27-located-specifications"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
 SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant", "reobserve"})
@@ -626,7 +626,7 @@ def _observed_measurements(visual: dict[str, Any]) -> list[dict[str, Any]]:
              'source_label': row['object'],
              'source_occurrence': row['measurement_id'], 'axis_hint': row['axis'],
              'source_region': row['region'], 'source_endpoints': row['endpoints'],
-             'measurement_kind': row['kind'], 'view_id': row['view_id']}
+             'measurement_kind': row['kind'], 'evidence_type': row['evidence_type'], 'view_id': row['view_id']}
             for row in visual['measurements']]
 
 
@@ -644,7 +644,7 @@ def _measurement_rows(values: list[dict[str, Any]], child: dict[str, Any]) -> li
                 "source_occurrence": str(value.get("source_occurrence") or ""),
                 "axis_hint": str(value.get("axis_hint") or ""),
                 "confidence": "confirmed" if pair and pair in spec_pairs else "source_visible",
-                **{key: value[key] for key in ('source_region', 'source_endpoints', 'measurement_kind', 'view_id')},
+                **{key: value[key] for key in ('source_region', 'source_endpoints', 'measurement_kind', 'evidence_type', 'view_id')},
             }
         )
     return rows
@@ -739,7 +739,7 @@ def _semantic_revision(row: dict[str, Any]) -> str:
 def _visual_semantics(value: Any) -> dict[str, Any]:
     row = value if isinstance(value, dict) else {}
     keys = ("status", "role_guess", "objects", "physical_views", "reference_views", "evidence_gaps", "text_gaps",
-            "text_observations", "variant_identity", "child_facts_revision_id", "policy_version")
+            "text_observations", "measurement_issues", "variant_identity", "child_facts_revision_id", "policy_version")
     return {key: row.get(key) for key in keys if key in row}
 def _failure_row(plugin: ProductPlugin, download: dict[str, Any], exc: Exception) -> dict[str, Any]:
     source_index = _source_index(download)

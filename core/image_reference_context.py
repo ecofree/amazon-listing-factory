@@ -205,7 +205,8 @@ def measurement_attachment_location(row: dict[str, Any], references: list[dict[s
     if points is not None:
         for point in points:
             source_point(point)
-    return {'attachment': index, 'view': row['view_id'], 'label': label, 'endpoints': points}
+    return {'attachment': index, 'view': row['view_id'], 'label': label, 'endpoints': points,
+            'evidence_type': row['evidence_type']}
 
 
 def reference_semantics(reference: dict[str, Any]) -> dict[str, Any]:

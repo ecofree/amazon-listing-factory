@@ -29,13 +29,13 @@ def check_child_components(case):
     raw = {'family_art_direction': art, 'image_briefs': [
         {'role': role, 'source_id': source['source_id'], 'image_direction': deepcopy(direction)} for role in ('main', 'scene')]}
     request = design_binding_request(raw['image_briefs'][1], art, source=source)
-    case.assertEqual(['presentation_state:scene'], request['physical_operations'])
+    case.assertEqual([], request['physical_operations'])
     with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as reviewer, patch(
             'core.visual_design_kit.gemini_stream_generate') as repair:
         planned = _finish_image_briefs(raw, job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame',
             source_paths=[], source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+5, cached=None)
         case.assertTrue(all(row['status'] == 'ready' for row in planned['image_briefs'] if row['role'] in {'main', 'scene'}))
-        case.assertEqual(1, reviewer.call_count)
+        reviewer.assert_not_called()
         repair.assert_not_called()
     unknown = deepcopy(raw)
     unknown['image_briefs'][1]['image_direction']['unowned_design'] = 'A second per-image palette'
@@ -86,6 +86,8 @@ def check_child_components(case):
 
 
 def _check_shared_leaf_scope(case, source, raw):
+    source, raw = deepcopy(source), deepcopy(raw)
+    source['observation']['objects'] = [dict(object_id='frame', kind='frame', sale_membership='unknown', state='visible', visibility='visible', membership_evidence=[])]
     from core.image_task_inputs import shared_design_values
     from core.image_tasks import _task_fingerprint
     from core.visual_semantics import _planning_review_rows
@@ -126,12 +128,15 @@ def _check_shared_leaf_scope(case, source, raw):
     for path in ('palette_direction', 'palette_direction.bedding', 'palette_direction.undefined.item'):
         good, errors = _planning_review_rows([dict(key='binding', status='contradiction', reason='Conflict', findings=[
             dict(operation='shared_design:' + path, status='contradiction', reason='Conflict')])], [request])
-        case.assertFalse(good)
+        case.assertFalse(good['binding']['findings'])
+        case.assertEqual('inconclusive', good['binding']['status'])
         case.assertIn('existing leaf path', errors['binding'])
 
 
 def _check_execution_conflicts(case, source, raw):
     """Exercise routing of model findings, not claim regexes can judge designs."""
+    source = deepcopy(source)
+    source['observation']['objects'] = [dict(object_id='frame', kind='frame', sale_membership='unknown', state='visible', visibility='visible', membership_evidence=[])]
     from core.visual_design_kit import compact_product_claims
     claims = compact_product_claims({'title': 'White wood bed frame', 'specs': {'width': '64 in'}})
     for wrong in ('Show a black metal bed frame', 'Make the frame 60 inches wide', 'Use blue bedding instead of the assigned component color'):
@@ -147,7 +152,7 @@ def _check_execution_conflicts(case, source, raw):
                 case.assertEqual(claims, request['required_facts']['product_claims'])
                 if request['role_design']['visual_goal'] == wrong:
                     results[request['key']].update(status='contradiction', findings=[{
-                        'operation': 'presentation_state:scene', 'status': 'contradiction', 'reason': wrong}])
+                        'operation': request['physical_operations'][0], 'status': 'contradiction', 'reason': wrong}])
             return results
         def repair(prompt, paths, **kwargs):
             payload = json.loads(prompt.split('\n', 1)[1])

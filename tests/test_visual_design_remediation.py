@@ -97,14 +97,14 @@ class VisualDesignRemediationTests(unittest.TestCase):
             with patch('core.visual_semantics.gemini_stream_generate', side_effect=inspect_review):
                 review_planning_bindings([request], job=job, child='B1', source_manifest=[source],
                     source_paths=[job/'source.png'], trace_dir=job/'execution_review')
-            inside = dict(source_id='source_02', view_id='upper', source_region=dict(left=.15, top=.3, right=.3, bottom=.4), source_endpoints=None)
+            inside = dict(source_id='source_02', view_id='upper', source_region=dict(left=.15, top=.3, right=.3, bottom=.4), source_endpoints=None, evidence_type='text_spec')
             source['measurements'] = [inside]
             combined = resolve_edit_references({**draft, 'role': 'func'}, [source], job=job, child='B1')
             self.assertEqual(2, len(combined))
             self.assertEqual(1, measurement_attachment_location(inside, combined)['attachment'])
             located = dict(source_id='source_02', view_id='upper',
                            source_region=dict(left=.125, top=.0625, right=.375, bottom=.1875),
-                           source_endpoints=None)
+                           source_endpoints=None, evidence_type='text_spec')
             source['measurements'] = [located]
             source['observation']['reference_views'][0]['purposes'].append('measurement')
             appearance = view_reference(source, views[0], job=job, child='B1', kind='edit_base')
@@ -158,7 +158,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
         raw = dict(family_art_direction=current_art_direction(), image_briefs=[
             dict(role='main', source_id='source_00', image_direction=current_image_direction()), draft])
         request = design_binding_request(draft, raw['family_art_direction'], source=source)
-        self.assertEqual(['presentation_state:func'], request['physical_operations'])
+        self.assertEqual([], request['physical_operations'])
         self.assertNotIn('unknown_product_objects', request['required_facts'])
         self.assertEqual(['view_01'], [row['view']['view_id'] for row in request['selected_evidence']])
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as reviewer, patch(
@@ -166,7 +166,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
             ready = _finish_image_briefs(raw, job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
                 source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
             self.assertEqual('ready', _role_brief(ready, 'func')['status'])
-            self.assertEqual(1, reviewer.call_count)
+            reviewer.assert_not_called()
             remote.assert_not_called()
         for invalid_id in (None, 'bad_source_id'):
             broken = deepcopy(raw)
@@ -185,11 +185,11 @@ class VisualDesignRemediationTests(unittest.TestCase):
                 self.assertEqual('ready', _role_brief(repaired, 'func')['status'])
                 self.assertEqual(_role_brief(ready, 'main'), _role_brief(repaired, 'main'))
                 self.assertEqual(1, remote.call_count)
-                self.assertEqual(2, reviewer.call_count)
+                reviewer.assert_not_called()
         draft['display_copy']['labels'] = [dict(text='Effortless pull-out', evidence_ids=['drawer'])]
         def review(requests, **kwargs):
             return {**supported_review_results(requests), **{row['key']: dict(key=row['key'], policy=CLAIM_REVIEW_POLICY, response_sha256='b'*64,
-                    status='inconclusive', reason='Unsupported performance', findings=[]) for row in requests if row['kind'] == 'product_claim'}}
+                    status='inconclusive', resolution='revise_plan', reason='Unsupported performance', findings=[]) for row in requests if row['kind'] == 'product_claim'}}
         def repair(prompt, attachments, **kwargs):
             self.assertIn('Effortless pull-out', prompt)
             self.assertEqual(1, kwargs['max_physical_requests'])
@@ -220,7 +220,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
         from core.visual_semantics import candidate_view_targets
         self.assertEqual(draft['image_direction']['evidence_usage'], candidate_view_targets(draft))
         request = design_binding_request(draft, raw['family_art_direction'], source=source)
-        self.assertEqual(['coverage_transfer:source_00/view_02', 'presentation_state:func'], request['physical_operations'])
+        self.assertEqual(['coverage_transfer:source_00/view_02'], request['physical_operations'])
         self.assertEqual('pending', _role_brief(compile_visual_design_kit_response(raw, source_manifest=[source]), 'func')['status'])
         reviews = supported_review_results([request])
         self.assertEqual('ready', _role_brief(compile_visual_design_kit_response(raw, source_manifest=[source], claim_reviews=reviews), 'func')['status'])
@@ -237,13 +237,12 @@ class VisualDesignRemediationTests(unittest.TestCase):
             visibility='visible', state='visible product')
         source['observation']['objects'] = [disputed, {**disputed, 'object_id': 'unselected'}]
         request = design_binding_request(draft, raw['family_art_direction'], source=source, product_claims=product_claims)
-        self.assertEqual(['presentation_state:func', 'sold_membership:source_00/view_01'], request['physical_operations'])
+        self.assertEqual(['sold_membership:source_00/view_01'], request['physical_operations'])
         self.assertEqual([dict(source_id='source_00', **disputed)], request['required_facts']['unknown_product_objects'])
         self.assertEqual(product_claims, request['required_facts']['product_claims'])
         self.assertEqual('product.title', request['required_facts']['product_claims'][0]['field_path'])
         unchanged = deepcopy(raw)
-        state = unchanged['image_briefs'][0]['image_direction']['presentation']['state']
-        source['observation']['objects'] = [{**disputed, 'sale_membership': 'product', 'state': state}]
+        source['observation']['objects'] = [{**disputed, 'sale_membership': 'product', 'state': 'Assembled frame with mattress'}]
         unchanged['image_briefs'][1]['display_copy']['labels'] = [dict(text='Drawers on wheels', evidence_ids=['drawer'])]
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings') as review, patch(
                 'core.visual_design_kit.gemini_stream_generate') as redesign:
@@ -618,7 +617,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
             compiled = compile_visual_design_kit_response(raw, source_manifest=[source], design_references=refs, claim_reviews=supported_design_reviews(raw, [source], refs))
             brief = _role_brief(compiled, 'func')
             self.assertEqual("ready", brief["status"])
-            self.assertEqual('supported', brief['design_review']['status'])
+            self.assertEqual({}, brief['design_review'])
             from core.visual_design_kit_compiler import design_binding_request, validate_compiled_visual_design_kit
             from core.visual_semantics import CLAIM_REVIEW_POLICY
             request = design_binding_request(raw['image_briefs'][0], compiled['family_art_direction'], source=source, design_references=refs)

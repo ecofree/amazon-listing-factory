@@ -24,11 +24,11 @@ from .visual_design_kit import read_visual_design_kits, visual_design_kit_row_cu
 
 
 IMAGE_TASK_SCHEMA_VERSION = "image-task-v12"
-IMAGE_TASK_POLICY_VERSION = "output-evidence-child-direction-v41-fact-scope"
+IMAGE_TASK_POLICY_VERSION = "output-evidence-child-direction-v42-recoverable-facts"
 IMAGE_TASK_ARTIFACT = "image_tasks_v12.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
 _TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
-_TASK_BLOCKED_FIELDS = _TASK_BASE_FIELDS | {"formation_reason_code"}
+_TASK_BLOCKED_FIELDS = _TASK_BASE_FIELDS | {"formation_reason_code", "formation_failure_owner"}
 
 
 class ImageTaskError(RuntimeError):
@@ -42,6 +42,8 @@ def build_image_tasks(
     del workers
     job = Path(job_dir).resolve()
     rows = _expected_rows(job, plugin, include_optional=include_optional)
+    for row in rows:
+        validate_image_task(row)
     write_jsonl(job / "reports" / IMAGE_TASK_ARTIFACT, rows)
     failures = [_task_failure(row) for row in rows if row["formation_status"] == "blocked"]
     scope = read_run_scope(job)
@@ -73,18 +75,19 @@ def build_image_tasks(
 def read_image_tasks(job_dir: str | Path, *, category_id: str = "") -> dict[str, Any]:
     path = Path(job_dir) / "reports" / IMAGE_TASK_ARTIFACT
     if not path.is_file():
-        raise ImageTaskError(f"ImageTaskV11 is missing: {path}")
+        raise ImageTaskError(f"ImageTask is missing: {path}")
     rows = read_jsonl(path)
     seen: set[tuple[str, str]] = set()
     for row in rows:
         validate_image_task(row)
         if category_id and row["category_id"] != category_id:
-            raise ImageTaskError("ImageTaskV11 category does not match the active plugin")
+            raise ImageTaskError("ImageTask category does not match the active plugin")
         key = (str(row["child"]), str(row["role"]))
         if key in seen:
-            raise ImageTaskError(f"ImageTaskV11 has a duplicate row: {key[0]}/{key[1]}")
+            raise ImageTaskError(f"ImageTask has a duplicate row: {key[0]}/{key[1]}")
         seen.add(key)
-    return {"schema_version": IMAGE_TASK_SCHEMA_VERSION, "task_count": len(rows), "tasks": rows}
+    return {"schema_version": IMAGE_TASK_SCHEMA_VERSION, "task_count": len(rows), "tasks": rows,
+            "failures": [_task_failure(row) for row in rows if row['formation_status'] == 'blocked']}
 
 
 def image_tasks_current(
@@ -116,7 +119,7 @@ def validate_task_inventory(tasks: list[dict[str, Any]], expected_children: list
     for task in tasks:
         key = (str(task.get("child") or ""), str(task.get("role") or ""))
         if key in seen or key[0] not in expected or role_prefix(key[1]) not in required:
-            raise ImageTaskError(f"Invalid ImageTaskV11 inventory row: {key}")
+            raise ImageTaskError(f"Invalid ImageTask inventory row: {key}")
         seen.add(key)
 
 
@@ -148,10 +151,10 @@ def executable_coverage(
 
 def validate_image_task(row: Any) -> None:
     if not isinstance(row, dict) or row.get("schema_version") != IMAGE_TASK_SCHEMA_VERSION:
-        raise ImageTaskError("Invalid ImageTaskV11")
+        raise ImageTaskError("Invalid ImageTask")
     expected = _TASK_READY_FIELDS if row.get("formation_status") == "ready" else _TASK_BLOCKED_FIELDS
     if set(row) != expected:
-        raise ImageTaskError(f"ImageTaskV11 has unknown or missing fields: {sorted(set(row) ^ expected)}")
+        raise ImageTaskError(f"ImageTask has unknown or missing fields: {sorted(set(row) ^ expected)}")
     required = (
         "policy_version", "category_id", "child", "role", "role_family",
         "formation_status", "logical_task_id", "input_revision_id", "task_fingerprint",
@@ -166,11 +169,15 @@ def validate_image_task(row: Any) -> None:
                 f"expected={IMAGE_TASK_POLICY_VERSION!r}; task_fingerprint={row.get('task_fingerprint')!r}"
             )
         raise ImageTaskError(
-            f"ImageTaskV11 is incomplete: missing={missing};{mismatch} "
+            f"ImageTask is incomplete: missing={missing};{mismatch} "
             "regenerate the current ImageTask artifact from the active brief contract"
         )
     if row["formation_status"] not in {"ready", "blocked"}:
-        raise ImageTaskError("ImageTaskV11 formation status is invalid")
+        raise ImageTaskError("ImageTask formation status is invalid")
+    if row['formation_status'] == 'blocked' and (
+            row['formation_failure_owner'] not in {'brief', 'observation', 'shared_design', 'review'}
+            or not row['formation_reason'] or not row['formation_reason_code']):
+        raise ImageTaskError('Blocked ImageTask has no valid failure responsibility')
     if row["formation_status"] == "ready":
         needed = (
             "family_design_id", "family_art_direction", "source_path", "source_sha256",
@@ -182,7 +189,7 @@ def validate_image_task(row: Any) -> None:
             needed += ("image_direction",)
         absent = [key for key in needed if row.get(key) in (None, "", [], {})]
         if absent:
-            raise ImageTaskError(f"Ready ImageTaskV11 is incomplete: {absent}")
+            raise ImageTaskError(f"Ready ImageTask is incomplete: {absent}")
         references = row["generation_references"]
         try:
             validate_reference_set(references, child=row["child"], edit_base_sha256=row["edit_base_sha256"])
@@ -190,12 +197,12 @@ def validate_image_task(row: Any) -> None:
             raise ImageTaskError(str(exc)) from exc
         expected = build_renderable_text_contract(row["role_family"], row["measurement_authority"], display_copy=row['display_copy_contract'])
         if row["renderable_text_contract"] != expected:
-                raise ImageTaskError("ImageTaskV11 renderable text changed after formation")
+                raise ImageTaskError("ImageTask renderable text changed after formation")
         edit = row.get("edit_contract")
         if not isinstance(edit, dict) or set(edit) != {"create", "reference_authority", "preserve", "replace", "forbid", "reference_completeness"}:
-            raise ImageTaskError("ImageTaskV11 edit contract is not canonical")
+            raise ImageTaskError("ImageTask edit contract is not canonical")
     if row.get("task_fingerprint") != _task_fingerprint(row):
-        raise ImageTaskError("ImageTaskV11 content changed")
+        raise ImageTaskError("ImageTask content changed")
 
 
 def _expected_rows(job: Path, plugin: ProductPlugin, *, include_optional: bool = False) -> list[dict[str, Any]]:
@@ -360,7 +367,7 @@ def _measurement_authority(family: str, source: dict[str, Any], selected: list[t
                 "source_text": str(row.get("text") or "").strip(),
                 "measured_part": row['source_label'],
                 "axis": row['axis_hint'],
-                **{key: row[key] for key in ('view_id', 'source_region', 'source_endpoints')},
+                **{key: row[key] for key in ('view_id', 'source_region', 'source_endpoints', 'evidence_type')},
                 "kind": "measurement",
                 "canonical_value": str(row.get("canonical_pair") or ""),
                 "render_text": us_measurement_text(row.get("text"), upper_bound="capacity" in str(row.get("source_label") or "").lower()),
