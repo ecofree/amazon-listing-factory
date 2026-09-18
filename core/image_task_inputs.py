@@ -31,6 +31,42 @@ def role_art_direction(art: dict[str, Any], direction: dict[str, Any], role: str
         result.update({key: art[key] for key in ('typography_direction', 'graphic_direction')})
     return result
 
+def measurement_authority(role: str, direction: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolve only planned quantities, independently of the selected edit photograph."""
+    from .text_evidence import us_measurement_text
+    ids = direction.get('measurement_ids')
+    if not isinstance(ids, list) or any(not isinstance(key, str) for key in ids) or len(ids) != len(set(ids)):
+        raise ValueError('measurement_ids must be unique child measurement identities')
+    if role not in {'func', 'size'} and ids:
+        raise ValueError('Main and scene do not render measurement labels')
+    available = {source['source_id'] + ':' + row['source_occurrence']: (source, row)
+                 for source in sources for row in source.get('measurements', [])}
+    missing = set(ids) - available.keys()
+    if missing:
+        raise ValueError('Selected measurements are not observed in this child: ' + ', '.join(sorted(missing)))
+    if role == 'size' and not ids:
+        raise ValueError('Size needs actual measured quantities; choose measurement_ids from the child catalog')
+    groups, seen = [], set()
+    for key in ids:
+        source, row = available[key]
+        identity = (row['source_label'].strip().casefold(), row['axis_hint'].strip().casefold(),
+                    row['measurement_kind'], row['canonical_pair'], row['text'].strip().casefold())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        groups.append({
+            'id': key, 'source_id': source['source_id'], 'source_text': row['text'],
+            'measured_part': row['source_label'], 'axis': row['axis_hint'],
+            'evidence_type': row['evidence_type'], 'kind': 'measurement',
+            'canonical_value': row['canonical_pair'],
+            'render_text': us_measurement_text(row['text'], upper_bound='capacity' in row['source_label'].lower()),
+            'confidence': row.get('confidence') or 'source_visible',
+            'measurement_role': 'load_capacity' if row['measurement_kind'] == 'capacity' else row['measurement_kind'],
+        })
+    return {'mode': 'source_image' if groups else 'none',
+            'render_text': list(dict.fromkeys(row['render_text'] for row in groups)), 'measurement_groups': groups}
+
+
 def build_renderable_text_contract(family: str, measurement: dict[str, Any], *, display_copy: dict[str, Any]) -> dict[str, Any]:
     """Return the only strings an image provider may render as pixels."""
     if family in {"main", "scene"}:
@@ -204,34 +240,87 @@ def measurement_contract(child: dict[str, Any]) -> dict[str, Any]:
         "evidence": evidence,
     }
 
-def task_specs(
-    child: dict[str, Any], sources: list[dict[str, Any]], *, include_optional: bool = False,
-) -> list[dict[str, Any]]:
-    """One output inventory for planning, task formation and delivery accounting."""
-    ordered = sorted(sources, key=lambda row: int(row.get("source_index") or 0))
+def _appearance_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     appearances = []
-    for source in ordered:
-        if child.get('asin') and source.get('child') not in (None, child['asin']):
-            continue
+    for source in sources:
         observation = source.get('observation', source.get('visual_evidence')) or {}
-        selected = {row['view_id'] for row in observation.get('reference_views', [])
-                    if 'appearance' in row['purposes']}
-        if any(view['view_id'] in selected and view.get('extent') == 'whole_view'
-               for view in observation.get('physical_views', [])):
+        if observation.get('product_extent') == 'whole_view' and 'appearance' in observation.get('reference_purposes', []):
             appearances.append(source)
-    main = min(appearances, key=lambda row: (row.get('role') != 'main', int(row.get('source_index') or 0))) if appearances else None
+    return sorted(appearances, key=lambda row: (row.get('role') != 'main', int(row.get('source_index') or 0)))
+
+
+def initial_output_inventory(sources: list[dict[str, Any]], *, previous: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Keep allocated identities, adding only newly available scoped sources."""
+    ordered = sorted(sources, key=lambda row: int(row.get("source_index") or 0))
+    if previous is not None:
+        inventory = [dict(row) for row in previous['output_inventory']]
+        known = {row['source_id'] for row in previous['source_references']}
+        for slot in inventory:
+            if slot['source_id']:
+                continue
+            candidate = next((row for row in ordered if row['role'] == slot['role']), None)
+            if candidate is None and slot['role'] in {'main', 'scene'}:
+                candidate = next(iter(_appearance_sources(ordered)), None)
+            if candidate is not None:
+                slot['source_id'] = candidate.get('source_id') or f"source_{int(candidate['source_index']):02d}"
+        for source in ordered:
+            source_id = source.get('source_id') or f"source_{int(source['source_index']):02d}"
+            family = source['role']
+            if source_id in known or family not in {'scene', 'func', 'size'}:
+                continue
+            peers = [row for row in inventory if row['role'].split('_', 1)[0] == family]
+            if any(row['source_id'] == source_id for row in peers):
+                continue
+            empty = next((row for row in peers if not row['source_id']), None)
+            if empty is not None:
+                empty['source_id'] = source_id
+            elif family != 'size':
+                ordinal = max(int(row['role'].split('_')[1]) if '_' in row['role'] else 1 for row in peers) + 1
+                inventory.append({'role': f'{family}_{ordinal:02d}', 'source_id': source_id})
+        return inventory
+    appearances = _appearance_sources(ordered)
+    main = appearances[0] if appearances else None
     specs = [{'role': 'main', 'source': main, 'reason': '' if main else 'No selected whole-product appearance evidence'}]
     for family in ('scene', 'func', 'size'):
         matches = [row for row in ordered if row.get('role') == family]
-        if family != 'size' and not include_optional:
-            matches = matches[:1]
-        if family == 'size' and len(matches) > 1:
-            specs.append({'role': family, 'source': None, 'reason': 'Multiple size authorities require resolution'})
-        elif matches:
+        if family == 'size':
+            matches = matches[:1]  # Other measurement sources remain evidence, not competing outputs.
+        if family == 'scene' and not matches and main:
+            matches = [main]
+        if matches:
             specs.extend({'role': family if i == 1 else f'{family}_{i:02d}', 'source': row, 'reason': ''}
                          for i, row in enumerate(matches, 1))
         else:
             specs.append({'role': family, 'source': None, 'reason': f'No final source intent is classified as {family}'})
+    return [{'role': spec['role'], 'source_id': (
+        spec['source'].get('source_id') or f"source_{int(spec['source']['source_index']):02d}") if spec['source'] else ''}
+        for spec in specs]
+
+
+def task_specs(child: dict[str, Any], sources: list[dict[str, Any]], *, inventory: list[dict[str, str]],
+               include_optional: bool = False) -> list[dict[str, Any]]:
+    """Resolve frozen output slots against current evidence, never renumber them."""
+    if (not isinstance(inventory, list) or not inventory
+            or any(not isinstance(row, dict) or set(row) != {'role', 'source_id'}
+                   or not isinstance(row['source_id'], str)
+                   or not re.fullmatch(r'(main|scene|func|size)(?:_\d{2,})?', str(row['role'])) for row in inventory)
+            or len({row['role'] for row in inventory}) != len(inventory)
+            or not {'main', 'scene', 'func', 'size'} <= {row['role'] for row in inventory}):
+        raise ValueError('Current child needs its frozen output inventory')
+    catalog = {row.get('source_id') or f"source_{int(row['source_index']):02d}": row for row in sources
+               if not child.get('asin') or row.get('child') in (None, child['asin'])}
+    appearances = _appearance_sources(list(catalog.values()))
+    specs = []
+    for slot in inventory:
+        role = slot['role']
+        if not include_optional and role not in {'main', 'scene', 'func', 'size'}:
+            continue
+        source = catalog.get(slot['source_id'])
+        if source is None and not slot['source_id']:
+            source = next((row for row in catalog.values() if row.get('role') == role), None)
+        if (role.split('_', 1)[0] in {'main', 'scene'} and source is None) or (role == 'main' and source not in appearances):
+            source = appearances[0] if appearances else None
+        specs.append({'role': role, 'source': source, 'reason': '' if source else 'Output evidence anchor is unresolved'})
     for spec in specs:
         family = spec['role'].split('_', 1)[0]
         peers = [row for row in specs if row['role'].split('_', 1)[0] == family]

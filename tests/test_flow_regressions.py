@@ -226,7 +226,7 @@ class FlowRegressionTests(unittest.TestCase):
         self.assertEqual(current["failures"], resumed["failures"])
         self.assertFalse(production._stage_has_usable_output("classify", {"tasks": [conflict]}))
         self.assertEqual("retryable", _stage_failure({**conflict, "visual_evidence": {"status": "failed"}})["task_status"])
-        reference = dict(kind='product_evidence', source_id='source_04', original_sha256='reference-sha')
+        reference = dict(kind='product_evidence', source_id='source_04', sha256='reference-sha')
         tasks = [
             {"child": "B1", "role": "main", "source_sha256": "main-sha", "source_intent_revision_id": "main-rev", 'generation_references': [reference]},
             {'child': 'B1', 'role': 'func', 'generation_references': [reference]},

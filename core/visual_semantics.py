@@ -11,12 +11,12 @@ from .status import input_revision_id
 from .vision_gemini_client import gemini_stream_generate, VisionRequestError
 from .text_evidence import extract_measurements, measurement_qualifiers
 from .image_task_inputs import shared_design_values
-from .image_reference_context import physical_views, selected_reference_views, source_box, source_point, measurement_attachment_location, view_identity, resolve_edit_references, reference_semantics
+from .image_reference_context import product_features, source_box, source_point, measurement_attachment, resolve_edit_references, reference_semantics
 
 
-OBSERVATION_POLICY = "child-joint-observation-v26-located-specifications"
-CLAIM_REVIEW_POLICY = "planning-binding-review-v23-evidence-operations"
-CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v16-presentation-and-quantifiers"
+OBSERVATION_POLICY = "child-joint-observation-v29-original-evidence"
+CLAIM_REVIEW_POLICY = "planning-binding-review-v25-output-scope"
+CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v18-output-scope"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "unknown"}
 
@@ -101,8 +101,12 @@ def observe_child_sources(
                 revision_matches = not correction or row.get('correction_revision', '') == correction['revision']
                 applied = (bool(row.get('planning_correction')) and revision_matches
                            and (not correction or row['planning_correction'] == correction.get('planning_correction')))
+                annotation_pending = bool(correction and observed[row['source_id']].get('text_gaps') and any(
+                    item.get('operation') == 'source_text:' + row['source_id']
+                    for item in (correction.get('planning_correction') or {}).get('findings', [])))
                 if (revision_matches and (not correction or not correction.get('planning_correction') or applied)
-                        and observed[row['source_id']]['status'] == 'success' and not observed[row['source_id']].get('measurement_issues')):
+                        and observed[row['source_id']]['status'] == 'success' and not observed[row['source_id']].get('measurement_issues')
+                        and not annotation_pending):
                     retained.append(row)
             if len(retained) == len(sources):
                 return observed
@@ -121,12 +125,11 @@ def observe_child_sources(
             "has_callouts_or_panels": False,
             "visible_numbers_or_units": ["34.5 inches"],
             "evidence_gaps": ["specific unavailable product evidence, empty when unnecessary"],
-            "text_gaps": ["specific unreadable necessary product claim or dimension, never prop text"],
-            "reference_views": [{"view_id": "view_01", "purposes": ["appearance", "feature", "measurement"]}],
-            "physical_views": [{"view_id": "view_01", "region": {"left": 0.12, "top": 0.23, "right": 0.87, "bottom": 0.94},
-                "extent": "whole_view|detail", "evidence": [{"feature_id": "stable physical feature/state identity shared ONLY if visibly present in both views",
-                    "object_id": "one observed object_id", "region": {"left": 0.12, "top": 0.23, "right": 0.87, "bottom": 0.94},
-                    "physical_facts": ["one directly visible part, geometry, mechanism, finish, local count or state; confirmed absence only with visible evidence"]}]}],
+            "text_gaps": [{"text": "unreadable necessary product annotation", "kind": "product_fact|measurement"}],
+            "reference_purposes": ["appearance", "feature", "measurement"],
+            "product_extent": "whole_view|detail|none",
+            "product_features": [{"feature_id": "stable physical feature identity", "object_id": "observed object_id",
+                "physical_facts": ["directly visible part, geometry, mechanism, finish, count or state"]}],
             "confidence": 0.0,
             "evidence": ["One product view with a visible height annotation"],
             "variant_identity": {
@@ -136,15 +139,10 @@ def observe_child_sources(
                 "conflicts": [{"fact_id": "product.*", "observed": "visible conflicting attribute"}],
             },
             "text_observations": [{"text": "verbatim necessary product information", "kind": "product_fact|product_label|marketing|measurement|unknown"}],
-            "measurements": [{"measurement_id": "unique source-local annotation identity",
-                "text": "34.5 inches", "object": "cabinet",
-                "axis": "width",
-                "region": {"left": 0.15, "top": 0.07, "right": 0.25, "bottom": 0.12},
-                "endpoints": [{"x": 0.12, "y": 0.3}, {"x": 0.87, "y": 0.3}],
-                "kind": "dimension", "evidence_type": "dimension_line", "view_id": "view_01"},
-                {"measurement_id": "load_01", "text": "120 lbs", "object": "whole cabinet", "axis": "capacity",
-                 "region": {"left": 0.15, "top": 0.07, "right": 0.25, "bottom": 0.12},
-                 "endpoints": None, "kind": "capacity", "evidence_type": "text_spec", "view_id": "view_01"}],
+            "measurements": [{"measurement_id": "unique source-local identity", "text": "34.5 inches",
+                "object": "cabinet", "axis": "width", "kind": "dimension", "evidence_type": "dimension_line"},
+                {"measurement_id": "load_01", "text": "120 lbs", "object": "whole cabinet",
+                 "axis": "capacity", "kind": "capacity", "evidence_type": "text_spec"}],
             "objects": [{
                 "object_id": "stable child-local identity across views",
                 "kind": "sold product or specific disputed included part, never ordinary staging",
@@ -173,26 +171,16 @@ def observe_child_sources(
         "(8 plywood slats, Embedded Design, No Box Spring Needed); marketing for generic praise "
         "(High-Quality); product_label for surface markings, not functional callouts. "
         "Quote complete facts with their subjects and qualifiers; leave illegible text unknown. "
-        "physical_views catalogs necessary product evidence; reference_views recommends initial inputs, not the final layout. "
-        "Do not inventory every inset or duplicate angle; retain distinct facts required for the output's functions and measurements. "
-        "Enclose the complete visible sold object or selected detail without clipping parts. Describe which part belongs to which assembly "
-        "and visible support/joint relationships, including distinct compartments, actual shelves and attached supports, not just a generic product name. "
-        "A feature_id identifies the same visible structure AND state, not merely the same product; an edge joint is not slatted support. "
-        "Source regions are named {left,top,right,bottom}; endpoints are named {x,y}. All coordinates are fractions of the ORIGINAL attachment width/height. "
-        "Left/right measure horizontal distance from the left edge; top/bottom measure vertical distance from the top edge. Never return coordinate arrays. "
-        "Use whole_view for a complete visible product view, detail for a partial close-up. "
-        "Crop each photo independently, excluding separable title bands, neighboring insets and room decor. "
-        "Overlapping graphics stay in the evidence crop; never erase or clip a product part or occluding bedding to remove them. "
-        "Each physical view encloses its complete measured product and, for dimension_line evidence, both physical endpoints. Record each annotation once in measurements: "
-        "the measured part/property (clearance is not overall height), axis, full quantity including bounds, ranges and qualifiers, and its original-page label region. "
-        "A dimension label or capacity badge can lie OUTSIDE the product view; bind it to the measured view without moving its coordinates. "
-        "Measurement kind is dimension, capacity or weight. evidence_type is dimension_line for an actual two-endpoint measurement, "
-        "or text_spec for a written specification of any property, including length or recommended thickness; text_spec has null endpoints. "
-        "Resolve OCR against pixels at the same annotation; inches and feet readings of one mark are alternatives, not two facts. "
-        "Never promote unlocated OCR or a bare number into measurements; report unreadable annotations in evidence. "
-        "physical_views and reference_views may be empty for an unselected source; keep its role and relevant text evidence. "
-        "evidence_gaps records only specific unavailable product evidence, not incomplete room parsing. "
-        "text_gaps requests OCR only for unreadable necessary product annotations; omit ordinary packaging and book text. "
+        "product_features records directly visible product structure and operating state, without coordinates or crop instructions. "
+        "product_extent is whole_view when a complete product is visible somewhere in the original, detail for partial products, none for no visible product. "
+        "reference_purposes selects original attachments, not output panels. "
+        "Describe actual compartments, joints and supports, not just a generic product name. "
+        "Record measurements with the measured object/property, axis, full quantity, unit and qualifiers. "
+        "Resolve OCR against original pixels; inches and feet readings of one mark are alternatives, not two facts. "
+        "dimension_line means a visible measurement diagram; text_spec means a written specification. "
+        "Neither requires pixel endpoints or a designated view. Do not infer measurements from apparent proportions. "
+        "For unselected sources, retain delivery role and relevant product text. evidence_gaps and text_gaps describe necessary "
+        "unavailable product information, not unreadable decor or incomplete room parsing. "
         "visible_numbers_or_units is also a list of strings, not measurement objects. "
         "Alternative adjustment positions, arrows, ghosted parts and inset borders are diagram notation, not additional physical components. "
         "objects contains the sold product and necessary included parts or specific disputed accessories only. "
@@ -254,6 +242,7 @@ def observe_child_sources(
 
         _events, record = _attempt_trace(trace.with_name(trace.name + '.attempts.json'), observer=settle)
         request_scope = [row['source_id'] for row in requested]
+        images = [Path(row['path']) for row in requested]
         limits = list({(item.get('provider'), item.get('model'), item.get('max_output_tokens')): item
             for row in requested for failure in [result[row['source_id']].get('request_failure', {})]
             if failure.get('request_scope') == request_scope for item in failure.get('output_limits', [])}.values())
@@ -267,7 +256,7 @@ def observe_child_sources(
         trace.with_name(trace.name + f".{attempt + 1}.request.txt").write_text(request, encoding="utf-8")
         try:
             response = gemini_stream_generate(
-                request, [Path(row["path"]) for row in requested], client_scope="visual_planning",
+                request, images, client_scope="visual_planning",
                 attempts=1, timeout_seconds=60, total_timeout_seconds=100,
                 max_physical_requests=1, deadline_monotonic=deadline,
                 max_output_tokens=min(32768, max(8192, 2400 * len(requested),
@@ -341,7 +330,7 @@ def _validate_observation_rows(
             raise ValueError("observed layout flags must be explicit booleans")
         if not isinstance(row.get("confidence"), (int, float)) or not 0 <= row["confidence"] <= 1:
             raise ValueError("observation confidence is outside zero to one")
-        errors = [f'{field} must be a list of strings' for field in ('visible_numbers_or_units', 'evidence', 'evidence_gaps', 'text_gaps')
+        errors = [f'{field} must be a list of strings' for field in ('visible_numbers_or_units', 'evidence', 'evidence_gaps')
                   if not isinstance(row.get(field), list) or any(not isinstance(item, str) for item in row[field])]
         identity = row.get("variant_identity")
         if not isinstance(identity, dict) or identity.get("status") not in ("consistent", "contradiction", "unknown"):
@@ -362,7 +351,7 @@ def _validate_observation_rows(
             if not isinstance(item, dict) or not isinstance(item.get('kind'), str) or item['kind'] not in (TEXT_KINDS - {'prop'}) | {'product_fact'} or not isinstance(item.get("text"), str):
                 raise ValueError("invalid observed text category")
         allowed = {'source_id', 'role_guess', 'has_dimension_lines', 'has_callouts_or_panels',
-                   'visible_numbers_or_units', 'evidence_gaps', 'text_gaps', 'reference_views', 'physical_views',
+                   'visible_numbers_or_units', 'evidence_gaps', 'text_gaps', 'reference_purposes', 'product_features', 'product_extent',
                    'confidence', 'evidence', 'variant_identity', 'text_observations', 'measurements', 'objects',
                    'status', 'policy_version', 'child_facts_revision_id', 'correction_revision', 'planning_correction', 'measurement_issues'}
         if set(row) - allowed:
@@ -371,16 +360,20 @@ def _validate_observation_rows(
                 or row['has_dimension_lines'] or row['has_callouts_or_panels']
                 or any(item.get('kind') in {'product_fact', 'measurement'} for item in texts or [] if isinstance(item, dict))):
             errors.append('Required product annotations cannot be classified as unused reference material')
-        views = []
+        features = []
         try:
-            views = physical_views(row.get('physical_views'))
+            features = product_features(row)
+            gaps = row.get('text_gaps')
+            if (not isinstance(gaps, list) or any(not isinstance(gap, dict) or set(gap) != {'text', 'kind'}
+                    or not isinstance(gap['text'], str) or not gap['text'].strip()
+                    or not isinstance(gap['kind'], str) or gap['kind'] not in {'product_fact', 'measurement'} for gap in gaps)):
+                raise ValueError('Unresolved product text needs text and kind')
             if not isinstance(row.get('measurements'), list) or not isinstance(row.get('measurement_issues', []), list):
                 raise ValueError('Observation needs a measurement list and a local issue inventory')
             if any(not isinstance(issue, dict) or set(issue) != {'measurement', 'error'} for issue in row.get('measurement_issues', [])):
                 raise ValueError('Invalid local measurement issue')
             measurements, measurement_issues = _validate_source_measurements(
-                [*row.get('measurements', []), *(issue['measurement'] for issue in row.get('measurement_issues', []))], views)
-            selected_reference_views(row)
+                [*row.get('measurements', []), *(issue['measurement'] for issue in row.get('measurement_issues', []))])
         except ValueError as exc:
             errors.append(str(exc))
         if errors:
@@ -410,8 +403,8 @@ def _validate_observation_rows(
                     raise ValueError(f"objects[{obj['object_id']}].membership_evidence: invalid fact_id/quote {ref!r}; use an exact facts key and its text")
             if obj["sale_membership"] in {"product", "included_accessory"} and not refs:
                 raise ValueError("sales membership requires product evidence; otherwise use unknown")
-        if any(item['object_id'] not in seen_objects for view in views for item in view['evidence']):
-            raise ValueError("Physical view evidence refers to an unobserved object")
+        if any(item['object_id'] not in seen_objects for item in features):
+            raise ValueError("Product evidence refers to an unobserved object")
         result[key] = {**row, 'measurements': measurements, 'measurement_issues': measurement_issues,
                        "status": "success", "policy_version": OBSERVATION_POLICY,
                        "child_facts_revision_id": input_revision_id(facts)}
@@ -420,18 +413,17 @@ def _validate_observation_rows(
     return result
 
 
-def _validate_source_measurements(rows: Any, views: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
+def _validate_source_measurements(rows: Any) -> tuple[list[dict], list[dict]]:
     if not isinstance(rows, list):
         raise ValueError('Observation needs a located measurement inventory, empty when not applicable')
-    by_view = {view['view_id']: source_box(view['region']) for view in views}
-    identities, locations = set(), set()
+    identities = set()
     valid, issues = [], []
     ids = [row['measurement_id'] for row in rows if isinstance(row, dict) and isinstance(row.get('measurement_id'), str) and row['measurement_id']]
     if len(ids) != len(set(ids)):
         raise ValueError('One annotation has competing readings; resolve its original pixels')
     for index, row in enumerate(rows):
         try:
-            _validate_measurement(row, by_view, identities, locations)
+            _validate_measurement(row, identities)
             valid.append(row)
         except ValueError as exc:
             if 'competing readings' in str(exc):
@@ -441,34 +433,18 @@ def _validate_source_measurements(rows: Any, views: list[dict[str, Any]]) -> tup
     return valid, issues
 
 
-def _validate_measurement(row: Any, by_view: dict, identities: set, locations: set) -> None:
+def _validate_measurement(row: Any, identities: set) -> None:
     quantities = extract_measurements(row.get('text')) if isinstance(row, dict) else []
     quantity_count = len(quantities) == 1 or (len(quantities) == 2 and 'range' in measurement_qualifiers(row['text'])
                                            and len({(m['kind'], m['raw_text']) for m in quantities}) == 1)
-    if (not isinstance(row, dict) or set(row) != {'measurement_id', 'text', 'object', 'axis', 'region', 'endpoints', 'kind', 'evidence_type', 'view_id'}
-            or not all(isinstance(row[k], str) and row[k].strip() for k in ('measurement_id', 'text', 'object', 'axis', 'view_id'))
-            or row['measurement_id'] in identities or row['view_id'] not in by_view
+    if (not isinstance(row, dict) or set(row) != {'measurement_id', 'text', 'object', 'axis', 'kind', 'evidence_type'}
+            or not all(isinstance(row[k], str) and row[k].strip() for k in ('measurement_id', 'text', 'object', 'axis'))
+            or row['measurement_id'] in identities
             or row['kind'] not in ('dimension', 'capacity', 'weight')
             or row['evidence_type'] not in ('dimension_line', 'text_spec')
             or (row['evidence_type'] == 'dimension_line' and row['kind'] != 'dimension')
             or not quantity_count or not re_has_object_name(row['object'])):
         raise ValueError('Measurement needs one located quantity or range and an actual measured object')
-    box, region = by_view[row['view_id']], source_box(row['region'])
-    location = (row['view_id'], tuple(region))
-    if location in locations:
-        raise ValueError('One annotation has competing readings; resolve its original pixels')
-    locations.add(location)
-    points = row['endpoints']
-    if row['evidence_type'] == 'dimension_line':
-        try:
-            valid = isinstance(points, list) and len(points) == 2 and points[0] != points[1] and all(
-                box[0] <= x <= box[2] and box[1] <= y <= box[3] for x, y in map(source_point, points))
-        except ValueError:
-            valid = False
-        if not valid:
-            raise ValueError(f"Dimension needs both physical endpoints inside its view {box}; received {points!r}")
-    elif points is not None:
-        raise ValueError(f"endpoints: text specifications need null, received {points!r}")
     identities.add(row['measurement_id'])
 
 
@@ -481,6 +457,18 @@ def re_has_object_name(text: str) -> bool:
 
 def claim_key(text: str, evidence: dict[str, str]) -> str:
     return input_revision_id({"policy": CLAIM_REVIEW_POLICY, "text": text, "evidence": evidence})
+
+
+def factual_shared_finding(request: dict, finding: dict) -> bool:
+    """Shared design may be corrected for cited product facts, never taste."""
+    if not str(finding.get('operation', '')).startswith('shared_design:') or finding.get('status') == 'supported':
+        return True
+    facts = {item['evidence_id'] for item in request.get('required_facts', {}).get('product_claims', [])}
+    facts.update('physical:' + item['source_id'] + ':' + feature['feature_id'] + ':' + str(i)
+        for item in request.get('selected_evidence', []) for feature in item['features']
+        for i, _ in enumerate(feature['physical_facts']))
+    ids = finding.get('fact_ids')
+    return isinstance(ids, list) and bool(ids) and all(isinstance(key, str) and key in facts for key in ids)
 
 
 def _planning_review_rows(rows: Any, requests: list[dict[str, Any]]) -> tuple[dict[str, dict], dict[str, str]]:
@@ -508,7 +496,7 @@ def _planning_review_rows(rows: Any, requests: list[dict[str, Any]]) -> tuple[di
             operations, checked_findings, broken_operations = set(), {}, set()
             for finding in findings:
                 if (not isinstance(finding, dict) or not {'operation', 'status', 'reason'} <= set(finding)
-                        or set(finding) - {'operation', 'status', 'reason', 'resolution'}
+                        or set(finding) - {'operation', 'status', 'reason', 'resolution', 'fact_ids'}
                         or not isinstance(finding.get('operation'), str)
                         or finding.get('status') not in ('supported', 'contradiction', 'inconclusive')
                         or not isinstance(finding.get('reason'), str) or not finding['reason'].strip()
@@ -523,11 +511,13 @@ def _planning_review_rows(rows: Any, requests: list[dict[str, Any]]) -> tuple[di
                     continue
                 operations.add(operation)
                 if operation.startswith('source_product:') and operation.split(':', 1)[1] not in {
-                        item['source_id'] + '/' + item['view']['view_id'] for item in request.get('selected_evidence', [])}:
+                        item['source_id'] for item in request.get('selected_evidence', [])}:
                     errors[key] = 'Source correction must cite a selected source/view'
                     continue
                 if operation.startswith('shared_design:') and operation.split(':', 1)[1] not in shared_design_values(request.get('shared_design', {})):
                     errors[key] = 'Shared correction must name an existing leaf path, not a container'
+                    continue
+                if not factual_shared_finding(request, finding):
                     continue
                 if request['kind'] == 'design_binding' and not operation.startswith(('source_product:', 'shared_design:')) and operation not in request['physical_operations']:
                     errors[key] = 'Unknown planning operation'
@@ -564,13 +554,12 @@ def review_planning_bindings(
     if not claims:
         return {}
     needed_sources = {key for row in claims for key in [row.get('source_id'), *row.get('evidence_sources', [])]}
-    needed_views = {(item['source_id'], item['view']['view_id']) for row in claims for item in row.get('selected_evidence', [])}
-    needed_views.update(tuple(key.split(':')[1:3]) for row in claims for key in row.get('evidence', {}) if key.startswith('physical:'))
-    needed_sources.update(source_id for source_id, _view in needed_views)
+    needed_sources.update(item['source_id'] for row in claims for item in row.get('selected_evidence', []))
+    needed_sources.update(key.split(':')[1] for row in claims for key in row.get('evidence', {}) if key.startswith('physical:'))
     images: list[Path] = []
     attachment_numbers: dict[str, int] = {}
     from .paths import resolve_job_owned_path
-    source_views, execution_inputs = [], []
+    source_views, execution_inputs, execution_catalog = [], [], {}
     for request in claims:
         if request['kind'] != 'design_binding':
             continue
@@ -583,8 +572,10 @@ def review_planning_bindings(
             if ref['sha256'] not in attachment_numbers:
                 images.append(path)
                 attachment_numbers[ref['sha256']] = len(images)
-            inputs.append({**reference_semantics(ref), 'generation_attachment': index,
-                           'review_attachment': attachment_numbers[ref['sha256']]})
+            semantics = {**reference_semantics(ref), 'review_attachment': attachment_numbers[ref['sha256']]}
+            reference_id = input_revision_id(semantics)[:20]
+            execution_catalog[reference_id] = semantics
+            inputs.append({'reference_id': reference_id, 'generation_attachment': index})
         execution_inputs.append({'key': request['key'], 'role': direction['role'], 'attachments': inputs})
     for source, path in zip(source_manifest, source_paths):
         if source['source_id'] not in needed_sources:
@@ -592,23 +583,25 @@ def review_planning_bindings(
         if source['source_sha256'] not in attachment_numbers:
             images.append(path)
             attachment_numbers[source['source_sha256']] = len(images)
-        source_views.append({'attachment_number': attachment_numbers[source['source_sha256']], 'source_id': source['source_id'],
-                             'views': [{key: view[key] for key in ('view_id', 'region', 'extent')} for view in source['observation']['physical_views']
-                                       if (source['source_id'], view['view_id']) in needed_views]})
+        source_views.append({'attachment_number': attachment_numbers[source['source_sha256']],
+                             'source_id': source['source_id'], 'extent': source['observation']['product_extent']})
     # Serialize shared facts and design once; binding keys still cover each role's consumed values.
-    fact_catalog, shared_design, evidence_catalog, bindings = {}, {}, {}, []
+    fact_catalog, fact_sets, shared_design, evidence_catalog, bindings = {}, {}, {}, {}, []
     for request in claims:
         binding = {key: value for key, value in request.items() if key != 'shared_design'}
         if request['kind'] == 'design_binding':
             binding['selected_evidence_ids'] = []
             for item in binding.pop('selected_evidence'):
-                key = item['source_id'] + '/' + item['view']['view_id']
+                key = item['source_id']
                 evidence_catalog[key] = item
                 binding['selected_evidence_ids'].append(key)
             required = request['required_facts']
             fact_catalog.update({row['evidence_id']: row for row in required['product_claims']})
+            fact_ids = [row['evidence_id'] for row in required['product_claims']]
+            fact_set = input_revision_id(fact_ids)[:20]
+            fact_sets[fact_set] = fact_ids
             binding['required_facts'] = {**{key: value for key, value in required.items() if key != 'product_claims'},
-                                        'product_claim_ids': [row['evidence_id'] for row in required['product_claims']]}
+                                        'product_fact_set': fact_set}
             binding['shared_design_paths'] = sorted(shared_design_values(request['shared_design']))
             for key, value in request['shared_design'].items():
                 if key == 'palette_direction':
@@ -630,24 +623,23 @@ def review_planning_bindings(
         "Status is supported, contradiction or inconclusive. The supplied operation ID owns its review category. "
         "For inconclusive results, resolution is retry_review for incomplete evaluation, correct_evidence for a cited source_product defect, "
         "or revise_plan for an unsupported proposed depiction or claim requiring a local change. Other results may omit resolution. "
-        "For design entries, report each supplied operation using its exact ID. "
-        "whole_product_transfer checks whether detail edits plus verification views support the proposed whole product. "
+        "For design entries, evaluate supplied operations by exact ID; child product facts are verification context, not features every image must display. "
         "Detail-only output depicts selected parts, not a new whole hero; sold quantity does not require full units in a detail image. "
         "Original source_views verify provenance only: a feature visible only on an original page does not prove it is in the generation attachments. "
         "Check explicit contradictory instructions, not aesthetic quality or pixel-level color equality; uncertainty about taste is not inconclusive. "
-        "Each binding's selected_evidence_ids resolves in selected_evidence; product_claim_ids resolves in child_product_facts. Its shared_design_paths names the only applicable leaf paths "
+        "selected_evidence_ids resolves in selected_evidence; product_fact_set resolves through fact_sets to child_product_facts. "
+        "execution_inputs preserves attachment order using reference_id entries in execution_catalog. shared_design_paths names the only applicable leaf paths "
         "in the shared_design catalog; ignore all other paths, including those supplied for other bindings. "
         "Product finish and specifications are facts; palette components are non-sold target staging only. "
         "Measurements own numeric labels, display_copy owns authored text, palette owns component appearance, typography owns font treatment, "
-        "and graphic_direction owns graphic colors. Report shared contradictions as shared_design:<exact leaf path>, "
+        "and graphic_direction owns graphic colors. Only a shared instruction contradicting identified product facts may be reported as "
+        "shared_design:<exact leaf path>, with fact_ids naming those supplied product or physical facts, "
         "for example shared_design:palette_direction.bedding.duvet or shared_design:graphic_direction.text_color; never name a whole container. "
         "Otherwise use the relevant supplied operation, without redesigning the palette. "
-        "product_coverage checks that the role retains necessary functional facts or measured objects and endpoint associations, "
-        "not the source's panel inventory. coverage_transfer checks only integrated features against displayed counterparts. "
-        "sold_membership resolves only the selected, specifically disputed sold part or included accessory against product records. "
-        "Verification-only views are evidence, not required output panels. Source and target feature IDs need not match if pixels support the same fact. "
-        "For an actual observation defect that misidentifies, clips or invents the SOLD PRODUCT, use source_product:<source_id/view_id>, "
-        "cite that selected view's original and crop and the specific product part. Crop context added by measurement labels is not an error. "
+        "Selected measurements specify only the quantities this output communicates; other source annotations are not required labels. "
+        "Compare measured subject, property, operating state and qualifiers before treating readings as conflicting. "
+        "sold_membership resolves only specifically disputed sold parts against product records. "
+        "For a product observation that misidentifies or invents the sold product, use source_product:<source_id> and cite the actual source. "
         "Missing ordinary props, different framing, room style, open/closed presentation supported elsewhere in the child, or replaced bedding "
         "are not observation defects. Unknown geometry is inconclusive only when the proposed product depiction depends on it. "
         "Compare subject, action, property, quantity, unit, conditions, negation and scope. A modifier stays with its source subject: "
@@ -662,8 +654,9 @@ def review_planning_bindings(
         "showing a bare frame with designed bedding is not, unless it conceals the feature this role must demonstrate. "
         "Do not judge beauty, enforce trends, require identical colors for different graphic roles, or add "
         "product requirements. Missing/ambiguous information is inconclusive, not contradiction.\n"
-        + json.dumps({"bindings": bindings, "child_product_facts": list(fact_catalog.values()), 'shared_design': shared_design,
-                      "selected_evidence": evidence_catalog, "source_views": source_views, "execution_inputs": execution_inputs}, ensure_ascii=False, separators=(',', ':'))
+        + json.dumps({"bindings": bindings, "child_product_facts": list(fact_catalog.values()), 'fact_sets': fact_sets, 'shared_design': shared_design,
+                      "selected_evidence": evidence_catalog, "source_views": source_views, "execution_inputs": execution_inputs,
+                      'execution_catalog': execution_catalog}, ensure_ascii=False, separators=(',', ':'))
     )
     trace_dir.mkdir(parents=True, exist_ok=True)
     (trace_dir / "planning_review_request.txt").write_text(prompt, encoding="utf-8")
@@ -692,11 +685,9 @@ def review_planning_bindings(
             for row in checked.values()}
 
 
-def candidate_view_targets(task: dict[str, Any]) -> list[dict[str, Any]]:
-    """The role's existing view dispositions are the comparison inventory."""
-    return [{'view_id': row['view_id'], 'source_id': row['source_id'],
-             'usage': row['usage'], 'covered_by': row['covered_by']}
-            for row in task['image_direction']['evidence_usage'] if row['usage'] != 'verification']
+def candidate_product_targets(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """QA inspects intended output and every depicted part, not every source panel."""
+    return [{'target_id': task['role'], **task['image_direction']['presentation']}]
 
 
 def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any], *, deadline_monotonic: float | None = None) -> dict[str, Any]:
@@ -704,28 +695,16 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
     from .vision_gemini_client import gemini_scope_execution_revision
 
     product_refs = [row for row in task["generation_references"] if row["kind"] != "design_reference"]
-    originals = {}
-    for row in product_refs:
-        if row.get('original_path'):
-            path = resolve_job_owned_path(job, row['original_path'])
-            if file_sha256(path) != row['original_sha256']:
-                raise ValueError('Original physical evidence changed before QA')
-            originals[row['source_id']] = {"source_id": row['source_id'], "path": row['original_path'],
-                "sha256": row['original_sha256'], "purpose": "Original source for measured endpoints and complete visible product comparison"}
-    product_refs = [*product_refs, *originals.values()]
     images = [resolve_job_owned_path(job, candidate["candidate_path"])] + [resolve_job_owned_path(job, row["path"]) for row in product_refs]
-    attachments = [{"attachment_index": index, "source_id": ref.get('source_id') or f"source_{int(task.get('source_index') or 0):02d}",
-                    "view_id": ref.get('view_id'), "purpose": ref.get('purpose'), "sha256": ref['sha256']} for index, ref in enumerate(product_refs, 2)]
-    required_views = candidate_view_targets(task)
-    for view in required_views:
-        view['attachment_index'] = next(a['attachment_index'] for a in attachments
-                                       if (a['source_id'], a['view_id']) == (view['source_id'], view['view_id']))
-    measurement_sources = []
-    for row in (task.get('measurement_authority') or {}).get('measurement_groups', []):
-        location = measurement_attachment_location(row, product_refs)
-        measurement_sources.append({**{key: row[key] for key in ('id', 'source_id', 'measured_part', 'axis', 'view_id', 'evidence_type')},
-            'attachment_index': location['attachment'] + 1, 'coordinate_frame': 'specified_attachment',
-            'source_region': location['label'], 'source_endpoints': location['endpoints']})
+    for ref, path in zip(product_refs, images[1:]):
+        if file_sha256(path) != ref['sha256']:
+            raise ValueError('Product reference changed before QA')
+    attachments = [{"attachment_index": index, "source_id": ref['source_id'],
+                    "purpose": ref['purpose'], "sha256": ref['sha256']} for index, ref in enumerate(product_refs, 2)]
+    required_targets = candidate_product_targets(task)
+    measurement_sources = [{**{key: row[key] for key in ('id', 'source_id', 'measured_part', 'axis', 'evidence_type')},
+                            'attachment_index': measurement_attachment(row, product_refs) + 1}
+                          for row in (task.get('measurement_authority') or {}).get('measurement_groups', [])]
     edit_scope = {}
     if candidate.get('revision_mode') == 'targeted_edit':
         from .candidate_state import candidate_by_sha
@@ -744,12 +723,12 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
     revision = input_revision_id({"policy": CANDIDATE_OBSERVATION_POLICY, "candidate": candidate["candidate_sha256"],
                                  "observer_execution": gemini_scope_execution_revision("vision_qa"),
                                  "references": product_refs, "product": task["product_facts"], "edit_scope": edit_scope,
-                                 "measurements": task.get('measurement_authority'), "required_views": required_views,
+                                 "measurements": task.get('measurement_authority'), "required_targets": required_targets,
                                  "presentation": task['image_direction']['presentation']})
     path = job / "reports" / "candidate_observations" / f"{revision}.json"
     if path.is_file():
         cached = read_json(path)
-        _validate_candidate_bindings(cached, attachments, required_views, measurement_sources, edit_scope)
+        _validate_candidate_bindings(cached, attachments, required_targets, measurement_sources, edit_scope)
         return cached
     schema = {
         "text_coverage": "complete|partial|unreadable",
@@ -762,7 +741,7 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
                           "confidence": 0.0, "source_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0), "candidate_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
         "measurement_coverage": "complete|partial|not_applicable",
         "product_coverage": "complete|partial",
-        "product_comparisons": [{"view_id": "required view_id or extra:unique_id for an additional depicted detail", "source_id": "its source_id", "attachment_index": 2,
+        "product_comparisons": [{"target_id": "required target_id or extra:unique_id for an additional depicted detail", "source_id": "its source_id", "attachment_index": 2,
                                "status": "consistent|contradiction|unknown", "part": "specific sold part",
                                "evidence": "source/candidate geometry, count, finish and state comparison, not aesthetics",
                                "confidence": 0.0, "source_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0), "candidate_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
@@ -777,13 +756,13 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
         "Transcribe candidate text verbatim. Regions use named {left,top,right,bottom}; endpoints use {x,y}, normalized to the specified attachment, not another crop or output. Distinguish marketing/dimensions from "
         "product surface labels and loose props; do not guess illegible words or brand identity. "
         "Compare full quantities including bounds, ranges and qualifiers, measured objects and endpoints; equivalent US-unit conversion with display rounding is not a product change. Transcribe both expressions exactly; bind each measurement id once. Use null endpoints for non-diagram callouts and unknown for unreadable geometry. "
-        "Return one product_comparisons row per required target view (source_id/view_id identify that target), "
+        "Return one product_comparisons row per required target_id, covering its intended product scope, "
         "using attachment_index and source_region to cite any supplied same-child view that proves its structure, plus extra:unique_id rows "
         "for all additional product-bearing insets/parts in the candidate, comparing against the original source attachment. "
-        "Compare each view's joints, visible faces, part count, attachment position and state, not merely its function. "
+        "Compare depicted joints, visible faces, part count, attachment position and state, not merely function. "
         "A stopper block serving the same purpose but showing a newly invented side/joint is not the same observed detail. "
         "Do not use a correct inset to excuse a changed main view. "
-        "Locate required features in the actual candidate, without a prescribed target layout. Integrated views still need their physical feature/state visible. "
+        "Inspect the planned demonstration without prescribing layout or requiring other views from the source gallery. "
         "Inspect the entire candidate including background and unlabeled details for extra or altered products or mechanisms. "
         "product_coverage is complete only when every depicted product region is compared; an unregistered detail is not automatically correct. "
         "Use presentation.scope: detail_only authorizes selected parts, not an invented assembled product. "
@@ -795,12 +774,12 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
         "When a necessary comparison is genuinely unavailable, report unknown/partial with its visible location, not absence or an empty region. "
         "Do not score aesthetics or improve the image. Every contradiction needs a specific part and two visible regions.\n"
         + "INPUT CONTEXT:\n" + json.dumps({"product_identity": task["product_facts"], "presentation": task['image_direction']['presentation'], "attachments": attachments,
-                      "required_views": required_views, "measurement_sources": measurement_sources, "edit_scope": edit_scope}, ensure_ascii=False)
+                      "required_targets": required_targets, "measurement_sources": measurement_sources, "edit_scope": edit_scope}, ensure_ascii=False)
         + "\nOUTPUT OBJECT (these fields are top-level):\n" + json.dumps(schema, ensure_ascii=False)
     )
     def validate(text: str) -> bool:
         observed = parse_json_object_response(text)
-        _validate_candidate_bindings(observed, attachments, required_views, measurement_sources, edit_scope)
+        _validate_candidate_bindings(observed, attachments, required_targets, measurement_sources, edit_scope)
         return True
     events, record = _attempt_trace(path.with_suffix(".attempts.json"))
     raw = gemini_stream_generate(prompt, images, client_scope="vision_qa", attempts=1,
@@ -808,14 +787,14 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
                                 deadline_monotonic=deadline_monotonic, response_validator=validate,
                                 request_id=f"candidate-observation:{revision}", attempt_observer=record)
     result = parse_json_object_response(raw)
-    _validate_candidate_bindings(result, attachments, required_views, measurement_sources, edit_scope)
+    _validate_candidate_bindings(result, attachments, required_targets, measurement_sources, edit_scope)
     success = next((event for event in reversed(events) if event.get("status") == "success"), {})
     result["provider"] = {key: success.get(key) or "unavailable" for key in ("provider", "model", "protocol")}
     write_json(path, result)
     return result
 
 
-def _validate_candidate_bindings(observed, attachments, required_views, measurement_sources, edit_scope):
+def _validate_candidate_bindings(observed, attachments, required_targets, measurement_sources, edit_scope):
     _validate_candidate_observation(observed)
     expected = {(row['source_id'], row['id']): row for row in measurement_sources}
     seen = set()
@@ -831,11 +810,11 @@ def _validate_candidate_bindings(observed, attachments, required_views, measurem
         seen.add(key)
     if seen != set(expected):
         observed['measurement_coverage'] = 'partial'
-    required = {(row['source_id'], row['view_id']) for row in required_views}
+    required = {row['target_id'] for row in required_targets}
     for row in observed['product_comparisons']:
-        extra = row['view_id'].startswith('extra:')
-        if ((not extra and (row['source_id'], row['view_id']) not in required)
-                or not any(row['attachment_index'] == a['attachment_index'] for a in attachments)):
+        extra = row['target_id'].startswith('extra:')
+        if ((not extra and row['target_id'] not in required)
+                or not any(row['attachment_index'] == a['attachment_index'] and row['source_id'] == a['source_id'] for a in attachments)):
             raise ValueError('Product comparison needs a planned target and supplied same-child evidence attachment')
     if edit_scope and 'edit_comparison' not in observed:
         raise ValueError('Targeted edit comparison is missing')
@@ -877,16 +856,16 @@ def _validate_candidate_observation(value: Any) -> None:
                 value['measurement_coverage'] = 'partial'
     comparisons = value.get("product_comparisons")
     if not isinstance(comparisons, list):
-        raise ValueError("Candidate per-view product comparisons are missing")
+        raise ValueError("Candidate output product comparisons are missing")
     seen = set()
     for comparison in comparisons:
         if (not isinstance(comparison, dict) or comparison.get('status') not in {'consistent', 'contradiction', 'unknown'}
-                or not all(comparison.get(key) for key in ('source_id', 'view_id', 'evidence', 'part'))
+                or not all(comparison.get(key) for key in ('source_id', 'target_id', 'evidence', 'part'))
                 or type(comparison.get('attachment_index')) is not int or comparison['attachment_index'] < 2):
             raise ValueError('Candidate product comparison needs a bound view and located evidence')
-        key = (comparison['source_id'], comparison['view_id'])
+        key = comparison['target_id']
         if key in seen:
-            raise ValueError('Candidate product comparison repeats a view')
+            raise ValueError('Candidate product comparison repeats a target')
         seen.add(key)
         if not _located_finding(comparison, ('source_region', 'candidate_region'), 'status', 'unknown'):
             value['product_coverage'] = 'partial'

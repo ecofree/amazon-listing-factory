@@ -315,8 +315,6 @@ def _validate_manifest_binding(job_path: Path, manifest: dict[str, Any], task: d
         raise CandidateStateError(str(exc)) from exc
     for ref in [*references, *expected_refs]:
         inputs = [('reference', ref['path'], ref['sha256'])]
-        if ref.get('original_path'):
-            inputs.append(('original', ref['original_path'], ref.get('original_sha256')))
         if ref.get('protected_mask'):
             inputs.append(('mask', ref['protected_mask'].get('path'), ref['protected_mask'].get('sha256')))
         for kind, value, expected_sha in inputs:

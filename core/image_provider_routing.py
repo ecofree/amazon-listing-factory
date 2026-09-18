@@ -41,7 +41,7 @@ from .image_provider_common import (
 from .image_provider_transport import generate_with_registry_image_provider, has_registry_image_provider
 from .image_role_utils import role_key
 from .io import read_json, write_json
-from .image_response import RESPONSE_SCHEMA, new_response_path, save_response, save_transport_response, finish_response
+from .image_response import begin_response, save_response, save_transport_response, finish_response
 from .model_call_health import (
     model_provider_cooldown_active,
     open_provider_run_circuit,
@@ -300,10 +300,8 @@ def _generate_with_provider_deadline(
     result_queue = context.Queue(maxsize=1)
     if response_directory is None or not request_audit or not request_audit.get('response_binding'):
         raise CandidateCommitError('Durable response binding is required before sending')
-    receipt = new_response_path(response_directory)
+    receipt = begin_response(response_directory, provider=provider_name, audit=request_audit)
     result_path = receipt.with_suffix('.bin')
-    write_json(receipt, {'schema': RESPONSE_SCHEMA, 'binding': request_audit['response_binding'],
-                        'provider': provider_name, 'status': 'prepared', 'request_audit': dict(request_audit)})
     process = context.Process(
         target=_provider_worker,
         args=(provider_name, image_input_paths, prompt, mask_bytes, request_id, str(receipt), result_queue),
@@ -391,11 +389,11 @@ def _provider_worker(
     transport_started = False
     try:
         images = [Path(path).read_bytes() for path in image_input_paths]
-        write_json(receipt, {**record, 'status': 'submitted'})
         def prepared(snapshot):
+            nonlocal transport_started
+            transport_started = True
             write_json(receipt, {**record, 'status': 'submitted', 'request_audit': dict(snapshot)})
             output.put({'event': 'request_prepared', 'request_audit': snapshot})
-        transport_started = True
         data = generate_with_registry_image_provider(
             provider_name=provider, image_inputs=images, prompt=prompt, mask_bytes=mask,
             request_id=request_id, request_audit=audit,

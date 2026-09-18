@@ -10,7 +10,7 @@ from core import image_qa
 from core.candidate_state import CandidateStateError
 from core.image_tasks import IMAGE_TASK_POLICY_VERSION
 from tests.current_image_contract_fixture import current_image_task, current_prompt_artifact, current_image_direction
-from core.visual_semantics import candidate_view_targets
+from core.visual_semantics import candidate_product_targets
 
 
 def _task(role: str, mode: str = "none") -> dict:
@@ -25,7 +25,7 @@ def _task(role: str, mode: str = "none") -> dict:
             "strings": ["Storage That Adapts", "Adjustable Shelf"] if family == "func" else [],
         },
         "source_path": "source.png",
-        "generation_references": [{"source_id": "source_00", "view_id": "view_01"}],
+        "generation_references": [{"source_id": "source_00"}],
         "image_direction": current_image_direction(),
     }
 
@@ -36,10 +36,10 @@ def _observed(task: dict) -> dict:
         "product_coverage": "complete",
         "texts": [{"text": text, "kind": "marketing", "confidence": 0.99, "region": dict(left=0, top=0, right=1, bottom=1)}
                   for text in task["renderable_text_contract"]["strings"]],
-        "product_comparisons": [{"source_id": row['source_id'], "view_id": row['view_id'], "attachment_index": index,
+        "product_comparisons": [{"source_id": task["generation_references"][0]["source_id"], "target_id": row["target_id"], "attachment_index": index,
                                 "status": "consistent", "part": "sold structure", "confidence": 0.99,
                                 "evidence": "Fixture geometry retained", "source_region": dict(left=0, top=0, right=1, bottom=1), "candidate_region": dict(left=0, top=0, right=1, bottom=1)}
-                               for index, row in enumerate(candidate_view_targets(task), 2)],
+                               for index, row in enumerate(candidate_product_targets(task), 2)],
     }
 
 
@@ -242,8 +242,6 @@ class QaLiteV1Tests(unittest.TestCase):
         from copy import deepcopy
         from core.visual_semantics import _validate_candidate_observation
         task = _task('func')
-        task['generation_references'].append({'source_id': 'source_00', 'view_id': 'view_02'})
-        task['image_direction']['evidence_usage'].append({'source_id': 'source_00', 'view_id': 'view_02', 'usage': 'display', 'covered_by': []})
         complete = _observed(task)
         _validate_candidate_observation(complete)
         self.assertEqual('pass', image_qa._semantic_gates(task, complete)[2]['status'])
@@ -251,22 +249,23 @@ class QaLiteV1Tests(unittest.TestCase):
         partial['product_coverage'] = 'partial'
         self.assertEqual('inconclusive', image_qa._semantic_gates(task, partial)[2]['status'])
         extra = deepcopy(complete)
-        extra['product_comparisons'].append({**extra['product_comparisons'][0], 'view_id': 'extra:caster',
+        extra['product_comparisons'].append({**extra['product_comparisons'][0], 'target_id': 'extra:caster',
             'status': 'contradiction', 'part': 'drawer stop', 'evidence': 'Wooden stop replaced by a caster brake'})
         _validate_candidate_observation(extra)
         self.assertEqual('fail', image_qa._semantic_gates(task, extra)[2]['status'])
         wrong = deepcopy(complete)
-        wrong['product_comparisons'][1].update(status='contradiction', part='corner', evidence='Product corner joint replaced by a different construction')
+        wrong['product_comparisons'][0].update(status='contradiction', part='corner', evidence='Product corner joint replaced by a different construction')
         self.assertEqual('fail', image_qa._semantic_gates(task, wrong)[2]['status'])
-        wrong['product_comparisons'][1]['confidence'] = .4
+        wrong['product_comparisons'][0]['confidence'] = .4
         self.assertEqual('inconclusive', image_qa._semantic_gates(task, wrong)[2]['status'])
         complete['product_comparisons'].pop()
         self.assertEqual('inconclusive', image_qa._semantic_gates(task, complete)[2]['status'])
+        complete = _observed(task)
         complete['product_comparisons'].append(deepcopy(complete['product_comparisons'][0]))
-        with self.assertRaisesRegex(ValueError, 'repeats a view'):
+        with self.assertRaisesRegex(ValueError, 'repeats a target'):
             _validate_candidate_observation(complete)
         del complete['product_comparisons']
-        with self.assertRaisesRegex(ValueError, 'per-view'):
+        with self.assertRaisesRegex(ValueError, 'output product comparisons'):
             _validate_candidate_observation(complete)
 
 

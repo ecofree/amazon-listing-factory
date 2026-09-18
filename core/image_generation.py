@@ -14,7 +14,7 @@ from .api_registry import (
 )
 from .candidate_state import CandidateStateError, current_candidate
 from .image_generation_executor import generate_one, finalize_candidate
-from .image_response import recover_response
+from .image_response import recover_response, response_resolved
 from .image_provider_common import (
     ProviderQueueUnavailable,
     provider_attempts,
@@ -182,7 +182,7 @@ def run_image_generation(
                 failures.append(_failure({**task, **state}, owner='generation',
                     error=str(state.get('error') or 'Generation contract is blocked'), status='blocked'))
                 continue
-            if state.get('request_outcome') == 'unknown':
+            if state.get('request_outcome') == 'unknown' and not response_resolved(runtime_task):
                 failures.append(_failure({**task, **state}, owner='generation',
                     error='Remote request outcome unknown; obtain provider confirmation or explicit resend approval before another paid request', status='review'))
                 continue

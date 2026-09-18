@@ -1,24 +1,22 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from pathlib import Path
 from typing import Any
 
-from .image_reference_context import reference_prompt, measurement_attachment_location, view_identity
+from .image_reference_context import reference_prompt, measurement_attachment
 from .image_task_inputs import task_renderable_text, role_art_direction
 from .io import read_jsonl, write_bytes_atomic, write_jsonl
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .status import input_revision_id, logical_task_id
-from .text_evidence import extract_measurements, normalize_text
 
 
-PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v92-located-specifications"
+PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v94-original-evidence"
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v74-located-specifications"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v75-output-measurements"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -371,16 +369,13 @@ def _role_content(task: dict[str, Any], role: str) -> str:
              "Depict the complete product structure supported by the whole-product evidence.")
     if (task.get('measurement_authority') or {}).get('mode') == 'source_image':
         scope += " Measurement views may show a representative unit, not the full package quantity."
-    rows = [scope, f"Product use/demonstration: {presentation['state']}",
-            "Product evidence (verification views supply identity and facts, not required output panels):"]
-    references = {view_identity(ref): ref for ref in task['generation_references']
-                  if ref['kind'] in {'edit_base', 'product_evidence'} and ref.get('view_id')}
-    for view in direction["evidence_usage"]:
-        key = view_identity(view)
-        ref = references[key]
-        features = '; '.join(f"{item['object_id']}/{item['feature_id']}: " + ', '.join(item['physical_facts'])
+    rows = [scope, f"Product use/demonstration: {presentation['state']}"]
+    for ref in task['generation_references']:
+        if ref['kind'] not in {'edit_base', 'product_evidence'}:
+            continue
+        features = '; '.join(f"{item['object_id']}: " + ', '.join(item['physical_facts'])
                              for item in ref.get('visible_evidence', []))
-        rows.append(f"{key}: {view['usage']}; covered by {view['covered_by']}; {ref.get('extent', '')}; physical features: {features}")
+        rows.append(f"{ref['source_id']} product facts: {features}")
     if (task.get("measurement_authority") or {}).get("mode") == "source_image":
         rows.append(_measurement_content(task.get("measurement_authority"), task['generation_references'], authored_text=task_renderable_text(task)))
     return "\n".join(row for row in rows if row)
@@ -436,24 +431,13 @@ def _compact_token_direction(value: Any) -> str:
 
 
 def _measurement_content(value: Any, references: list[dict[str, Any]], *, authored_text: list[str] = ()) -> str:
-    def coordinates(value: Any) -> Any:
-        # Limit coordinate serialization noise; measurement values/units and
-        # persisted evidence coordinates remain untouched.
-        if isinstance(value, dict):
-            return {key: coordinates(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [coordinates(item) for item in value]
-        return round(value, 6) if isinstance(value, float) else value
-
     rows = []
     for row in value.get('measurement_groups', []):
-        location = measurement_attachment_location(row, references)
+        attachment = measurement_attachment(row, references)
         label = f"TEXT item {authored_text.index(row['render_text']) + 1}" if row['render_text'] in authored_text else row['render_text']
-        rows.append(f"{row['measured_part']} / {row['axis']}: {label} @ " + json.dumps(coordinates(location), sort_keys=True, separators=(',', ':')))
-    return ('Measurement copy: replace each located source label once with its US-unit text; retain its measured object and endpoints. '
-            'Equal values on different objects remain separate; do not duplicate a label on one association. '
-            'Coordinates locate evidence in the numbered ATTACHMENT, not the output canvas. dimension_line binds two physical endpoints; '
-            'text_spec binds a written property or limit to its object without a measurement arrow. '
+        rows.append(f"{row['measured_part']} / {row['axis']}: {label} (source attachment {attachment}; {row['evidence_type']})")
+    return ('Measurement associations: depict each listed measured object/property once with its authorized US-unit label. '
+            'Design positions and arrows for the output geometry, not source pixels. Written properties or limits need no dimension arrow. '
             + '; '.join(rows))
 
 

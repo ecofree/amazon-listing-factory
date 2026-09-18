@@ -8,7 +8,7 @@ import threading
 from PIL import Image
 
 from core.io import write_json, read_json
-from core.image_response import RESPONSE_SCHEMA, new_response_path, response_directory, response_binding, recover_response
+from core.image_response import RESPONSE_SCHEMA, begin_response, response_directory, response_binding, recover_response
 from core.image_provider_routing import _provider_worker
 from core.image_generation_executor import generate_one, finalize_candidate
 from core.image_provider_common import CandidateCommitError, ProviderTransportError, ProviderQueueUnavailable
@@ -33,7 +33,7 @@ def verify_paid_response_recovery(test):
         test.assertEqual(response_binding(referenced), response_binding(changed))
         changed['generation_references'][0]['sha256'] = 'b'*64
         test.assertNotEqual(response_binding(referenced), response_binding(changed))
-        receipt = new_response_path(response_directory(task))
+        receipt = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
         write_json(receipt, {'schema': RESPONSE_SCHEMA, 'binding': response_binding(task), 'status': 'prepared',
                             'provider': 'fixture', 'request_audit': {'request_id': 'paid-once', 'provider_attempts': {'fixture': 1}}})
         queue = Queue()
@@ -67,7 +67,7 @@ def verify_paid_response_recovery(test):
             remote.assert_not_called()
         test.assertFalse(Path(saved['raw_path']).exists())
         test.assertEqual('finalized', read_json(receipt)['status'])
-        unknown = new_response_path(response_directory(task))
+        unknown = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
         write_json(unknown, {**read_json(receipt), 'status': 'submitted'})
         with test.assertRaises(ProviderTransportError):
             generate_one(task, plugin=None)
@@ -138,7 +138,7 @@ def verify_interrupted_response_recovery(test):
         spec = SimpleNamespace(api_type='openai_images_edit', model='fixture', url='https://fixture.invalid/v1/images/edits')
         for partial in (True, False):
             task = {'job_dir': tmp, 'logical_task_id': f'generate:B1:{partial}', 'task_fingerprint': str(partial)}
-            receipt = new_response_path(response_directory(task))
+            receipt = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
             write_json(receipt, {'schema': RESPONSE_SCHEMA, 'binding': response_binding(task), 'status': 'prepared',
                                  'provider': 'fixture', 'request_audit': {}})
             response = MagicMock()
@@ -148,7 +148,8 @@ def verify_interrupted_response_recovery(test):
             response.read.return_value = b'{"data":[{"url":"https://fixture.invalid/paid-image.png"}]}'
             def request(**kwargs):
                 return transport._generate_with_openai_images_edit(provider_name='fixture', image_inputs=kwargs['image_inputs'],
-                    prompt='fixture', mask_bytes=None, request_audit=kwargs['request_audit'], transport_observer=kwargs['transport_observer'])
+                    prompt='fixture', mask_bytes=None, request_audit=kwargs['request_audit'], transport_observer=kwargs['transport_observer'],
+                    request_observer=kwargs['request_observer'])
             queue = Queue()
             with patch.object(transport, '_image_provider_spec', return_value=spec), patch.object(transport, '_provider_api_key', return_value='fixture'), \
                  patch.object(transport, '_canonical_image_edit_request'), patch.object(transport, '_openai_images_edit_multipart_body', return_value=(b'post', 'fixture')), \
@@ -157,6 +158,8 @@ def verify_interrupted_response_recovery(test):
                  patch('core.image_provider_routing.generate_with_registry_image_provider', side_effect=request):
                 _provider_worker('fixture', [str(source)], 'fixture', None, 'once', str(receipt), queue)
             outcome = queue.get_nowait()
+            while outcome.get('event'):
+                outcome = queue.get_nowait()
             record = read_json(receipt)
             test.assertEqual('remote-known-id', record['request_audit']['remote_request_id'])
             test.assertEqual('submitted', record['status'])
@@ -273,12 +276,11 @@ def verify_safe_transport_retry(test):
             with test.assertRaises(kind) as caught:
                 transport._generate_with_openai_images_edit(provider_name='fixture', image_inputs=[b'input'], prompt='fixture', mask_bytes=None)
             test.assertEqual(ambiguous, bool(getattr(caught.exception, 'ambiguous', False)))
-    from core.image_response import new_response_path, RESPONSE_SCHEMA, response_binding, response_directory, recover_response
     for code, kind in (('model_not_found', ProviderConfigurationError), ('no_available_channel', ProviderTransportError),
                        ('unknown_gateway_error', CandidateCommitError)):
         with TemporaryDirectory() as tmp:
             task = {'job_dir': tmp, 'logical_task_id': 'generate:B1:func', 'prompt': 'fixture'}
-            receipt = new_response_path(response_directory(task))
+            receipt = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
             write_json(receipt, {'schema': RESPONSE_SCHEMA, 'binding': response_binding(task), 'status': 'prepared',
                                  'provider': 'fixture', 'request_audit': {}})
             response = MagicMock()
@@ -288,7 +290,7 @@ def verify_safe_transport_retry(test):
             output = MagicMock()
             def call_transport(**kwargs):
                 return transport._generate_with_openai_images_edit(**{key: kwargs[key] for key in (
-                    'provider_name', 'image_inputs', 'prompt', 'mask_bytes', 'request_audit', 'transport_observer')})
+                    'provider_name', 'image_inputs', 'prompt', 'mask_bytes', 'request_audit', 'transport_observer', 'request_observer')})
             source = Path(tmp) / 'source.png'
             source.write_bytes(b'fixture image handled by mocked encoder')
             with patch.object(transport, '_image_provider_spec', return_value=spec), patch.object(

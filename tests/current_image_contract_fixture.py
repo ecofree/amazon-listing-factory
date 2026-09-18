@@ -33,10 +33,15 @@ def supported_review_results(requests, **kwargs):
                                                for op in row.get('physical_operations', [])]} for row in requests}
 
 
-def current_physical_view(view_id: str = 'view_01', region: list[float] | None = None, *, feature: str = 'frame_support', object_id: str = 'frame') -> dict[str, Any]:
-    box = dict(zip(('left', 'top', 'right', 'bottom'), region or [0.1, 0.2, 0.9, 0.8]))
-    return {'view_id': view_id, 'region': box, 'extent': 'whole_view',
-            'evidence': [{'feature_id': feature, 'object_id': object_id, 'region': box.copy(), 'physical_facts': ['Visible frame support and its joints']}]}
+def current_product_feature(*, feature='frame_support', object_id='frame'):
+    return {'feature_id': feature, 'object_id': object_id, 'physical_facts': ['Visible frame support and its joints']}
+
+
+def current_measurement_rows():
+    from core.final_source_intents import _observed_measurements, _measurement_rows
+    from core.visual_semantics import OBSERVATION_POLICY
+    return _measurement_rows(_observed_measurements({'status': 'success', 'policy_version': OBSERVATION_POLICY,
+        'measurements': [current_observed_measurement()]}), {})
 
 
 def current_art_direction() -> dict[str, Any]:
@@ -53,16 +58,15 @@ def current_art_direction() -> dict[str, Any]:
 def current_observed_measurement(text='17 in', object_name='Cabinet', axis='width', *, key='width', kind='dimension', evidence_type=None):
     evidence_type = evidence_type or ('dimension_line' if kind == 'dimension' else 'text_spec')
     return {'measurement_id': key, 'text': text, 'object': object_name, 'axis': axis,
-            'view_id': 'view_01', 'region': {'left': .2, 'top': .25, 'right': .3, 'bottom': .3}, 'kind': kind,
-            'evidence_type': evidence_type,
-            'endpoints': [{'x': .2, 'y': .4}, {'x': .7, 'y': .4}] if evidence_type == 'dimension_line' else None}
+            'kind': kind, 'evidence_type': evidence_type}
 
 
-def current_image_direction(*, environment: str = "designed_environment", source_id: str = 'source_00') -> dict[str, Any]:
+
+def current_image_direction(*, environment: str = "designed_environment", source_id: str = 'source_00', measurement_ids=None) -> dict[str, Any]:
     return {"visual_goal": "Explain the visible physical feature at a glance",
             "presentation": {"scope": "whole_product", "state": "Show the complete product with its functional parts visible",
                              "components": ['room.wall', 'room.floor', 'bath.towels'] if environment == 'designed_environment' else []},
-            "evidence_usage": [{"source_id": source_id, "view_id": "view_01", "usage": "display", "covered_by": []}],
+            "product_sources": [source_id], "measurement_ids": list(measurement_ids or []),
             "design_transfer": [],
             "environment_mode": environment}
 
@@ -131,9 +135,7 @@ def current_image_task(
                 "purpose": "Edit this product view", "evidence_ids": [],
                 "path": "images/func-source.png" if family == "func" else "images/source.png",
                 "sha256": source_sha256,
-                "original_path": base["source_path"], "original_sha256": source_sha256,
-                "view_id": "view_01", "extent": "whole_view",
-                "visible_evidence": current_physical_view()['evidence'],
+                "extent": "whole_view", "visible_evidence": [current_product_feature()],
             }
         ]
         base.update({
@@ -187,3 +189,13 @@ def current_prompt_artifact(
     row = _prompt_row(Path(job), task)
     validate_image_prompt(row)
     return {"schema_version": IMAGE_PROMPT_SCHEMA_VERSION, "prompts": [row]}
+
+
+def write_observation_images(sources):
+    from PIL import Image
+    from core.io import file_sha256
+    for source in sources:
+        source['path'].parent.mkdir(parents=True, exist_ok=True)
+        with Image.new('RGB', (200, 200), 'white') as image:
+            image.save(source['path'])
+        source['sha256'] = file_sha256(source['path'])

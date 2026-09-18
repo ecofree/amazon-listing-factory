@@ -408,7 +408,7 @@ def source_inventory_coverage(
                 (str(task.get("source_sha256") or "") == str(intent.get("source_sha256") or "")
                  and str(task.get("source_intent_revision_id") or "") == revision)
                 or any(ref.get('source_id') == base['source_id']
-                       and ref.get('original_sha256') == intent.get('source_sha256')
+                       and ref.get('sha256') == intent.get('source_sha256')
                        for ref in task.get('generation_references', []) if ref.get('kind') != 'design_reference')
             )
         ]

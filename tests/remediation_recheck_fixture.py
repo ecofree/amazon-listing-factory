@@ -1,4 +1,5 @@
 """Boundary counterexamples exercised by the existing production test cases."""
+from core.image_task_inputs import initial_output_inventory
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -11,7 +12,7 @@ from core.visual_design_kit_compiler import (
     compile_visual_design_kit_response, design_binding_request, validate_compiled_visual_design_kit,
 )
 from tests.current_image_contract_fixture import (
-    current_art_direction, current_image_direction, current_physical_view,
+    current_art_direction, current_image_direction, current_product_feature,
     supported_design_reviews, supported_review_results,
 )
 
@@ -21,8 +22,8 @@ def _source(key='source_00', role='func', *, disputed=False):
             'source_sha256': 'a' * 64, 'input_revision_id': 'evidence-1',
             'role': role, 'measurements': [],
             'claims': [{'evidence_id': 'shelf', 'text': 'Adjustable Shelf'}] if role == 'func' else [],
-            'observation': {'status': 'success', 'physical_views': [current_physical_view()],
-                'reference_views': [{'view_id': 'view_01', 'purposes': ['appearance', 'feature']}],
+            'observation': {'status': 'success', 'product_features': [current_product_feature()], 'product_extent': 'whole_view',
+                'reference_purposes': ['appearance', 'feature'],
                 'evidence_gaps': [], 'text_gaps': [],
                 'objects': [{'object_id': 'frame', 'kind': 'frame', 'state': 'visible',
                              'sale_membership': 'unknown', 'membership_evidence': [],
@@ -39,7 +40,7 @@ def _draft(key='source_00', role='func'):
 def _plan(sources):
     return {'family_art_direction': current_art_direction(), 'image_briefs': [
         _draft(spec['source']['source_id'], spec['role'])
-        for spec in task_specs({}, sources, include_optional=True) if spec['source']]}
+        for spec in task_specs({}, sources, inventory=initial_output_inventory(sources), include_optional=True) if spec['source']]}
 
 
 def _brief(payload, role):
@@ -52,7 +53,7 @@ def verify_review_projection(test):
     draft = _brief(raw, 'func')
     before = deepcopy(raw)
     reviews = supported_design_reviews(raw, [source])
-    compiled = compile_visual_design_kit_response(raw, source_manifest=[source], claim_reviews=reviews)
+    compiled = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], claim_reviews=reviews)
     test.assertEqual('ready', _brief(compiled, 'func')['status'])
     test.assertEqual(draft['image_direction'], _brief(compiled, 'func')['image_direction'])
     test.assertEqual(['Adjustable Shelf'], _brief(compiled, 'func')['display_copy_contract']['labels'])
@@ -64,19 +65,21 @@ def verify_review_projection(test):
             validate_compiled_visual_design_kit(changed, source_manifest=[source])
     previous_request = design_binding_request(draft, raw['family_art_direction'], source=source)
     test.assertIn(previous_request['key'], reviews)
-    source['measurements'] = [{'view_id': 'view_01', 'source_region': dict(left=.1, top=.05, right=.3, bottom=.1)}]
+    from tests.current_image_contract_fixture import current_measurement_rows
+    source['measurements'] = current_measurement_rows()
+    draft['image_direction']['measurement_ids'] = ['source_00:width']
     request = design_binding_request(draft, raw['family_art_direction'], source=source)
-    test.assertEqual([source['measurements'][0]['source_region']], request['selected_evidence'][0]['required_annotation_regions'])
+    test.assertEqual('Cabinet', request['required_facts']['measurements'][0]['measured_part'])
     test.assertNotEqual(previous_request['key'], request['key'])
     from core.visual_design_kit import _finish_image_briefs
-    for field, invalid in (('evidence_usage', ['not a view']),
+    for field, invalid in (('product_sources', ['unknown_source']),
                            ('design_transfer', [{'reference_id': 'missing'}]), ('environment_mode', None)):
         sources = [_source(), _source('source_01', 'scene')]
         malformed = _plan(sources)
         _brief(malformed, 'func')['image_direction'][field] = invalid
         with TemporaryDirectory() as tmp, patch('core.visual_design_kit.gemini_stream_generate', return_value=json.dumps({'image_briefs': [_draft()]})), patch(
                 'core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as review:
-            result = _finish_image_briefs(malformed, job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame',
+            result = _finish_image_briefs(malformed, output_inventory=initial_output_inventory(sources), job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame',
                 source_paths=[], source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
         review.assert_not_called()
         test.assertEqual({'main': 'ready', 'scene': 'ready', 'func': 'ready', 'size': 'pending'},
@@ -92,7 +95,7 @@ def verify_shared_repair(test):
     _brief(raw, 'func')['image_direction']['environment_mode'] = None
     valid_raw = deepcopy(raw)
     _brief(valid_raw, 'func')['image_direction'] = current_image_direction()
-    before = compile_visual_design_kit_response(raw, source_manifest=sources, claim_reviews=supported_design_reviews(valid_raw, sources))
+    before = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory(sources), source_manifest=sources, claim_reviews=supported_design_reviews(valid_raw, sources))
     def repair(prompt, paths, **kwargs):
         request = json.loads(prompt.split('\n', 1)[1])
         test.assertEqual(['func'], [row['role'] for row in request['pending']])
@@ -101,7 +104,7 @@ def verify_shared_repair(test):
         return json.dumps({'image_briefs': [_draft()]})
     with TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as review, patch(
             'core.visual_design_kit.gemini_stream_generate', side_effect=repair) as remote:
-        result = _finish_image_briefs(raw, job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame', source_paths=[],
+        result = _finish_image_briefs(raw, output_inventory=initial_output_inventory(sources), job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame', source_paths=[],
             source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
     test.assertEqual(1, remote.call_count)
     review.assert_not_called()
@@ -113,38 +116,28 @@ def verify_shared_repair(test):
     unauthorized['family_art_direction']['graphic_direction']['text_color'] = '#000000'
     with TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as review, patch(
             'core.visual_design_kit.gemini_stream_generate', return_value=json.dumps(unauthorized)):
-        result = _finish_image_briefs(raw, job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame', source_paths=[],
+        result = _finish_image_briefs(raw, output_inventory=initial_output_inventory(sources), job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame', source_paths=[],
             source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
         test.assertIn('outside the current repair contract', (Path(tmp) / 'brief_repair_error.txt').read_text())
     review.assert_not_called()
     test.assertEqual(before, result)
     alternate = deepcopy(valid_raw)
     _brief(alternate, 'func')['image_direction'] = current_image_direction(source_id='source_01')
-    detail = current_physical_view('detail', feature='local_support')
-    detail['extent'] = 'detail'
-    sources[0]['observation']['physical_views'].append(detail)
-    _brief(valid_raw, 'func')['image_direction']['evidence_usage'][0]['view_id'] = 'detail'
-    sources[1]['observation']['reference_views'][0]['purposes'] = ['feature']
-    def missing_reference(requests, **kwargs):
-        result = supported_review_results(requests)
-        for row in requests:
-            if row.get('role_design', {}).get('role') == 'func' and row['role_design']['evidence_usage'][0]['source_id'] == 'source_00':
-                result[row['key']]['findings'] = [dict(operation='whole_product_transfer:func', status='inconclusive', resolution='revise_plan',
-                                                     reason='Another child view is needed to prove the support')]
-        return result
+    _brief(valid_raw, 'func')['image_direction']['product_sources'] = ['unknown_source']
+    sources[1]['observation']['reference_purposes'] = ['feature']
     def switch_reference(prompt, paths, **kwargs):
         request = json.loads(prompt.split('\n', 1)[1])
         test.assertEqual(['source_00', 'source_01'], [r['source_id'] for r in request['source_evidence']])
-        test.assertEqual([dict(attachment_number=1, source_id='source_00', view_id='view_01')], request['evidence_attachments'])
+        test.assertEqual([dict(attachment_number=1, source_id='source_00')], request['evidence_attachments'])
         test.assertEqual(['00.png'], [p.name for p in paths])
         return json.dumps({'image_briefs': [_brief(alternate, 'func')]})
-    with TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=missing_reference), patch(
+    with TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results), patch(
             'core.visual_design_kit.gemini_stream_generate', side_effect=switch_reference):
-        corrected = _finish_image_briefs(valid_raw, job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame',
+        corrected = _finish_image_briefs(valid_raw, output_inventory=initial_output_inventory(sources), job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame',
             source_paths=[Path(tmp)/'00.png'], source_originals=[], trace_dir=Path(tmp),
             deadline_monotonic=time.monotonic()+10, cached=None)
     test.assertEqual('ready', _brief(corrected, 'func')['status'])
-    test.assertEqual('source_01', _brief(corrected, 'func')['image_direction']['evidence_usage'][0]['source_id'])
+    test.assertEqual('source_01', _brief(corrected, 'func')['image_direction']['product_sources'][0])
     for sibling in ('main', 'scene', 'func_02', 'size'):
         test.assertEqual(_brief(before, sibling), _brief(corrected, sibling))
 
@@ -156,9 +149,9 @@ def verify_observation_feedback(test):
     reviews = supported_design_reviews(raw, [source])
     request = design_binding_request(_brief(raw, 'func'), raw['family_art_direction'], source=source)
     review = reviews[request['key']]
-    review['findings'] = [{'operation': 'source_product:source_00/view_01', 'status': 'contradiction',
+    review['findings'] = [{'operation': 'source_product:source_00', 'status': 'contradiction',
                           'reason': 'A sold frame support is clipped in the evidence crop'}]
-    compiled = compile_visual_design_kit_response(raw, source_manifest=[source], claim_reviews=reviews)
+    compiled = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], claim_reviews=reviews)
     kit = {'children': {'B1': {**compiled, 'main_image_policy': 'product_first_lifestyle',
                              'source_references': [source], 'product_claims': [], 'input_revision_id': 'kit-1'}}}
     corrections = observation_corrections(kit)
@@ -166,17 +159,17 @@ def verify_observation_feedback(test):
     test.assertEqual({'source_00'}, set(corrections['B1']))
     test.assertEqual(source['source_sha256'], corrections['B1']['source_00']['source_sha256'])
     test.assertEqual(review['key'], corrections['B1']['source_00']['findings'][0]['review_key'])
-    for extra in ('sold_membership:source_00/view_01', 'shared_design:photography_direction'):
+    for extra in ('sold_membership:source_00', 'shared_design:photography_direction'):
         mixed = deepcopy(reviews)
         mixed[request['key']]['findings'].append({'operation': extra, 'status': 'contradiction',
                                                 'reason': 'Requested depiction also conflicts with the clipped evidence'})
-        combined = compile_visual_design_kit_response(raw, source_manifest=[source], claim_reviews=mixed)
+        combined = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], claim_reviews=mixed)
         test.assertEqual('observation', _brief(combined, 'func')['failure_owner'])
         test.assertEqual(corrections, observation_corrections({'children': {'B1': {
             **kit['children']['B1'], **combined}}}))
     unreviewed_copy = deepcopy(raw)
     _brief(unreviewed_copy, 'func')['display_copy']['labels'][0]['text'] = 'Shelf height adjusts'
-    combined = compile_visual_design_kit_response(unreviewed_copy, source_manifest=[source], claim_reviews=reviews)
+    combined = compile_visual_design_kit_response(unreviewed_copy, output_inventory=initial_output_inventory([source]), source_manifest=[source], claim_reviews=reviews)
     test.assertEqual('observation', _brief(combined, 'func')['failure_owner'])
     changed = deepcopy(kit)
     changed['children']['B1']['source_references'][0]['input_revision_id'] = 'changed'
@@ -225,7 +218,7 @@ def verify_partial_review_rows(test):
             'core.visual_semantics.gemini_stream_generate', side_effect=response), patch('core.visual_design_kit.gemini_stream_generate') as repair:
         arguments = dict(job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame',
                          source_paths=[], source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10)
-        result = _finish_image_briefs(raw, cached=None, **arguments)
+        result = _finish_image_briefs(raw, output_inventory=initial_output_inventory(arguments['source_manifest']), cached=None, **arguments)
         test.assertEqual('ready', _brief(result, 'main')['status'])
         test.assertEqual('ready', _brief(result, 'scene')['status'])
         test.assertEqual('review', _brief(result, 'func')['failure_owner'])
@@ -235,7 +228,7 @@ def verify_partial_review_rows(test):
         test.assertEqual(1, findings['semantic_failed_rows'])
         test.assertEqual(3, findings['semantic_valid_rows'])
         repair_count[0] = 1
-        resumed = _finish_image_briefs(raw, cached=result, **arguments)
+        resumed = _finish_image_briefs(raw, output_inventory=initial_output_inventory(arguments['source_manifest']), cached=result, **arguments)
         test.assertEqual([('design_binding', 'func')], requests_seen[2])
         test.assertEqual('ready', _brief(resumed, 'func')['status'])
         test.assertEqual(_brief(result, 'main'), _brief(resumed, 'main'))
@@ -248,7 +241,7 @@ def verify_partial_review_rows(test):
 
     source_request = design_binding_request(_brief(raw, 'func'), raw['family_art_direction'], source=sources[0])
     source_review = dict(key=source_request['key'], status='contradiction', reason='Crop is incomplete', findings=[
-        dict(operation='source_product:source_00/view_01', status='contradiction', reason='Support leg clipped')])
+        dict(operation='source_product:source_00', status='contradiction', reason='Support leg clipped')])
     valid, errors = _planning_review_rows([source_review], [source_request])
     test.assertFalse(errors)
     test.assertIn(source_request['key'], valid)
@@ -271,8 +264,8 @@ def _verify_observation_cache(test, finding):
         'has_dimension_lines': False, 'has_callouts_or_panels': False, 'visible_numbers_or_units': [],
         'confidence': .95, 'evidence': [], 'measurements': [], 'text_observations': [],
         'objects': [{'object_id': 'frame', 'kind': 'frame', 'state': 'visible', 'sale_membership': 'unknown',
-                     'visibility': 'visible', 'membership_evidence': []}], 'physical_views': [current_physical_view()],
-        'reference_views': [{'view_id': 'view_01', 'purposes': ['appearance', 'feature']}],
+                     'visibility': 'visible', 'membership_evidence': []}], 'product_features': [current_product_feature()], 'product_extent': 'whole_view',
+        'reference_purposes': ['appearance', 'feature'],
         'evidence_gaps': [], 'text_gaps': [],
         'variant_identity': {'status': 'unknown', 'observed_color': '', 'reason': 'Not identifiable', 'conflicts': []}}
     sibling = dict(valid, source_id='source_01')
@@ -280,6 +273,8 @@ def _verify_observation_cache(test, finding):
         job = Path(tmp)
         sources = [{'source_id': row['source_id'], 'sha256': 'a'*64, 'ocr': [], 'path': job / (row['source_id']+'.png')}
                    for row in (valid, sibling)]
+        from tests.current_image_contract_fixture import write_observation_images
+        write_observation_images(sources)
         def canonical_response(prompt, images, **kwargs):
             request = json.loads(prompt.split('Input evidence, not response fields:\n', 1)[1])
             test.assertNotIn('fact_texts', request)
@@ -310,12 +305,12 @@ def _verify_observation_cache(test, finding):
         correction = {'source_00': {'revision': '', 'planning_correction': finding, 'reason': finding}}
         corrected = deepcopy(valid)
         corrected['objects'][0]['state'] = 'The frame support and its joints are visible'
-        corrected['physical_views'][0]['evidence'][0]['physical_facts'].append(corrected['objects'][0]['state'])
+        corrected['product_features'][0]['physical_facts'].append(corrected['objects'][0]['state'])
         with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps({'sources': [corrected]})) as remote:
             result = observe_child_sources(job, {'asin': 'B1'}, sources, corrections=correction)
             test.assertEqual([sources[0]['path']], remote.call_args.args[1])
             test.assertEqual(corrected['objects'], result['source_00']['objects'])
-            test.assertEqual(corrected['physical_views'], result['source_00']['physical_views'])
+            test.assertEqual(corrected['product_features'], result['source_00']['product_features'])
             test.assertEqual(finding, result['source_00']['planning_correction'])
             observe_child_sources(job, {'asin': 'B1'}, sources, corrections=correction)
             observe_child_sources(job, {'asin': 'B1'}, sources)
@@ -455,7 +450,7 @@ def _verify_bound_artifact_repair(test):
                 observations.append(kwargs['corrections'])
                 result['source_02'].update(planning_correction=kwargs['corrections']['source_02']['planning_correction'],
                     correction_revision='')
-                result['source_02']['physical_views'][0]['evidence'][0]['physical_facts'].append('The supported shelf joint is visible')
+                result['source_02']['product_features'][0]['physical_facts'].append('The supported shelf joint is visible')
             return result
         stack.enter_context(patch.object(intents, 'observe_child_sources', side_effect=observe))
         intents.build_final_source_intents(job_dir=job, plugin=_Plugin())
@@ -473,7 +468,7 @@ def _verify_bound_artifact_repair(test):
             result = _fixture_reviews(requests, **kwargs)
             for request in requests:
                 if not corrected and request.get('kind') == 'design_binding' and request['source_id'] == 'source_02':
-                    result[request['key']]['findings'].append({'operation': 'source_product:source_02/view_01',
+                    result[request['key']]['findings'].append({'operation': 'source_product:source_02',
                         'status': 'contradiction', 'reason': 'The visible shelf joint is missing from product evidence'})
             path = Path(next(iter(result.values()))['response_path'])
             write_json(path, {'reviews': [{**{key: row[key] for key in ('key', 'status', 'reason')},
@@ -495,7 +490,7 @@ def _verify_bound_artifact_repair(test):
         test.assertTrue(all(row['status'] == 'ready' for row in kit['image_briefs']))
         after = intents.read_final_source_intents(job, plugin=_Plugin())
         test.assertEqual([row for row in before if row['source_index'] != 2], [row for row in after if row['source_index'] != 2])
-        expected_roles = {spec['role'] for spec in task_specs({}, kit['source_references'], include_optional=True)}
+        expected_roles = {spec['role'] for spec in task_specs({}, kit['source_references'], inventory=initial_output_inventory(kit['source_references']), include_optional=True)}
         test.assertEqual(expected_roles, {row['role'] for row in read_image_tasks(job, category_id=_Plugin.category_id)['tasks']})
         production._run_stage('brief', request=request)
         test.assertEqual(1, len(observations))
@@ -563,29 +558,28 @@ def verify_output_capacity_and_raw_trace(test):
         review_dir = job / 'review'
         review_dir.mkdir()
         with patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results):
-            ordinary = _finish_image_briefs(raw, job=job, child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
+            ordinary = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=job, child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
                 source_originals=[], trace_dir=review_dir, deadline_monotonic=time.monotonic()+10, cached=None)
         test.assertEqual('ready', _brief(ordinary, 'scene')['status'])
         test.assertEqual([], calls)
         source['observation']['objects'] = _source(disputed=True)['observation']['objects']
         from PIL import Image
-        original, crop = job / 'source.png', job / 'crop.png'
+        original = job / 'source.png'
         with Image.new('RGB', (32, 32), 'white') as pixels:
             pixels.save(original)
-            pixels.save(crop)
         from core.io import file_sha256
         source.update(source_path='source.png', source_sha256=file_sha256(original))
         for _ in range(3):
-            _finish_image_briefs(raw, job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[crop],
+            _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[original],
                 source_originals=[original], trace_dir=review_dir,
                 deadline_monotonic=time.monotonic()+10, cached=None)
         test.assertEqual([('primary', 8192), ('reserve', 16384)], calls)
         test.assertEqual(2, json.loads((review_dir/'attempt_budget.json').read_text())['review'])
         review_request = json.loads((review_dir/'initial/planning_review_request.txt').read_text().split('\n', 1)[1])
         test.assertEqual(['source_00'], [row['source_id'] for row in review_request['source_views']])
-        test.assertTrue(all([(ref['source_id'], ref['view_id']) for ref in row['attachments']] == [('source_00', 'view_01')]
+        test.assertTrue(all([review_request['execution_catalog'][ref['reference_id']]['source_id'] for ref in row['attachments']] == ['source_00']
                          for row in review_request['execution_inputs']))
-        test.assertTrue(all('sold_membership:source_00/view_01' in row['physical_operations']
+        test.assertTrue(all('sold_membership:source_00' in row['physical_operations']
                             for row in review_request['bindings']))
         calls.clear()
         source['observation']['objects'] = []
@@ -594,7 +588,7 @@ def verify_output_capacity_and_raw_trace(test):
         repair_dir.mkdir()
         with patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results):
             for _ in range(3):
-                pending = _finish_image_briefs(raw, job=job, child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
+                pending = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=job, child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
                     source_originals=[], trace_dir=repair_dir, deadline_monotonic=time.monotonic()+10, cached=None)
         test.assertEqual([('primary', 8192), ('reserve', 16384)], calls)
         test.assertEqual('pending', _brief(pending, 'scene')['status'])

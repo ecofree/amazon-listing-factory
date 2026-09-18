@@ -264,6 +264,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
+    receipt = getattr(args, 'response_receipt', '')
+    if receipt:
+        from core.image_response import resolve_response
+        if args.approve or args.reject or args.list or args.child or args.role or args.candidate_sha256 or args.resolutions:
+            raise ValueError('Receipt resolution cannot also change candidate reviews')
+        with job_run_lock(Path(args.job)):
+            result = resolve_response(Path(args.job), receipt, action=args.response_action, reason=args.reason)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if getattr(args, 'response_action', ''):
+        raise ValueError('--response-action requires one --response-receipt')
     _assert_runtime_dependencies()
     from core.release_manifest import (
         build_release_manifest,
@@ -584,6 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("review", help="List or review current candidates; required rows are the default queue.")
+    p.add_argument("--response-receipt", default="", help="Resolve one unknown paid-request receipt; never sends an image request.")
+    p.add_argument("--response-action", choices=["confirmed_not_generated", "approve_one_resend"], default="")
     p.add_argument("--candidate-sha256", default="", help="Explicit candidate selection for one child/role.")
     p.add_argument("--resolutions", default="", help="JSON list of source/candidate-bound resolutions for inconclusive facts.")
     p.add_argument("--job", required=True)

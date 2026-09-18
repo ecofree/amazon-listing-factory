@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
+
 import re
 from typing import Any
 
 from .visual_semantics import CLAIM_REVIEW_POLICY, claim_key
-from .image_reference_context import evidence_view_catalog, view_identity, physical_views
-from .image_task_inputs import task_specs, role_art_direction, shared_design_values
+from .image_reference_context import product_features
+from .image_task_inputs import measurement_authority, task_specs, role_art_direction, shared_design_values
 from .text_evidence import has_bad_encoding, us_measurement_text, extract_measurements
 
 
@@ -83,10 +85,8 @@ IMAGE_DIRECTION_SCHEMA = {
         "state": "product use/demonstration, necessary parts and physical support or installation; not layout, colors or source props",
         "components": ["bedding.duvet"],
     },
-    "evidence_usage": [
-        {"source_id": "source_00", "view_id": "view_01", "usage": "display", "covered_by": []},
-        {"source_id": "source_00", "view_id": "view_02", "usage": "integrated", "covered_by": ["source_00/view_01"]},
-    ],
+    "product_sources": ["same-child source IDs; first is the preferred edit photograph, others supply necessary facts"],
+    "measurement_ids": ["source_id:measurement_id for quantities this output will express; empty for non-measurement func"],
     "design_transfer": [{"reference_id": "approved ID", "inherit": "defining features used here", "adapt": "change and reason, or retain as approved"}],
     "environment_mode": "designed_environment|graphic_canvas|source_setting; choose the target setting; source_setting retains only necessary installation relationships",
 }
@@ -120,6 +120,7 @@ _RENDERABLE_COPY_INSTRUCTION_RE = re.compile(
 
 def compile_visual_design_kit_response(
     raw: Any, *, source_manifest: list[dict[str, Any]], category_id: str = "", main_policy: str = '',
+    output_inventory: list[dict[str, str]],
     product_claims: list[dict[str, Any]] = (),
     claim_reviews: dict[str, dict[str, Any]] | None = None,
     design_references: list[dict[str, Any]] | None = None,
@@ -131,14 +132,15 @@ def compile_visual_design_kit_response(
     raw_briefs = raw.get("image_briefs")
     if not isinstance(raw_briefs, list):
         raise VisualDesignKitCompileError("image_briefs must be a list")
-    specs = task_specs({}, source_manifest, include_optional=True)
+    specs = task_specs({}, source_manifest, inventory=output_inventory, include_optional=True)
     expected_roles = {spec['role'] for spec in specs}
-    raw_by_role = {}
-    for row in raw_briefs:
-        if not isinstance(row, dict) or row.get("role") not in expected_roles:
-            raise VisualDesignKitCompileError("image brief has an unknown output role")
+    raw_by_role, duplicates, unassigned = {}, set(), []
+    for index, row in enumerate(raw_briefs):
+        if not isinstance(row, dict) or not isinstance(row.get('role'), str) or row['role'] not in expected_roles:
+            unassigned.append({'row_index': index, 'error': 'Unknown output role'})
+            continue
         if row["role"] in raw_by_role:
-            raise VisualDesignKitCompileError("duplicate output brief")
+            duplicates.add(row['role'])
         raw_by_role[row["role"]] = row
     briefs = []
     for spec in specs:
@@ -148,6 +150,8 @@ def compile_visual_design_kit_response(
         review = {}
         bound_reviews = {}
         try:
+            if role in duplicates:
+                raise VisualDesignKitCompileError('Duplicate output brief; this slot needs one unambiguous row')
             if not source:
                 raise VisualDesignKitCompileError(spec['reason'], failure_owner='observation')
             if draft.get('source_id') != source['source_id']:
@@ -174,9 +178,36 @@ def compile_visual_design_kit_response(
                 "design_review": review,
                 "claim_reviews": bound_reviews,
             }
+            if role in duplicates:
+                brief['draft'] = {}
+            if not draft and unassigned:
+                brief['error'] += '; unassigned response rows: ' + json.dumps(unassigned, ensure_ascii=False)
         briefs.append(brief)
-    result = {"family_art_direction": art_direction, "image_briefs": briefs}
+    result = {"family_art_direction": art_direction, "image_briefs": briefs, 'output_inventory': output_inventory}
     validate_compiled_visual_design_kit(result, source_manifest=source_manifest, category_id=category_id, main_policy=main_policy, product_claims=product_claims, design_references=design_references)
+    return result
+
+
+def required_observation_issues(draft: dict[str, Any], source: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Use the same factual dependencies for rejection and observation recovery."""
+    role = str(draft.get('role', '')).split('_', 1)[0]
+    result = {}
+    if role in {'func', 'size'}:
+        direction = draft.get('image_direction')
+        chosen = direction.get('measurement_ids', []) if isinstance(direction, dict) else []
+        chosen = {key for key in chosen if isinstance(key, str)} if isinstance(chosen, list) else set()
+        missing_size_facts = role == 'size' and not any(owner.get('measurements') for owner in sources)
+        for owner in sources:
+            observation = owner.get('observation') or {}
+            gaps = [dict(reason=gap['text'], kind=gap['kind']) for gap in observation.get('text_gaps', [])
+                    if (role == 'func' and owner['source_id'] == source['source_id'] and gap['kind'] == 'product_fact')
+                    or (missing_size_facts and gap['kind'] == 'measurement')]
+            gaps += [dict(reason=issue['error'], kind='measurement')
+                     for issue in (observation.get('measurement_issues') or [])
+                     if isinstance(issue['measurement'], dict) and
+                     owner['source_id'] + ':' + str(issue['measurement'].get('measurement_id')) in chosen]
+            if gaps:
+                result[owner['source_id']] = gaps
     return result
 
 
@@ -187,17 +218,10 @@ def validate_image_brief_draft(draft: dict[str, Any], source: dict[str, Any], ar
     """Local contract used before paid review and by final compilation."""
     errors = []
     role = str(draft.get('role', '')).split('_', 1)[0]
-    if role in {'func', 'size'} and (source.get('observation') or {}).get('text_gaps'):
-        raise VisualDesignKitCompileError('Required product text is unresolved: ' + '; '.join(source['observation']['text_gaps']), failure_owner='observation')
-    if role in {'func', 'size'}:
-        direction = draft.get('image_direction')
-        usages = direction.get('evidence_usage', []) if isinstance(direction, dict) else []
-        selected_views = {view_identity(row) for row in usages if isinstance(row, dict) and {'source_id', 'view_id'} <= set(row)} if isinstance(usages, list) else set()
-        unresolved = [issue['error'] for owner in sources for issue in (owner.get('observation') or {}).get('measurement_issues') or []
-                      if owner['source_id'] == source['source_id'] or (isinstance(issue['measurement'], dict)
-                      and owner['source_id'] + '/' + str(issue['measurement'].get('view_id')) in selected_views)]
-        if unresolved:
-            raise VisualDesignKitCompileError('Required measurement evidence is unresolved: ' + '; '.join(unresolved), failure_owner='observation')
+    issues = required_observation_issues(draft, source, sources)
+    if issues:
+        raise VisualDesignKitCompileError('Required product text or measurement evidence is unresolved: '
+                                         + '; '.join(item['reason'] for gaps in issues.values() for item in gaps), failure_owner='observation')
     if set(draft) - {'role', 'source_id', 'image_direction', 'display_copy'}:
         errors.append('Brief contains fields outside the current response schema')
     try:
@@ -206,6 +230,7 @@ def validate_image_brief_draft(draft: dict[str, Any], source: dict[str, Any], ar
         if not set(direction['presentation']['components']) <= available_components:
             raise VisualDesignKitCompileError('presentation.components must select existing child palette component IDs')
         _validate_reference_approval(direction, role, design_references or [])
+        measurement_authority(role, direction, sources)
     except ValueError as exc:
         errors.append(str(exc))
     if role in {'func', 'size'}:
@@ -271,37 +296,23 @@ def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source
         text['environment_mode'] = 'graphic_canvas'
     required_facts = {
         'claims': [{key: row.get(key) for key in ('evidence_id', 'text')} for row in source.get('claims', [])],
-        'measurements': [{key: row.get(key) for key in ('text', 'source_label', 'axis_hint', 'view_id', 'source_endpoints')}
-                         for row in source.get('measurements', [])],
     } if role in {'func', 'size'} else {}
     required_facts['product_claims'] = list(product_claims)
-    catalog = evidence_view_catalog(list(source_manifest) or [source])
-    usage = text.get('evidence_usage')
-    usage = [row for row in usage if isinstance(row, dict) and all(isinstance(row.get(k), str) for k in ('source_id', 'view_id'))] if isinstance(usage, list) else []
-    selected = {view_identity(row) for row in usage}
+    sources = list(source_manifest) or [source]
+    selected = set(text.get('product_sources') or [])
+    required_facts['measurements'] = measurement_authority(role, direction, sources)['measurement_groups']
+    selected.update(row['source_id'] for row in required_facts['measurements'])
     evidence = [{'source_id': owner['source_id'], 'source_sha256': owner['source_sha256'],
-                 'source_revision': owner['input_revision_id'], 'view': view,
-                 'required_annotation_regions': [m['source_region'] for m in owner.get('measurements', []) if m['view_id'] == view['view_id']],
-                 'crops': [crop for crop in owner.get('crop_provenance', []) if crop['view_id'] == view['view_id']]}
-                for key, (owner, view) in catalog.items() if key in selected]
-    risks = ['coverage_transfer:' + view_identity(row) for row in usage if row.get('usage') == 'integrated']
-    if text['presentation']['scope'] == 'whole_product' and not any(
-            catalog[view_identity(row)][1]['extent'] == 'whole_view' for row in usage if row['usage'] == 'display'):
-        risks.append('whole_product_transfer:' + brief['role'])
-    shown = {view_identity(row) for row in usage if row.get('usage') != 'verification'}
-    omitted_measurements = any(source['source_id'] + '/' + row['view_id'] not in shown for row in source.get('measurements', []))
-    if role in {'func', 'size'} and omitted_measurements:
-        risks.append('product_coverage:' + source['source_id'])
-    unknown_objects = {}
-    for key in sorted(selected):
-        if key not in catalog:
+                 'source_revision': owner['input_revision_id'], 'extent': owner['observation']['product_extent'],
+                 'features': product_features(owner['observation'])}
+                for owner in sources if owner['source_id'] in selected]
+    risks, unknown_objects = [], {}
+    for owner in sources:
+        if owner['source_id'] not in selected:
             continue
-        owner, view = catalog[key]
-        objects = {row['object_id']: row for row in owner['observation'].get('objects', [])}
-        disputed = [objects[item['object_id']] for item in view['evidence']
-                    if objects.get(item['object_id'], {}).get('sale_membership') == 'unknown']
+        disputed = [obj for obj in owner['observation'].get('objects', []) if obj['sale_membership'] == 'unknown']
         if disputed:
-            risks.append('sold_membership:' + key)
+            risks.append('sold_membership:' + owner['source_id'])
             for obj in disputed:
                 unknown_objects[(owner['source_id'], obj['object_id'])] = {'source_id': owner['source_id'], **obj}
     if unknown_objects:
@@ -314,7 +325,7 @@ def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source
     key = input_revision_id({"policy": CLAIM_REVIEW_POLICY, "role_design": text,
         'source_revision': source['input_revision_id'], 'source_sha256': source['source_sha256'],
         'selected_evidence': evidence, 'required_facts': required_facts,
-        'crop_policy': 'floor-ceil-original-png-v3-detail-evidence-bounds', 'reference_scopes': scopes, 'shared_design': shared})
+        'reference_scopes': scopes, 'shared_design': shared})
     return {"kind": "design_binding", "key": key, "source_id": brief.get("source_id"), "role_design": text,
             "reference_scopes": scopes, "physical_operations": sorted(set(risks)), "selected_evidence": evidence,
             'required_facts': required_facts, 'shared_design': shared}
@@ -330,8 +341,9 @@ def review_failure_owner(record: dict[str, Any]) -> str:
 
 
 def _validate_physical_review(request: dict[str, Any], review: dict[str, Any]) -> None:
-    findings = review.get('findings', [])
-    allowed = set(request['physical_operations']) | {'source_product:' + row['source_id'] + '/' + row['view']['view_id']
+    from .visual_semantics import factual_shared_finding
+    findings = [row for row in review.get('findings', []) if factual_shared_finding(request, row)]
+    allowed = set(request['physical_operations']) | {'source_product:' + row['source_id']
                                                    for row in request['selected_evidence']}
     allowed.update('shared_design:' + key for key in shared_design_values(request['shared_design']))
     conflicts = [row for row in findings if row.get('status') == 'contradiction' and row.get('operation') in allowed]
@@ -360,7 +372,7 @@ def validate_compiled_visual_design_kit(
     product_claims: list[dict[str, Any]] = (),
     design_references: list[dict[str, Any]] | None = None,
 ) -> None:
-    if not isinstance(data, dict) or set(data) != {"family_art_direction", "image_briefs"}:
+    if not isinstance(data, dict) or set(data) != {"family_art_direction", "image_briefs", 'output_inventory'}:
         raise VisualDesignKitCompileError("planner response fields do not match the current VisualDesignKit contract")
     _validate_art_direction(data["family_art_direction"])
     sources = {row['source_id']: row for row in source_manifest}
@@ -381,6 +393,7 @@ def validate_compiled_visual_design_kit(
         source_manifest,
         product_claims=product_claims,
         category_id=category_id,
+        output_inventory=data['output_inventory'],
     )
 
 
@@ -439,7 +452,7 @@ def _compile_image_brief(
                     for row in result["display_copy_contract"]["bindings"]}
         result["claim_reviews"] = {key: value for key, value in claim_reviews.items() if key in used_keys}
     if role == "size":
-        result["measurement_authority"] = "located_source_measurements"
+        result["measurement_authority"] = "selected_source_measurements"
     return result
 
 
@@ -523,11 +536,12 @@ def _validate_briefs(
     briefs: Any,
     sources: list[dict[str, Any]],
     *,
+    output_inventory: list[dict[str, str]],
     product_claims: list[dict[str, Any]] | None = None,
     category_id: str = "",
     source_manifest: list[dict[str, Any]] | None = None,
 ) -> None:
-    expected = {row['role']: row['source'] or {} for row in task_specs({}, sources, include_optional=True)}
+    expected = {row['role']: row['source'] or {} for row in task_specs({}, sources, inventory=output_inventory, include_optional=True)}
     if not isinstance(briefs, list) or len(briefs) != len(expected):
         raise VisualDesignKitCompileError(
             "image_briefs do not cover every output role exactly once"
@@ -575,7 +589,7 @@ def _validate_briefs(
         if (
             role == "size"
             and (
-                brief["measurement_authority"] != "located_source_measurements"
+                brief["measurement_authority"] != "selected_source_measurements"
             )
         ):
             raise VisualDesignKitCompileError(
@@ -633,17 +647,18 @@ def _available_claims(
     }
     for source in sources:
         source_id = source['source_id']
-        for view in physical_views(source['observation']['physical_views']):
-            for feature in view['evidence']:
-                for index, fact in enumerate(feature['physical_facts']):
-                    evidence[f"physical:{source_id}:{view['view_id']}:{feature['feature_id']}:{index}"] = fact
+        for feature in product_features(source['observation']):
+            for index, fact in enumerate(feature['physical_facts']):
+                evidence[f"physical:{source_id}:{feature['feature_id']}:{index}"] = fact
         for index, row in enumerate(source.get('measurements') or []):
             evidence[f'measurement:{source_id}:{index}'] = str(row.get('source_label') or row.get('text') or '')
     return evidence
 
 
 def _required_text(value: Any, label: str, maximum: int) -> str:
-    text = " ".join(str(value or "").split())
+    if not isinstance(value, str):
+        raise VisualDesignKitCompileError(f'{label} must be text')
+    text = " ".join(value.split())
     if not text:
         raise VisualDesignKitCompileError(f"{label} is missing")
     if len(text) > maximum:
@@ -660,27 +675,23 @@ def _design_mapping(value: Any, schema: dict[str, Any], label: str) -> dict[str,
 
 
 def _image_direction(value: Any, source: dict[str, Any], *, role: str, category_id: str = "", source_manifest: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """One creative contract with explicit evidence disposition, not one panel per crop."""
+    """One creative contract with source facts and output intent, not a source-panel graph."""
     if not isinstance(value, dict) or set(value) != set(IMAGE_DIRECTION_SCHEMA):
         raise VisualDesignKitCompileError("image_direction needs the current named design fields")
-    if value["environment_mode"] not in {"designed_environment", "graphic_canvas", "source_setting"}:
+    if not isinstance(value['environment_mode'], str) or value["environment_mode"] not in {"designed_environment", "graphic_canvas", "source_setting"}:
         raise VisualDesignKitCompileError("image_direction has unknown environment_mode")
-    catalog = evidence_view_catalog(source_manifest or [source])
-    usage = value['evidence_usage']
-    if not isinstance(usage, list) or any(not isinstance(row, dict)
-            or any(not isinstance(row.get(k), str) for k in ('source_id', 'view_id')) for row in usage):
-        raise VisualDesignKitCompileError('evidence_usage needs source/view dispositions')
-    errors = [f'evidence_usage[{i}] needs source_id, view_id, usage and covered_by (display uses [])'
-              for i, row in enumerate(usage) if set(row) != {'source_id', 'view_id', 'usage', 'covered_by'}]
-    ids = [view_identity(row) for row in usage]
-    if len(ids) != len(set(ids)) or not set(ids) <= set(catalog):
-        raise VisualDesignKitCompileError('Selected evidence must identify unique views of this child')
-    views = {key: catalog[key][1] for key in ids}
-    if errors:
-        raise VisualDesignKitCompileError('; '.join(errors))
+    catalog = {row['source_id']: row for row in source_manifest or [source]}
+    ids = value['product_sources']
+    if (not isinstance(ids, list) or not ids or any(not isinstance(key, str) for key in ids)
+            or len(ids) != len(set(ids)) or not set(ids) <= set(catalog)):
+        raise VisualDesignKitCompileError('product_sources needs unique original references of this child')
+    if any(not product_features(catalog[key]['observation']) for key in ids):
+        raise VisualDesignKitCompileError('Selected references have no observed product evidence')
+    measurement_authority(role, value, list(catalog.values()))
     _required_text(value['visual_goal'], 'visual_goal', 240)
     presentation = value['presentation']
     if (not isinstance(presentation, dict) or set(presentation) != {'scope', 'state', 'components'}
+            or not isinstance(presentation['scope'], str)
             or presentation['scope'] not in {'whole_product', 'detail_only'}
             or not isinstance(presentation['components'], list)
             or any(not isinstance(key, str) or not re.fullmatch(r'[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*', key)
@@ -703,32 +714,11 @@ def _image_direction(value: Any, source: dict[str, Any], *, role: str, category_
             _required_text(row[field], field, 350)
             if re.search(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6})\b", row[field]):
                 raise VisualDesignKitCompileError("design_transfer must reference shared color roles, not redefine colors")
-    displayed = {view_identity(row) for row in usage if row["usage"] == "display"}
-    if not displayed:
-        raise VisualDesignKitCompileError("An image must display observed product evidence")
-    if presentation['scope'] == 'whole_product' and not any(view['extent'] == 'whole_view' for view in views.values()):
-        raise VisualDesignKitCompileError('whole_product presentation needs same-child whole_view evidence, including verification; otherwise plan detail_only')
+    if presentation['scope'] == 'whole_product' and not any(
+            catalog[key]['observation']['product_extent'] == 'whole_view' for key in value['product_sources']):
+        raise VisualDesignKitCompileError('Whole-product output needs a same-child complete product reference; otherwise plan detail_only')
     if role == 'main' and presentation['scope'] != 'whole_product':
         raise VisualDesignKitCompileError('Main presents the complete sold product')
-    if role == 'main' and not any(
-            catalog[key][1]['extent'] == 'whole_view'
-            and any(row['view_id'] == catalog[key][1]['view_id'] and 'appearance' in row['purposes']
-                    for row in catalog[key][0]['observation']['reference_views']) for key in displayed):
-        raise VisualDesignKitCompileError('Main requires selected whole-product appearance evidence')
-    if role in {'func', 'size'}:
-        measured = {key for key in views if any(view_identity(row) == key and row['usage'] != 'verification' for row in usage)
-                    for measurement in catalog[key][0].get('measurements', [])
-                    if measurement['view_id'] == catalog[key][1]['view_id']}
-        if not measured <= displayed:
-            raise VisualDesignKitCompileError('Selected measurement views need visible endpoint geometry')
-    for row in usage:
-        links = row["covered_by"]
-        if row["usage"] not in {"display", "integrated", "verification"}:
-            raise VisualDesignKitCompileError("Unknown evidence disposition")
-        if not isinstance(links, list) or any(not isinstance(key, str) or key not in displayed or key == view_identity(row) for key in links):
-            raise VisualDesignKitCompileError("Covered evidence must reference displayed views")
-        if (row["usage"] in {'display', 'verification'} and links) or (row["usage"] == 'integrated' and not links):
-            raise VisualDesignKitCompileError("Only integrated evidence names its displayed coverage")
     return value
 
 

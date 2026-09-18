@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.text_evidence import extract_measurements, us_measurement_text, measurement_values_match
-from tests.current_image_contract_fixture import current_physical_view
+from tests.current_image_contract_fixture import current_product_feature
 from core.template_field_values import template_dimensions_from_facts
 from core.image_qa import _line_matches_any, _unsupported_contract_lines
 from core.visual_design_kit import compact_product_claims
@@ -77,10 +77,13 @@ class UsMeasurementContractTests(unittest.TestCase):
 
     def test_observer_cache_changes_with_model_without_image_generation(self):
         from core.visual_semantics import observe_candidate
+        from core.io import file_sha256
         from tests.test_qa_lite_v1 import _task, _observed
         task = {**_task('main'), 'product_facts': {}}
         task['generation_references'][0].update(kind='edit_base', path='source.png', sha256='a' * 64, purpose='Original view')
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(_observed(task))) as request:
+            (Path(tmp) / 'source.png').write_bytes(b'original source fixture')
+            task['generation_references'][0]['sha256'] = file_sha256(Path(tmp) / 'source.png')
             candidate = {'candidate_path': 'image.png', 'candidate_sha256': 'c' * 64}
             with patch('core.vision_gemini_client.gemini_scope_execution_revision', return_value='model1'):
                 observe_candidate(Path(tmp), task, candidate)
@@ -96,6 +99,7 @@ class UsMeasurementContractTests(unittest.TestCase):
         from core.io import file_sha256
         from core.image_qa import _semantic_gates
         with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'source.png').write_bytes(b'original source fixture')
             parent_path, prompt_path = Path(tmp) / 'parent.png', Path(tmp) / 'edit.txt'
             parent_path.write_bytes(b'parent test bytes')
             prompt_path.write_text('# Revision request\nFix title spacing only', encoding='utf-8')
@@ -109,41 +113,42 @@ class UsMeasurementContractTests(unittest.TestCase):
                 self.assertEqual(parent_path, request.call_args.args[1][-1])
                 self.assertEqual('fail', _semantic_gates(task, observed)[-1]['status'])
         task = {**_task('size', 'source_image'), 'product_facts': {}}
-        task['generation_references'][0].update(kind='edit_base', path='source.png', sha256='a'*64,
-            purpose='Measured view', original_region=dict(left=.1, top=.1, right=.9, bottom=.9))
-        task['generation_references'].append({**task['generation_references'][0], 'kind': 'product_evidence', 'view_id': 'drawer'})
-        task['generation_references'].append({**task['generation_references'][0], 'kind': 'measurement_evidence',
-                                             'path': 'measurement.png', 'purpose': 'Measure only, not appearance'})
-        task['measurement_authority']['measurement_groups'] = [{'id': 'width', 'source_id': 'source_00', 'view_id': 'view_01',
-            'measured_part': 'Cabinet', 'axis': 'width', 'evidence_type': 'dimension_line', 'source_region': dict(left=.2, top=.2, right=.4, bottom=.4),
-            'source_endpoints': [dict(x=.2, y=.5), dict(x=.8, y=.5)]}]
+        task['generation_references'] = [
+            dict(kind='edit_base', source_id='source_00', path='source.png', purpose='Product original', sha256=''),
+            dict(kind='measurement_evidence', source_id='source_02', path='measurement.png', purpose='Measure only', sha256='')]
+        task['measurement_authority']['measurement_groups'] = [
+            dict(id='source_02:width', source_id='source_02', measured_part='Cabinet', axis='width', evidence_type='dimension_line')]
         response = _observed(task)
-        response.update(measurement_coverage='complete', measurements=[{'measurement_id': 'width', 'object': 'Cabinet width',
-            'source_id': 'source_00', 'attachment_index': 3, 'source_text': '17 in', 'candidate_text': '17 in',
-            'relationship': 'same', 'confidence': .99, 'source_region': dict(left=.125, top=.125, right=.375, bottom=.375),
-            'candidate_region': dict(left=.1, top=.1, right=.3, bottom=.3),
-            'source_endpoints': [dict(x=.125, y=.5), dict(x=.875, y=.5)], 'candidate_endpoints': [dict(x=.1, y=.5), dict(x=.9, y=.5)]}])
+        response.update(measurement_coverage='complete', measurements=[{
+            'measurement_id': 'source_02:width', 'object': 'Cabinet width', 'source_id': 'source_02', 'attachment_index': 2,
+            'source_text': '17 in', 'candidate_text': '17 in', 'relationship': 'same', 'confidence': .99,
+            'source_region': dict(left=.1, top=.1, right=.3, bottom=.3),
+            'candidate_region': dict(left=.1, top=.1, right=.3, bottom=.3)}])
         candidate = {'candidate_path': 'image.png', 'candidate_sha256': 'c'*64}
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
+            for reference in task['generation_references']:
+                path = job / reference['path']
+                path.write_bytes(reference['source_id'].encode())
+                reference['sha256'] = file_sha256(path)
             with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)):
-                with self.assertRaisesRegex(ValueError, 'different view attachment'):
+                with self.assertRaisesRegex(ValueError, 'different source attachment'):
                     observe_candidate(job, task, candidate)
-            response['measurements'][0]['attachment_index'] = 4
+            response['measurements'][0]['attachment_index'] = 3
             with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)) as request:
                 observe_candidate(job, task, candidate)
                 context = json.loads(request.call_args.args[0].split('INPUT CONTEXT:\n')[1].split('\nOUTPUT OBJECT')[0])
                 binding = context['measurement_sources'][0]
-                self.assertEqual(4, binding['attachment_index'])
-                self.assertAlmostEqual(.125, binding['source_region']['left'])
-                self.assertEqual(2, context['required_views'][0]['attachment_index'])
+                self.assertEqual(3, binding['attachment_index'])
+                self.assertNotIn('source_region', binding)
+                self.assertEqual('size', context['required_targets'][0]['target_id'])
                 self.assertNotIn('source_text', binding)
             path = next((job / 'reports/candidate_observations').glob('*.json'))
             corrupted = json.loads(path.read_text(encoding='utf-8'))
-            corrupted['measurements'][0]['attachment_index'] = 3
+            corrupted['measurements'][0]['attachment_index'] = 2
             path.write_text(json.dumps(corrupted), encoding='utf-8')
             with patch('core.visual_semantics.gemini_stream_generate') as remote:
-                with self.assertRaisesRegex(ValueError, 'different view attachment'):
+                with self.assertRaisesRegex(ValueError, 'different source attachment'):
                     observe_candidate(job, task, candidate)
                 remote.assert_not_called()
 
@@ -172,8 +177,8 @@ class UsMeasurementContractTests(unittest.TestCase):
     def test_unsupported_included_accessory_is_isolated_to_affected_source(self):
         from core.visual_semantics import _validate_observations
         row = {'source_id': 'a', 'role_guess': 'scene', 'evidence_gaps': [], 'text_gaps': [],
-               'reference_views': [{'view_id': 'view_01', 'purposes': ['appearance']}], 'has_dimension_lines': False, 'has_callouts_or_panels': False,
-               'physical_views': [current_physical_view(region=[.1, .1, .9, .9], object_id='drawer')],
+               'reference_purposes': ['appearance'], 'has_dimension_lines': False, 'has_callouts_or_panels': False,
+               'product_features': [current_product_feature(object_id='drawer')], 'product_extent': 'whole_view',
                'confidence': .9, 'visible_numbers_or_units': [], 'evidence': [], 'text_observations': [], 'measurements': [],
                'variant_identity': {'status': 'unknown', 'observed_color': '', 'reason': 'Occluded', 'conflicts': []},
                'objects': [{'object_id': 'drawer', 'kind': 'drawer', 'state': 'open', 'visibility': 'visible',
@@ -182,7 +187,7 @@ class UsMeasurementContractTests(unittest.TestCase):
         other['source_id'], other['objects'][0]['sale_membership'] = 'b', 'included_accessory'
         other['objects'][0]['membership_evidence'] = []
         clear['source_id'], clear['objects'][0]['object_id'] = 'c', 'frame'
-        clear['physical_views'][0]['evidence'][0]['object_id'] = 'frame'
+        clear['product_features'][0]['object_id'] = 'frame'
         rows = _validate_observations([row, other, clear], ['a', 'b', 'c'], {'product.specs.drawers': '2 drawers'})
         self.assertEqual('success', rows['a']['status'])
         self.assertEqual('failed', rows['b']['status'])

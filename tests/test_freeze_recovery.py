@@ -23,6 +23,57 @@ from tests.test_status_revision_contract import _job
 
 
 class FreezeRecoveryTests(unittest.TestCase):
+    def _check_receipt_resolution_and_submission_boundary(self):
+        from core.image_response import (begin_response, recover_response, resolve_response,
+            response_binding, response_directory, response_resolved, save_response)
+        from core.image_provider_routing import _provider_worker
+        from queue import Queue
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            task = dict(job_dir=tmp, logical_task_id='generate:B1:func', task_fingerprint='fixed',
+                        candidate_revision=1, prompt='fixed prompt', generation_references=[])
+            directory = response_directory(task)
+            audit = {'response_binding': response_binding(task)}
+            receipt = begin_response(directory, provider='cxk_fixed', audit=audit)
+            image = job / 'source.png'
+            image.write_bytes(b'fixture')
+            def prep_failure(**kwargs):
+                self.assertEqual('prepared', read_json(receipt)['status'])
+                raise MemoryError('local encoding')
+            with patch('core.image_provider_routing.generate_with_registry_image_provider', side_effect=prep_failure):
+                _provider_worker('cxk_fixed', [str(image)], 'p', None, 'r', str(receipt), Queue())
+            self.assertEqual('known_failure', read_json(receipt)['status'])
+            receipt = begin_response(directory, provider='cxk_fixed', audit=audit)
+            def submitted_failure(**kwargs):
+                kwargs['request_observer'](audit)
+                self.assertEqual('submitted', read_json(receipt)['status'])
+                raise ProviderTransportError('cxk_fixed', 'Remote outcome unknown', ambiguous=True)
+            with patch('core.image_provider_routing.generate_with_registry_image_provider', side_effect=submitted_failure):
+                _provider_worker('cxk_fixed', [str(image)], 'p', None, 'r', str(receipt), Queue())
+            with self.assertRaises(ProviderTransportError):
+                recover_response(task)
+            outcome = resolve_response(job, str(receipt), action='approve_one_resend', reason='Explicit test authorization')
+            self.assertEqual(0, outcome['requests_sent'])
+            self.assertTrue(response_resolved(task))
+            self.assertEqual({}, recover_response(task))
+            replacement = begin_response(directory, provider='cxk_fixed', audit=audit)
+            self.assertEqual(replacement.name, read_json(receipt)['replacement_receipt'])
+            write_json(replacement, {**read_json(replacement), 'status': 'submitted'})
+            with self.assertRaisesRegex(ValueError, 'One unknown-result replacement'):
+                resolve_response(job, str(replacement), action='approve_one_resend', reason='No unbounded resend')
+            with self.assertRaises(ProviderTransportError):
+                recover_response(task)
+            resolve_response(job, str(replacement), action='confirmed_not_generated', reason='Provider confirmed no image created')
+            self.assertEqual({}, recover_response(task))
+            paid = begin_response(directory, provider='cxk_fixed', audit=audit)
+            save_response(paid, b'saved remote image', audit)
+            with self.assertRaisesRegex(ValueError, 'saved responses'):
+                resolve_response(job, str(paid), action='approve_one_resend', reason='Must reuse')
+            self.assertEqual(str(paid), recover_response(task)['receipt_path'])
+            from core.image_provider_common import CandidateCommitError
+            with self.assertRaises(CandidateCommitError):
+                begin_response(directory, provider='cxk_fixed', audit=audit)
+
     def tearDown(self):
         from core.model_call_health import reset_provider_run_circuits
         reset_provider_run_circuits()
@@ -91,6 +142,7 @@ class FreezeRecoveryTests(unittest.TestCase):
                         self.assertTrue(all(call.kwargs["total_timeout_seconds"] == min(420, remaining) for call in transport.call_args_list))
 
     def test_unknown_state_roundtrip_and_controller_exception_cleanup(self):
+        self._check_receipt_resolution_and_submission_boundary()
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
             _job(job)

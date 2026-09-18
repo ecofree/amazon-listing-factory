@@ -93,13 +93,11 @@ class GenerationStateContractTests(unittest.TestCase):
             source.write_bytes(b"immutable source")
             source_sha = file_sha256(source)
             edit_view = job / 'images/view.png'
-            edit_view.write_bytes(b'immutable cropped view')
+            edit_view.write_bytes(source.read_bytes())
             edit_sha = file_sha256(edit_view)
             refs = [{"kind": "edit_base", "child": "B1", "source_id": "source_00",
                      "path": "images/view.png", "sha256": edit_sha, "purpose": "Edit reference", "evidence_ids": [],
-                     "view_id": "view_01", "extent": "whole_view", "original_region": dict(left=0, top=0, right=1, bottom=1),
-                     "visible_evidence": [{'physical_facts': ['Two doors']}],
-                     "original_path": "images/source.png", "original_sha256": source_sha}]
+                     "extent": "whole_view", "visible_evidence": [{'physical_facts': ['Two doors']}]}]
             mask = job / 'images/mask.png'
             mask.write_bytes(b'immutable mask')
             refs[0]['protected_mask'] = dict(path='images/mask.png', sha256=file_sha256(mask))
@@ -153,8 +151,6 @@ class GenerationStateContractTests(unittest.TestCase):
                 for ref in moved['generation_references']:
                     ref['path'] = 'images/current-view.png'
                     ref['approved_at'] = 'new approval audit date'
-                    if ref.get('original_path'):
-                        ref['original_path'] = moved['source_path']
                 moved['generation_references'][0]['protected_mask']['path'] = 'images/current-mask.png'
                 before = manifest_path.read_bytes()
                 self.assertEqual(candidate_sha, current_candidate(job, moved)['candidate_sha256'])
@@ -162,7 +158,7 @@ class GenerationStateContractTests(unittest.TestCase):
                 altered = job / 'images/altered.png'
                 altered.write_bytes(b'different input bytes')
                 semantic_changes = []
-                for change in ('pixels', 'facts', 'crop', 'mask'):
+                for change in ('pixels', 'facts', 'mask'):
                     changed = deepcopy(moved)
                     ref = changed['generation_references'][0]
                     if change == 'pixels':
@@ -170,8 +166,6 @@ class GenerationStateContractTests(unittest.TestCase):
                         changed['edit_base_sha256'] = ref['sha256']
                     elif change == 'facts':
                         ref['visible_evidence'][0]['physical_facts'] = ['Three doors']
-                    elif change == 'crop':
-                        ref['original_region']['left'] = .1
                     else:
                         ref['protected_mask'] = dict(path='images/altered.png', sha256=file_sha256(altered))
                     semantic_changes.append(changed)

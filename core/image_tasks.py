@@ -5,8 +5,9 @@ from typing import Any
 
 from .final_source_intents import planning_source_intents, selected_task_source_intents
 from .image_prompt_compiler import PROMPT_CONTRACT_VERSION, compile_task_prompt
-from .image_reference_context import validate_reference_set, resolve_edit_references, evidence_view_catalog, view_identity, reference_semantics
+from .image_reference_context import validate_reference_set, resolve_edit_references, reference_semantics
 from .image_task_inputs import (
+    measurement_authority,
     build_display_copy_contract,
     build_renderable_text_contract,
     execution_profile,
@@ -19,13 +20,12 @@ from .product_family import read_product_family
 from .required_role_policy import compiled_image_policy, required_role_policy
 from .run_scope import read_run_scope
 from .status import input_revision_id, logical_task_id
-from .text_evidence import us_measurement_text
 from .visual_design_kit import read_visual_design_kits, visual_design_kit_row_current
 
 
-IMAGE_TASK_SCHEMA_VERSION = "image-task-v12"
-IMAGE_TASK_POLICY_VERSION = "output-evidence-child-direction-v42-recoverable-facts"
-IMAGE_TASK_ARTIFACT = "image_tasks_v12.jsonl"
+IMAGE_TASK_SCHEMA_VERSION = "image-task-v13"
+IMAGE_TASK_POLICY_VERSION = "output-evidence-child-direction-v44-original-sources"
+IMAGE_TASK_ARTIFACT = "image_tasks_v13.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
 _TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
 _TASK_BLOCKED_FIELDS = _TASK_BASE_FIELDS | {"formation_reason_code", "formation_failure_owner"}
@@ -231,7 +231,7 @@ def _expected_rows(job: Path, plugin: ProductPlugin, *, include_optional: bool =
             # ImageTask for every expected role.
             continue
         specs = task_specs(
-            children[asin], sources_by_child.get(asin, []), include_optional=include_optional,
+            children[asin], sources_by_child.get(asin, []), inventory=design_kit['output_inventory'], include_optional=include_optional,
         )
         for spec in specs:
             rows.append(_form_task(
@@ -285,9 +285,7 @@ def _form_task(
                         failure_owner=image_brief.get('failure_owner', 'brief'))
     try:
         image_direction = image_brief["image_direction"]
-        catalog = evidence_view_catalog(design_kit['source_references'])
-        selected = [catalog[view_identity(row)] for row in image_direction['evidence_usage'] if row['usage'] != 'verification']
-        measurement = _measurement_authority(family, source, selected)
+        measurement = measurement_authority(family, image_direction, design_kit['source_references'])
         story = (
             build_display_copy_contract(
                 design_kit['source_references'],
@@ -352,42 +350,6 @@ def _image_brief(
     raise ImageTaskError("source brief is missing or duplicated")
 
 
-def _measurement_authority(family: str, source: dict[str, Any], selected: list[tuple[dict, dict]]) -> dict[str, Any]:
-    inputs = [(owner, row) for owner, view in selected for row in owner.get('measurements', []) if row['view_id'] == view['view_id']]
-    has_func_measurement = family == "func" and bool(inputs or (source.get("visual_evidence") or {}).get("has_dimension_lines"))
-    if family != "size" and not has_func_measurement:
-        return {"mode": "none", "render_text": [], "measurement_groups": []}
-    if source.get("role") == "size" or has_func_measurement:
-        if source.get('measurements') and not inputs:
-            raise ImageTaskError('The selected views omit the required measured product; repair the size/function brief')
-        measurements = [
-            {
-                "id": owner['source_id'] + ':' + row['source_occurrence'],
-                "source_id": owner['source_id'],
-                "source_text": str(row.get("text") or "").strip(),
-                "measured_part": row['source_label'],
-                "axis": row['axis_hint'],
-                **{key: row[key] for key in ('view_id', 'source_region', 'source_endpoints', 'evidence_type')},
-                "kind": "measurement",
-                "canonical_value": str(row.get("canonical_pair") or ""),
-                "render_text": us_measurement_text(row.get("text"), upper_bound="capacity" in str(row.get("source_label") or "").lower()),
-                "confidence": str(row.get("confidence") or "source_visible"),
-                "measurement_role": 'load_capacity' if row['measurement_kind'] == 'capacity' else row['measurement_kind'],
-            }
-            for owner, row in inputs
-            if isinstance(row, dict) and str(row.get("text") or "").strip()
-        ]
-        return {
-            "mode": "source_image", "source_sha256": str(source.get("source_sha256") or ""),
-            "source_intent_revision_id": str(source.get("input_revision_id") or ""),
-            "render_text": list(dict.fromkeys(row["render_text"] for row in measurements)),
-            "measurement_groups": measurements,
-            "ocr_role": "definite_error_warning_only",
-            "relationship_policy": "Preserve physical quantities, measured parts, endpoints and product-instance associations; display the authorized US-unit labels.",
-        }
-    raise ImageTaskError("Size task requires one source image classified as size")
-
-
 def _edit_contract(
     family: str, measurement: dict[str, Any], policy: dict[str, Any],
     *, reference_completeness: str = "",
@@ -398,7 +360,7 @@ def _edit_contract(
         "func": "Create one square Amazon US function image.",
         "size": "Create one square Amazon US size image.",
     }[family]
-    reference = "Each product view binds its own physical evidence; the first is only the transport edit base."
+    reference = "Product attachments supply same-child evidence; the first is the transport edit base, not a layout template."
     preserve = [
         "Sold-product geometry, proportions, finish and parts, using this child's evidenced structures and operating states",
     ]

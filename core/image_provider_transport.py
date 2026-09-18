@@ -116,7 +116,7 @@ def generate_with_registry_image_provider(
                         "sent_bytes": len(data), "transform": "unchanged" if original == hashlib.sha256(data).hexdigest() else "bounded_image_encoding"}
                        for original, data in zip(originals, image_inputs)],
         })
-    if request_observer is not None:
+    if request_observer is not None and (not spec or spec.api_type != 'openai_images_edit'):
         request_observer(dict(request_audit or {}))
     if spec and spec.api_type == "openai_images_edit":
         return _generate_with_openai_images_edit(
@@ -126,6 +126,7 @@ def generate_with_registry_image_provider(
             mask_bytes=mask_bytes,
             request_audit=request_audit,
             transport_observer=transport_observer,
+            request_observer=request_observer,
         )
     if spec and spec.api_type == "openai_chat_completions_image":
         if mask_bytes is not None:
@@ -158,6 +159,7 @@ def _generate_with_openai_images_edit(
     *, provider_name: str, image_inputs: list[bytes], prompt: str, mask_bytes: bytes | None,
     request_audit: dict[str, Any] | None = None,
     transport_observer: Any | None = None,
+    request_observer: Any | None = None,
 ) -> bytes:
     spec = _image_provider_spec(provider_name)
     if spec is None or spec.api_type != "openai_images_edit":
@@ -189,6 +191,8 @@ def _generate_with_openai_images_edit(
             "User-Agent": "Mozilla/5.0",
         },
     )
+    if request_observer is not None:
+        request_observer(dict(request_audit or {}))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if request_audit is not None:
@@ -206,6 +210,11 @@ def _generate_with_openai_images_edit(
             if transport_observer:
                 transport_observer('body', raw, request_audit or {})
     except urllib.error.HTTPError as exc:
+        if request_audit is not None:
+            request_audit['remote_request_id'] = str(exc.headers.get('x-request-id') or '')[:200] if exc.headers else ''
+            request_audit['http_status'] = exc.code
+        if transport_observer:
+            transport_observer('headers', b'', request_audit or {})
         try:
             excerpt = exc.read(800).decode("utf-8", errors="replace")
         except Exception as body_error:

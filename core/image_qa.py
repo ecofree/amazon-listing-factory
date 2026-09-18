@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from .visual_semantics import observe_candidate, candidate_view_targets
+from .visual_semantics import observe_candidate, candidate_product_targets
 from .candidate_state import CandidateStateError, current_candidate
 from .image_pixel_evidence import inspect_image_pixel_evidence
 from .image_provider_common import ProviderQueueUnavailable
@@ -33,7 +33,7 @@ from .image_task_inputs import release_candidate_fingerprint
 from .image_tasks import read_image_tasks
 from .run_scope import scoped_child_set
 from .status import input_revision_id, logical_task_id
-from .text_evidence import extract_measurements, normalize_text, measurement_values_match, measurement_qualifiers, numeric_signature
+from .text_evidence import extract_measurements, measurement_values_match, measurement_qualifiers, numeric_signature
 
 
 def run_image_qa(
@@ -260,10 +260,10 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
         dimension_gate = _gate("dimension_accuracy", "pass", "Observed measurement relationships match" if dimensions else "No measurement diagram; func numeric claims remain checked as exact authored copy")
 
     product = observation["product_comparisons"]
-    expected = {(row['source_id'], row['view_id']) for row in candidate_view_targets(task)}
-    observed = [(row['source_id'], row['view_id']) for row in product]
+    expected = {row['target_id'] for row in candidate_product_targets(task)}
+    observed = [row['target_id'] for row in product]
     complete = (bool(expected) and expected.issubset(observed) and len(observed) == len(set(observed))
-                and all(pair in expected or pair[1].startswith('extra:') for pair in observed)
+                and all(pair in expected or pair.startswith('extra:') for pair in observed)
                 and observation.get('product_coverage') == 'complete')
     status = ('fail' if any(row['status'] == 'contradiction' and row['confidence'] >= .9 for row in product)
               else 'pass' if complete and all(row['status'] == 'consistent' and row['confidence'] >= .9 for row in product)

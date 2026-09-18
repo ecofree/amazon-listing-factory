@@ -14,7 +14,7 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v27-located-specifications"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v29-original-evidence"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
 SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant", "reobserve"})
@@ -52,7 +52,8 @@ def build_final_source_intents(*, job_dir: str | Path, plugin: ProductPlugin, wo
         visual = row.get('visual_evidence') or {}
         if (finding and finding['source_sha256'] == row['source_sha256']
                 and finding['source_revision'] == row['input_revision_id']
-                and (visual.get('planning_correction') != finding or visual.get('status') != 'success')):
+                and (visual.get('planning_correction') != finding or visual.get('status') != 'success'
+                     or any(item.get('operation') == 'source_text:' + source_id for item in finding.get('findings', [])))):
             correction_inputs.setdefault(child, {})[source_id] = finding
     if observation_corrections is not None:
         downloads = [row for row in downloads if row['child'] in correction_inputs]
@@ -427,9 +428,6 @@ def _finalize_child(prepared_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
         and isinstance(row.get("source_review"), dict)
         and row["source_review"].get("role") == "size"
     ]
-    if len(reviewed_sizes) > 1:
-        child = str(reviewed_sizes[0].get("download", {}).get("child") or "")
-        raise FinalSourceIntentError(f"Source review assigns more than one size image for {child}")
     candidates = [
         row for row in prepared_rows
         if row.get("size_candidate")
@@ -442,9 +440,8 @@ def _finalize_child(prepared_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     reliable = [row for row in prepared_rows if not row.get('final_row') and not row.get('identity_issue')
                 and row.get('visual_evidence', {}).get('status') == 'success'
                 and (row.get('source_review') or {}).get('role') != 'excluded_wrong_variant'
-                and any(view.get('extent') == 'whole_view' and view['view_id'] in {
-                    ref['view_id'] for ref in row['visual_evidence'].get('reference_views', []) if 'appearance' in ref['purposes']}
-                    for view in row['visual_evidence'].get('physical_views', []))]
+                and row['visual_evidence'].get('product_extent') == 'whole_view'
+                and 'appearance' in row['visual_evidence'].get('reference_purposes', [])]
     primary = next((row for row in reliable if row['source_index'] == 0 and row is not size_winner
                     and not row.get('source_review') and _non_size_role(row) == 'scene'), None)
     if primary is None:
@@ -474,8 +471,8 @@ def _non_size_role(prepared: dict[str, Any]) -> str:
     signals = prepared["signals"]
     visual = prepared["visual_evidence"]
     visual_role = str(visual.get("role_guess") or "unknown")
-    if visual_role == 'size' and prepared.get('measurements') and signals['has_authored_function_text']:
-        return 'func'
+    if visual_role == 'size' and prepared.get('measurements'):
+        return 'func' if signals['has_authored_function_text'] else 'size'
     if visual_role == 'reference_only':
         return ('review_required' if visual.get('text_gaps') or visual.get('has_dimension_lines')
                 or signals['has_authored_information'] else 'reference_only')
@@ -492,7 +489,7 @@ def _build_final_row(
     signals = dict(prepared["signals"])
     signals["reference_completeness"] = _reference_completeness(role, signals)
     flags = _evidence_flags(signals)
-    claims = _bound_claims(prepared) if role in {"func", "review_required"} else []
+    claims = _bound_claims(prepared) if role in {"func", "size", "review_required"} else []
     measurements = list(prepared["measurements"])
     warnings = _warnings(prepared, role, additional_size=additional_size)
     row = {
@@ -605,7 +602,7 @@ def _signals(source_index: int, evidence: dict[str, Any], measurements: list[dic
         "has_authored_function_text": authored_function,
         "has_authored_information": authored_info,
         "has_untrusted_ocr_text": untrusted_ocr_text,
-        "has_alternate_product_view": any(view['extent'] == 'whole_view' for view in visual.get('physical_views', [])),
+        "has_alternate_product_view": visual.get('product_extent') == 'whole_view',
         "visual_role_guess": str(visual.get("role_guess") or "unknown"),
         "visual_confidence": float(visual.get("confidence") or 0.0),
     }
@@ -625,8 +622,7 @@ def _observed_measurements(visual: dict[str, Any]) -> list[dict[str, Any]]:
              'canonical_pair': ';'.join(item['canonical_pair'] for item in extract_measurements(row['text'])),
              'source_label': row['object'],
              'source_occurrence': row['measurement_id'], 'axis_hint': row['axis'],
-             'source_region': row['region'], 'source_endpoints': row['endpoints'],
-             'measurement_kind': row['kind'], 'evidence_type': row['evidence_type'], 'view_id': row['view_id']}
+             'measurement_kind': row['kind'], 'evidence_type': row['evidence_type']}
             for row in visual['measurements']]
 
 
@@ -644,7 +640,7 @@ def _measurement_rows(values: list[dict[str, Any]], child: dict[str, Any]) -> li
                 "source_occurrence": str(value.get("source_occurrence") or ""),
                 "axis_hint": str(value.get("axis_hint") or ""),
                 "confidence": "confirmed" if pair and pair in spec_pairs else "source_visible",
-                **{key: value[key] for key in ('source_region', 'source_endpoints', 'measurement_kind', 'evidence_type', 'view_id')},
+                **{key: value[key] for key in ('measurement_kind', 'evidence_type')},
             }
         )
     return rows
@@ -683,7 +679,7 @@ def _classification_reason(role: str, signals: dict[str, Any], *, additional_siz
         return "reliable complete product view assigned to the main output slot"
     reasons: list[str] = []
     if role == "size":
-        reasons.append("won the child-level size authority ranking")
+        reasons.append("observed measurement evidence for the child's single size output contract")
     if signals.get("has_textual_dimension_layout"):
         reasons.append("multiple independent measurements with authored dimension layout")
     if signals.get("has_visual_dimension_layout"):
@@ -697,8 +693,7 @@ def _classification_reason(role: str, signals: dict[str, Any], *, additional_siz
     if signals.get("has_alternate_product_view") and not signals.get("has_authored_information"):
         reasons.append("non-primary product view is preserved as scene usage")
     if additional_size:
-        reasons.append("secondary measurement view; observed functional facts support func usage" if role == 'func'
-                       else "not the strongest size source; non-size purpose remains unresolved")
+        reasons.append("complementary measurement source; preserve its objects, values and qualifiers")
     if role == "review_required":
         reasons.append("available evidence cannot determine scene versus func without guessing")
     return f"final={role}; " + "; ".join(reasons or ["deterministic source-purpose rule"])
@@ -738,7 +733,7 @@ def _semantic_revision(row: dict[str, Any]) -> str:
     return input_revision_id(payload)
 def _visual_semantics(value: Any) -> dict[str, Any]:
     row = value if isinstance(value, dict) else {}
-    keys = ("status", "role_guess", "objects", "physical_views", "reference_views", "evidence_gaps", "text_gaps",
+    keys = ("status", "role_guess", "objects", "product_features", "product_extent", "reference_purposes", "evidence_gaps", "text_gaps",
             "text_observations", "measurement_issues", "variant_identity", "child_facts_revision_id", "policy_version")
     return {key: row.get(key) for key in keys if key in row}
 def _failure_row(plugin: ProductPlugin, download: dict[str, Any], exc: Exception) -> dict[str, Any]:
