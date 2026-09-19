@@ -227,6 +227,37 @@ class QaLiteV1Tests(unittest.TestCase):
         observed["measurements"][0]["candidate_text"] = '16"'
         self.assertEqual("fail", image_qa._semantic_gates(mixed, observed)[1]["status"])
 
+        from copy import deepcopy
+        from core.visual_semantics import _validate_candidate_bindings
+        bound_task = _task('size', 'source_image')
+        group = dict(id='source_00:width', source_id='source_00', attachment_index=2,
+                     evidence_type='dimension_line', render_text='36 in')
+        bound_task['measurement_authority']['measurement_groups'] = [group]
+        attachments = [dict(source_id='source_00', attachment_index=2)]
+        points = [dict(x=.1, y=.2), dict(x=.8, y=.2)]
+        for kind, source_points, candidate_points, relationship, expected in (
+            ('dimension_line', None, None, 'same', 'inconclusive'),
+            ('dimension_line', points, None, 'same', 'inconclusive'),
+            ('dimension_line', None, points, 'same', 'inconclusive'),
+            ('dimension_line', points, points, 'same', 'pass'),
+            ('dimension_line', points, points, 'different', 'fail'),
+            ('dimension_line', points, [dict(x=-1, y=0), dict(x=1, y=1)], 'same', 'inconclusive'),
+            ('text_spec', None, None, 'same', 'pass'),
+        ):
+            with self.subTest(kind=kind, endpoints=(source_points, candidate_points), relationship=relationship):
+                bound_task['measurement_authority']['measurement_groups'][0]['evidence_type'] = kind
+                obs = _observed(bound_task)
+                obs.update(measurement_coverage='complete', measurements=[{
+                    **measurement, 'measurement_id': group['id'], 'source_id': 'source_00', 'attachment_index': 2,
+                    'relationship': relationship, 'confidence': .99, 'source_endpoints': deepcopy(source_points),
+                    'candidate_endpoints': deepcopy(candidate_points),
+                }])
+                _validate_candidate_bindings(obs, attachments, candidate_product_targets(bound_task), [group], {})
+                self.assertEqual(expected, image_qa._semantic_gates(bound_task, obs)[1]['status'])
+        obs['measurements'][0]['attachment_index'] = 3
+        with self.assertRaisesRegex(ValueError, 'different source attachment'):
+            _validate_candidate_bindings(obs, attachments, candidate_product_targets(bound_task), [group], {})
+
     def test_obvious_nonwhite_main_is_a_hard_fact_failure(self) -> None:
         plugin = type("Plugin", (), {"category_id": "medicine_cabinet", "merged_config": lambda _self: {"image_generation": {"main_image_policy": "white_background"}}})()
         with patch.object(image_qa, "inspect_image_pixel_evidence", return_value={"white_background": False}):

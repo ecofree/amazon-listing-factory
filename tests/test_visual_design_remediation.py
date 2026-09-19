@@ -132,6 +132,25 @@ class VisualDesignRemediationTests(unittest.TestCase):
                     source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=unavailable)
             self.assertEqual('ready', _role_brief(recovered, 'func')['status'])
             unnecessary.assert_not_called()
+        from core.vision_errors import VisionRequestError
+        for busy_primary, expected_calls in ((True, 2), (False, 1)):
+            failure = VisionRequestError('visual_planning', 'auth_failure', 'backup quota exhausted', metadata={
+                'physical_request_count': 1, 'response_candidate_count': 0,
+                'attempts': ([{'status': 'queue_unavailable'}] if busy_primary else []) + [{'status': 'auth_failure'}]})
+            def resume_primary(requests, **kwargs):
+                kwargs['attempt_observer']({'event': 'request_budget', 'physical_request_count': 1})
+                if reviewer.call_count == 1:
+                    raise failure
+                return supported_review_results(requests)
+            with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=resume_primary) as reviewer, patch(
+                    'core.visual_design_kit.gemini_stream_generate') as unnecessary:
+                recovered = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1',
+                    source_manifest=[source], category_id='bed_frame', source_paths=[], source_originals=[], trace_dir=Path(tmp),
+                    deadline_monotonic=time.monotonic()+10, cached=None)
+                self.assertEqual(expected_calls, reviewer.call_count)
+                self.assertEqual('ready' if busy_primary else 'pending', _role_brief(recovered, 'func')['status'])
+                self.assertEqual(expected_calls, json.loads((Path(tmp)/'attempt_budget.json').read_text())['review'])
+                unnecessary.assert_not_called()
         draft['display_copy']['labels'][0]['text'] = 'Drawers on wheels'
         from core.visual_semantics import candidate_product_targets
         self.assertEqual([{'target_id': 'func', **draft['image_direction']['presentation']}], candidate_product_targets(draft))
@@ -318,7 +337,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
         result = _compile_display_copy([source], {"title": None, "labels": [
             {"text": "Pathway", "evidence_ids": ["0"]}, {"text": "Wedding", "evidence_ids": ["1"]}]})
         self.assertEqual(["Pathway", "Wedding"], result["labels"])
-        from core.visual_design_kit_compiler import claim_review_requests
+        from core.visual_design_kit_compiler import claim_review_requests, compile_visual_design_kit_response
         from core.visual_semantics import CLAIM_REVIEW_POLICY
         physical_id = 'physical:source_00:frame_support:0'
         copy = {'title': None, 'labels': [{'text': 'Visible frame support and its joints', 'evidence_ids': [physical_id]}]}
@@ -358,6 +377,27 @@ class VisualDesignRemediationTests(unittest.TestCase):
             build_display_copy_contract(sources, dict(source_id='source_00', display_copy_contract=stale_contract))
         stale['labels'][0]['text'] = 'recommended mattress thickness'
         self.assertEqual(['recommended mattress thickness'], _compile_display_copy(sources, stale)['labels'])
+        product_claims = [dict(type='source_product_statement', evidence_id='bullet',
+                              text='Built to Last: Crafted from solid wood for long-term durability.'),
+                          dict(type='source_product_statement', evidence_id='capacity', text='Up to 400 lbs: With evenly distributed load.')]
+        for text, evidence_id in (('Dimensions', 'measurement:source_00:0'), ('Built to Last', 'bullet')):
+            title = dict(text=text, evidence_ids=[evidence_id])
+            story = dict(title=title, labels=[])
+            self.assertEqual([], claim_review_requests({'image_briefs': [dict(role='size', source_id='source_00', display_copy=story)]}, sources, product_claims))
+            self.assertEqual(text, _compile_display_copy(sources, story, product_claims=product_claims)['title'])
+            raw = dict(family_art_direction=current_art_direction(), image_briefs=[dict(
+                role='func', source_id='source_00', image_direction=current_image_direction(), display_copy=story)])
+            compiled = compile_visual_design_kit_response(raw, source_manifest=[source], output_inventory=initial_output_inventory([source]),
+                product_claims=product_claims, claim_reviews=supported_design_reviews(raw, [source]))
+            self.assertEqual('ready', _role_brief(compiled, 'func')['status'])
+        for text, evidence_id in (('Accurate Dimensions', 'measurement:source_00:0'), ('Built to Last', physical_id),
+                                 ('Last', 'bullet'), ('400 lbs', 'capacity')):
+            story = dict(title=dict(text=text, evidence_ids=[evidence_id]), labels=[])
+            self.assertEqual(1, len(claim_review_requests({'image_briefs': [dict(role='func', source_id='source_00', display_copy=story)]}, sources, product_claims)))
+            with self.assertRaisesRegex(ValueError, 'independent evidence review'):
+                _compile_display_copy(sources, story, product_claims=product_claims)
+        with self.assertRaisesRegex(ValueError, 'independent evidence review'):
+            _compile_display_copy(sources, dict(title=None, labels=[dict(text='Dimensions', evidence_ids=['measurement:source_00:0'])]))
         import time
         from core.visual_semantics import review_planning_bindings
         from tests.current_image_contract_fixture import current_art_direction

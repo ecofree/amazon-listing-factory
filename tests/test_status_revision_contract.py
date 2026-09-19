@@ -172,13 +172,40 @@ class StatusRevisionContractTests(unittest.TestCase):
             record_progress(job, "stage_started", stage="generate")
             record_progress(job, "stage_finished", stage="generate", seconds=12.5)
             record_progress(job, "image_provider_transport_attempt_started")
+            record_progress(job, "image_task_capacity_requeued")
             record_progress(job, "generate_candidate_committed")
             plugin = type("Plugin", (), {"category_id": "test"})()
             request = production.JobRunRequest(job_dir=job, plugin=plugin)
             with patch.object(production, 'load_status', return_value={'stages': {'fetch': {'status': 'success'}}, 'tasks': {}}):
-                fetched = production._write_summary(request, status='partial_success', timings={}, started=time.monotonic(), release={})
+                fetched = production._write_summary(request, status='success', timings={'fetch': 1.0}, started=time.monotonic(), release={})
             self.assertEqual('selected_stages_completed_downstream_not_requested', fetched['workflow_reason'])
             self.assertEqual(0, fetched['active_task_failure_count'])
+            selected = ('fetch', 'download', 'classify', 'brief', 'generate')
+            scope_state = {'stages': {name: {'status': 'success'} for name in (*selected, 'copy', 'qa')}, 'tasks': {}}
+            scope_release = {'status': 'failed', 'rows': [{'candidate_sha256': 'a'*64, 'automatic_decision': 'not_run'}]}
+            with patch.object(production, 'load_status', return_value=scope_state):
+                completed = production._write_summary(request, status='success', timings=dict.fromkeys(selected, 1.0),
+                    started=time.monotonic(), release=scope_release)
+                self.assertEqual('success', completed['workflow_status'])
+                self.assertEqual('generate', completed['completed_through_stage'])
+                self.assertEqual('failed', completed['release_status'])
+                self.assertEqual({'not_run': 1}, completed['qa_decision_counts'])
+                self.assertEqual('selected_stages_completed_downstream_not_requested', completed['workflow_reason'])
+                fetch_only = production._write_summary(request, status='success', timings={'fetch': 1.0},
+                    started=time.monotonic(), release=scope_release)
+                self.assertEqual('fetch', fetch_only['completed_through_stage'])
+                scope_state['stages']['brief']['status'] = 'partial_success'
+                scope_state['tasks']['brief:B1:size'] = {'status': 'retryable'}
+                scope_release['rows'].append({'candidate_sha256': '', 'final_decision': 'blocked_task'})
+                coverage = {**production._source_scope_counts(request), 'source_unresolved_count': 1}
+                with patch.object(production, '_source_scope_counts', return_value=coverage):
+                    partial = production._write_summary(request, status='success', timings=dict.fromkeys(selected, 1.0),
+                        started=time.monotonic(), release=scope_release)
+                self.assertEqual('partial_success', partial['workflow_status'])
+                self.assertEqual('classify', partial['completed_through_stage'])
+                self.assertEqual(1, partial['planned_image_unresolved_count'])
+                self.assertEqual(1, partial['source_unresolved_count'])
+                self.assertEqual(1, partial['active_task_failure_count'])
             summary = production._write_summary(
                 request,
                 status="partial_success",
@@ -203,6 +230,7 @@ class StatusRevisionContractTests(unittest.TestCase):
             self.assertEqual({"generate": 1}, summary["stage_attempt_counts"])
             self.assertEqual({"generate": 12.5}, summary["cumulative_stage_seconds"])
             self.assertEqual(1, summary["image_provider_request_count"])
+            self.assertEqual(1, summary["image_capacity_requeue_count"])
             self.assertEqual(1, summary["candidate_commit_count"])
             review_summary = production._write_summary(
                 request,

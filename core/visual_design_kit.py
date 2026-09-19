@@ -500,6 +500,12 @@ def _finish_image_briefs(
                 transient = not isinstance(exc, VisionRequestError) or exc.failure_kind in {
                     'timeout_failure', 'transport_failure', 'server_failure', 'queue_unavailable',
                     'rate_limit_failure', 'output_limit', 'json_syntax'}
+                # A terminal backup failure does not settle a primary that
+                # was only locally busy. Reuse this bounded review loop;
+                # the failed route is already excluded by its run circuit.
+                if isinstance(exc, VisionRequestError) and not exc.metadata.get('response_candidate_count'):
+                    transient = transient or any(row.get('status') == 'queue_unavailable'
+                                                for row in exc.metadata.get('attempts', []))
                 if not transient or review_attempt == 1 or time.monotonic() >= deadline_monotonic:
                     break
                 time.sleep(min(.25, max(0, deadline_monotonic - time.monotonic())))

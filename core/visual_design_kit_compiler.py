@@ -270,13 +270,13 @@ def claim_review_requests(raw: Any, source_manifest: list[dict[str, Any]], produ
         if not isinstance(story, dict):
             continue
         labels = story.get("labels") if isinstance(story.get("labels"), list) else []
-        for value in [story.get("title"), *labels]:
+        for index, value in enumerate([story.get("title"), *labels]):
             try:
                 bound = _copy_binding(value, available)
             except VisualDesignKitCompileError:
                 continue
             evidence = {key: available[key] for key in bound["evidence_ids"]}
-            if not any(key.startswith('physical:') for key in evidence) and bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
+            if not _copy_needs_review(bound, evidence, is_title=index == 0, product_claims=product_claims):
                 continue
             key = claim_key(bound["text"], evidence)
             requests[key] = {"kind": "product_claim", "key": key, "source_id": source['source_id'],
@@ -470,7 +470,8 @@ def _compile_display_copy(
         (f"label:{i}", row) for i, row in enumerate(value["labels"])]
     for location, row in entries:
         try:
-            bindings.append(_bind_display_text(row, available, claim_reviews=claim_reviews))
+            bindings.append(_bind_display_text(row, available, claim_reviews=claim_reviews,
+                                               is_title=location == 'title', product_claims=product_claims))
         except VisualDesignKitCompileError as exc:
             errors.append(f"{location}: {exc}")
             owners.append(exc.failure_owner)
@@ -500,13 +501,33 @@ def _copy_binding(value: Any, available: dict[str, str]) -> dict[str, Any]:
     return {"evidence_ids": list(ids), "text": us_measurement_text(text)}
 
 
+def _copy_needs_review(bound: dict[str, Any], evidence: dict[str, str], *,
+                       is_title: bool = False, product_claims: Any = ()) -> bool:
+    if any(key.startswith('physical:') for key in evidence):
+        return True
+    text = bound['text']
+    if text in [us_measurement_text(value) for value in evidence.values()]:
+        return False
+    if is_title and all(key.startswith('measurement:') for key in evidence) and re.fullmatch(
+            r'(?:(?:product|overall) )?(?:dimensions?|measurements?|size)', text, re.IGNORECASE):
+        return False
+    # An original catalog bullet heading is already a source statement. Do
+    # not apply substring matching to qualifiers, visual facts, or labels.
+    return not (is_title and len(evidence) == 1 and any(
+        row.get('type') == 'source_product_statement' and row.get('evidence_id') in evidence
+        and ':' in row.get('text', '')
+        and text == us_measurement_text(row['text'].split(':', 1)[0].strip())
+        for row in product_claims or ()))
+
+
 def _bind_display_text(
     value: Any, available: dict[str, str], *,
     claim_reviews: dict[str, dict[str, Any]] | None = None,
+    is_title: bool = False, product_claims: Any = (),
 ) -> dict[str, Any]:
     bound = _copy_binding(value, available)
     evidence = {key: available[key] for key in bound["evidence_ids"]}
-    if not any(key.startswith('physical:') for key in evidence) and bound["text"] in [us_measurement_text(text) for text in evidence.values()]:
+    if not _copy_needs_review(bound, evidence, is_title=is_title, product_claims=product_claims):
         return bound
     key = claim_key(bound["text"], evidence)
     review = (claim_reviews or {}).get(key) or {}
@@ -627,8 +648,9 @@ def _validate_display_brief(
     if len(strings) != len(story["bindings"]) or len(strings) != len(set(strings)):
         raise VisualDesignKitCompileError("display copy bindings changed")
     available = _available_claims(sources, product_claims)
-    for text, binding in zip(strings, story["bindings"]):
-        if _bind_display_text(binding, available, claim_reviews=brief["claim_reviews"])["text"] != text:
+    for binding_index, (text, binding) in enumerate(zip(strings, story["bindings"])):
+        if _bind_display_text(binding, available, claim_reviews=brief["claim_reviews"],
+                              is_title=bool(story['title']) and binding_index == 0, product_claims=product_claims)["text"] != text:
             raise VisualDesignKitCompileError("func text disagrees with its reviewed binding")
 
 

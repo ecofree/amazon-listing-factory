@@ -271,10 +271,7 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
             and selected[-1] == "template"
             and release_submit_ready(release)
         )
-        completed_draft_template = bool(selected and selected[-1] == "template" and not submit_ready_template)
-        # A stage invocation completing without an exception is not the same
-        # as the whole listing workflow being complete.  The summary writer
-        # below keeps execution completion and workflow completion separate.
+        # The summary projects this invocation separately from release readiness.
         if completed_family:
             final_status = "success"
         elif run_had_failures and not release:
@@ -284,7 +281,7 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
         elif run_had_failures or release.get("status") == "partial_success":
             final_status = "partial_success"
         else:
-            final_status = "success" if completed_draft_template else "partial_success"
+            final_status = "success"
         return _finish(
             request,
             status=final_status,
@@ -977,35 +974,35 @@ def _write_summary(
     )
     publish_mode = _publish_mode(request.job_dir, publish_ran=publish_ran)
     source_scope = _source_scope_counts(request)
-    missing_candidate_count = max(0, len(release_rows) - candidate_count) + (source_scope['source_unresolved_count'] or 0)
+    missing_candidate_count = max(0, len(release_rows) - candidate_count)
     image_completion_status = (
         "incomplete" if missing_candidate_count else "not_run" if not release_rows else "success"
     )
     stage_rows = state.get("stages") if isinstance(state.get("stages"), dict) else {}
     completed_stages = [
         stage for stage in PRODUCTION_STAGES
-        if isinstance(stage_rows.get(stage), dict)
+        if stage in timings and isinstance(stage_rows.get(stage), dict)
         and str(stage_rows[stage].get("status") or "") == "success"
     ]
     completed_through_stage = ""
-    for stage in PRODUCTION_STAGES:
+    for stage in (name for name in PRODUCTION_STAGES if name in timings):
         if stage not in completed_stages:
             break
         completed_through_stage = stage
-    template_stage_complete = "template" in completed_stages
+    downstream_ran = any(stage in timings for stage in ('qa', 'publish', 'template'))
     workflow_status = (
         "partial_success"
         if (
             status == "success"
             and (
                 active_failure_count
-                or image_completion_status == "incomplete"
-                or str(effective_release.get("status") or "") in {"failed", "partial_success"}
-                or not template_stage_complete
+                or ('generate' in timings and (image_completion_status == "incomplete" or source_scope['source_unresolved_count']))
+                or (downstream_ran and str(effective_release.get("status") or "") in {"failed", "partial_success"})
+                or ('template' in timings and 'template' not in completed_stages)
             )
         )
         or (
-            template_status in {"draft_with_blockers", "submit_ready_blocked"}
+            'template' in timings and template_status in {"draft_with_blockers", "submit_ready_blocked"}
             and status not in {"failed", "awaiting_review"}
         )
         else status
@@ -1028,8 +1025,7 @@ def _write_summary(
         "publish_mode": publish_mode,
         "template_status": template_status,
         "workflow_reason": ('selected_stages_completed_downstream_not_requested'
-                            if not error and not active_failure_count and completed_stages
-                            and not any(stage in stage_rows for stage in ('download', 'classify', 'brief', 'generate', 'qa', 'publish', 'template'))
+                            if not error and workflow_status == 'success' and completed_stages and not downstream_ran
                             else _summary_status_reason(workflow_status, effective_release, error)),
         "candidate_count": candidate_count,
         "qa_decision_counts": qa_decision_counts,
@@ -1072,6 +1068,7 @@ def _cumulative_progress(job_dir: Path) -> dict[str, Any]:
         "cumulative_stage_seconds": {name: round(value, 3) for name, value in stage_seconds.items()},
         "stage_attempt_counts": stage_attempt_counts,
         "image_provider_request_count": counts.get("image_provider_transport_attempt_started", 0),
+        "image_capacity_requeue_count": counts.get("image_task_capacity_requeued", 0),
         "candidate_commit_count": counts.get("generate_candidate_committed", 0),
         "candidate_reuse_count": counts.get("generate_candidate_reused", 0),
         "candidate_revision_commit_count": counts.get("generate_revision_committed", 0),

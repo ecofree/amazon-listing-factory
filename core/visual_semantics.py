@@ -16,7 +16,7 @@ from .image_reference_context import product_features, source_box, source_point,
 
 OBSERVATION_POLICY = "child-joint-observation-v29-original-evidence"
 CLAIM_REVIEW_POLICY = "planning-binding-review-v25-output-scope"
-CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v18-output-scope"
+CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v19-measurement-endpoints"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "unknown"}
 
@@ -760,6 +760,8 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
         "using attachment_index and source_region to cite any supplied same-child view that proves its structure, plus extra:unique_id rows "
         "for all additional product-bearing insets/parts in the candidate, comparing against the original source attachment. "
         "Compare depicted joints, visible faces, part count, attachment position and state, not merely function. "
+        "Alternative adjustment positions do not mean simultaneous extra parts. Compare door coverage and enclosed versus open compartments. "
+        "Dimension arrows must span the same measured part's full stated extent; matching numbers on a shorter inner panel are a contradiction. "
         "A stopper block serving the same purpose but showing a newly invented side/joint is not the same observed detail. "
         "Do not use a correct inset to excuse a changed main view. "
         "Inspect the planned demonstration without prescribing layout or requiring other views from the source gallery. "
@@ -807,6 +809,10 @@ def _validate_candidate_bindings(observed, attachments, required_targets, measur
         binding = expected.get(key)
         if binding is None or key in seen or row['attachment_index'] != binding['attachment_index']:
             raise ValueError('Measurement ID refers to a different view attachment or is repeated')
+        if binding['evidence_type'] == 'dimension_line' and any(
+                row.get(field) is None for field in ('source_endpoints', 'candidate_endpoints')):
+            row.update(relationship='unknown', confidence=0.0, location_error='Dimension line endpoints are missing')
+            observed['measurement_coverage'] = 'partial'
         seen.add(key)
     if seen != set(expected):
         observed['measurement_coverage'] = 'partial'
