@@ -168,6 +168,11 @@ class QaLiteV1Tests(unittest.TestCase):
             self.assertEqual("inconclusive", evidence["automatic_decision"])
             self.assertTrue(evidence_is_current(evidence, task, candidate))
             self.assertEqual("unavailable", evidence['observation_status'])
+            self.assertEqual({'product_fidelity', 'unauthorized_text'}, {row['gate'] for row in evidence['gates'] if row['status'] == 'inconclusive'})
+            with patch.object(image_qa, 'observe_candidate', side_effect=TimeoutError('bounded')):
+                scoped = image_qa._evaluate(Path(tmp), object(), _task('size', 'source_image'), {**candidate, 'revision_mode': 'targeted_edit'})
+            self.assertEqual({'product_fidelity', 'unauthorized_text', 'dimension_accuracy', 'edit_scope'},
+                             {row['gate'] for row in scoped['gates'] if row['status'] == 'inconclusive'})
             unknown = _observed(task)
             unknown["product_comparisons"][0]["status"] = "unknown"
             with patch.object(image_qa, "observe_candidate", return_value=unknown):
@@ -207,9 +212,10 @@ class QaLiteV1Tests(unittest.TestCase):
 
     def test_source_size_semantic_measurements_require_observed_relationships(self) -> None:
         task = _task("size_01", "source_image")
+        task['measurement_authority']['measurement_groups'] = [dict(id='width', render_text='36 in')]
         observation = _observed(task)
         observation["measurement_coverage"] = "complete"
-        measurement = {"object": "cabinet overall width", "source_text": "36 in", "candidate_text": "3 ft",
+        measurement = {"measurement_id": "width", "object": "cabinet overall width", "source_text": "36 in", "candidate_text": "3 ft",
                        "relationship": "same", "confidence": .99, "source_region": dict(left=0, top=0, right=1, bottom=1), "candidate_region": dict(left=0, top=0, right=1, bottom=1)}
         observation["measurements"] = [measurement]
         self.assertEqual("pass", image_qa._semantic_gates(task, observation)[1]["status"])
@@ -218,6 +224,7 @@ class QaLiteV1Tests(unittest.TestCase):
         measurement["confidence"] = .6
         self.assertEqual("inconclusive", image_qa._semantic_gates(task, observation)[1]["status"])
         mixed = _task("func_04", "source_image")
+        mixed['measurement_authority']['measurement_groups'] = [dict(id='width', render_text='12 in')]
         mixed["renderable_text_contract"]["strings"] = ["Ample Space under Bed"]
         observed = _observed(mixed)
         observed["texts"].append({"text": '12"', "kind": "measurement", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)})

@@ -16,7 +16,7 @@ from .status import input_revision_id, logical_task_id
 PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v94-original-evidence"
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v75-output-measurements"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v76-selected-inputs"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -399,7 +399,7 @@ def _family_art_direction(
     elif environment_mode == 'source_setting':
         rows.append("Retain only necessary product installation relationships; source decor is not a design requirement.")
     else:
-        rows.append("Environment: " + _compact_token_direction(direction.get("environment_and_staging")))
+        rows.append("Shared atmosphere (ROLE owns the concrete room and product state): " + _compact_token_direction(direction.get("environment_and_staging")))
     return "\n".join(row for row in rows if row)
 
 
@@ -435,8 +435,9 @@ def _measurement_content(value: Any, references: list[dict[str, Any]], *, author
     for row in value.get('measurement_groups', []):
         attachment = measurement_attachment(row, references)
         label = f"TEXT item {authored_text.index(row['render_text']) + 1}" if row['render_text'] in authored_text else row['render_text']
-        rows.append(f"{row['measured_part']} / {row['axis']}: {label} (source attachment {attachment}; {row['evidence_type']})")
-    return ('Measurement associations: depict each listed measured object/property once with its authorized US-unit label. '
+        rows.append(f"{row['measured_part']} / {row['axis']}: {label} (association {row['id']}; source attachment {attachment}; {row['evidence_type']})")
+    return ('Measurement associations: preserve each selected physical relationship; equal labels do not merge different locations. '
+            'IDs identify evidence, not drawable text or proof of location; use the source view and described part/state. '
             'Design positions and arrows for the output geometry, not source pixels. Written properties or limits need no dimension arrow. '
             + '; '.join(rows))
 

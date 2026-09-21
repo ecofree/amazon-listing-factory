@@ -200,8 +200,7 @@ def required_observation_issues(draft: dict[str, Any], source: dict[str, Any], s
         for owner in sources:
             observation = owner.get('observation') or {}
             gaps = [dict(reason=gap['text'], kind=gap['kind']) for gap in observation.get('text_gaps', [])
-                    if (role == 'func' and owner['source_id'] == source['source_id'] and gap['kind'] == 'product_fact')
-                    or (missing_size_facts and gap['kind'] == 'measurement')]
+                    if missing_size_facts and gap['kind'] == 'measurement']
             gaps += [dict(reason=issue['error'], kind='measurement')
                      for issue in (observation.get('measurement_issues') or [])
                      if isinstance(issue['measurement'], dict) and

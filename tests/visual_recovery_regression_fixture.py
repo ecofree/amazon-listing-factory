@@ -63,15 +63,14 @@ def _planner(job, calls):
 
 
 def verify_visual_recovery(test):
-    _text_gap_roundtrip(test)
-    _text_gap_budget(test)
+    _unselected_text_gap_roundtrip(test)
     _checkpoint_roundtrip(test)
     _repair_checkpoint(test)
     _sibling_interruption(test)
     _recovered_inventory(test)
 
 
-def _text_gap_roundtrip(test):
+def _unselected_text_gap_roundtrip(test):
     with _workspace() as (job, stack, scope):
         observation_calls = []
         def observe(prompt, paths, **kwargs):
@@ -91,15 +90,15 @@ def _text_gap_roundtrip(test):
         request = production.JobRunRequest(job_dir=job, plugin=_Plugin(), workers=1)
         result = production._run_stage('brief', request=request)
         test.assertEqual([], result['failures'])
-        test.assertEqual([['source_00', 'source_01', 'source_02', 'source_03'], ['source_02']], observation_calls)
+        test.assertEqual([['source_00', 'source_01', 'source_02', 'source_03']], observation_calls)
         after = intents.read_final_source_intents(job, plugin=_Plugin())
-        test.assertEqual([row for row in before if row['source_index'] != 2], [row for row in after if row['source_index'] != 2])
+        test.assertEqual(before, after)
         test.assertEqual(1, len(plans))
         saved = design.read_visual_design_kits(job, plugin=_Plugin())
         test.assertTrue(all(row['status'] == 'ready' for row in saved['tasks'][0]['image_briefs']))
         test.assertEqual({}, design.observation_corrections(saved))
         production._run_stage('brief', request=request)
-        test.assertEqual(2, len(observation_calls))
+        test.assertEqual(1, len(observation_calls))
         test.assertEqual(1, len(plans))
 
 
@@ -141,38 +140,6 @@ def _checkpoint_roundtrip(test):
             test.assertTrue(all(row['task_fingerprint'] == fingerprints[row['role']]
                                 for row in final['tasks'] if row['role'] in fingerprints))
             test.assertTrue(design._planner_trace_current(job, saved))  # Earlier immutable checkpoint still verifies.
-
-
-def _text_gap_budget(test):
-    with _workspace() as (job, stack, scope):
-        calls = []
-        def observe(prompt, paths, **kwargs):
-            context = json.loads(prompt.split('Input evidence, not response fields:\n', 1)[1])
-            calls.append([row['source_id'] for row in context['attachments']])
-            rows = _fixture_observation(job, _family()['family']['children'][0], context['attachments'])
-            rows['source_02']['text_gaps'] = [dict(text='Unreadable necessary shelf note', kind='product_fact')]
-            kwargs['attempt_observer']({'event': 'request_budget', 'physical_request_count': 1})
-            return json.dumps({'sources': list(rows.values())})
-        stack.enter_context(patch('core.visual_semantics.gemini_stream_generate', side_effect=observe))
-        intents.build_final_source_intents(job_dir=job, plugin=_Plugin())
-        plans = []
-        stack.enter_context(patch.object(design, 'gemini_stream_generate', side_effect=_planner(job, plans)))
-        request = production.JobRunRequest(job_dir=job, plugin=_Plugin(), workers=1)
-        production._run_stage('brief', request=request)
-        first = design.read_visual_design_kits(job, plugin=_Plugin())['tasks'][0]
-        before = build_image_tasks(job_dir=job, plugin=_Plugin(), include_optional=True)
-        for _ in range(5):
-            production._run_stage('brief', request=request)
-        final = design.read_visual_design_kits(job, plugin=_Plugin())['tasks'][0]
-        test.assertEqual(4, len(calls))
-        test.assertTrue(all(keys == ['source_02'] for keys in calls[1:]))
-        test.assertEqual(1, len(plans))
-        test.assertEqual(first['family_design_id'], final['family_design_id'])
-        test.assertEqual(['func'], [row['role'] for row in final['image_briefs'] if row['status'] != 'ready'])
-        after = build_image_tasks(job_dir=job, plugin=_Plugin(), include_optional=True)
-        fingerprints = {row['role']: row['task_fingerprint'] for row in after['tasks']}
-        test.assertTrue(all(fingerprints[row['role']] == row['task_fingerprint'] for row in before['tasks']
-                            if row['formation_status'] == 'ready'))
 
 
 def _repair_checkpoint(test):

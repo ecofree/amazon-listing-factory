@@ -325,7 +325,7 @@ def finalize_candidate(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
     waiting = False
     try:
         from .candidate_state import current_candidate
-        if not current_candidate(task['job_dir'], task):
+        if not current_candidate(task['job_dir'], task, revision=int(task.get('candidate_revision') or 0)):
             receipt = Path(task['raw_response_path']) if task.get('raw_response_path') else None
             if receipt:
                 saved = recover_response(task)

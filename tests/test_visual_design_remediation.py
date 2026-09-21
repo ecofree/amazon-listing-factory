@@ -241,9 +241,24 @@ class VisualDesignRemediationTests(unittest.TestCase):
         raw = dict(family_art_direction=current_art_direction(), image_briefs=briefs)
         self.assertTrue(all(row['status'] == 'ready' for row in compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory(sources), source_manifest=sources, claim_reviews=supported_design_reviews(raw, sources))['image_briefs']))
         sources[0]['observation']['text_gaps'] = [dict(text='Required width is unreadable', kind='measurement')]
+        sources[3]['observation']['text_gaps'] = [dict(text='Unselected source claim unreadable', kind='product_fact')]
         affected = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory(sources), source_manifest=sources, claim_reviews=supported_design_reviews(raw, sources))
         self.assertEqual([], [row['role'] for row in affected['image_briefs'] if row['status'] != 'ready'])
         from core.image_generation import _compose_revision_prompt
+        measured_func = _evidence_source('func')
+        measured_func['measurements'] = current_measurement_rows()
+        frozen = initial_output_inventory([measured_func])
+        self.assertEqual('source_00', next(row['source_id'] for row in frozen if row['role'] == 'size'))
+        replacement = {**measured_func, 'source_id': 'source_07', 'source_index': 7, 'source_sha256': 'b'*64, 'input_revision_id': 'r2'}
+        resumed = initial_output_inventory([replacement], previous={'output_inventory': frozen, 'source_references': [measured_func]})
+        self.assertEqual(frozen, initial_output_inventory([measured_func], previous={'output_inventory': frozen, 'source_references': [measured_func]}))
+        self.assertEqual(['main', 'scene', 'func', 'size'], [row['role'] for row in resumed])
+        self.assertTrue(all(row['source_id'] == 'source_07' for row in resumed))
+        current = task_specs({'asin': 'B1'}, [dict(measured_func, child='B2'), dict(replacement, child='B1')], inventory=frozen)
+        self.assertTrue(all(row['source']['source_id'] == 'source_07' for row in current))
+        replacement['measurements'] = []
+        pending = task_specs({}, [replacement], inventory=resumed)
+        self.assertEqual(['size'], [row['role'] for row in pending if row['evidence_pending']])
         base = 'x' * 7394
         revised = _compose_revision_prompt(base_prompt=base, request_heading='full redraw', request_intro='Redraw the same task.', reason='Preserve the original joint.')
         self.assertTrue(revised.startswith(base))
@@ -290,13 +305,21 @@ class VisualDesignRemediationTests(unittest.TestCase):
         task = _task("size", "source_image")
         task['renderable_text_contract'] = {'mode': 'exact', 'strings': ['Dimensions']}
         task["measurement_authority"] = authority
+        repeated_source = _evidence_source('func')
+        first = current_measurement_rows()[0]
+        repeated_source['measurements'] = [dict(first, source_occurrence='upper'), dict(first, source_occurrence='lower')]
+        repeated_authority = measurement_authority('func', {'measurement_ids': ['source_00:upper', 'source_00:lower']}, [repeated_source])
+        self.assertEqual(['source_00:upper', 'source_00:lower'], [row['id'] for row in repeated_authority['measurement_groups']])
+        self.assertEqual(1, len(repeated_authority['render_text']))
         obs = _observed(task)
         obs.update(texts=[{"text": text, "kind": "marketing", "confidence": .99} for text in ("Dimensions", "300 lbs")],
                    measurement_coverage="complete", measurements=[{
                        "measurement_id": row["id"], "candidate_text": row["render_text"], "source_text": row["source_text"],
                        "relationship": "same", "confidence": .99} for row in authority["measurement_groups"]])
         obs["measurements"].append({"measurement_id": None, "source_text": '4.5"', "candidate_text": '4.5"', "relationship": "same", "confidence": .99})
-        self.assertEqual(["pass", "pass"], [r["status"] for r in _semantic_gates(task, obs)[:2]])
+        self.assertEqual(["pass", "fail"], [r["status"] for r in _semantic_gates(task, obs)[:2]])
+        obs['measurements'][-1]['candidate_text'] = obs['measurements'][-1]['source_text'] = authority['measurement_groups'][0]['render_text']
+        self.assertEqual('inconclusive', _semantic_gates(task, obs)[1]['status'])
         obs["measurements"][-1]["candidate_text"] = '6"'
         self.assertEqual("fail", _semantic_gates(task, obs)[1]["status"])
         obs["texts"].append({"text": "Waterproof", "kind": "marketing", "confidence": .99})

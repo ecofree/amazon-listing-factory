@@ -206,6 +206,8 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 task = current_image_task(role, category_id=category)
                 task.update(category_image_policy=policy, family_art_direction=current_art_direction())
                 task["edit_contract"] = _edit_contract(role, task["measurement_authority"], policy)
+                self.assertTrue(set(policy['forbidden_additions']) <= set(task['edit_contract']['forbid']))
+                self.assertTrue(all('Preserve where evidenced and depicted: ' + value in task['edit_contract']['preserve'] for value in policy['structure_invariants']))
                 if role == "size":
                     task["image_direction"]["visual_goal"] = "Clarify overall product dimensions and drawer size."
                 prompt = compile_task_prompt(task=task)
@@ -224,7 +226,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 for forbidden in task["edit_contract"]["forbid"]:
                     self.assertIn(forbidden.rstrip(" .;:"), prompt)
                 if role == "size":
-                    self.assertIn('measured object/property once', prompt)
+                    self.assertIn('preserve each selected physical relationship', prompt)
                 styles[role] = prompt.split("[STYLE]\n")[1].split("\n\n[TEXT]")[0]
                 self.assertNotIn("or readable text", prompt)
                 if category != "bed_frame":
@@ -266,7 +268,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
         self.assertEqual(1, shared.count('bath.towels ='))
         task['generation_references'][0]['visible_evidence'] = [dict(current_product_feature(), physical_facts=['Platform frame without headboard'])]
         task['measurement_authority'] = {'mode': 'source_image', 'measurement_groups': [{
-            'source_id': 'source_00', 'measured_part': 'Underbed clearance',
+            'id': 'source_00:clearance', 'source_id': 'source_00', 'measured_part': 'Underbed clearance',
             'axis': 'height', 'render_text': '12 in', 'evidence_type': 'dimension_line'}]}
         self.assertIn('source attachment 1', compile_task_prompt(task=task))
         task['measurement_authority']['measurement_groups'][0]['source_id'] = 'missing'
@@ -624,7 +626,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertNotIn("Cohesion Rule:", func_prompt)
             size_prompt = next(row["prompt"] for row in prompts if row["role"] == "size")
             self.assertIn("with readable spacing", size_prompt)
-            self.assertIn("each listed measured object/property once", size_prompt)
+            self.assertIn("equal labels do not merge different locations", size_prompt)
             self.assertEqual(1, size_prompt.count('Cabinet / width: 24 in'))
             self.assertNotIn('intact diagram as a unit', size_prompt)
             self.assertIn("font_family = Inter", size_prompt)

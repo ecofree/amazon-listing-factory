@@ -364,6 +364,7 @@ def _edit_contract(
     preserve = [
         "Sold-product geometry, proportions, finish and parts, using this child's evidenced structures and operating states",
     ]
+    preserve.extend('Preserve where evidenced and depicted: ' + str(value) for value in policy.get('structure_invariants', []))
     replace: list[str] = []
     if family == "func":
         preserve.append(
@@ -400,7 +401,7 @@ def _edit_contract(
         str(value) for value in (policy.get("role_specific_rules") or {}).get(family) or []
         if str(value).strip()
     ]
-    forbid = role_rules
+    forbid = [*role_rules, *policy.get('forbidden_additions', [])]
     return {
         "create": create,
         "reference_authority": reference,

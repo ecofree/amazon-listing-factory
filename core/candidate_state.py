@@ -43,10 +43,13 @@ _CANDIDATE_MANIFEST_FIELDS = {
 }
 
 
-def current_candidate(job_dir: str | Path, task: dict[str, Any], *, required: bool = False) -> dict[str, Any]:
+def current_candidate(job_dir: str | Path, task: dict[str, Any], *, required: bool = False, revision: int | None = None) -> dict[str, Any]:
     job_path = Path(job_dir).resolve()
-    candidate = _recover_candidate_from_manifest(job_path, task)
+    candidate = _recover_candidate_from_manifest(job_path, task, revision=revision)
     if candidate:
+        if revision is not None and (candidate['output_path'] != _job_owned_path(job_path, str(task.get('candidate_path') or task['output_path']))
+                                    or candidate['request_prompt_fingerprint'] != task.get('request_prompt_fingerprint')):
+            raise CandidateStateError('Committed candidate does not match the exact request path or prompt')
         return candidate
     if required:
         raise CandidateStateError(f"Current CandidateManifest is missing or stale: {task['child']}/{task['role']}")
@@ -175,7 +178,7 @@ def _image_dimensions(path: Path) -> tuple[int, int]:
         return int(image.width), int(image.height)
 
 
-def _recover_candidate_from_manifest(job_path: Path, task: dict[str, Any]) -> dict[str, Any]:
+def _recover_candidate_from_manifest(job_path: Path, task: dict[str, Any], *, revision: int | None = None) -> dict[str, Any]:
     manifest_dir = _job_owned_path(
         job_path,
         str(
@@ -185,7 +188,11 @@ def _recover_candidate_from_manifest(job_path: Path, task: dict[str, Any]) -> di
     )
     if not manifest_dir.is_dir():
         return {}
-    candidates = list(manifest_dir.glob("candidate*.json"))
+    if revision is None:
+        candidates = list(manifest_dir.glob('candidate*.json'))
+    else:
+        selected = manifest_dir / f'candidate{revision}.json'
+        candidates = [selected] if selected.is_file() else []
     invalid = [path for path in candidates if not re.fullmatch(r"candidate(?:0|[1-9]\d*)\.json", path.name)]
     if invalid:
         raise CandidateStateError(f"CandidateManifest filename is invalid: {invalid[0]}")
@@ -196,8 +203,8 @@ def _recover_candidate_from_manifest(job_path: Path, task: dict[str, Any]) -> di
     )
     if not manifests:
         return {}
-    # The highest revision is the only current candidate authority. A corrupt
-    # or incomplete newer revision must not silently resurrect an older image.
+    # General readers use the highest revision; finalization resolves its exact request.
+    # A corrupt selected revision must never silently resurrect an older image.
     highest = manifests[0]
     expected_revision = _candidate_revision_from_name(highest.name, "candidate")
     try:
@@ -252,6 +259,8 @@ def _recover_bound_manifest(job_path: Path, manifest: dict[str, Any], task: dict
         "candidate_sha256": sha,
         "candidate_path": str(manifest.get("candidate_path") or output.relative_to(job_path)),
         "candidate_revision": int(manifest.get("candidate_revision") or 0),
+        "revision_mode": manifest['revision_mode'],
+        "edit_parent_candidate_sha256": manifest['edit_parent_candidate_sha256'],
         "provider_physical": str(manifest.get("provider_physical") or ""),
         "provider_name": str(manifest.get("provider_name") or ""),
         "task_prompt_fingerprint": str(manifest.get("task_prompt_fingerprint") or ""),

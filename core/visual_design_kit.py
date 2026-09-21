@@ -52,7 +52,7 @@ from .visual_design_kit_compiler import (
     DESIGN_FIELD_SCHEMAS, IMAGE_DIRECTION_SCHEMA,
 )
 VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v16"
-VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v74-original-evidence"
+VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v75-scoped-projection"
 VISUAL_DESIGN_KIT_ARTIFACT = "visual_design_kits_v16.jsonl"
 
 _ROW_FIELDS = {"schema_version", "policy_version", "category_id", "main_image_policy", "child", "source_reference", "source_sha256", "source_references", "product_claims", "child_facts_revision_id", "input_revision_id", "family_design_id", "visual_design_kit_id", "family_art_direction", "image_briefs", "output_inventory", "planner", "approved_design_references"}
@@ -431,6 +431,7 @@ def _finish_image_briefs(
                 write_json(budget_path, budget)
         return observe
 
+    protocol_errors = budget.setdefault('review_errors', {})
     reviews = {key: value for brief in (cached or {}).get("image_briefs", [])
                for key, value in brief.get("claim_reviews", {}).items()}
     reviews.update({brief["design_review"]["key"]: brief["design_review"]
@@ -485,11 +486,13 @@ def _finish_image_briefs(
                 break
             try:
                 received = review_planning_bindings(requests,
+                    protocol_errors=protocol_errors,
                     source_manifest=source_manifest, source_paths=source_originals,
                     job=job, child=child, design_references=design_references or [],
                     trace_dir=trace_dir / (attempt if review_attempt == 0 else attempt + '_unresolved'), deadline_monotonic=deadline_monotonic,
                     attempt_observer=settlement('review'),
                     prior_output_limits=budget.get('output_limits', {}).get(f'claim-review:{input_revision_id(requests)}', []))
+                write_json(budget_path, budget)
                 for key, value in received.items():
                     findings = {finding['operation']: finding for finding in reviews.get(key, {}).get('findings', [])}
                     findings.update({finding['operation']: finding for finding in value.get('findings', [])})
@@ -782,7 +785,7 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
             "palette_direction": {"room": {"wall": "one #RRGGBB, material, pattern or solid"},
                                   "bedding": {"duvet": "one #RRGGBB, material, pattern or solid"}},
             "photography_direction": "bright clear exposure retaining product edges, balanced white balance, contrast and material clarity; no room, window or prop instructions",
-            "environment_and_staging": "believable US room type, spatial needs and atmosphere; no component colors or prop inventory",
+            "environment_and_staging": "shared spatial style and atmosphere; concrete rooms belong to each presentation.state; no lighting, component colors or prop inventory",
             **DESIGN_FIELD_SCHEMAS,
         },
         "image_briefs": expected_briefs,
@@ -804,10 +807,10 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
         "Return one brief per output role, retaining role and source_id from the inventory. Multiple roles may share a source; "
         "retain every output slot. visual_goal states the buyer question, not a second appearance specification or preset layout. "
         "Main follows category policy and uses reliable complete product evidence. presentation states the intended product use/demonstration, "
-        "including real physical support or installation, not source staging. whole_product needs a same-child complete product reference; "
+        "including its concrete room, use, physical support and installation; category settings are suggestions, never overrides of evidenced use. whole_product needs a same-child complete product reference; "
         "detail_only stays close-up without inventing a full hero. Scene goals serve the evidenced audience; "
         "func goals communicate specific proven features rather than generic benefits.\n"
-        "product_sources lists the original same-child images to attach: first choose a clean/simple edit photograph when available; "
+        "product_sources lists original same-child images: choose an edit base that clearly supports this output's structure and state; "
         "add other sources only for necessary product evidence absent there. Their facts are authoritative, not their layouts, graphics or decor. "
         "measurement_ids selects exact source_id:measurement_id facts this output communicates, independent of the edit photograph. "
         "Size requires real measurements; func may use [] when its feature needs no numeric annotation. Selected measurement originals are attached automatically. "
@@ -939,6 +942,7 @@ def _kit_input_revision(*, child: dict[str, Any], policy: dict[str, Any], source
     # the new design direction while appearing current.
     planner_prompt_sha256 = hashlib.sha256(planner_prompt.encode("utf-8")).hexdigest()
     revision = input_revision_id({
+        "review_policy": CLAIM_REVIEW_POLICY,
         "child_facts_revision_id": child_facts_revision,
         "child_material": _material_facts(child),
         "complete_image_policy_id": policy_id,

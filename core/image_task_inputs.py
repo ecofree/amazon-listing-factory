@@ -24,7 +24,7 @@ def role_art_direction(art: dict[str, Any], direction: dict[str, Any], role: str
     result['palette_direction'] = {
         group: chosen for group, parts in art['palette_direction'].items()
         if (chosen := {part: value for part, value in parts.items()
-                       if environment or (group != 'room' and f'{group}.{part}' in selected)})}
+                       if (environment or group != 'room') and f'{group}.{part}' in selected})}
     if environment:
         result['environment_and_staging'] = art['environment_and_staging']
     if role.split('_', 1)[0] in {'func', 'size'}:
@@ -46,14 +46,9 @@ def measurement_authority(role: str, direction: dict[str, Any], sources: list[di
         raise ValueError('Selected measurements are not observed in this child: ' + ', '.join(sorted(missing)))
     if role == 'size' and not ids:
         raise ValueError('Size needs actual measured quantities; choose measurement_ids from the child catalog')
-    groups, seen = [], set()
+    groups = []
     for key in ids:
         source, row = available[key]
-        identity = (row['source_label'].strip().casefold(), row['axis_hint'].strip().casefold(),
-                    row['measurement_kind'], row['canonical_pair'], row['text'].strip().casefold())
-        if identity in seen:
-            continue
-        seen.add(identity)
         groups.append({
             'id': key, 'source_id': source['source_id'], 'source_text': row['text'],
             'measured_part': row['source_label'], 'axis': row['axis_hint'],
@@ -249,24 +244,39 @@ def _appearance_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(appearances, key=lambda row: (row.get('role') != 'main', int(row.get('source_index') or 0)))
 
 
+def _role_sources(sources: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
+    if family == 'main':
+        return _appearance_sources(sources)
+    if family == 'size':
+        return sorted((row for row in sources if row.get('measurements')),
+                      key=lambda row: row.get('role') != 'size')
+    matches = [row for row in sources if row.get('role') == family]
+    return matches or (_appearance_sources(sources)[:1] if family == 'scene' else [])
+
+
 def initial_output_inventory(sources: list[dict[str, Any]], *, previous: dict[str, Any] | None = None) -> list[dict[str, str]]:
     """Keep allocated identities, adding only newly available scoped sources."""
-    ordered = sorted(sources, key=lambda row: int(row.get("source_index") or 0))
+    ordered = sorted(({**row, 'source_id': row.get('source_id') or f"source_{int(row['source_index']):02d}"} for row in sources),
+                     key=lambda row: int(row.get('source_index') or 0))
     if previous is not None:
         inventory = [dict(row) for row in previous['output_inventory']]
         known = {row['source_id'] for row in previous['source_references']}
         for slot in inventory:
-            if slot['source_id']:
+            family = slot['role'].split('_', 1)[0]
+            eligible = _role_sources(ordered, family)
+            if any(row.get('source_id') == slot['source_id'] for row in eligible):
                 continue
-            candidate = next((row for row in ordered if row['role'] == slot['role']), None)
-            if candidate is None and slot['role'] in {'main', 'scene'}:
-                candidate = next(iter(_appearance_sources(ordered)), None)
+            used = {row['source_id'] for row in inventory if row is not slot and row['role'].split('_', 1)[0] == family}
+            candidate = next((row for row in eligible if row.get('source_id') not in used), None)
+            slot['source_id'] = ''
             if candidate is not None:
-                slot['source_id'] = candidate.get('source_id') or f"source_{int(candidate['source_index']):02d}"
+                slot['source_id'] = candidate['source_id']
         for source in ordered:
-            source_id = source.get('source_id') or f"source_{int(source['source_index']):02d}"
+            source_id = source['source_id']
             family = source['role']
             if source_id in known or family not in {'scene', 'func', 'size'}:
+                continue
+            if source not in _role_sources(ordered, family):
                 continue
             peers = [row for row in inventory if row['role'].split('_', 1)[0] == family]
             if any(row['source_id'] == source_id for row in peers):
@@ -282,18 +292,15 @@ def initial_output_inventory(sources: list[dict[str, Any]], *, previous: dict[st
     main = appearances[0] if appearances else None
     specs = [{'role': 'main', 'source': main, 'reason': '' if main else 'No selected whole-product appearance evidence'}]
     for family in ('scene', 'func', 'size'):
-        matches = [row for row in ordered if row.get('role') == family]
+        matches = _role_sources(ordered, family)
         if family == 'size':
             matches = matches[:1]  # Other measurement sources remain evidence, not competing outputs.
-        if family == 'scene' and not matches and main:
-            matches = [main]
         if matches:
             specs.extend({'role': family if i == 1 else f'{family}_{i:02d}', 'source': row, 'reason': ''}
                          for i, row in enumerate(matches, 1))
         else:
             specs.append({'role': family, 'source': None, 'reason': f'No final source intent is classified as {family}'})
-    return [{'role': spec['role'], 'source_id': (
-        spec['source'].get('source_id') or f"source_{int(spec['source']['source_index']):02d}") if spec['source'] else ''}
+    return [{'role': spec['role'], 'source_id': spec['source']['source_id'] if spec['source'] else ''}
         for spec in specs]
 
 
@@ -309,17 +316,18 @@ def task_specs(child: dict[str, Any], sources: list[dict[str, Any]], *, inventor
         raise ValueError('Current child needs its frozen output inventory')
     catalog = {row.get('source_id') or f"source_{int(row['source_index']):02d}": row for row in sources
                if not child.get('asin') or row.get('child') in (None, child['asin'])}
-    appearances = _appearance_sources(list(catalog.values()))
     specs = []
     for slot in inventory:
         role = slot['role']
         if not include_optional and role not in {'main', 'scene', 'func', 'size'}:
             continue
         source = catalog.get(slot['source_id'])
-        if source is None and not slot['source_id']:
-            source = next((row for row in catalog.values() if row.get('role') == role), None)
-        if (role.split('_', 1)[0] in {'main', 'scene'} and source is None) or (role == 'main' and source not in appearances):
-            source = appearances[0] if appearances else None
+        eligible = _role_sources(list(catalog.values()), role.split('_', 1)[0])
+        if source not in eligible:
+            family = role.split('_', 1)[0]
+            used = {row['source_id'] for row in inventory if row is not slot and row['role'].split('_', 1)[0] == family}
+            used.update(key for key, row in catalog.items() if any(spec['source'] is row and spec['role'].split('_', 1)[0] == family for spec in specs))
+            source = next((row for row in eligible if (row.get('source_id') or f"source_{int(row['source_index']):02d}") not in used), None)
         specs.append({'role': role, 'source': source, 'reason': '' if source else 'Output evidence anchor is unresolved'})
     for spec in specs:
         family = spec['role'].split('_', 1)[0]

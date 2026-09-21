@@ -164,7 +164,12 @@ def _evaluate(job: Path, plugin: ProductPlugin, task: dict[str, Any], candidate:
         except Exception as exc:
             if isinstance(exc, ProviderQueueUnavailable) or (isinstance(exc, VisionRequestError) and exc.failure_kind == "queue_unavailable" and exc.metadata.get("physical_request_count") == 0):
                 raise ProviderQueueUnavailable("vision_qa", "QA not executed: vision capacity unavailable; candidate retained") from exc
-            gates.append(_gate("product_fidelity", "inconclusive", f"Independent observation unavailable: {type(exc).__name__}: {exc}"))
+            applicable = ['product_fidelity', 'unauthorized_text']
+            if task['role_family'] == 'size' or (task.get('measurement_authority') or {}).get('mode') == 'source_image':
+                applicable.append('dimension_accuracy')
+            if candidate.get('revision_mode') == 'targeted_edit':
+                applicable.append('edit_scope')
+            gates.extend(_gate(name, 'inconclusive', f"Independent observation unavailable: {type(exc).__name__}: {exc}") for name in applicable)
     statuses = {row["status"] for row in gates}
     decision = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
     evidence = {
@@ -243,17 +248,25 @@ def _semantic_gates(task: dict[str, Any], observation: dict[str, Any]) -> list[d
 
     dimensions = observation["measurements"]
     groups = {r['id']: r for r in (task.get('measurement_authority') or {}).get('measurement_groups', [])}
+    authorized_values = permitted + [row['render_text'] for row in groups.values()]
     expected_ids = set(groups)
     observed_ids = [r.get('measurement_id') for r in dimensions if r.get('measurement_id')]
-    unbound = bool(set(observed_ids) != expected_ids or len(observed_ids) != len(set(observed_ids)))
+    unbound = bool(set(observed_ids) != expected_ids or len(observed_ids) != len(dimensions)
+                   or len(observed_ids) != len(set(observed_ids)))
     if expected_ids and any(not extract_measurements(row['candidate_text']) for row in dimensions):
         unbound = True
     wrong = [row for row in dimensions if row["confidence"] >= 0.9 and (
         row["relationship"] == "different" or (
             _measurement_values([row["source_text"]]) and _measurement_values([row["candidate_text"]])
             and not measurement_values_match(groups.get(row.get('measurement_id'), {}).get('render_text') or row["source_text"], row["candidate_text"])))]
-    if wrong:
-        dimension_gate = _gate("dimension_accuracy", "fail", f"Located measured-object/value/endpoint contradictions: {wrong}")
+    unauthorized = [row['text'] for row in texts if has_diagram and row['kind'] == 'measurement'
+                    and row['confidence'] >= .9 and extract_measurements(row['text'])
+                    and not any(measurement_values_match(value, row['text']) for value in authorized_values)]
+    unauthorized += [row['candidate_text'] for row in dimensions if has_diagram and row['confidence'] >= .9
+                     and row.get('measurement_id') not in groups and extract_measurements(row['candidate_text'])
+                     and not any(measurement_values_match(value, row['candidate_text']) for value in authorized_values)]
+    if wrong or unauthorized:
+        dimension_gate = _gate("dimension_accuracy", "fail", f"Located measured-object/value/endpoint contradictions: {wrong}; unapproved measurement text: {unauthorized}")
     elif unbound or (has_diagram and (not dimensions or observation["measurement_coverage"] != "complete")) or observation["measurement_coverage"] == "partial" or any(row["confidence"] < 0.9 or row["relationship"] == "unknown" for row in dimensions):
         dimension_gate = _gate("dimension_accuracy", "inconclusive", "Incomplete measured-object, value or endpoint observation")
     else:

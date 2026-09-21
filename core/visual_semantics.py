@@ -14,8 +14,8 @@ from .image_task_inputs import shared_design_values
 from .image_reference_context import product_features, source_box, source_point, measurement_attachment, resolve_edit_references, reference_semantics
 
 
-OBSERVATION_POLICY = "child-joint-observation-v29-original-evidence"
-CLAIM_REVIEW_POLICY = "planning-binding-review-v25-output-scope"
+OBSERVATION_POLICY = "child-joint-observation-v30-visible-structure"
+CLAIM_REVIEW_POLICY = "planning-binding-review-v26-typed-diagnostics"
 CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v19-measurement-endpoints"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "unknown"}
@@ -174,7 +174,8 @@ def observe_child_sources(
         "product_features records directly visible product structure and operating state, without coordinates or crop instructions. "
         "product_extent is whole_view when a complete product is visible somewhere in the original, detail for partial products, none for no visible product. "
         "reference_purposes selects original attachments, not output panels. "
-        "Describe actual compartments, joints and supports, not just a generic product name. "
+        "Describe actual compartments, joints and supports, including clearly visible counts, connections and operating state. "
+        "Record only visible structure; never infer hidden or occluded parts from category expectations. "
         "Record measurements with the measured object/property, axis, full quantity, unit and qualifiers. "
         "Resolve OCR against original pixels; inches and feet readings of one mark are alternatives, not two facts. "
         "dimension_line means a visible measurement diagram; text_spec means a written specification. "
@@ -490,7 +491,7 @@ def _planning_review_rows(rows: Any, requests: list[dict[str, Any]]) -> tuple[di
         try:
             if row.get('status') not in ('supported', 'contradiction', 'inconclusive') or not isinstance(row.get('reason'), str) or not row['reason'].strip():
                 raise ValueError('Review needs a verdict and explanation')
-            findings = row.get('findings')
+            findings = row.get('findings', [] if request['kind'] == 'product_claim' and not request.get('physical_operations') else None)
             if not isinstance(findings, list) or (not findings and request.get('physical_operations')):
                 raise ValueError('Review needs typed findings for required operations')
             operations, checked_findings, broken_operations = set(), {}, set()
@@ -528,13 +529,15 @@ def _planning_review_rows(rows: Any, requests: list[dict[str, Any]]) -> tuple[di
                 missing = set(request.get('physical_operations', [])) - checked_findings.keys()
                 if missing and not any(item['status'] == 'contradiction' for item in checked_findings.values()):
                     errors[key] = 'Review omitted required operations: ' + ', '.join(sorted(missing))
+                if key in errors:
+                    raise ValueError(errors[key])
                 statuses = {item['status'] for item in checked_findings.values()}
-                status = 'contradiction' if 'contradiction' in statuses else 'inconclusive' if missing or 'inconclusive' in statuses or key in errors else 'supported'
+                status = 'contradiction' if 'contradiction' in statuses else 'inconclusive' if 'inconclusive' in statuses else 'supported'
                 result[key] = {**row, 'status': status, 'findings': list(checked_findings.values())}
             else:
                 if key in errors:
                     raise ValueError(errors[key])
-                result[key] = row
+                result[key] = {**row, 'findings': list(checked_findings.values())}
         except ValueError as exc:
             errors[key] = str(exc)
     for key in expected.keys() - result.keys() - errors.keys():
@@ -549,6 +552,7 @@ def review_planning_bindings(
     deadline_monotonic: float | None = None,
     attempt_observer: Any = None,
     prior_output_limits: list[dict[str, Any]] | None = None,
+    protocol_errors: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """One existing planning review request for facts and explicit design bindings, not aesthetics."""
     if not claims:
@@ -654,7 +658,9 @@ def review_planning_bindings(
         "showing a bare frame with designed bedding is not, unless it conceals the feature this role must demonstrate. "
         "Do not judge beauty, enforce trends, require identical colors for different graphic roles, or add "
         "product requirements. Missing/ambiguous information is inconclusive, not contradiction.\n"
-        + json.dumps({"bindings": bindings, "child_product_facts": list(fact_catalog.values()), 'fact_sets': fact_sets, 'shared_design': shared_design,
+        + json.dumps({"bindings": bindings, 'prior_protocol_errors': {row['key']: protocol_errors[row['key']] for row in claims
+                        if protocol_errors is not None and row['key'] in protocol_errors},
+                      "child_product_facts": list(fact_catalog.values()), 'fact_sets': fact_sets, 'shared_design': shared_design,
                       "selected_evidence": evidence_catalog, "source_views": source_views, "execution_inputs": execution_inputs,
                       'execution_catalog': execution_catalog}, ensure_ascii=False, separators=(',', ':'))
     )
@@ -678,7 +684,11 @@ def review_planning_bindings(
         request_id=f"claim-review:{input_revision_id(claims)}", attempt_observer=record,
     )
     (trace_dir / "planning_review_response.txt").write_text(response, encoding="utf-8")
-    checked, _errors = _planning_review_rows(parse_json_object_response(response).get('reviews'), claims)
+    checked, errors = _planning_review_rows(parse_json_object_response(response).get('reviews'), claims)
+    if protocol_errors is not None:
+        for request in claims:
+            protocol_errors.pop(request['key'], None)
+        protocol_errors.update({key: error for key, error in errors.items() if key in {r['key'] for r in claims}})
     provenance = {'policy': CLAIM_REVIEW_POLICY, 'response_path': str((trace_dir / 'planning_review_response.txt').resolve()),
                   'response_sha256': file_sha256(trace_dir / 'planning_review_response.txt')}
     return {row['key']: {**row, **provenance, 'findings': [{**finding, **provenance} for finding in row['findings']]}

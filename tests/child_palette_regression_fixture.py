@@ -56,8 +56,8 @@ def check_child_components(case):
         conditional = compile_task_prompt(task=task)
         for component in components:
             group, part = component.split('.')
-            case.assertEqual(1, conditional.count(component + ' = ' + art['palette_direction'][group][part]))
-        case.assertIn('they do not add objects or change the product presentation', conditional)
+            case.assertNotIn(component + ' = ' + art['palette_direction'][group][part], conditional)
+        case.assertNotIn('Target components:', conditional)
         task['image_direction']['environment_mode'] = 'graphic_canvas'
         canvas = compile_task_prompt(task=task)
         case.assertNotIn('room.wall =', canvas)
@@ -132,8 +132,7 @@ def _check_shared_leaf_scope(case, source, raw):
     for path in ('palette_direction', 'palette_direction.bedding', 'palette_direction.undefined.item'):
         good, errors = _planning_review_rows([dict(key='binding', status='contradiction', reason='Conflict', findings=[
             dict(operation='shared_design:' + path, status='contradiction', reason='Conflict')])], [request])
-        case.assertFalse(good['binding']['findings'])
-        case.assertEqual('inconclusive', good['binding']['status'])
+        case.assertFalse(good)
         case.assertIn('existing leaf path', errors['binding'])
 
 

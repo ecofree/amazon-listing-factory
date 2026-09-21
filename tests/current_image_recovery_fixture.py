@@ -14,6 +14,45 @@ from core.image_generation_executor import generate_one, finalize_candidate
 from core.image_provider_common import CandidateCommitError, ProviderTransportError, ProviderQueueUnavailable
 
 
+def verify_exact_candidate_finalization(test, job, task, manifest):
+    """A paid revision must not be discarded because an earlier candidate exists."""
+    from copy import deepcopy
+    from core.candidate_state import current_candidate
+    from core.image_response import save_response
+    from core.imagegen_artifacts import imagegen_output_marker
+    original = deepcopy(task)
+    output = job / task['output_dir'] / 'task.candidate1.png'
+    runtime = {**task, 'job_dir': str(job), 'candidate_revision': 1, 'provider': 'copy',
+               'candidate_path': str(output), 'output_path': str(output), 'revision_mode': 'full_redraw',
+               'prompt': 'immutable request prompt', 'prompt_path': str(job / manifest['prompt_path']),
+               'task_prompt_fingerprint': manifest['task_prompt_fingerprint'],
+               'request_prompt_fingerprint': manifest['request_prompt_fingerprint']}
+    receipt = begin_response(response_directory(runtime), provider='copy', audit={'response_binding': response_binding(runtime)})
+    save_response(receipt, b'new candidate bytes', {})
+    with patch('core.image_generation_executor._finalize_candidate_bytes', side_effect=lambda value: value), patch(
+            'core.candidate_state.upscale_for_publication_with_backend', side_effect=lambda value: (value, 'pillow-lanczos-v1')), patch(
+            'core.image_generation_executor.reserve_image'), patch('core.image_generation_executor.release_image'), patch(
+            'core.image_generation_executor.generate_with_provider_retries') as remote:
+        ready = generate_one(runtime, plugin=None)
+        with patch('core.image_generation_executor.finish_response', side_effect=OSError('interrupted after candidate commit')):
+            with test.assertRaises(CandidateCommitError):
+                finalize_candidate(ready, plugin=None)
+        test.assertTrue(output.is_file())
+        test.assertEqual('received', read_json(receipt)['status'])
+        finalized = finalize_candidate(ready, plugin=None)
+        test.assertEqual(len(b'new candidate bytes'), finalized['bytes'])
+        test.assertEqual(1, current_candidate(job, original)['candidate_revision'])
+        test.assertEqual('finalized', read_json(receipt)['status'])
+        test.assertFalse(receipt.with_suffix('.bin').exists())
+        finalize_candidate(ready, plugin=None)
+        with test.assertRaisesRegex(CandidateCommitError, 'request'):
+            finalize_candidate({**ready, 'request_prompt_fingerprint': 'different-request'}, plugin=None)
+        remote.assert_not_called()
+    output.unlink()
+    imagegen_output_marker(output).unlink()
+    (job / 'reports/candidate_manifests/B1/main/task/candidate1.json').unlink()
+
+
 def verify_paid_response_recovery(test):
     verify_interrupted_response_recovery(test)
     verify_safe_transport_retry(test)

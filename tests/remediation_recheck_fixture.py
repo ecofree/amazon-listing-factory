@@ -196,6 +196,9 @@ def verify_partial_review_rows(test):
     def response(prompt, paths, **kwargs):
         payload = json.loads(prompt.split('\n', 1)[1])
         requests = payload['bindings']
+        if requests_seen:
+            test.assertEqual({requests[0]['key']}, set(payload['prior_protocol_errors']))
+            test.assertIn('findings', payload['prior_protocol_errors'][requests[0]['key']])
         shared = shared_design_values(payload['shared_design'])
         test.assertNotIn('shared_design_fields', prompt)
         test.assertTrue(all('shared_design' not in row for row in requests))
@@ -206,6 +209,8 @@ def verify_partial_review_rows(test):
         rows = [{**row, 'reason': 'Bound product evidence supports this operation'}
                 for row in supported_review_results(requests).values()]
         for request, row in zip(requests, rows):
+            if request['kind'] == 'product_claim':
+                row.pop('findings', None)
             if request.get('role_design', {}).get('role') == 'func' and repair_count[0] == 0:
                 row['findings'] = 'invalid list'
         payload = json.dumps({'reviews': rows})
@@ -245,6 +250,12 @@ def verify_partial_review_rows(test):
     valid, errors = _planning_review_rows([source_review], [source_request])
     test.assertFalse(errors)
     test.assertIn(source_request['key'], valid)
+    required = dict(key='binding', kind='design_binding', physical_operations=['depiction'], shared_design={})
+    finding = dict(operation='depiction', status='supported', reason='Visible in reference')
+    for findings in ([], [finding, finding], [dict(finding, operation='unknown')], [finding, dict(finding, operation='unknown')]):
+        valid, errors = _planning_review_rows([dict(key='binding', status='supported', reason='Review', findings=findings)], [required])
+        test.assertFalse(valid)
+        test.assertIn('binding', errors)
 
     requests = [dict(key=key, kind='product_claim') for key in ('a', 'b', 'c')]
     a = dict(key='a', status='supported', reason='Supported source', findings=[])
@@ -255,6 +266,13 @@ def verify_partial_review_rows(test):
         test.assertTrue({'b', 'c'} <= set(errors))
     with test.assertRaises(ValueError):
         _planning_review_rows({}, requests)
+    for status in ('supported', 'inconclusive', 'contradiction'):
+        row = dict(key='a', status=status, reason='Original reason', resolution='retry_review')
+        valid, _ = _planning_review_rows([row], requests)
+        test.assertEqual({**row, 'findings': []}, valid['a'])
+    valid, errors = _planning_review_rows([dict(a, findings=None)], requests)
+    test.assertFalse(valid)
+    test.assertIn('a', errors)
 
 
 def _verify_observation_cache(test, finding):

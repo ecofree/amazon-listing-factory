@@ -144,6 +144,8 @@ class GenerationStateContractTests(unittest.TestCase):
             ):
                 self.assertEqual("manifest_recovered", current_candidate(job, task)["state"])
                 self.assertEqual("copy", read_json(imagegen_output_marker(output))["provider"])
+                from tests.current_image_recovery_fixture import verify_exact_candidate_finalization
+                verify_exact_candidate_finalization(self, job, task, manifest)
                 moved = deepcopy(task)
                 for name in ('source', 'view', 'mask'):
                     (job / f'images/current-{name}.png').write_bytes((job / f'images/{name}.png').read_bytes())
@@ -222,6 +224,8 @@ class GenerationStateContractTests(unittest.TestCase):
                     saved = write_candidate_manifest(job, runtime)
                     self.assertEqual(candidate_sha, saved["edit_parent_candidate_sha256"])
                     self.assertEqual(file_sha256(edited_output), current_candidate(job, runtime)["candidate_sha256"])
+                    self.assertEqual('targeted_edit', current_candidate(job, runtime)['revision_mode'])
+                    self.assertEqual(candidate_sha, current_candidate(job, runtime)['edit_parent_candidate_sha256'])
                 self.assertEqual(file_sha256(edited_output), current_candidate(job, task)["candidate_sha256"])
                 edited_manifest_path = manifest_path.with_name('candidate2.json')
                 before = edited_manifest_path.read_bytes()

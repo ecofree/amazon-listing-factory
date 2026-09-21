@@ -85,7 +85,7 @@ def planner_visual_context_instruction(
 ) -> str:
     """Give the planner usable context without duplicating the full policy."""
 
-    instruction = "Use child facts for age and buyer suitability; category defaults suggest context, not product claims. Design the US setting yourself."
+    instruction = "Child facts govern suitability and installation; room defaults suggest context. Each presentation.state owns its evidenced room and use."
     heading = "CATEGORY CONTEXT (DESIGN GUIDANCE)\n"
     context = format_visual_context(policy, max_chars=max_chars - len(instruction) - len(heading) - 1)
     if not context:
