@@ -25,7 +25,7 @@ from tests.test_status_revision_contract import _job
 class FreezeRecoveryTests(unittest.TestCase):
     def _check_receipt_resolution_and_submission_boundary(self):
         from core.image_response import (begin_response, recover_response, resolve_response,
-            response_binding, response_directory, response_resolved, save_response)
+            response_binding, response_directory, save_response, submit_response, finish_response)
         from core.image_provider_routing import _provider_worker
         from queue import Queue
         with tempfile.TemporaryDirectory() as tmp:
@@ -33,7 +33,7 @@ class FreezeRecoveryTests(unittest.TestCase):
             task = dict(job_dir=tmp, logical_task_id='generate:B1:func', task_fingerprint='fixed',
                         candidate_revision=1, prompt='fixed prompt', generation_references=[])
             directory = response_directory(task)
-            audit = {'response_binding': response_binding(task)}
+            audit = {'response_binding': response_binding(task), 'logical_task_id': task['logical_task_id']}
             receipt = begin_response(directory, provider='cxk_fixed', audit=audit)
             image = job / 'source.png'
             image.write_bytes(b'fixture')
@@ -52,14 +52,27 @@ class FreezeRecoveryTests(unittest.TestCase):
                 _provider_worker('cxk_fixed', [str(image)], 'p', None, 'r', str(receipt), Queue())
             with self.assertRaises(ProviderTransportError):
                 recover_response(task)
+            changed = {**task, 'task_fingerprint': 'changed', 'prompt': 'new prompt'}
+            with self.assertRaises(ProviderTransportError):
+                recover_response(changed)
+            with self.assertRaises(ProviderTransportError):
+                begin_response(response_directory(changed), provider='other', audit={**audit, 'response_binding': response_binding(changed)})
+            independent = {**changed, 'logical_task_id': 'generate:B2:func'}
+            self.assertEqual({}, recover_response(independent))
             outcome = resolve_response(job, str(receipt), action='approve_one_resend', reason='Explicit test authorization')
             self.assertEqual(0, outcome['requests_sent'])
-            self.assertTrue(response_resolved(task))
+            self.assertEqual('resend_authorized', read_json(receipt)['status'])
+            with self.assertRaises(ProviderTransportError):
+                recover_response(changed)
             self.assertEqual({}, recover_response(task))
             replacement = begin_response(directory, provider='cxk_fixed', audit=audit)
             self.assertEqual(replacement.name, read_json(receipt)['replacement_receipt'])
             write_json(replacement, {**read_json(replacement), 'status': 'submitted'})
-            with self.assertRaisesRegex(ValueError, 'One unknown-result replacement'):
+            for _ in range(2):
+                resolve_response(job, str(replacement), action='approve_one_resend', reason='User authorized three resends')
+                replacement = begin_response(directory, provider='cxk_fixed', audit=audit)
+                submit_response(replacement, audit)
+            with self.assertRaisesRegex(ValueError, 'replacement limit'):
                 resolve_response(job, str(replacement), action='approve_one_resend', reason='No unbounded resend')
             with self.assertRaises(ProviderTransportError):
                 recover_response(task)
@@ -73,6 +86,18 @@ class FreezeRecoveryTests(unittest.TestCase):
             from core.image_provider_common import CandidateCommitError
             with self.assertRaises(CandidateCommitError):
                 begin_response(directory, provider='cxk_fixed', audit=audit)
+            with self.assertRaises(CandidateCommitError):
+                recover_response(changed)
+            finish_response(paid, 'finalized')
+            # Two workers may prepare locally; only one may cross the paid submission boundary.
+            first = begin_response(directory, provider='cxk_fixed', audit=audit)
+            changed_audit = {**audit, 'response_binding': response_binding(changed)}
+            second = begin_response(response_directory(changed), provider='other', audit=changed_audit)
+            submit_response(first, audit)
+            with self.assertRaises(ProviderTransportError):
+                submit_response(second, changed_audit)
+            self.assertEqual('prepared', read_json(second)['status'])
+            self.assertEqual({}, recover_response(independent))
 
     def tearDown(self):
         from core.model_call_health import reset_provider_run_circuits
@@ -91,20 +116,29 @@ class FreezeRecoveryTests(unittest.TestCase):
             self.assertIn("qc_yc_fixed", registry)
             self.assertNotIn("lz_token_gpt_image_2", registry)
             self.assertFalse(any(name.startswith('aicost_') for name in registry))
-            roles = ("main", "scene_03", "func_04", "size")
+            roles = ("func_04", "size", "main", "scene_03", "scene_04")
             tasks = [routing.apply_role_provider_policy({"child": "B1", "role": role}, plugin) for role in roles]
             for role, task in zip(roles, tasks):
                 models = {registry[name].model for name in task["providers"]}
                 self.assertEqual(
-                    {"gpt-image-2.5-flare", "gpt-image-2.5-sunburst"} if role.startswith(("func", "size"))
-                    else {"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare"}, models,
+                    {"gpt-image-2", "gpt-image-2.5-sunburst"} if role.startswith(('func', 'size'))
+                    else {"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}, models,
                 )
             assigned = routing.assign_provider_pool(tasks)
             for source, result in zip(tasks, assigned):
                 self.assertEqual(set(source["providers"]), set(result["providers"] + result["child_provider_reserve"]))
-            self.assertEqual(assigned[0]["child_provider_primary"], assigned[1]["child_provider_primary"])
-            self.assertEqual(assigned[2]["child_provider_primary"], assigned[3]["child_provider_primary"])
-            self.assertEqual(["photo", "photo", "infographic", "infographic"], [t["child_provider_role_lane"] for t in assigned])
+            self.assertEqual(5, len({row['child_provider_primary'] for row in assigned}))
+            self.assertTrue(all(registry[row['child_provider_primary']].model.startswith('gpt-image-2.5') for row in assigned))
+            self.assertTrue(all(registry[row['child_provider_primary']].model == 'gpt-image-2.5-sunburst' for row in assigned[:2]))
+            self.assertTrue(all(registry[row['child_provider_backup']].model == 'gpt-image-2' for row in assigned))
+            from core.image_generation import _dispatch_generation_batch
+            with patch('core.image_generation._effective_generation_workers', return_value=8):
+                first, waiting = _dispatch_generation_batch(assigned, 8)
+                self.assertEqual(5, len(first))
+                self.assertEqual([], waiting)
+                blocked, waiting = _dispatch_generation_batch([{**assigned[0], 'role': 'scene_05'}], 8, active=first)
+                self.assertEqual([], blocked)  # An idle GPT-image-2 must not steal normal work.
+                self.assertEqual(1, len(waiting))
 
     def test_provider_growth_does_not_shorten_request_budget(self):
         from core import image_generation_executor as executor

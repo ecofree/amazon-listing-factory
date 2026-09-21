@@ -14,8 +14,8 @@ from .image_task_inputs import shared_design_values
 from .image_reference_context import product_features, source_box, source_point, measurement_attachment, resolve_edit_references, reference_semantics
 
 
-OBSERVATION_POLICY = "child-joint-observation-v30-visible-structure"
-CLAIM_REVIEW_POLICY = "planning-binding-review-v26-typed-diagnostics"
+OBSERVATION_POLICY = "child-joint-observation-v33-physical-relations"
+CLAIM_REVIEW_POLICY = "planning-binding-review-v27-product-depiction"
 CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v19-measurement-endpoints"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "unknown"}
@@ -131,7 +131,7 @@ def observe_child_sources(
             "product_features": [{"feature_id": "stable physical feature identity", "object_id": "observed object_id",
                 "physical_facts": ["directly visible part, geometry, mechanism, finish, count or state"]}],
             "confidence": 0.0,
-            "evidence": ["One product view with a visible height annotation"],
+            "evidence": ["Visible evidence explaining the selected primary image purpose, not merely a list of product features"],
             "variant_identity": {
                 "status": "consistent|contradiction|unknown",
                 "observed_color": "visible sold-product finish, not bedding or lighting; empty if unclear",
@@ -160,11 +160,17 @@ def observe_child_sources(
         "Locate a sufficient set of distinct product views: appearance for reliable product form/finish, "
         "feature for distinct functional evidence, measurement for real quantities and their objects. "
         "Select appearance inputs for child-wide design: prefer a reliable complete product photograph with little unrelated setting; "
-        "a size-page photo can serve this purpose, but a line drawing cannot prove finish. Select one preferred whole-product appearance "
-        "reference when available, adding another appearance view only for essential form or finish absent there. A background is not "
+        "a size-page photo can serve this purpose, but a line drawing cannot prove finish. Select exactly one reliable whole-product appearance "
+        "reference when available; retain other views as feature or measurement evidence, not additional appearance inputs. A background is not "
         "a reason to reject otherwise reliable evidence when no cleaner view exists. Feature and measurement views remain available "
         "for editing and factual review, not as additional room-style inputs to planning. "
-        "Classify each gallery image's output purpose scene/func/size independently of whether its pixels are selected. "
+        "Choose role_guess from the image's primary communication purpose, independently of reference_purposes: "
+        "scene presents the product in everyday use or a room; an open cabinet showing stored items remains scene "
+        "when the image primarily presents that room/use context. Visible shelves or an open door alone do not make it func. "
+        "func primarily explains a specific feature, mechanism or installation through a focused demonstration, detail or callout; "
+        "it need not contain text, and a necessary room or wall does not make an installation detail scene. "
+        "size primarily communicates measured dimensions. In evidence, explain the visible emphasis supporting the chosen role; "
+        "resolve any mismatch between that explanation and role_guess before returning the observation. "
         "Use reference_only solely for material with no product-image delivery purpose, not to hide uncertain identity or unreadable facts. "
         "Do not describe source room styling, ordinary props, their text, colors, counts, locations or relationships. "
         "Classify text by meaning: product_fact for mechanisms, parts, counts and functional claims "
@@ -174,7 +180,8 @@ def observe_child_sources(
         "product_features records directly visible product structure and operating state, without coordinates or crop instructions. "
         "product_extent is whole_view when a complete product is visible somewhere in the original, detail for partial products, none for no visible product. "
         "reference_purposes selects original attachments, not output panels. "
-        "Describe actual compartments, joints and supports, including clearly visible counts, connections and operating state. "
+        "Describe visible part-to-part relations: name the owning compartment, mounting face and connected part; top/bottom alone is ambiguous. "
+        "For installation, distinguish the product's mounting face and fixing point from the wall's. Separate visible counts from total counts. "
         "Record only visible structure; never infer hidden or occluded parts from category expectations. "
         "Record measurements with the measured object/property, axis, full quantity, unit and qualifiers. "
         "Resolve OCR against original pixels; inches and feet readings of one mark are alternatives, not two facts. "
@@ -183,7 +190,8 @@ def observe_child_sources(
         "For unselected sources, retain delivery role and relevant product text. evidence_gaps and text_gaps describe necessary "
         "unavailable product information, not unreadable decor or incomplete room parsing. "
         "visible_numbers_or_units is also a list of strings, not measurement objects. "
-        "Alternative adjustment positions, arrows, ghosted parts and inset borders are diagram notation, not additional physical components. "
+        "For adjustable parts, record which positions are mutually exclusive states of the same part, not simultaneous parts. "
+        "Arrows, emphasis rings, alternative-position ghosts and inset borders cannot prove physical parts, material or mounting. "
         "objects contains the sold product and necessary included parts or specific disputed accessories only. "
         "Do not name, classify, number or record ordinary non-sold bedding, furniture, decor or their relationships. "
         "Product state and physical_facts describe the sold object only. An occluded joint is unavailable product evidence, "
@@ -206,7 +214,14 @@ def observe_child_sources(
         requested_ids = {row["source_id"] for row in requested}
         if any(not isinstance(row, dict) or row.get("source_id") not in requested_ids for row in value["sources"]):
             raise ValueError("Observation response changed the requested attachment scope")
-        _validate_observations([*retained, *value["sources"]], source_ids, facts)
+        checked = _validate_observations([*retained, *value["sources"]], source_ids, facts)
+        usable = [row for row in checked.values() if row['status'] == 'success'
+                  and row.get('variant_identity', {}).get('status') != 'contradiction']
+        appearance = [row for row in usable if 'appearance' in row['reference_purposes']]
+        if len(appearance) > 1 or any(row['product_extent'] != 'whole_view' for row in appearance):
+            raise ValueError('Select exactly one reliable whole-product appearance reference; keep other views as feature/measurement evidence')
+        if not appearance and any(row['product_extent'] == 'whole_view' and row['product_features'] for row in usable):
+            raise ValueError('Choose the one reliable whole-product appearance reference from the observed gallery')
         return True
 
     trace = cache.with_name(cache.stem + '.' + uuid.uuid4().hex)
@@ -250,7 +265,7 @@ def observe_child_sources(
         request = prompt + "\nInput evidence, not response fields:\n" + json.dumps({
             "facts": facts,
             "attachments": [{k: row[k] for k in ('source_id', 'sha256', 'ocr')} for row in requested],
-            "already_observed_read_only": [{"source_id": row['source_id'], "objects": row.get('objects', [])} for row in retained],
+            "already_observed_read_only": [{key: row.get(key) for key in ('source_id', 'objects', 'reference_purposes', 'product_extent')} for row in retained],
             "repair_findings": {row['source_id']: result[row['source_id']].get('error') or result[row['source_id']].get('measurement_issues') for row in requested},
             'correction_requests': {row['source_id']: corrections[row['source_id']]['reason'] for row in requested if row['source_id'] in corrections},
         }, ensure_ascii=False)
@@ -628,6 +643,14 @@ def review_planning_bindings(
         "For inconclusive results, resolution is retry_review for incomplete evaluation, correct_evidence for a cited source_product defect, "
         "or revise_plan for an unsupported proposed depiction or claim requiring a local change. Other results may omit resolution. "
         "For design entries, evaluate supplied operations by exact ID; child product facts are verification context, not features every image must display. "
+        "product_depiction checks only this output's depicted parts, mounting faces, connections, mutually exclusive states and measured subjects "
+        "against the selected original pixels. Observed physical_facts are claims to check, not independent proof. "
+        "If an observation turns graphic notation into parts or mislocates a connection, report source_product:<source_id> with the faulty fact "
+        "and pixel evidence; use correct_evidence when inconclusive. If evidence is sound but the proposed depiction needs a different "
+        "mounting face, extra parts or an unsupported view, report product_depiction with revise_plan when inconclusive. "
+        "A required relation left ambiguous in the target is revise_plan; unchanged source-supported depiction needs no redundant prose. "
+        "Check one part's alternative positions as alternatives, not extra physical parts. Do not require unseen unrelated joints, "
+        "a whole-product count in a close-up, or particular layouts, room styles, typography or graphics. "
         "Detail-only output depicts selected parts, not a new whole hero; sold quantity does not require full units in a detail image. "
         "Original source_views verify provenance only: a feature visible only on an original page does not prove it is in the generation attachments. "
         "Check explicit contradictory instructions, not aesthetic quality or pixel-level color equality; uncertainty about taste is not inconclusive. "

@@ -18,7 +18,7 @@ def _task(role: str, mode: str = "none") -> dict:
     return {
         "child": "B1", "role": role, "role_family": family,
         "policy_version": IMAGE_TASK_POLICY_VERSION, "task_fingerprint": "task",
-        "category_image_policy": {},
+        "category_image_policy": {"main_image_policy": "white_background"},
         "measurement_authority": {"mode": mode, "render_text": []},
         "renderable_text_contract": {
             "mode": "exact" if family in {"func", "size"} else "none",
@@ -266,9 +266,14 @@ class QaLiteV1Tests(unittest.TestCase):
             _validate_candidate_bindings(obs, attachments, candidate_product_targets(bound_task), [group], {})
 
     def test_obvious_nonwhite_main_is_a_hard_fact_failure(self) -> None:
-        plugin = type("Plugin", (), {"category_id": "medicine_cabinet", "merged_config": lambda _self: {"image_generation": {"main_image_policy": "white_background"}}})()
         with patch.object(image_qa, "inspect_image_pixel_evidence", return_value={"white_background": False}):
-            gate = image_qa._main_background_gate(plugin, _task("main"), Path("candidate.png"))
+            gate = image_qa._main_background_gate(_task("main"), Path("candidate.png"))
+            lifestyle = _task('main')
+            lifestyle['category_image_policy']['main_image_policy'] = 'product_first_lifestyle'
+            self.assertEqual('pass', image_qa._main_background_gate(lifestyle, Path('candidate.png'))['status'])
+            lifestyle['category_image_policy'] = {}
+            with self.assertRaises(KeyError):
+                image_qa._main_background_gate(lifestyle, Path('candidate.png'))
         self.assertEqual("fail", gate["status"])
         observation = _observed(_task("main"))
         observation["texts"] = [{"text": "Beautiful Storage", "kind": "marketing", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)}]

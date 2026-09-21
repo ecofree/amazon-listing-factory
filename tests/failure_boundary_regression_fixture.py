@@ -21,7 +21,7 @@ from core.vision_errors import VisionRequestError
 from tests.test_status_revision_contract import _job
 from tests.current_image_contract_fixture import (
     current_image_task, current_art_direction, current_image_direction, current_product_feature,
-    current_observed_measurement, supported_review_results,
+    current_observed_measurement, supported_review_results, supported_design_reviews,
 )
 
 
@@ -75,7 +75,9 @@ def _frozen_output_isolation(test):
     after = task_specs({}, sources, inventory=inventory, include_optional=True)
     test.assertEqual([(r['role'], (r['source'] or {}).get('source_id')) for r in before],
                      [(r['role'], (r['source'] or {}).get('source_id')) for r in after])
-    alternate = task_specs({}, [r for r in sources if r['source_id'] != 'source_00'], inventory=inventory, include_optional=True)
+    replacement = deepcopy([r for r in sources if r['source_id'] != 'source_00'])
+    next(r for r in replacement if r['source_id'] == 'source_01')['observation']['reference_purposes'] = ['appearance', 'feature']
+    alternate = task_specs({}, replacement, inventory=inventory, include_optional=True)
     test.assertEqual([r['role'] for r in before], [r['role'] for r in alternate])
     test.assertEqual('source_01', alternate[0]['source']['source_id'])
     broken = dict(plan, image_briefs=[*plan['image_briefs'], deepcopy(plan['image_briefs'][2]), 'bad', {'role': []}])
@@ -146,7 +148,8 @@ def _output_measurements(test):
                 display_copy={'title': None, 'labels': []})
     raw = {'family_art_direction': current_art_direction(), 'image_briefs': [size]}
     compiled = compile_visual_design_kit_response(raw, source_manifest=[appearance, dimensions],
-                output_inventory=initial_output_inventory([appearance, dimensions]))
+                output_inventory=initial_output_inventory([appearance, dimensions]),
+                claim_reviews=supported_design_reviews(raw, [appearance, dimensions]))
     test.assertEqual('ready', next(r for r in compiled['image_briefs'] if r['role'] == 'size')['status'])
     with TemporaryDirectory() as tmp:
         job = Path(tmp)

@@ -13,10 +13,10 @@ from .paths import resolve_job_owned_path
 from .status import input_revision_id, logical_task_id
 
 
-PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v94-original-evidence"
+PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v96-physical-relations"
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v76-selected-inputs"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v78-physical-relations"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -216,6 +216,10 @@ def compile_task_prompt(
         "Ordinary unbranded prop text is allowed where this role permits props; never treat it as product evidence. "
         "Do not invent brands, model labels or unreadable pseudo-text."
     )
+    if role in {'func', 'size'}:
+        text_rule += (" Copy roles (instructions, not visible text): the first string is the title; remaining strings are labels."
+                      if task['display_copy_contract'].get('title') else
+                      " Copy roles (instructions, not visible text): no title; all authored strings are labels.")
     prompt = "\n\n".join((
         f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}",
         "[ROLE]\nImage goal: " + image_direction["visual_goal"]
@@ -369,13 +373,19 @@ def _role_content(task: dict[str, Any], role: str) -> str:
              "Depict the complete product structure supported by the whole-product evidence.")
     if (task.get('measurement_authority') or {}).get('mode') == 'source_image':
         scope += " Measurement views may show a representative unit, not the full package quantity."
-    rows = [scope, f"Product use/demonstration: {presentation['state']}"]
+    rows = [scope, f"Target product state/use: {presentation['state']}",
+            "The following are observations of each source, not additional output states. Preserve evidenced structure; "
+            "depict the target state supported by the selected references, not every source state simultaneously."]
+    if role in {'func', 'size'}:
+        rows.append("Alternative positions of the same part are mutually exclusive; indicate unoccupied positions as diagram notation, "
+                    "never extra solid parts. Preserve the evidenced mounting faces and connections. Where another view would require "
+                    "inventing a hidden connection, retain the source-supported view and redesign its surrounding layout only.")
     for ref in task['generation_references']:
         if ref['kind'] not in {'edit_base', 'product_evidence'}:
             continue
         features = '; '.join(f"{item['object_id']}: " + ', '.join(item['physical_facts'])
                              for item in ref.get('visible_evidence', []))
-        rows.append(f"{ref['source_id']} product facts: {features}")
+        rows.append(f"Observed in {ref['source_id']}: {features}")
     if (task.get("measurement_authority") or {}).get("mode") == "source_image":
         rows.append(_measurement_content(task.get("measurement_authority"), task['generation_references'], authored_text=task_renderable_text(task)))
     return "\n".join(row for row in rows if row)

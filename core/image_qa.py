@@ -28,7 +28,6 @@ from .qa_evidence import (
     read_qa_evidence,
     write_qa_evidence,
 )
-from .required_role_policy import main_image_policy
 from .image_task_inputs import release_candidate_fingerprint
 from .image_tasks import read_image_tasks
 from .run_scope import scoped_child_set
@@ -200,18 +199,21 @@ def _local_gates(job: Path, plugin: ProductPlugin, task: dict[str, Any], output:
     except Exception as exc:
         gates.append(_gate("image_integrity", "fail", f"{type(exc).__name__}: {exc}"))
         return gates
-    gates.append(_main_background_gate(plugin, task, output))
+    gates.append(_main_background_gate(task, output))
     if gates[-1]["status"] == "fail":
         return gates
     return gates
 
 
-def _main_background_gate(plugin: ProductPlugin, task: dict[str, Any], output: Path) -> dict[str, Any]:
+def _main_background_gate(task: dict[str, Any], output: Path) -> dict[str, Any]:
     if task["role_family"] != "main":
         return _gate("main_background", "pass", "not a main-image task")
+    policy = task['category_image_policy']['main_image_policy']
+    if policy not in {'white_background', 'product_first_lifestyle'}:
+        raise ValueError('ImageTask has an invalid main-image policy')
     pixel = inspect_image_pixel_evidence(output)
     white = bool(pixel.get("white_background"))
-    if main_image_policy(plugin) == "product_first_lifestyle":
+    if policy == "product_first_lifestyle":
         return _gate(
             "main_background",
             "pass",

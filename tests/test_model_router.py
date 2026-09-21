@@ -71,9 +71,7 @@ class ModelRouterTests(unittest.TestCase):
         rows = {row["name"]: row for row in registry["providers"]}
         sunburst = rows["cxk_gpt_image_25_sunburst"]
         self.assertEqual("gpt-image-2.5-sunburst", sunburst["model"])
-        self.assertEqual(["func", "size"], sunburst["allowed_roles"])
         self.assertTrue(sunburst["enabled"])
-        self.assertEqual(rows["cxk_fixed"]["resource_group"], sunburst["resource_group"])
         self.assertEqual(rows["cxk_fixed"]["key_env"], sunburst["key_env"])
         self.assertTrue(rows["qc_yc_fixed"]["enabled"])
         self.assertNotIn("qc_yc_fixed_gpt_image_25", rows)

@@ -35,17 +35,19 @@ from .image_reference_context import (
     generation_reference_primary_path,
     generation_reference_sources,
 )
-from .api_registry import image_provider_supports_mask, image_provider_supports_multiple_references
+from .api_registry import image_provider_supports_mask, image_provider_supports_multiple_references, image_provider_fallback_only
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .provider_policy import assert_provider_allowed, load_provider_policy
 from .progress_trace import record_progress
 from .status import input_revision_id
-from .image_response import recover_response, response_binding, response_directory, finish_response, materialize_response
+from .image_response import recover_response, response_binding, response_directory, finish_response, materialize_response, authorize_unknown_resend, unknown_result_resend_limit
 from .image_resources import reserve_image, release_image
 
 
 def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
+    if authorize_unknown_resend(task):
+        task['request_outcome'] = 'unknown'
     saved = recover_response(task)
     if saved:
         return {**task, 'provider': saved['provider'], 'request_audit': saved['request_audit'],
@@ -126,8 +128,8 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
     global_policy = load_provider_policy()
     attempted_providers: list[str] = []
     circuit_skipped_providers: list[str] = []
-    # Reserve time for one fallback, regardless of the number of configured models.
-    default_role_budget = min(600.0, max(float(provider_timeout_seconds(name)) for name in providers) + 120.0)
+    # Budget follows the bounded resend policy, never the size of the model pool.
+    default_role_budget = min(1800.0, max(float(provider_timeout_seconds(name)) for name in providers) * (1 + unknown_result_resend_limit()) + 120.0)
     try:
         role_budget_seconds = max(60.0, float(os.environ.get("AMAZON_FACTORY_IMAGEGEN_ROLE_DEADLINE_SECONDS") or default_role_budget))
     except ValueError:
@@ -137,7 +139,16 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
         role_deadline = min(role_deadline, float(task["deadline_monotonic"]))
     if time.monotonic() >= role_deadline:
         raise ImageGenerationError("Image execution deadline exhausted before provider request")
+    backups = [name for name in providers if image_provider_fallback_only(name)]
+    normal = [name for name in providers if name not in backups]
+    if task.get('request_outcome') == 'unknown' and not backups:
+        raise ProviderConfigurationError(providers[0], 'Authorized resend requires an eligible fallback model')
+    providers = normal + backups
     for provider in providers:
+        if backups and (attempted_failures or task.get('request_outcome') == 'unknown') and provider not in backups:
+            continue
+        if provider in backups and normal and not attempted_failures and task.get('request_outcome') != 'unknown':
+            continue
         if provider_run_circuit_open(provider_runtime_circuit_key(provider)):
             circuit_skipped_providers.append(provider)
             _record_generation_progress(task, "image_provider_attempt_skipped_circuit_open", provider)
@@ -158,7 +169,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             ) -> None:
                 if status == "started":
                     counts = dict(task.get("provider_attempts") or {})
-                    counts[current_provider] = min(2, int(counts.get(current_provider) or 0) + 1)
+                    counts[current_provider] = int(counts.get(current_provider) or 0) + 1
                     task["provider_attempts"] = counts
                     task["provider_attempts_exact"] = True
                     request_audit['provider_attempts'] = counts
@@ -228,6 +239,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             except Exception as exc:
                 raise CandidateCommitError(f'Paid response saved; local validation failed: {exc}') from exc
             provider_duration = time.monotonic() - provider_started
+            task.pop('request_outcome', None)
             commit_task = {
                 **task,
                 "provider": provider,
@@ -299,7 +311,13 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             )
             if failure_class == "configuration":
                 open_provider_run_circuit(provider_runtime_circuit_key(provider), task_id=str(task.get("logical_task_id") or ""))
-            if getattr(exc, "ambiguous", False) or failure_class in {"contract", "candidate_commit"}:
+            if getattr(exc, "ambiguous", False):
+                if backups and role_deadline - time.monotonic() > 1 and authorize_unknown_resend(task):
+                    replacement = min(backups, key=lambda name: (attempted_providers.count(name), name == provider))
+                    providers.append(replacement)
+                    continue
+                break
+            if provider in backups or failure_class in {"contract", "candidate_commit"}:
                 # Neither an immutable task-contract failure nor a local
                 # artifact-commit failure can be repaired by spending a backup
                 # provider call.

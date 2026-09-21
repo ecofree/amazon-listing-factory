@@ -18,6 +18,7 @@ from .api_registry import (
     image_provider_entries,
     image_provider_physical_identity,
     image_provider_resource_group,
+    image_provider_fallback_only,
 )
 from .image_provider_common import (
     ImageGenerationError,
@@ -41,7 +42,7 @@ from .image_provider_common import (
 from .image_provider_transport import generate_with_registry_image_provider, has_registry_image_provider
 from .image_role_utils import role_key
 from .io import read_json, write_json
-from .image_response import begin_response, save_response, save_transport_response, finish_response
+from .image_response import begin_response, submit_response, save_response, save_transport_response, finish_response
 from .model_call_health import (
     model_provider_cooldown_active,
     open_provider_run_circuit,
@@ -119,63 +120,27 @@ def _persistently_unhealthy_providers(task: dict[str, Any]) -> set[str]:
 
 
 def assign_provider_pool(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Assign one model per child photo/infographic group within role eligibility."""
-    child_rows: dict[tuple[str, str], list[tuple[int, dict[str, Any], list[str]]]] = {}
-    for index, task in enumerate(tasks):
-        candidates = [str(name) for name in (task.get("providers") or []) if str(name).strip()]
-        ordered = _order_by_health(task, candidates)
-        child_lane = str(task.get("child_provider_lane_key") or task.get("child") or "default")
-        role_lane = "infographic" if role_key(task.get("role", "")) in {"func", "size"} else "photo"
-        child_rows.setdefault((child_lane, role_lane), []).append((index, task, ordered))
-    result: list[dict[str, Any] | None] = [None] * len(tasks)
-    assigned_load: dict[str, int] = {}
-    for (child_lane, role_lane), rows in child_rows.items():
-        # First select from the candidates common to the complete child.  In
-        # normal production all roles share the same filtered registry list;
-        # the union fallback only handles a role-specific capability gap.
-        common = set(rows[0][2]) if rows else set()
-        for _index, _task, ordered in rows[1:]:
-            common.intersection_update(ordered)
-        candidates = list(common) if common else list(dict.fromkeys(
-            name for _index, _task, ordered in rows for name in ordered
-        ))
-        score_totals: dict[str, float] = {name: 0.0 for name in candidates}
-        first_position: dict[str, int] = {}
-        for _index, task, ordered in rows:
-            scores = _provider_scores(task, ordered)
-            for name in candidates:
-                if name in scores:
-                    score_totals[name] += float(scores[name])
-                first_position.setdefault(name, ordered.index(name) if name in ordered else len(ordered))
-        candidates = sorted(candidates, key=lambda name: (first_position.get(name, 999), name))
-        family_primary = min(
-            candidates,
-            key=lambda name: (
-                assigned_load.get(image_provider_resource_group(name), 0) / max(1, provider_concurrency_limit(name)),
-                first_position.get(name, 999),
-                -score_totals.get(name, 0.0),
-                name,
-            ),
-            default="",
-        )
-        if family_primary:
-            group = image_provider_resource_group(family_primary)
+    """Spread normal work across models; fallback-only routes never take spare work."""
+    result, assigned_load = [], {}
+    for task in tasks:
+        ordered = _order_by_health(task, list(task.get("providers") or []))
+        normal = [name for name in ordered if not image_provider_fallback_only(name)]
+        backups = [name for name in ordered if image_provider_fallback_only(name)]
+        choices = backups if task.get('request_outcome') == 'unknown' else normal or backups
+        primary = min(choices, key=lambda name: (
+            assigned_load.get(image_provider_resource_group(name), 0) / max(1, provider_concurrency_limit(name)),
+            choices.index(name)), default="")
+        if primary:
+            group = image_provider_resource_group(primary)
             assigned_load[group] = assigned_load.get(group, 0) + 1
-        for index, task, ordered in rows:
-            primary = family_primary if family_primary in ordered else (ordered[0] if ordered else "")
-            backup = next((name for name in ordered if name != primary), "")
-            eligible = [name for name in (primary, backup) if name]
-            reserves = [name for name in ordered if name not in eligible]
-            result[index] = {
-                **task,
-                "providers": eligible,
-                "child_provider_reserve": reserves,
-                "child_provider_primary": primary,
-                "child_provider_backup": backup,
-                "child_provider_lane": child_lane,
-                "child_provider_role_lane": role_lane,
-            }
-    return [row for row in result if row is not None]
+        backup = next((name for name in backups if name != primary), "")
+        eligible = [name for name in (primary, backup) if name]
+        result.append({**task, "providers": eligible,
+            "child_provider_reserve": [name for name in ordered if name not in eligible],
+            "child_provider_primary": primary, "child_provider_backup": backup,
+            "child_provider_lane": str(task.get("child_provider_lane_key") or task.get("child") or "default"),
+            "child_provider_role_lane": "infographic" if role_key(task.get("role", "")) in {"func", "size"} else "photo"})
+    return result
 
 
 def generate_with_provider_retries(
@@ -392,7 +357,7 @@ def _provider_worker(
         def prepared(snapshot):
             nonlocal transport_started
             transport_started = True
-            write_json(receipt, {**record, 'status': 'submitted', 'request_audit': dict(snapshot)})
+            submit_response(receipt, snapshot)
             output.put({'event': 'request_prepared', 'request_audit': snapshot})
         data = generate_with_registry_image_provider(
             provider_name=provider, image_inputs=images, prompt=prompt, mask_bytes=mask,

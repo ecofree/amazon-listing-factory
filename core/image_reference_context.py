@@ -57,9 +57,10 @@ def product_features(observation: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def planning_reference_inputs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{'attachment_number': index + 1, 'source_id': source['source_id']}
-            for index, source in enumerate(source for source in sources
-                if 'appearance' in source['observation']['reference_purposes'])]
+    selected = [source for source in sources if 'appearance' in source['observation']['reference_purposes']]
+    if len(selected) != 1 or selected[0]['observation']['product_extent'] != 'whole_view':
+        raise ValueError('Child observation must select one reliable whole-product appearance reference')
+    return [{'attachment_number': 1, 'source_id': selected[0]['source_id']}]
 
 
 def prepare_planning_references(job: Path, sources: list[dict[str, Any]], directory: Path,
@@ -76,7 +77,7 @@ def prepare_planning_references(job: Path, sources: list[dict[str, Any]], direct
             raise ValueError('Source changed before planning')
         paths.append(path)
         manifest.append({**item, 'path': source['source_path'], 'sha256': source['source_sha256']})
-    write_json(directory / 'manifest.json', {'attachments': manifest, 'selection': 'observed_appearance_originals',
+    write_json(directory / 'manifest.json', {'attachments': manifest, 'selection': 'observed_primary_appearance_original',
         'context_limit': 'Original source graphics may remain; reference selection is not background removal.'})
     return paths
 
@@ -176,8 +177,10 @@ def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[
                 if targeted_edit else f"Inherit within that scope: {decision['inherit']} Adapt: {decision['adapt']}")
         elif row['kind'] == 'measurement_evidence':
             purpose = 'Measurement verification only: quantities, measured objects and endpoints; not styling or an extra output panel.'
-        elif row["kind"] == "product_evidence" or not targeted_edit:
-            purpose = str(row.get('extent') or 'Observed product view') + '.'
+        elif row['kind'] == 'product_evidence':
+            purpose = 'Supplementary identity/structure evidence; its photographed state does not override the target state.'
+        elif not targeted_edit:
+            purpose = 'Primary edit evidence for the target structure and state; source graphics are not the target layout.'
         else:
             purpose = "Selected candidate: retain its design and physical state except for the requested correction."
         identity = row['source_id']

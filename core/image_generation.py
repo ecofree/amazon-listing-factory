@@ -14,7 +14,7 @@ from .api_registry import (
 )
 from .candidate_state import CandidateStateError, current_candidate
 from .image_generation_executor import generate_one, finalize_candidate
-from .image_response import recover_response, response_resolved
+from .image_response import recover_response, authorize_unknown_resend, unknown_result_resend_limit
 from .image_provider_common import (
     ProviderQueueUnavailable,
     provider_attempts,
@@ -33,6 +33,7 @@ from .image_prompt_compiler import (
 )
 from .image_task_inputs import EXECUTION_PROFILES
 from .image_provider_routing import apply_role_provider_policy, assign_provider_pool, provider_order
+from .api_registry import image_provider_fallback_only
 from .image_provider_transport import eligible_imagegen_providers
 from .image_tasks import IMAGE_TASK_SCHEMA_VERSION, read_image_tasks
 from .imagegen_artifacts import IMAGEGEN_OUTPUT_CACHE_VERSION
@@ -175,16 +176,14 @@ def run_image_generation(
                 "provider_attempts": dict(state.get("provider_attempts") or {}),
                 "execution_revision": execution_revision,
             }
+            if authorize_unknown_resend(runtime_task):
+                runtime_task['request_outcome'] = 'unknown'
             if recover_response(runtime_task):
                 runtime.append(runtime_task)
                 continue
             if state.get('status') == 'blocked' and state.get('execution_revision') == execution_revision:
                 failures.append(_failure({**task, **state}, owner='generation',
                     error=str(state.get('error') or 'Generation contract is blocked'), status='blocked'))
-                continue
-            if state.get('request_outcome') == 'unknown' and not response_resolved(runtime_task):
-                failures.append(_failure({**task, **state}, owner='generation',
-                    error='Remote request outcome unknown; obtain provider confirmation or explicit resend approval before another paid request', status='review'))
                 continue
             apply_role_provider_policy(runtime_task, plugin)
             if not runtime_task.get("providers"):
@@ -425,6 +424,8 @@ def run_image_revision(
                 status="retryable",
             )],
         }
+    if authorize_unknown_resend(runtime_task):
+        runtime_task['request_outcome'] = 'unknown'
     assigned = assign_provider_pool([runtime_task])
     previous_provider = str(current.get("provider_name") or "")
     if previous_provider and assigned:
@@ -433,7 +434,7 @@ def run_image_revision(
             *(str(name) for name in assigned_task.get("providers") or [] if str(name)),
             *(str(name) for name in assigned_task.get("child_provider_reserve") or [] if str(name)),
         ]))
-        if mode == "targeted_edit" and previous_provider in ordered:
+        if mode == "targeted_edit" and previous_provider in ordered and not image_provider_fallback_only(previous_provider) and runtime_task.get('request_outcome') != 'unknown':
             preferred = [previous_provider, *[name for name in ordered if name != previous_provider]]
             assigned_task["providers"] = preferred[:2]
             assigned_task["child_provider_reserve"] = preferred[2:]
@@ -703,6 +704,9 @@ def _dispatch_generation_batch(
         routes = [name for name in routes if name and
                   (len(references) <= 1 or image_provider_supports_multiple_references(name, len(references))) and
                   (not any(row.get('protected_mask') for row in references) or image_provider_supports_mask(name))]
+        normal = [name for name in routes if not image_provider_fallback_only(name)]
+        routes = ([name for name in routes if image_provider_fallback_only(name)]
+                  if task.get('request_outcome') == 'unknown' else normal or routes)
         primary = next((name for name in routes if provider_concurrency_limit(name) <= 0 or
                         used.get(image_provider_resource_group(name), 0) < provider_concurrency_limit(name)), '')
         if routes and not primary:
@@ -842,12 +846,12 @@ def _candidate_task_result(task: dict[str, Any], candidate: dict[str, Any], *, e
 def _provider_attempt_counts(task: dict[str, Any], *, selected: str, attempted: Any = None) -> dict[str, int]:
     counts = dict(task.get("provider_attempts") or {})
     if task.get("provider_attempts_exact") is True:
-        return {str(name): min(2, max(0, int(value))) for name, value in counts.items()}
+        return {str(name): max(0, int(value)) for name, value in counts.items()}
     attempted_names = [str(value) for value in attempted or [] if str(value or "").strip()]
     if selected and selected not in attempted_names:
         attempted_names.append(selected)
     for provider in attempted_names:
-        counts[provider] = min(2, int(counts.get(provider) or 0) + 1)
+        counts[provider] = int(counts.get(provider) or 0) + 1
     return counts
 
 
@@ -859,7 +863,8 @@ def _generation_execution_revision(providers: list[str]) -> str:
         # A task that was blocked under the old single-reference runtime must
         # be eligible for recovery after the current func dual-reference fix.
         "generation_reference_contract": "typed-reference-edit-base-v2",
-        "routing_contract": "role-model-pool-v2-durable-group-dispatch",
+        "routing_contract": "role-model-pool-v3-primary-fallback",
+        "unknown_result_resends": unknown_result_resend_limit(),
         "execution_profiles": sorted(EXECUTION_PROFILES),
         "url_safety_policy": URL_SAFETY_POLICY_VERSION,
         "providers": [],
@@ -873,6 +878,8 @@ def _generation_execution_revision(providers: list[str]) -> str:
             "credential_revision": hashlib.sha256(str(getattr(entry, "api_key", "")).encode("utf-8")).hexdigest(),
             "prompt_max_chars": int(raw.get("prompt_max_chars") or 0),
             "allowed_roles": raw.get("allowed_roles") or [],
+            "fallback_only": raw.get("fallback_only") is True,
+            "resource_group": raw.get("resource_group") or name,
             # The resolved protocol profile is part of currentness: endpoint,
             # request dimensions, quality/background and output contract all
             # affect provider behaviour even when the prompt is unchanged.

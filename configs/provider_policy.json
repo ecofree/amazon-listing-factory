@@ -2,6 +2,8 @@
   "image_generation": {
     "forbidden_image_providers": ["lz_token_gpt_image_2"],
     "max_parallel_provider_jobs": 4,
+    "unknown_result_resends": 3,
+    "unknown_result_resend_authorization": "User authorized up to three default resends for unknown image outcomes, accepting duplicate-charge risk, on 2026-09-21.",
     "require_true_image_to_image": true,
     "forbid_local_final_compositing": true
   },

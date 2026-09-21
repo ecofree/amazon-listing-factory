@@ -52,7 +52,7 @@ from .visual_design_kit_compiler import (
     DESIGN_FIELD_SCHEMAS, IMAGE_DIRECTION_SCHEMA,
 )
 VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v16"
-VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v75-scoped-projection"
+VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v77-physical-relations"
 VISUAL_DESIGN_KIT_ARTIFACT = "visual_design_kits_v16.jsonl"
 
 _ROW_FIELDS = {"schema_version", "policy_version", "category_id", "main_image_policy", "child", "source_reference", "source_sha256", "source_references", "product_claims", "child_facts_revision_id", "input_revision_id", "family_design_id", "visual_design_kit_id", "family_art_direction", "image_briefs", "output_inventory", "planner", "approved_design_references"}
@@ -107,7 +107,10 @@ def build_visual_design_kits(
         source_manifest = _source_manifest(sources, job=job)
         product_claims = compact_product_claims(child)
         design_refs = approved_design_references(job, asin)
-        prompt = visual_design_kit_prompt(plugin, compact_product_facts(child), policy, source_manifest, design_refs, brand_design_brief(job), product_claims=product_claims, output_inventory=inventory)
+        try:
+            prompt = visual_design_kit_prompt(plugin, compact_product_facts(child), policy, source_manifest, design_refs, brand_design_brief(job), product_claims=product_claims, output_inventory=inventory)
+        except ValueError as exc:
+            return asin, None, [_failure(asin, str(exc))]
         revision, child_facts_revision = _kit_input_revision(child=child, policy=policy, sources=sources, planner_prompt=prompt)
         cached_current = bool(cached and visual_design_kit_row_current(
             job, plugin, asin, cached, child_row=child, sources=sources, policy=policy,
@@ -227,7 +230,6 @@ def build_visual_design_kits(
 
         try:
             source_paths = prepare_planning_references(job, source_manifest, trace_dir / "references", deadline_monotonic=child_deadline)
-            source_paths += [resolve_job_owned_path(job, row["path"]) for row in design_refs]
             record_progress(job, "visual_design_kit_started", child=asin, input_revision=revision)
             plan_requests = min(2, 4 - budget.get('plan', 0))
             if not (cached_current or scoped_repair):
@@ -538,6 +540,7 @@ def _finish_image_briefs(
         +
         "Use the original brief schema; preserve complete claim objects, counts and qualifiers. "
         "Preserve the child design and necessary specific product features and claim qualifiers; the image model owns composition. "
+        "Remove redundant explanatory copy; if a claim is corrected, also correct its outdated goal/state wording. "
         "Do not redesign unaffected parts of the child or change other output briefs.\n"
         + json.dumps({"shared_design": planned["family_art_direction"], "pending": [
                           {**{key: row[key] for key in ('role', 'source_id', 'error')}, 'draft': draft}
@@ -550,7 +553,7 @@ def _finish_image_briefs(
                           for row in pending if row['design_review']],
                       "source_evidence": repair_evidence,
                       "evidence_attachments": planning_reference_inputs(source_manifest),
-                      "design_references": _planner_design_refs(design_references or [], len(planning_reference_inputs(source_manifest))),
+                      "design_references": _planner_design_refs(design_references or []),
                       "claim_texts": repair_claims,
                       "schemas": [_brief_schema_for_output(row) for row in pending]}, ensure_ascii=False)
     )
@@ -768,10 +771,10 @@ def _planner_product_identity(facts: dict[str, Any]) -> dict[str, Any]:
 
 
 
-def _planner_design_refs(rows: list[dict[str, Any]], offset: int) -> list[dict[str, Any]]:
-    return [{"attachment_number": offset + index, "reference_id": row["source_id"],
+def _planner_design_refs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"reference_id": row["source_id"],
              "roles": row["roles"], "transfer_principles": row["purpose"], "approval_boundary": row['visual_review']['transfer_scope']}
-            for index, row in enumerate(rows, 1)]
+            for row in rows]
 
 
 def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], policy: dict[str, Any], source_manifest: list[dict[str, Any]], design_references: list[dict[str, Any]] | None = None, brand_brief: dict[str, Any] | None = None, *, output_inventory: list[dict[str, str]], product_claims: list[dict[str, Any]] = ()) -> str:
@@ -798,24 +801,31 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
     return (
         "Return JSON for one Amazon child. The program supplies verified facts and process; you plan the child-wide visual direction. "
         "The GPT image model designs each composition, room arrangement, lighting placement and information layout within that direction.\n\n"
-        "Appearance attachments identify the product's form, color and material, not its decorative styling. Plan from this product, "
+        "The single appearance attachment identifies product form, color and material, not decorative styling. Plan from this product, "
         "its evidenced users, use and US market. Ordinary source bedding, rooms and graphics are not a design brief. "
         "Other observed views remain in the fact catalog for function and measurement bindings; their original pixels go to editing and factual review. "
         "Preserve the sold product's geometry, finish, parts and quantity; use evidenced mechanisms and states, not invented hidden structure.\n\n"
         + (visual_context_guardrail + "\n\n" if visual_context_guardrail else "")
         + "OUTPUT IMAGE BRIEFS\n"
+        "First allocate distinct buyer questions across the existing output roles, then choose evidence, target states and concise copy. "
+        "Repeating the same capacity message in a different room is not a distinct information responsibility. Reuse necessary facts without inventing differences. "
         "Return one brief per output role, retaining role and source_id from the inventory. Multiple roles may share a source; "
         "retain every output slot. visual_goal states the buyer question, not a second appearance specification or preset layout. "
         "Main follows category policy and uses reliable complete product evidence. presentation states the intended product use/demonstration, "
-        "including its concrete room, use, physical support and installation; category settings are suggestions, never overrides of evidenced use. whole_product needs a same-child complete product reference; "
+        "including its concrete room, use, physical support and installation. For functional details, state the owning compartment, "
+        "mounting face and connected parts; preserve a source-supported view when a new angle would invent an unseen connection. "
+        "Category settings are suggestions, never overrides of evidenced use. whole_product needs a same-child complete product reference; "
         "detail_only stays close-up without inventing a full hero. Scene goals serve the evidenced audience; "
         "func goals communicate specific proven features rather than generic benefits.\n"
         "product_sources lists original same-child images: choose an edit base that clearly supports this output's structure and state; "
-        "add other sources only for necessary product evidence absent there. Their facts are authoritative, not their layouts, graphics or decor. "
+        "add other sources only for necessary product evidence absent there. Auxiliary photographed states do not override presentation.state. "
+        "Their facts are authoritative, not their layouts, graphics or decor. "
         "measurement_ids selects exact source_id:measurement_id facts this output communicates, independent of the edit photograph. "
         "Size requires real measurements; func may use [] when its feature needs no numeric annotation. Selected measurement originals are attached automatically. "
         "Do not reproduce optional source numbers merely because they exist; never invent or discard the qualifiers of a selected fact.\n"
-        "design_transfer selects role-approved references within their transfer_principles: inherit only permitted features and explain adaptations. A reference approval is scoped, not permission to copy its whole style. Use [] without suitable references: autonomous, not reference-calibrated.\n"
+        "design_transfer may select role-approved references from their reviewed text catalog, not from images seen in this request. "
+        "Inherit only permitted features and explain adaptations; original style pixels remain available to factual/design review and generation. "
+        "Use [] without suitable references: autonomous, not reference-calibrated.\n"
         "Each instruction has one owner: product facts own product finish; measurements own numeric labels; display_copy owns exact authored text; "
         "palette_direction owns core non-product appearance; typography owns font language; graphic_direction owns graphic colors. "
         "Other fields reference these choices without repeating them.\n"
@@ -825,8 +835,14 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
         "Select bedding for normal bed use, not exposed measurements or hidden mechanism demonstrations. The image model designs secondary decor. "
         "designed_environment uses the room direction; graphic_canvas is technical without room staging; source_setting preserves necessary installation relationships only. "
         "Keep graphic inks and the user backing boundary coherent; the image model designs sizing, line breaks and symbols.\n"
-        "For func/size, display_copy owns exact titles and captions: title may be null, labels may be empty. Bind each string to evidence IDs from this child's catalog, including other sources; the output anchor does not restrict fact scope. physical: proves visible structure only, not material/performance; measurement: supports measured-object headings. Numeric annotations belong to measurement authority, not duplicate copy. Cover distinctive proven mechanisms across the gallery, with their counts and qualifiers; omit repeated generic praise.\n\n"
-        "Source-colored outlines, adjustment ghosts and highlights are diagram notation, not finish or extra physical parts. Size preserves quantities and measurement associations; program-approved US-unit labels replace metric labels.\n\n"
+        "For func/size, edit display_copy into concise exact titles and labels before binding: title may be null, labels may be empty. "
+        "Remove paragraphs repeating the headline or diagram and generic praise; preserve quantities, subjects, conditions and limits. Accurate short source phrases may remain. "
+        "Bind each string to this child's evidence IDs, including other sources; the output anchor does not restrict fact scope. "
+        "physical: proves visible structure only, not material/performance; measurement: supports measured-object headings. "
+        "Numeric annotations belong to measurement authority, not duplicate copy. Cover distinctive proven mechanisms across the gallery.\n\n"
+        "For an adjustable part, presentation.state distinguishes its one installed position from mutually exclusive alternatives; "
+        "choose non-solid diagram notation for unoccupied positions. Source outlines, emphasis rings and ghosts do not authorize "
+        "material, added parts or mounting changes. Size preserves quantities and measurement associations; program-approved US-unit labels replace metric labels.\n\n"
         f"Category: {plugin.category_id}\n"
         f"Product type: {plugin.display_name}\n"
         f"Product identity: {json.dumps(_planner_product_identity(facts), ensure_ascii=False, separators=(',', ':'))}\n"
@@ -835,7 +851,7 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
         f"Final source intents: {json.dumps(evidence, ensure_ascii=False, separators=(',', ':'))}\n"
         f"Output inventory: {json.dumps(outputs, separators=(',', ':'))}\n"
         f"Evidence attachment map: {json.dumps(attachments, separators=(',', ':'))}\n"
-        f"Approved style-only attachments (never fact evidence): {json.dumps(_planner_design_refs(design_references or [], len(attachments)), ensure_ascii=False)}\n"
+        f"Reviewed style catalog (text only here, never product facts): {json.dumps(_planner_design_refs(design_references or []), ensure_ascii=False)}\n"
         f"Reference design systems: {json.dumps(list(dict.fromkeys(row['design_system'] for row in design_references or [])), ensure_ascii=False)}\n"
         f"Program-owned product-boundary policy: {json.dumps(_planner_policy_view(policy), ensure_ascii=False)}\n"
         f"Required response schema: {json.dumps(response_schema, ensure_ascii=False, separators=(',', ':'))}"
@@ -1006,16 +1022,16 @@ def _validate_source_manifest(rows: Any) -> None:
             or not isinstance(row["measurements"], list)
         ):
             raise VisualDesignKitError(f"source_references[{index}] evidence must be lists")
-        if row["role"] == "func":
+        if row["claims"]:
             claim_ids: set[str] = set()
             for claim in row["claims"]:
                 if not isinstance(claim, dict) or set(claim) != {"evidence_id", "source_sha256", "text", "type", "confidence"}:
-                    raise VisualDesignKitError(f"source_references[{index}] has malformed func evidence")
+                    raise VisualDesignKitError(f"source_references[{index}] has malformed claim evidence")
                 if claim["source_sha256"] != row["source_sha256"] or not str(claim["evidence_id"]):
-                    raise VisualDesignKitError(f"source_references[{index}] has unbound func evidence")
+                    raise VisualDesignKitError(f"source_references[{index}] has unbound claim evidence")
                 claim_ids.add(str(claim["evidence_id"]))
             if len(claim_ids) != len(row["claims"]):
-                raise VisualDesignKitError(f"source_references[{index}] has duplicate func evidence IDs")
+                raise VisualDesignKitError(f"source_references[{index}] has duplicate claim evidence IDs")
 def _planner_evidence(sources: list[dict[str, Any]], product_claims: list[dict[str, Any]] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     evidence = [_planner_source_view(row) for row in sources]
     texts: dict[str, list[str]] = {}

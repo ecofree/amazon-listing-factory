@@ -154,7 +154,11 @@ def _repair_checkpoint(test):
                 next(row for row in raw['image_briefs'] if row['role'] == 'func')['image_direction']['environment_mode'] = []
             return json.dumps(raw)
         stack.enter_context(patch.object(design, 'gemini_stream_generate', side_effect=planner))
-        with patch.object(design, 'review_planning_bindings', side_effect=KeyboardInterrupt('after local repair')), test.assertRaises(KeyboardInterrupt):
+        def interrupt_repaired_role(requests, **kwargs):
+            if any(row.get('role_design', {}).get('role') == 'func' for row in requests):
+                raise KeyboardInterrupt('after local repair')
+            return _fixture_reviews(requests, **kwargs)
+        with patch.object(design, 'review_planning_bindings', side_effect=interrupt_repaired_role), test.assertRaises(KeyboardInterrupt):
             design.build_visual_design_kits(job_dir=job, plugin=_Plugin(), workers=1)
         kit = design.read_visual_design_kits(job, plugin=_Plugin())['tasks'][0]
         pending = next(row for row in kit['image_briefs'] if row['role'] == 'func')

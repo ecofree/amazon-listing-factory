@@ -67,7 +67,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
     def tearDown(self) -> None:
         reset_provider_run_circuits()
 
-    def test_assigned_tasks_share_one_child_lane_provider_and_a_reserve(self) -> None:
+    def test_assigned_tasks_keep_eligible_reserves_and_health_order(self) -> None:
         with (
             patch.object(routing, "provider_order", return_value=["krill_gpt_image_2", "aicost_gpt_image_2", "apimart"]),
             patch.object(routing, "image_provider_entries", return_value=[
@@ -84,9 +84,9 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         ):
             assigned = routing.assign_provider_pool([task])[0]
         self.assertLessEqual(len(assigned["providers"]), 2)
-        self.assertEqual(["apimart"], assigned["child_provider_reserve"])
+        self.assertEqual(["aicost_gpt_image_2", "apimart"], assigned["child_provider_reserve"])
         self.assertEqual("krill_gpt_image_2", assigned["child_provider_primary"])
-        self.assertEqual("aicost_gpt_image_2", assigned["child_provider_backup"])
+        self.assertEqual("", assigned["child_provider_backup"])
         self.assertNotIn('child_provider_lock', assigned)
         entries = [SimpleNamespace(name="flare", raw={}), SimpleNamespace(name="sunburst", raw={"role_priority": {"func": 1, "size": 1}})]
         with patch.object(routing, "image_provider_entries", return_value=entries), patch.object(routing, "_provider_scores", return_value={"flare": 0.0, "sunburst": 0.0}):
@@ -96,7 +96,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         with patch.object(routing, "image_provider_entries", return_value=entries), patch.object(routing, "_provider_scores", return_value={"flare": 0.0, "sunburst": -3.0}):
             self.assertEqual(["flare", "sunburst"], routing._order_by_health({"role": "size"}, ["flare", "sunburst"]))
 
-    def test_pool_keeps_each_role_group_on_one_child_provider(self) -> None:
+    def test_pool_spreads_same_child_roles_across_free_models(self) -> None:
         from core.api_registry import image_provider_resource_group
         entries = [SimpleNamespace(name=name, raw={"resource_group": "account-a"}) for name in ("model-a", "model-b")]
         with patch("core.api_registry.image_provider_entries", return_value=entries):
@@ -114,7 +114,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             patch.object(routing, "image_provider_physical_identity", return_value={"model": "gpt-image-2"}),
         ):
             assigned = routing.assign_provider_pool(tasks)
-        self.assertEqual(["a", "a", "a"], [row["child_provider_primary"] for row in assigned])
+        self.assertEqual(["a", "b", "c"], [row["child_provider_primary"] for row in assigned])
         self.assertTrue(all(len(row["providers"]) <= 2 for row in assigned))
         with (
             patch.object(routing, "_order_by_health", side_effect=lambda _task, providers: providers),
@@ -122,7 +122,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             patch.object(routing, "image_provider_physical_identity", return_value={"model": "gpt-image-2"}),
         ):
             assigned = routing.assign_provider_pool(tasks)
-            self.assertEqual(["a", "a", "a"], [row["child_provider_primary"] for row in assigned])
+            self.assertEqual(["a", "b", "c"], [row["child_provider_primary"] for row in assigned])
 
         infographic_tasks = [
             {
@@ -139,11 +139,11 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             ),
         ):
             assigned = routing.assign_provider_pool(infographic_tasks)
-        self.assertTrue(all(row["child_provider_primary"] == "aicost_gpt_image_2" for row in assigned))
-        self.assertEqual(1, len({row["child_provider_primary"] for row in assigned}))
+        self.assertEqual(3, len({row["child_provider_primary"] for row in assigned}))
+        self.assertEqual(3, len({row["child_provider_primary"] for row in assigned}))
         self.assertTrue(all('child_provider_lock' not in row for row in assigned))
         self.assertTrue(all(row["child_provider_role_lane"] == "infographic" for row in assigned))
-        self.assertTrue(all("dragoncode_gpt_image_2" in row["child_provider_reserve"] for row in assigned))
+        self.assertTrue(all(set(row["providers"] + row["child_provider_reserve"]) == set(infographic_tasks[0]["providers"]) for row in assigned))
 
     def test_auto_generation_admits_three_child_lanes_across_three_providers(self) -> None:
         from core import image_provider_common as common
@@ -366,45 +366,65 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual(1, generate.call_count)
         self.assertEqual(mask_sha, hashlib.sha256(generate.call_args.kwargs["mask_bytes"]).hexdigest())
 
-    def test_assigned_reserve_is_reached_after_two_content_failures(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "candidate.png"
-            source = Path(tmp) / "source.png"
-            source.write_bytes(b"source")
-            receipt = Path(tmp) / 'response.json'
-            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
-            task = {
-                "job_dir": tmp, "output_path": str(output), "prompt": "prompt",
-                "providers": ["a", "b"], "child_provider_reserve": ["c"],
-                "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "scene",
-                "logical_task_id": "generate:B1:scene", "provider_attempts": {},
-                "task_fingerprint": "fixture-task", "generation_references": [],
-            }
-            with (
-                patch("core.image_generation_executor.generation_reference_primary_path", return_value=source),
-                patch(
-                    "core.image_generation_executor.generation_reference_sources",
-                    return_value=[{"kind": "edit_base", "path": source, "source_id": "source_00", "sha256": "a" * 64, "purpose": "Product evidence", "evidence_ids": []}],
-                ),
-                patch("core.image_generation_executor.assert_imagegen_prompt_preflight"),
-                patch("core.image_generation_executor.load_provider_policy", return_value={}),
-                patch("core.image_generation_executor.provider_run_circuit_open", return_value=False),
-                patch("core.image_generation_executor.provider_runtime_circuit_key", side_effect=lambda name: f"provider:{name}"),
-                patch("core.image_generation_executor.assert_provider_allowed"),
-                patch(
-                    "core.image_generation_executor.generate_with_provider_retries",
-                    side_effect=[
-                        ProviderContentError("a", "solid output"),
-                        ProviderContentError("b", "solid output"),
-                        receipt,
-                    ],
-                ) as generate,
-                patch("core.image_generation_executor._record_generation_progress"),
-                patch("core.image_generation_executor._record_provider_event_audit_only"),
-            ):
-                result = generate_one(task, plugin=_Plugin())
-        self.assertEqual(["a", "b", "c"], [call.kwargs["provider_name"] for call in generate.call_args_list])
-        self.assertEqual("c", result["provider"])
+    def test_failed_primary_uses_fallback_and_unknown_resends_are_durable(self) -> None:
+        from core.image_response import begin_response, submit_response, save_response, response_directory
+        from core.io import read_json
+        for unknown, failures in ((False, 1), (True, 1), (True, 3), (True, 4)):
+            with self.subTest(unknown=unknown, failures=failures), tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / "source.png"
+                Image.new('RGB', (32, 32), 'white').save(source)
+                task = {"job_dir": tmp, "output_path": str(Path(tmp)/'candidate.png'), "prompt": "prompt",
+                    "providers": ["primary", "fallback-a"], "child_provider_reserve": ["other-primary", "fallback-b"],
+                    "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "func",
+                    "logical_task_id": "generate:B1:func", "provider_attempts": {},
+                    "task_fingerprint": "fixture-task", "generation_references": []}
+                calls = []
+                def request(**kwargs):
+                    name, audit = kwargs['provider_name'], kwargs['request_audit']
+                    calls.append(name)
+                    receipt = begin_response(response_directory(task), provider=name, audit=audit)
+                    submit_response(receipt, audit)
+                    if len(calls) <= failures:
+                        if unknown:
+                            raise ProviderTransportError(name, 'HTTP 524: remote outcome unknown', ambiguous=True)
+                        from core.image_response import finish_response
+                        finish_response(receipt, 'known_failure')
+                        raise ProviderContentError(name, 'invalid content')
+                    save_response(receipt, source.read_bytes(), audit)
+                    return receipt
+                with (
+                    patch('core.image_generation_executor.image_provider_fallback_only', side_effect=lambda name: name.startswith('fallback')),
+                    patch('core.image_generation_executor.reserve_image'),
+                    patch('core.image_generation_executor.release_image'),
+                    patch('core.image_generation_executor.generation_reference_primary_path', return_value=source),
+                    patch('core.image_generation_executor.generation_reference_sources', return_value=[{
+                        'kind':'edit_base','path':source,'source_id':'source_00','sha256':'a'*64,'purpose':'Product evidence','evidence_ids':[]}]),
+                    patch('core.image_generation_executor.assert_imagegen_prompt_preflight'),
+                    patch('core.image_generation_executor.provider_run_circuit_open', return_value=False),
+                    patch('core.image_generation_executor.assert_provider_allowed'),
+                    patch('core.image_generation_executor.generate_with_provider_retries', side_effect=request),
+                    patch('core.image_generation_executor._record_generation_progress'),
+                    patch('core.image_generation_executor._record_provider_event_audit_only'),
+                ):
+                    if failures == 4:
+                        with self.assertRaises(ProviderTransportError):
+                            generate_one(task, plugin=_Plugin())
+                        # A new executor invocation cannot reset the persisted allowance.
+                        with self.assertRaises(ProviderTransportError):
+                            generate_one({**task, 'request_outcome': ''}, plugin=_Plugin())
+                        self.assertEqual(4, len(calls))
+                    else:
+                        result = generate_one(task, plugin=_Plugin())
+                        self.assertTrue(result['provider'].startswith('fallback'))
+                        self.assertNotIn('request_outcome', result)
+                        count = len(calls)
+                        generate_one(task, plugin=_Plugin())  # Saved paid response: no resend.
+                        self.assertEqual(count, len(calls))
+                self.assertEqual('primary', calls[0])
+                self.assertTrue(all(name.startswith('fallback') for name in calls[1:]))
+                receipts = [read_json(p) for p in response_directory(task).glob('*.json')]
+                self.assertEqual(min(failures, 3) if unknown else 0,
+                    sum(r.get('resolution', {}).get('action') == 'approve_one_resend' for r in receipts))
 
     def test_moderation_rejection_does_not_poison_physical_provider_circuit(self) -> None:
         error = ImageGenerationError(

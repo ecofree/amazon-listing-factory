@@ -250,6 +250,17 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
         task["image_direction"]["environment_mode"] = "graphic_canvas"
         task['image_direction']['presentation']['scope'] = 'detail_only'
         compiled = compile_task_prompt(task=task)
+        before = deepcopy(task)
+        self.assertEqual(compiled, compile_task_prompt(task=json.loads(json.dumps(task))))
+        self.assertEqual(before, task)
+        labels_only = deepcopy(task)
+        copy_contract = labels_only['display_copy_contract']
+        copy_contract['labels'].insert(0, copy_contract['title'])
+        copy_contract['title'] = ''
+        self.assertNotEqual(compiled, compile_task_prompt(task=labels_only))
+        from core.image_tasks import _task_fingerprint
+        self.assertNotEqual(_task_fingerprint(task), _task_fingerprint(labels_only))
+        self.assertIn('no title; all authored strings are labels', compile_task_prompt(task=labels_only))
         self.assertIn('Depict only the selected product details', compiled)
         self.assertIn('not a reconstructed whole product', compiled)
         self.assertNotIn('Product presentation: detail_only', compiled)
@@ -288,6 +299,13 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
         self.assertEqual(1, scoped.count('Underbed clearance / height: 12 in'))
         self.assertIn('source attachment 1', scoped)
         self.assertIn('OTHER_VIEW_STATE', scoped)
+        self.assertIn('not additional output states', scoped)
+        self.assertIn('Observed in source_99: frame: OTHER_VIEW_STATE', scoped)
+        task['image_direction']['presentation']['state'] = 'One installed shelf; two unoccupied levels shown as dashed outlines'
+        scoped = compile_task_prompt(task=task)
+        self.assertEqual(1, scoped.count(task['image_direction']['presentation']['state']))
+        self.assertIn('mutually exclusive', scoped)
+        self.assertIn('Preserve the evidenced mounting faces and connections', scoped)
         for absent in ('MEASUREMENT_CROP_IS_NOT_APPEARANCE', 'cyan dashed outline', 'occludes'):
             self.assertNotIn(absent, scoped)
         with patch("core.run_scope.read_run_scope", return_value={"selected_children": ["B1"], "selected_sources": {"B1": []}}):
@@ -355,6 +373,13 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 ocr.assert_not_called()
                 intents = read_final_source_intents(job, plugin=_Plugin())
                 observed = _fixture_observation(job, _child(), [{"source_id": f"source_{i:02d}"} for i in range(4)])
+                for key in ('source_00', 'source_01'):
+                    observed[key]['text_observations'] = [{'text': 'Adjustable shelf', 'kind': 'product_fact'}]
+                with patch('core.final_source_intents.observe_child_sources', return_value=observed):
+                    build_final_source_intents(job_dir=job, plugin=_Plugin())
+                    enriched = read_final_source_intents(job, plugin=_Plugin())
+                    self.assertEqual(['main', 'scene'], [r['role'] for r in enriched[:2]])
+                    self.assertTrue(all(r['claims'][0]['text'] == 'Adjustable shelf' for r in enriched[:2]))
                 observed["source_01"]["variant_identity"] = {
                     "status": "contradiction", "observed_color": "natural wood", "reason": "Natural frame in a white child gallery",
                     "conflicts": [{"fact_id": "product.normalized_facts.color", "observed": "natural wood"}],
@@ -447,7 +472,10 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             from core.visual_design_kit import _planner_trace_current
             import shutil
             for brief in kit['image_briefs']:
-                self.assertEqual({}, brief['design_review'])
+                if brief['role'].split('_', 1)[0] in {'func', 'size'}:
+                    self.assertIn('product_depiction', [f['operation'] for f in brief['design_review']['findings']])
+                else:
+                    self.assertEqual({}, brief['design_review'])
                 for review in brief.get('claim_reviews', {}).values():
                     self.assertFalse(Path(review['response_path']).is_absolute())
             with tempfile.TemporaryDirectory() as moved:
@@ -534,8 +562,8 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
                 self.assertEqual(3, measurement_attachment(group, formed['generation_references']))
             self.assertTrue(formed['measurement_authority']['measurement_groups'])
             cross_prompt = compile_task_prompt(task=formed)
-            self.assertIn('source_00 product facts', cross_prompt)
-            self.assertIn('source_02 product facts', cross_prompt)
+            self.assertIn('Observed in source_00:', cross_prompt)
+            self.assertIn('Observed in source_02:', cross_prompt)
             self.assertIn('source attachment 3', cross_prompt)
             self.assertNotIn('Supporting physical evidence only', cross_prompt)
             self.assertEqual(func_source['source_sha256'], formed['source_sha256'])
@@ -604,10 +632,10 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertIn("Ordinary unbranded prop text is allowed", func_prompt)
             self.assertNotIn("no readable text anywhere", func_prompt)
             self.assertNotIn("layout archetype", func_prompt.casefold())
-            self.assertIn("source_02 product facts", func_prompt)
+            self.assertIn("Observed in source_02:", func_prompt)
             self.assertIn("Visible frame support and its joints", func_prompt)
             self.assertIn('redesign source panels, titles, icons and highlights', func_prompt)
-            self.assertEqual(1, func_prompt.count('source_02 product facts:'))
+            self.assertEqual(1, func_prompt.count('Observed in source_02:'))
             self.assertIn("Adjustable Shelf", func_prompt)
             self.assertIn("Different Object Heights", func_prompt)
             self.assertIn("Wall-Mounted Organization", func_prompt)
@@ -641,7 +669,7 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
 
     def test_product_observation_precedes_gap_scoped_ocr(self) -> None:
         from core.visual_semantics import _validate_observations, observe_child_sources
-        from core.final_source_intents import _non_size_role, _signals
+        from core.final_source_intents import _classification_reason, _non_size_role, _signals
         observed = _fixture_observation(None, _child(), [{'source_id': 'source_00'}])['source_00']
         observed['objects'][0].update(sale_membership='unknown', membership_evidence=[])
         self.assertEqual('unknown', _validate_observations([observed], ['source_00'], {})['source_00']['objects'][0]['sale_membership'])
@@ -651,6 +679,11 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertEqual('success', checked['status'])
             signals = _signals(1, dict(visual_evidence=checked, claims=[], trusted_text=[]), [])
             self.assertEqual(role if role in {'scene', 'func'} else 'review_required', _non_size_role(dict(visual_evidence=checked, signals=signals)))
+            if role in {'scene', 'func'}:
+                reason = _classification_reason(role, signals, additional_size=False)
+                self.assertTrue(reason.startswith(f'final={role};'))
+                self.assertIn(f'selected {role}', reason)
+                self.assertNotIn('scene usage' if role == 'func' else 'func usage', reason)
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate',
                 return_value=json.dumps({'sources': [observed]})) as request:
             sources = [{'source_id': 'source_00', 'sha256': 'a' * 64, 'ocr': [], 'path': Path(tmp) / 'source.png'}]
@@ -659,6 +692,11 @@ class ImageBranchCurrentBehaviorTests(unittest.TestCase):
             self.assertEqual(observe_child_sources(Path(tmp), {'asin': 'B1'}, sources),
                              observe_child_sources(Path(tmp), {'asin': 'B1'}, sources))
             self.assertEqual(1, request.call_count)
+            from core.visual_semantics import OBSERVATION_POLICY
+            with patch('core.visual_semantics.OBSERVATION_POLICY', OBSERVATION_POLICY + '-revised'):
+                refreshed = observe_child_sources(Path(tmp), {'asin': 'B1'}, sources)
+            self.assertEqual(2, request.call_count)
+            self.assertEqual(OBSERVATION_POLICY + '-revised', refreshed['source_00']['policy_version'])
         partial = _validate_observations([observed], ['source_00', 'source_01'], {})
         self.assertEqual('success', partial['source_00']['status'])
         self.assertEqual('failed', partial['source_01']['status'])

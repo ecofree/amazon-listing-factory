@@ -140,6 +140,10 @@ def image_provider_resource_group(name: str) -> str:
     return str((entry.raw.get("resource_group") if entry else "") or name)
 
 
+def image_provider_fallback_only(name: str) -> bool:
+    return any(entry.name == name and entry.raw.get("fallback_only") is True for entry in image_provider_entries())
+
+
 def dedupe_image_provider_names(names: list[str]) -> list[str]:
     """Collapse logical aliases that resolve to the same physical endpoint/model."""
     unique: list[str] = []

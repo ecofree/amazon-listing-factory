@@ -14,7 +14,7 @@ from .text_evidence import clean_evidence_text, extract_measurements, has_bad_en
 from .visual_semantics import OBSERVATION_POLICY, observe_child_sources, source_fact_records
 FINAL_SOURCE_INTENT_SCHEMA_VERSION = "final-source-intent-v2"
 FINAL_SOURCE_INTENT_ARTIFACT = "final_source_intents_v2.jsonl"
-FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v29-original-evidence"
+FINAL_SOURCE_INTENT_POLICY_VERSION = "final-source-intent-policy-v31-role-independent-claims"
 SOURCE_INTENT_REVIEW_SCHEMA_VERSION = "source-intent-review-v1"
 SOURCE_INTENT_REVIEW_ARTIFACT = "source_intent_reviews_v1.jsonl"
 SOURCE_INTENT_REVIEW_ROLES = frozenset({"scene", "func", "size", "excluded_wrong_variant", "reobserve"})
@@ -489,7 +489,7 @@ def _build_final_row(
     signals = dict(prepared["signals"])
     signals["reference_completeness"] = _reference_completeness(role, signals)
     flags = _evidence_flags(signals)
-    claims = _bound_claims(prepared) if role in {"func", "size", "review_required"} else []
+    claims = _bound_claims(prepared) if role in {"main", "scene", "func", "size", "review_required"} else []
     measurements = list(prepared["measurements"])
     warnings = _warnings(prepared, role, additional_size=additional_size)
     row = {
@@ -678,6 +678,8 @@ def _classification_reason(role: str, signals: dict[str, Any], *, additional_siz
     if role == "main":
         return "reliable complete product view assigned to the main output slot"
     reasons: list[str] = []
+    if role in {"scene", "func"}:
+        reasons.append(f"source observation selected {role} as the primary image purpose")
     if role == "size":
         reasons.append("observed measurement evidence for the child's single size output contract")
     if signals.get("has_textual_dimension_layout"):
@@ -685,13 +687,11 @@ def _classification_reason(role: str, signals: dict[str, Any], *, additional_siz
     if signals.get("has_visual_dimension_layout"):
         reasons.append("visual recovery found measurement lines and multiple numbers")
     if signals.get("has_callout_layout"):
-        reasons.append("callout or panel layout indicates authored functional information")
+        reasons.append("source contains callouts or panels")
     if signals.get("has_authored_function_text"):
-        reasons.append("source-visible functional text indicates func usage")
+        reasons.append("source contains authored functional text")
     elif signals.get("has_authored_information"):
-        reasons.append("source-visible text or annotated detail indicates func usage")
-    if signals.get("has_alternate_product_view") and not signals.get("has_authored_information"):
-        reasons.append("non-primary product view is preserved as scene usage")
+        reasons.append("source contains authored information")
     if additional_size:
         reasons.append("complementary measurement source; preserve its objects, values and qualifiers")
     if role == "review_required":

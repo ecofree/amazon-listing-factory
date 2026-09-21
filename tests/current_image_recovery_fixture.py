@@ -108,7 +108,7 @@ def verify_paid_response_recovery(test):
         test.assertEqual('finalized', read_json(receipt)['status'])
         unknown = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
         write_json(unknown, {**read_json(receipt), 'status': 'submitted'})
-        with test.assertRaises(ProviderTransportError):
+        with patch('core.image_response.unknown_result_resend_limit', return_value=0), test.assertRaises(ProviderTransportError):
             generate_one(task, plugin=None)
         other = {**task, 'logical_task_id': 'generate:B2:main'}
         resources.reserve_image(other)

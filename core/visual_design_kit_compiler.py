@@ -305,7 +305,8 @@ def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source
                  'source_revision': owner['input_revision_id'], 'extent': owner['observation']['product_extent'],
                  'features': product_features(owner['observation'])}
                 for owner in sources if owner['source_id'] in selected]
-    risks, unknown_objects = [], {}
+    risks = ['product_depiction'] if role in {'func', 'size'} else []
+    unknown_objects = {}
     for owner in sources:
         if owner['source_id'] not in selected:
             continue
