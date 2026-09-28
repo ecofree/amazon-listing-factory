@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .product_family import supports_fact
+
 
 # Amazon's backend search-term field rejects the exact byte boundary in some
 # template/API paths; keep one byte of headroom for the serialized field.
@@ -30,16 +32,12 @@ CATEGORY_SYNONYMS: dict[str, tuple[str, ...]] = {
     ),
     "bathroom_cabinet": (
         "bathroom storage",
-        "wall cabinet",
         "bathroom organizer",
         "vanity storage",
-        "over toilet storage",
     ),
     "medicine_cabinet": (
         "bathroom mirror",
         "mirror cabinet",
-        "wall mirror cabinet",
-        "recessed cabinet",
         "bathroom storage mirror",
     ),
 }
@@ -77,6 +75,12 @@ def generate_backend_keywords(
     brand_words = _frontend_words(str(brand or "").lower())
     candidates: list[str] = []
     candidates.extend(CATEGORY_SYNONYMS.get(_normalize_category(category_id), ()))
+    mounting_terms = {
+        'wall cabinet': r'\bwall[- ]?(?:mount(?:ed)?|hung)\b',
+        'recessed cabinet': r'\brecess(?:ed)?\b',
+        'over toilet storage': r'\bover[- ](?:the[- ])?toilet\b',
+    }
+    candidates.extend(term for term, pattern in mounting_terms.items() if supports_fact(product_specific, pattern))
     candidates.extend(str(item) for item in competitor_keywords if item)
     candidates.extend(str(item) for item in (extra_terms or ()) if item)
     candidates.extend(_short_fact_terms(product_specific))
@@ -85,6 +89,13 @@ def generate_backend_keywords(
     seen: set[str] = set()
     for candidate in candidates:
         term = _clean_term(candidate)
+        conditions = (
+            (r'\bwall[- ](?:mounted[- ]|mount[- ]|mirror[- ])?cabinet\b|\bwall[- ]mount(?:ed)?\b', mounting_terms['wall cabinet']),
+            (r'\brecess(?:ed)?\b', mounting_terms['recessed cabinet']),
+            (r'\bover[- ](?:the[- ])?toilet\b', mounting_terms['over toilet storage']),
+        )
+        if any(re.search(trigger, term) and not supports_fact(product_specific, evidence) for trigger, evidence in conditions):
+            continue
         if not term or term in seen:
             continue
         if _contains_asin(term) or any(word in brand_words for word in term.split()):

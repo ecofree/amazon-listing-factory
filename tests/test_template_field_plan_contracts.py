@@ -33,6 +33,26 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
         self.assertEqual("New", resolved["condition"])
         self.assertEqual("200", resolved["quantity"])
 
+        for quantity, available in ((0, False), ('0', 'false')):
+            values = template_job_with_defaults({'quantity': quantity, 'inventory_available': available}, env={})
+            self.assertEqual(('0', 'false'), (values['quantity'], values['inventory_available']))
+        self.assertEqual('200', template_job_with_defaults({'quantity': '  '}, env={})['quantity'])
+        from core.template_field_plan import looks_numeric
+        for value in ('NaN', 'inf', '-inf'):
+            self.assertFalse(looks_numeric(value))
+        quantity_field = FIELD_ALIASES['quantity'][0]
+        for value, expected in (('0', 'pass'), ('2', 'pass'), ('1.5', 'invalid_numeric'), ('-1', 'invalid_numeric'), ('NaN', 'invalid_numeric')):
+            decisions = compile_field_decisions(fields={quantity_field: 1}, labels={}, aliases=FIELD_ALIASES,
+                allowed_values={}, values={quantity_field: value}, sources={}, requirements=[], row_context={}, invalid_candidates={})
+            self.assertEqual(expected, decisions[0]['validation_status'])
+        self.assertTrue(looks_numeric('1.5', field='item_dimensions.length.value'))
+        contract = template_engine._assert_submit_ready_job_contract
+        for exempt, count in ((True, 2), (False, 1)):
+            contract({'gtin_exempt': exempt, 'product_id': '123456789012', 'product_id_type': 'UPC'}, mode='submit_ready', child_count=count)
+        with self.assertRaisesRegex(template_engine.TemplateEngineError, 'multi-child'):
+            contract({'gtin_exempt': False, 'product_id': '123456789012', 'product_id_type': 'UPC'}, mode='submit_ready', child_count=2)
+        contract({'gtin_exempt': False}, mode='draft', child_count=2)
+
     def test_item_highlights_require_first_class_copy_list(self) -> None:
         self.assertEqual("", template_engine.item_highlights_text({"bullets": ["Sturdy Steel Frame: Built for stable everyday use in a family bedroom"]}))
         highlights = ["Sturdy Steel Frame", "Built-In Guardrails", "Under-Bed Space"]
@@ -369,6 +389,20 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
         )
         self.assertNotIn(main_field, image_plan["field_values"])
         self.assertEqual("https://example.com/source-scene.jpg", image_plan["field_values"][other_field])
+
+        from core.template_field_plan import fit_template_image_slots
+        from core.required_role_policy import required_role_policy
+        from core.plugin import load_plugin
+        rows = [{'role': 'scene'}] + [{'role': f'func_{i:02d}'} for i in range(7)] + [{'role': 'size'}]
+        for category in ('bathroom_cabinet', 'medicine_cabinet', 'artificial_tree', 'bed_frame'):
+            counts = required_role_policy(load_plugin(category)).counts
+            kept, omitted = fit_template_image_slots(rows, required_counts=counts)
+            self.assertEqual(8, len(kept))
+            self.assertTrue({'scene', 'size'} <= {row['role'] for row in kept})
+            self.assertTrue(omitted[0]['role'].startswith('func'))
+            self.assertEqual((kept, []), fit_template_image_slots(kept, required_counts=counts))
+        with self.assertRaisesRegex(ValueError, 'capacity'):
+            fit_template_image_slots(rows, required_counts={'scene': 4, 'func': 4, 'size': 1})
 
 
 if __name__ == "__main__":

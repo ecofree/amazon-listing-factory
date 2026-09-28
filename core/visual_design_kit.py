@@ -26,7 +26,7 @@ from .io import (
 from .job import load_job
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
-from .product_family import read_product_family
+from .product_family import read_product_family, effective_product_facts, fact_resolutions
 from .progress_trace import record_progress
 from .required_role_policy import compiled_image_policy
 from .run_scope import read_run_scope
@@ -51,8 +51,8 @@ from .visual_design_kit_compiler import (
     required_observation_issues,
     DESIGN_FIELD_SCHEMAS, IMAGE_DIRECTION_SCHEMA,
 )
-VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v16"
-VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v77-physical-relations"
+VISUAL_DESIGN_KIT_SCHEMA_VERSION = "visual-design-kit-v17"
+VISUAL_DESIGN_KIT_POLICY_VERSION = "gemini-output-design-v82-scoped-relations"
 VISUAL_DESIGN_KIT_ARTIFACT = "visual_design_kits_v16.jsonl"
 
 _ROW_FIELDS = {"schema_version", "policy_version", "category_id", "main_image_policy", "child", "source_reference", "source_sha256", "source_references", "product_claims", "child_facts_revision_id", "input_revision_id", "family_design_id", "visual_design_kit_id", "family_art_direction", "image_briefs", "output_inventory", "planner", "approved_design_references"}
@@ -712,19 +712,20 @@ def resolve_visual_design_kit(artifact: dict[str, Any], child: str) -> dict[str,
 def compact_product_facts(child: dict[str, Any]) -> dict[str, Any]:
     """Select whole source records without cutting qualifiers or measured objects."""
     normalized = child.get("normalized_facts") if isinstance(child.get("normalized_facts"), dict) else {}
-    specs = child.get("specs") if isinstance(child.get("specs"), dict) else {}
+    specs = effective_product_facts(child)
     relevant = {key: value for key, value in specs.items()
                 if any(term in str(key).casefold() for term in ("material", "finish", "color", "style", "room", "mount"))}
     return {
-        "title": str(child.get("title") or ""),
+        "title": source_fact_records(child).get("product.title", ""),
         "variation": visual_variation_values(child),
         "color": visual_product_color(child),
-        "size": normalized.get("size") or child.get("size") or "",
+        "size": specs.get("size") or "",
         "package": normalized.get("package") or child.get("package") or "",
-        "style": normalized.get("style") or child.get("style") or "",
+        "style": specs.get("style") or "",
         "material_and_context_specs": relevant,
+        "fact_resolutions": fact_resolutions(child),
         "market_context": {"site": "US", "language": "English", "price_position": "unconfirmed",
-                           "user_preferences": "bright clear presentation; avoid people and reflections; audience-appropriate staging; coherent child-wide palette and graphics"},
+                           "user_preferences": "bright clear presentation; avoid people and reflected people; audience-appropriate staging; coherent child-wide palette and graphics"},
     }
 
 
@@ -740,7 +741,7 @@ def compact_product_claims(child: dict[str, Any]) -> list[dict[str, str]]:
         rows.append({"evidence_id": input_revision_id({"origin": origin, "text": text})[:20],
                      "field_path": origin,
                      "text": us_measurement_text(f"{origin.split('.')[-1].replace('_', ' ')}: {text}" if origin.startswith(('product.specs.', 'product.product_specific.')) else text),
-                     "type": "source_product_statement"})
+                     "type": "fact_resolution" if origin.startswith("product.fact_resolutions.") else "source_product_statement"})
     return rows
 
 
@@ -788,7 +789,6 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
             "palette_direction": {"room": {"wall": "one #RRGGBB, material, pattern or solid"},
                                   "bedding": {"duvet": "one #RRGGBB, material, pattern or solid"}},
             "photography_direction": "bright clear exposure retaining product edges, balanced white balance, contrast and material clarity; no room, window or prop instructions",
-            "environment_and_staging": "shared spatial style and atmosphere; concrete rooms belong to each presentation.state; no lighting, component colors or prop inventory",
             **DESIGN_FIELD_SCHEMAS,
         },
         "image_briefs": expected_briefs,
@@ -800,29 +800,44 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
     visual_context_guardrail = planner_visual_context_instruction(policy, max_chars=420)
     return (
         "Return JSON for one Amazon child. The program supplies verified facts and process; you plan the child-wide visual direction. "
-        "The GPT image model designs each composition, room arrangement, lighting placement and information layout within that direction.\n\n"
+        "The GPT image model edits the selected photograph, designing non-product surroundings and graphics while retaining its visible product and viewpoint.\n\n"
         "The single appearance attachment identifies product form, color and material, not decorative styling. Plan from this product, "
         "its evidenced users, use and US market. Ordinary source bedding, rooms and graphics are not a design brief. "
         "Other observed views remain in the fact catalog for function and measurement bindings; their original pixels go to editing and factual review. "
-        "Preserve the sold product's geometry, finish, parts and quantity; use evidenced mechanisms and states, not invented hidden structure.\n\n"
+        "Preserve the sold product's geometry, finish, parts and confirmed sold quantity. fact_resolutions override raw prose and OCR; "
+        "omit conflicted claims and use confirmed values. Ordinary main/scene whole-product targets depict the sold unit/set, "
+        "not extra copies from a source room arrangement. Keep close-ups and mutually exclusive states distinct from sales quantity. "
+        "Use evidenced mechanisms and states, not invented hidden structure.\n\n"
         + (visual_context_guardrail + "\n\n" if visual_context_guardrail else "")
         + "OUTPUT IMAGE BRIEFS\n"
-        "First allocate distinct buyer questions across the existing output roles, then choose evidence, target states and concise copy. "
-        "Repeating the same capacity message in a different room is not a distinct information responsibility. Reuse necessary facts without inventing differences. "
+        "For each existing output role, choose visible evidence and a supported target state, then the buyer question that this image can answer. "
+        "A room photograph alone does not prove load capacity or coating performance. Allocate complementary questions across the gallery; "
+        "when evidence repeats, select an existing view/state or a distinct supported question, not a new product render or repeated feature list. "
         "Return one brief per output role, retaining role and source_id from the inventory. Multiple roles may share a source; "
-        "retain every output slot. visual_goal states the buyer question, not a second appearance specification or preset layout. "
+        "retain every output slot. visual_goal states the buyer question for planning, not an instruction to redesign the product. "
         "Main follows category policy and uses reliable complete product evidence. presentation states the intended product use/demonstration, "
-        "including its concrete room, use, physical support and installation. For functional details, state the owning compartment, "
-        "mounting face and connected parts; preserve a source-supported view when a new angle would invent an unseen connection. "
-        "Category settings are suggestions, never overrides of evidenced use. whole_product needs a same-child complete product reference; "
-        "detail_only stays close-up without inventing a full hero. Scene goals serve the evidenced audience; "
+        "including its concrete room, concise coordinated room style and whether the product is uninstalled, being installed or in use. "
+        "Main/scene execution uses presentation.state, not visual_goal: state a feasible edit of the first product source, not a benefit to exaggerate. In-use scenes specify the evidenced "
+        "support and fixing medium appropriate to that surface; exposed stakes are product details, not freestanding feet on hard floors. "
+        "presentation.state retains each depicted door's covered region and adjacent permanently open compartments; do not generalize a partial closure to all doors closed. "
+        "Keep fixed access openings distinct from moving gates; words such as Open Gate cannot authorize hinges or motion absent visual evidence. "
+        "Insets preserve the same assembly; retain mounting faces and connections without inventing hidden fixing points. "
+        "For func/size, state only the source-supported relationships needed for this demonstration, including mutually exclusive positions when relevant. "
+        "Complete observation lists remain review evidence, not generation instructions; unchanged visible details need no prose inventory. "
+        "Category settings and optional props are suggestions, never overrides of evidenced use. whole_product needs a complete first product source; "
+        "detail_only stays close-up without inventing a full hero or unseen connection. Scene goals serve the evidenced audience; "
         "func goals communicate specific proven features rather than generic benefits.\n"
         "product_sources lists original same-child images: choose an edit base that clearly supports this output's structure and state; "
-        "add other sources only for necessary product evidence absent there. Auxiliary photographed states do not override presentation.state. "
-        "Their facts are authoritative, not their layouts, graphics or decor. "
+        "add other sources only for necessary product evidence absent there, not a routine whole-product or dimension page for a sufficient detail view. "
+        "The edit base fixes the depicted assembly and viewpoint; adapt the goal to an available view instead of inventing hidden geometry. "
+        "Auxiliary images verify facts or supply depicted details, not a fused product view. Restyle surroundings visible through gaps, transparent surfaces and real mirrors without changing product material. "
         "measurement_ids selects exact source_id:measurement_id facts this output communicates, independent of the edit photograph. "
         "Size requires real measurements; func may use [] when its feature needs no numeric annotation. Selected measurement originals are attached automatically. "
-        "Do not reproduce optional source numbers merely because they exist; never invent or discard the qualifiers of a selected fact.\n"
+        "Select measurements that cover the stated measurement goal; do not promise overall dimensions when only a local spacing is evidenced. "
+        "Choose a view that exposes each selected dimension's distinct endpoint surfaces; rail underside clearance and a higher rail/slat level cannot share an endpoint. "
+        "If a measurement is unnecessary to the goal, leave it unselected; do not invent a cutaway to expose a hidden endpoint. "
+        "A thickness range is a recommendation, not the actual thickness of a supplied object. "
+        "Unselected source numbers are not output labels; preserve the selected fact's subjects, conditions and limits.\n"
         "design_transfer may select role-approved references from their reviewed text catalog, not from images seen in this request. "
         "Inherit only permitted features and explain adaptations; original style pixels remain available to factual/design review and generation. "
         "Use [] without suitable references: autonomous, not reference-calibrated.\n"
@@ -833,10 +848,14 @@ def visual_design_kit_prompt(plugin: ProductPlugin, facts: dict[str, Any], polic
         "Each leaf defines exactly one component with one hex, material and pattern. Include major cover and sleeping pillowcases when applicable. "
         "presentation.components selects only core component IDs used in this image; [] suits exposed measurement details. "
         "Select bedding for normal bed use, not exposed measurements or hidden mechanism demonstrations. The image model designs secondary decor. "
-        "designed_environment uses the room direction; graphic_canvas is technical without room staging; source_setting preserves necessary installation relationships only. "
+        "Coordinate the gallery through the shared palette and photography; each presentation.state alone owns its concrete room and staging style. "
+        "Do not restate product finish or unnecessary numeric prop specifications; components selects core non-product appearances. graphic_canvas is technical without room staging; "
+        "source_setting preserves necessary installation relationships only. "
         "Keep graphic inks and the user backing boundary coherent; the image model designs sizing, line breaks and symbols.\n"
-        "For func/size, edit display_copy into concise exact titles and labels before binding: title may be null, labels may be empty. "
-        "Remove paragraphs repeating the headline or diagram and generic praise; preserve quantities, subjects, conditions and limits. Accurate short source phrases may remain. "
+        "For func/size, proofread spelling and grammar, then edit display_copy into concise exact titles and labels before evidence binding: "
+        "title may be null, labels may be empty. Verbatim source text is evidence, not a guarantee of correct language. "
+        "One feature has one text placement: do not use synonymous title/label pairs even when different evidence IDs support them. "
+        "Remove repeated explanations and generic praise; preserve quantities, subjects, conditions and limits. Correct short source phrases may remain. "
         "Bind each string to this child's evidence IDs, including other sources; the output anchor does not restrict fact scope. "
         "physical: proves visible structure only, not material/performance; measurement: supports measured-object headings. "
         "Numeric annotations belong to measurement authority, not duplicate copy. Cover distinctive proven mechanisms across the gallery.\n\n"
@@ -1036,7 +1055,7 @@ def _planner_evidence(sources: list[dict[str, Any]], product_claims: list[dict[s
     evidence = [_planner_source_view(row) for row in sources]
     texts: dict[str, list[str]] = {}
     for row in product_claims:
-        texts.setdefault(row['text'], []).append(row['evidence_id'])
+        texts.setdefault(row['text'], []).extend([] if row.get('type') == 'fact_resolution' else [row['evidence_id']])
     for source, view in zip(sources, evidence):
         local = view.pop('source_supported_claims', [])
         view['source_supported_claim_ids'] = [row['evidence_id'] for row in local]

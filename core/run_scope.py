@@ -88,6 +88,8 @@ def read_run_scope(job_dir: str | Path) -> dict[str, Any]:
         raise RunScopeError("RunScopeV5 selected_sources must match selected_children")
     family = read_product_family(Path(job_dir))
     selected = {str(child) for child in children}
+    if data.get('mode') == 'production' and selected != {str(row['asin']) for row in family['family']['children']}:
+        raise RunScopeError('Production RunScopeV5 no longer covers the full family; create a new production job')
     expected_inventory = input_revision_id(_family_inventory(family, selected_children=selected))
     if data.get("family_inventory_fingerprint") != expected_inventory:
         raise RunScopeError(

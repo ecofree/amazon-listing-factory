@@ -7,6 +7,7 @@ from typing import Any
 
 from .visual_semantics import CLAIM_REVIEW_POLICY, claim_key
 from .image_reference_context import product_features
+from .product_family import fact_statement_issues
 from .image_task_inputs import measurement_authority, task_specs, role_art_direction, shared_design_values
 from .text_evidence import has_bad_encoding, us_measurement_text, extract_measurements
 
@@ -56,7 +57,6 @@ _ART_DIRECTION_FIELDS = {
     "audience_and_market",
     "palette_direction",
     "photography_direction",
-    "environment_and_staging",
     "typography_direction",
     "graphic_direction",
 }
@@ -290,6 +290,13 @@ def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source
     text = {key: direction.get(key) for key in IMAGE_DIRECTION_SCHEMA} if isinstance(direction, dict) else {}
     role = str(brief['role']).split('_', 1)[0]
     text["role"] = brief['role']
+    if role in {'func', 'size'}:
+        copy = brief.get('display_copy_contract')
+        if copy is None:
+            draft_copy = brief.get('display_copy') or {}
+            copy = {'title': us_measurement_text((draft_copy.get('title') or {}).get('text', '')),
+                    'labels': [us_measurement_text(row['text']) for row in draft_copy.get('labels', [])]}
+        text['display_copy'] = {key: copy[key] for key in ('title', 'labels')}
     shared = role_art_direction(art, direction, role, main_policy=main_policy)
     if role == 'main' and main_policy == 'white_background':
         text['environment_mode'] = 'graphic_canvas'
@@ -305,7 +312,7 @@ def design_binding_request(brief: dict[str, Any], art: dict[str, Any], *, source
                  'source_revision': owner['input_revision_id'], 'extent': owner['observation']['product_extent'],
                  'features': product_features(owner['observation'])}
                 for owner in sources if owner['source_id'] in selected]
-    risks = ['product_depiction'] if role in {'func', 'size'} else []
+    risks = ['product_depiction']
     unknown_objects = {}
     for owner in sources:
         if owner['source_id'] not in selected:
@@ -526,6 +533,11 @@ def _bind_display_text(
     is_title: bool = False, product_claims: Any = (),
 ) -> dict[str, Any]:
     bound = _copy_binding(value, available)
+    resolutions = {row['field_path'].split('.')[-1]: json.loads(row['text'])
+                   for row in product_claims or [] if row.get('type') == 'fact_resolution'}
+    conflicts = fact_statement_issues(bound['text'], resolutions)
+    if conflicts:
+        raise VisualDesignKitCompileError('display claim contradicts resolved facts: ' + ', '.join(conflicts))
     evidence = {key: available[key] for key in bound["evidence_ids"]}
     if not _copy_needs_review(bound, evidence, is_title=is_title, product_claims=product_claims):
         return bound
@@ -663,7 +675,7 @@ def _available_claims(
     evidence = {
         str(row.get("evidence_id") or ""): str(row.get("text") or "")
         for row in rows
-        if isinstance(row, dict)
+        if isinstance(row, dict) and row.get("type") != "fact_resolution"
         and str(row.get("evidence_id") or "")
         and str(row.get("text") or "").strip()
     }
@@ -736,9 +748,8 @@ def _image_direction(value: Any, source: dict[str, Any], *, role: str, category_
             _required_text(row[field], field, 350)
             if re.search(r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6})\b", row[field]):
                 raise VisualDesignKitCompileError("design_transfer must reference shared color roles, not redefine colors")
-    if presentation['scope'] == 'whole_product' and not any(
-            catalog[key]['observation']['product_extent'] == 'whole_view' for key in value['product_sources']):
-        raise VisualDesignKitCompileError('Whole-product output needs a same-child complete product reference; otherwise plan detail_only')
+    if presentation['scope'] == 'whole_product' and catalog[value['product_sources'][0]]['observation']['product_extent'] != 'whole_view':
+        raise VisualDesignKitCompileError('Whole-product output needs a complete edit base as first product source; select an available whole view or plan detail_only')
     if role == 'main' and presentation['scope'] != 'whole_product':
         raise VisualDesignKitCompileError('Main presents the complete sold product')
     return value

@@ -291,6 +291,22 @@ class StatusRevisionContractTests(unittest.TestCase):
                 summary["task_status_counts"],
             )
 
+            write_json(job / 'reports' / 'run_scope_v5.json', {'selected_children': ['B1', 'B2']})
+            only_one = {'rows': [{'child': 'B1', 'candidate_sha256': 'a'*64, 'automatic_decision': 'not_run'}]}
+            with patch('core.run_scope.read_run_scope', return_value={'selected_children': ['B1', 'B2']}), patch.object(
+                    production, 'load_status', return_value={'stages': {'generate': {'status': 'success'}}, 'tasks': {}}):
+                incomplete = production._write_summary(request, status='success', timings={'generate': 1},
+                    started=time.monotonic(), release=only_one)
+                self.assertEqual('incomplete', incomplete['planned_image_completion_status'])
+                self.assertEqual(['B2'], incomplete['planned_image_missing_children'])
+                self.assertEqual('partial_success', incomplete['workflow_status'])
+                self.assertEqual(1, incomplete['candidate_count'])
+                only_one['rows'].append({'child': 'B2', 'candidate_sha256': 'b'*64, 'automatic_decision': 'not_run'})
+                complete = production._write_summary(request, status='success', timings={'generate': 1},
+                    started=time.monotonic(), release=only_one)
+                self.assertEqual('success', complete['planned_image_completion_status'])
+                self.assertEqual({'not_run': 2}, complete['qa_decision_counts'])
+
 
 if __name__ == "__main__":
     unittest.main()

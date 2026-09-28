@@ -8,15 +8,16 @@ from typing import Any
 
 from .io import file_sha256, parse_json_object_response, read_json, write_json
 from .status import input_revision_id
+from .product_family import effective_product_facts, fact_resolutions, fact_statement_issues
 from .vision_gemini_client import gemini_stream_generate, VisionRequestError
 from .text_evidence import extract_measurements, measurement_qualifiers
 from .image_task_inputs import shared_design_values
 from .image_reference_context import product_features, source_box, source_point, measurement_attachment, resolve_edit_references, reference_semantics
 
 
-OBSERVATION_POLICY = "child-joint-observation-v33-physical-relations"
-CLAIM_REVIEW_POLICY = "planning-binding-review-v27-product-depiction"
-CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v19-measurement-endpoints"
+OBSERVATION_POLICY = "child-joint-observation-v36-identity-and-surfaces"
+CLAIM_REVIEW_POLICY = "planning-binding-review-v33-scoped-relations"
+CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v20-direct-edit"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "unknown"}
 
@@ -69,11 +70,16 @@ def source_fact_records(child: dict[str, Any]) -> dict[str, str]:
         elif value is not None and str(value).strip():
             records[prefix] = str(value).strip()
 
-    for field in ("title", "bullets", "description", "features", "specs", "product_specific", "variation_values"):
+    for field in ("title", "bullets", "description", "features"):
         visit(child.get(field), f"product.{field}")
-    normalized = child.get("normalized_facts") or {}
-    for field in ("color", "size", "style", "variation"):
-        visit(normalized.get(field), f"product.normalized_facts.{field}")
+    facts = effective_product_facts(child)
+    if fact_resolutions(child).get('sold_unit_count', {}).get('status') != 'confirmed':
+        facts.pop('sold_unit_count', None)
+    visit(facts, 'product.specs')
+    resolutions = fact_resolutions(child)
+    records = {key: value for key, value in records.items() if key.startswith('product.specs.') or not fact_statement_issues(value, resolutions)}
+    for key, row in resolutions.items():
+        records[f'product.fact_resolutions.{key}'] = json.dumps({"field": key, **row}, ensure_ascii=False, sort_keys=True)
     return records
 
 
@@ -129,7 +135,7 @@ def observe_child_sources(
             "reference_purposes": ["appearance", "feature", "measurement"],
             "product_extent": "whole_view|detail|none",
             "product_features": [{"feature_id": "stable physical feature identity", "object_id": "observed object_id",
-                "physical_facts": ["directly visible part, geometry, mechanism, finish, count or state"]}],
+                "physical_facts": ["visible part with its owning region, connected part and operating state; visible geometry, finish and count"]}],
             "confidence": 0.0,
             "evidence": ["Visible evidence explaining the selected primary image purpose, not merely a list of product features"],
             "variant_identity": {
@@ -140,7 +146,7 @@ def observe_child_sources(
             },
             "text_observations": [{"text": "verbatim necessary product information", "kind": "product_fact|product_label|marketing|measurement|unknown"}],
             "measurements": [{"measurement_id": "unique source-local identity", "text": "34.5 inches",
-                "object": "cabinet", "axis": "width", "kind": "dimension", "evidence_type": "dimension_line"},
+                "object": "cabinet between its left and right outer side faces", "axis": "width", "kind": "dimension", "evidence_type": "dimension_line"},
                 {"measurement_id": "load_01", "text": "120 lbs", "object": "whole cabinet",
                  "axis": "capacity", "kind": "capacity", "evidence_type": "text_spec"}],
             "objects": [{
@@ -180,13 +186,17 @@ def observe_child_sources(
         "product_features records directly visible product structure and operating state, without coordinates or crop instructions. "
         "product_extent is whole_view when a complete product is visible somewhere in the original, detail for partial products, none for no visible product. "
         "reference_purposes selects original attachments, not output panels. "
-        "Describe visible part-to-part relations: name the owning compartment, mounting face and connected part; top/bottom alone is ambiguous. "
-        "For installation, distinguish the product's mounting face and fixing point from the wall's. Separate visible counts from total counts. "
+        "Describe necessary visible relations as part, owning region and connection: a bar under the left compartment is not a full-width bottom bar. "
+        "Record each door's covered region and adjacent permanently open storage; a closed sliding door does not close the entire cabinet. "
+        "Distinguish a fixed access opening from a moving gate: marketing words such as Open Gate do not prove a leaf, hinge or motion. "
+        "For installation record the evidenced mounting face, fixing point and support medium; distinguish exposed uninstalled hardware from in-use support. "
+        "Do not infer that a stake stands on hard flooring because its full shape is shown on a product canvas. "
         "Record only visible structure; never infer hidden or occluded parts from category expectations. "
-        "Record measurements with the measured object/property, axis, full quantity, unit and qualifiers. "
+        "Authoritative product.fact_resolutions override raw prose and OCR: conflicted facts cannot authorize claims; confirmed values override stale source statements. "
+        "Record measurements with the measured object/property, axis, full quantity, unit and qualifiers, naming visible endpoint surfaces in object. "
         "Resolve OCR against original pixels; inches and feet readings of one mark are alternatives, not two facts. "
         "dimension_line means a visible measurement diagram; text_spec means a written specification. "
-        "Neither requires pixel endpoints or a designated view. Do not infer measurements from apparent proportions. "
+        "Pixel coordinates are unnecessary; do not name a hidden slat surface when the diagram points only to a visible rail edge. "
         "For unselected sources, retain delivery role and relevant product text. evidence_gaps and text_gaps describe necessary "
         "unavailable product information, not unreadable decor or incomplete room parsing. "
         "visible_numbers_or_units is also a list of strings, not measurement objects. "
@@ -199,7 +209,8 @@ def observe_child_sources(
         "Not observed never means confirmed absent. Product/accessory sales membership requires "
         "an exact citation to facts (fact_id is its product.* key, quote is text from that value); visual resemblance alone is insufficient. "
         "Use unknown only for a concrete sales-membership dispute, never as an inventory of unclassified room props. "
-        "Compare each visible sold product's finish, variant and structure to the child records and other views. "
+        "Compare visible finish and structure to the resolved child identity, model/spec records and other views. "
+        "Confirmed structured color overrides contradictory title color; it does not override visibly mismatching product pixels. "
         "Record a clear mismatch as variant_identity contradiction with the conflicting fact_id and observed attribute, "
         "even if that attachment came from this child's gallery. Never relabel its visible finish to match the listing. "
         "Cropped, occluded, uncolored diagrams or ambiguous lighting are unknown, not contradictions. "
@@ -636,6 +647,8 @@ def review_planning_bindings(
     prompt = (
         "Verify the supplied planning bindings, not aesthetic quality. For product_claim entries, "
         "verify proposed text against its supplied typed evidence and corresponding source pixels. "
+        "Child fact_resolutions are authoritative constraints, not claim evidence: conflicted facts cannot be asserted, "
+        "and confirmed values override contradictory raw prose, OCR and observations. "
         "physical: IDs prove only the observed geometry, local parts or state, never material specifications, load or performance. "
         "measurement: IDs support truthful group headings without asserting new measurements. Other IDs are quoted source statements. "
         "Return JSON {reviews:[{key,status,reason,resolution,findings:[{operation,status,reason,resolution}]}]}; "
@@ -643,15 +656,33 @@ def review_planning_bindings(
         "For inconclusive results, resolution is retry_review for incomplete evaluation, correct_evidence for a cited source_product defect, "
         "or revise_plan for an unsupported proposed depiction or claim requiring a local change. Other results may omit resolution. "
         "For design entries, evaluate supplied operations by exact ID; child product facts are verification context, not features every image must display. "
-        "product_depiction checks only this output's depicted parts, mounting faces, connections, mutually exclusive states and measured subjects "
-        "against the selected original pixels. Observed physical_facts are claims to check, not independent proof. "
+        "product_depiction checks this output's sold-unit presentation, depicted parts, mounting faces, connections, mutually exclusive states and measured subjects "
+        "against the first edit-base pixels in execution_inputs; other attachments verify facts, not an alternative camera or assembly to merge. "
+        "For main/scene, verify that presentation.state is feasible in that first view without changing visible product geometry to emphasize visual_goal. "
+        "If the goal needs another view, revise the brief using an available source or a feasible goal; never silently swap attachments. "
+        "No auxiliary view, mask or unrelated hidden-joint evidence is required for a supported edit. Observed physical_facts are claims to check, not independent proof. "
         "If an observation turns graphic notation into parts or mislocates a connection, report source_product:<source_id> with the faulty fact "
         "and pixel evidence; use correct_evidence when inconclusive. If evidence is sound but the proposed depiction needs a different "
         "mounting face, extra parts or an unsupported view, report product_depiction with revise_plan when inconclusive. "
-        "A required relation left ambiguous in the target is revise_plan; unchanged source-supported depiction needs no redundant prose. "
+        "Review role_design as the target; selected_evidence describes input photographs, not instructions to copy their state or quantity. "
+        "For product_depiction, explain the actual target state and its evidence: door coverage and permanently open compartments, "
+        "fixed openings versus evidenced movable parts, and the distinct visible surfaces owning selected dimension endpoints. "
+        "A proposed inset must remain the same local assembly; totals do not authorize redistributing parts. Leaders need evidenced target parts, "
+        "not invented attachment points on a closed or occluded view. In-use support must fit the planned surface and fixing medium. "
+        "A thickness diagram spans the depicted object's lower and upper surfaces; a recommendation range is not an actual supplied object's measured height. "
+        "State the specific supported relation or missing evidence in reason. Revise only ambiguous relations necessary to this depiction. "
+        "func/size execution uses presentation.state and selected measurements, not full observation prose: "
+        "check necessary demonstration relations there against the pixels; auxiliary views must supply needed missing facts. "
+        "Unchanged source-supported views need no redundant prose or unrelated hidden-joint evidence. "
         "Check one part's alternative positions as alternatives, not extra physical parts. Do not require unseen unrelated joints, "
         "a whole-product count in a close-up, or particular layouts, room styles, typography or graphics. "
-        "Detail-only output depicts selected parts, not a new whole hero; sold quantity does not require full units in a detail image. "
+        "Compare the current role_design.presentation target, not the edit-base photograph, with confirmed sold_unit_count for ordinary main/scene whole views. "
+        "A corrected single-unit target with same-child product evidence is valid even if the edit base shows two; a one-unit ordinary scene for a sold pair is not. "
+        "Reject only the conflicting target as product_depiction, revise_plan; do not reject the source arrangement or a superseded draft. "
+        "role_design.display_copy is the complete proposed image text: a synonymous title and label for the same feature are redundant despite different evidence IDs. "
+        "Assess the proposed set together; repeated feature lists need a distinct evidenced demonstration, not merely a new layout. "
+        "Detail-only output depicts selected parts, not a new whole hero; alternative states of one item are not multiple sold units. "
+        "A bright studio reflection is not proof that a mirror became an opaque panel; a recognizable room reflection is not required. "
         "Original source_views verify provenance only: a feature visible only on an original page does not prove it is in the generation attachments. "
         "Check explicit contradictory instructions, not aesthetic quality or pixel-level color equality; uncertainty about taste is not inconclusive. "
         "selected_evidence_ids resolves in selected_evidence; product_fact_set resolves through fact_sets to child_product_facts. "
@@ -667,7 +698,7 @@ def review_planning_bindings(
         "Compare measured subject, property, operating state and qualifiers before treating readings as conflicting. "
         "sold_membership resolves only specifically disputed sold parts against product records. "
         "For a product observation that misidentifies or invents the sold product, use source_product:<source_id> and cite the actual source. "
-        "Missing ordinary props, different framing, room style, open/closed presentation supported elsewhere in the child, or replaced bedding "
+        "Missing ordinary props, proportional framing, room style, open/closed presentation shown by the selected edit base, or replaced bedding "
         "are not observation defects. Unknown geometry is inconclusive only when the proposed product depiction depends on it. "
         "Compare subject, action, property, quantity, unit, conditions, negation and scope. A modifier stays with its source subject: "
         "drawers placeable on either bed side do not imply wheels mountable on either side. IDs and matching "
@@ -676,7 +707,7 @@ def review_planning_bindings(
         "A plausible but unsupported benefit is inconclusive, not supported. Do not rewrite claims "
         "or use the designer's confidence as evidence. Adding, removing or replacing non-sold "
         "mattresses, textiles and decor is allowed, provided necessary product feature demonstrations remain truthful. "
-        "New camera positions, crops, layout, furnishings and graphics are the designer's decisions, not source facts. "
+        "The first selected photograph fixes the depicted product viewpoint and assembly; redesign crops, proportional placement, furnishings and graphics without reconstructing visible product geometry. "
         "Removing a sold drawer, changing its mechanism or duplicating the sold product is a contradiction; "
         "showing a bare frame with designed bedding is not, unless it conceals the feature this role must demonstrate. "
         "Do not judge beauty, enforce trends, require identical colors for different graphic roles, or add "
@@ -802,7 +833,7 @@ def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any]
         "product_coverage is complete only when every depicted product region is compared; an unregistered detail is not automatically correct. "
         "Use presentation.scope: detail_only authorizes selected parts, not an invented assembled product. "
         "Repeated close-ups and a representative unit in a dimension diagram are not extra sold units. "
-        "A changed viewpoint or operating state is allowed when supported by any supplied same-child product evidence; "
+        "Compare the depicted product to its selected edit base and actual supplied detail views; auxiliary evidence does not excuse invented joints or fused viewpoints. "
         "unseen geometry is unknown, not an automatic contradiction. A contradiction needs an actually incompatible product part. "
         "Adjustment-position ghosts are not extra physical shelves. Non-sold rooms, bedding and props may be added, removed or replaced. "
         "Occlusion is not removal: judge depicted product regions and required functional demonstrations, not every part hidden by normal staging. "

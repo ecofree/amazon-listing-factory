@@ -125,7 +125,10 @@ def template_job_with_defaults(job: dict[str, Any], *, env: dict[str, str]) -> d
         "product_id_type": DEFAULT_TEMPLATE_PRODUCT_ID_TYPE,
     }
     for field, value in defaults.items():
-        updated[field] = str(updated.get(field) or value)
+        current = updated.get(field)
+        if current is None or (isinstance(current, str) and not current.strip()):
+            current = value
+        updated[field] = str(current).lower() if isinstance(current, bool) else str(current)
     if updated.get("gtin_exempt") is None:
         updated["gtin_exempt"] = True
     return updated

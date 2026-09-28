@@ -19,7 +19,7 @@ from .template_runtime import (
 )
 
 
-TEMPLATE_INPUT_POLICY_VERSION = "template-input-v9-parent-highlight-contract"
+TEMPLATE_INPUT_POLICY_VERSION = "template-input-v10-values-and-role-coverage"
 _TEMPLATE_JOB_FIELDS = (
     "seed_asin",
     "category_id",

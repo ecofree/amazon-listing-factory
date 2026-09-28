@@ -35,6 +35,14 @@ class SearchTermDatabaseTests(unittest.TestCase):
             self.assertIn("Bathroom Storage Cabinet", first["reference_title"])
             self.assertEqual(8.5, first["conversion_share"])
 
+        from core.backend_keywords import generate_backend_keywords
+        for mount, wall in (('Floor Mount', False), ('Wall Mounted', True)):
+            keywords = generate_backend_keywords(category_id='bathroom_cabinet', title='Storage Cabinet', bullets=[], description='',
+                product_specific={'mounting_type': mount}, competitor_keywords=['wall cabinet', 'recessed cabinet'], extra_terms=['over toilet storage'])
+            self.assertEqual(wall, 'wall cabinet' in keywords)
+            self.assertNotIn('recessed', keywords)
+            self.assertNotIn('over toilet', keywords)
+
     def test_copy_writer_injects_market_reference_into_deepseek_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -94,7 +94,7 @@ class VisualDesignRemediationTests(unittest.TestCase):
                 source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
             self.assertEqual('ready', _role_brief(ready, 'func')['status'])
             reviewer.assert_called_once()
-            self.assertEqual(['func'], [r['role_design']['role'] for r in reviewer.call_args.args[0]])
+            self.assertEqual(['main', 'func', 'scene'], [r['role_design']['role'] for r in reviewer.call_args.args[0]])
             cached = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
                 source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=ready)
             self.assertEqual(ready, cached)
@@ -135,7 +135,9 @@ class VisualDesignRemediationTests(unittest.TestCase):
                 self.assertEqual('ready', _role_brief(repaired, 'func')['status'])
                 self.assertEqual(_role_brief(ready, 'main'), _role_brief(repaired, 'main'))
                 self.assertEqual(1, remote.call_count)
-                reviewer.assert_called_once()
+                self.assertEqual(2, reviewer.call_count)
+                self.assertEqual(['main', 'scene'], [r['role_design']['role'] for r in reviewer.call_args_list[0].args[0]])
+                self.assertEqual(['func'], [r['role_design']['role'] for r in reviewer.call_args_list[1].args[0]])
         draft['display_copy']['labels'] = [dict(text='Effortless pull-out', evidence_ids=['drawer'])]
         def review(requests, **kwargs):
             return {**supported_review_results(requests), **{row['key']: dict(key=row['key'], policy=CLAIM_REVIEW_POLICY, response_sha256='b'*64,
@@ -152,7 +154,8 @@ class VisualDesignRemediationTests(unittest.TestCase):
                 source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
             self.assertEqual('ready', _role_brief(fixed, 'func')['status'])
             self.assertEqual(1, repair_call.call_count)
-            self.assertEqual(1, reviewer.call_count)
+            self.assertEqual(2, reviewer.call_count)
+            self.assertEqual(['Drawers on wheels'], reviewer.call_args.args[0][0]['role_design']['display_copy']['labels'])
             self.assertEqual(raw['family_art_direction'], fixed['family_art_direction'])
         with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=TimeoutError('review clock')), patch(
                 'core.visual_design_kit.gemini_stream_generate') as unnecessary:

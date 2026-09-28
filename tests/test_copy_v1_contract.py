@@ -54,6 +54,44 @@ class CopyV1ContractTests(unittest.TestCase):
             _validate_artifact_provenance(artifact)
             self.assertEqual(highlights, _copy_v1_for_row(artifact, row_type="Parent", sku="P", asin="B1")[1])
 
+        import tempfile
+        from pathlib import Path
+        from core.copy_polish import _write_fragment, _load_fragment, _copy_groups
+        row['item_highlights'] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_fragment(Path(tmp), 'parent', row)
+            self.assertEqual(row, _load_fragment(Path(tmp), 'parent', row_type='Parent'))
+            self.assertIsNone(_load_fragment(Path(tmp), 'parent', row_type='Child'))
+        children = [{'asin': 'B1', 'title': 'Storage Cabinet', 'specs': {'material': 'Wood', 'color': 'White'}},
+                    {'asin': 'B2', 'title': 'Storage Cabinet', 'specs': {'material': 'Wood', 'color': 'Blue'}}]
+        self.assertEqual(1, len(_copy_groups(children)))
+        for field, value in (('material', 'Metal'), ('sold_unit_count', 2), ('number_of_doors', 3)):
+            altered = {**children[1], 'specs': {**children[1]['specs'], field: value}}
+            self.assertEqual(2, len(_copy_groups([children[0], altered])))
+
+        from core import copy_polish
+        from core.plugin import load_plugin
+        from core.io import write_json, read_json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_json(root / 'source' / 'product_family_v3.json', {'family': {'children': children}})
+            child_copy = {**row, 'item_highlights': ['Wall Mounted Storage', 'Adjustable Shelf']}
+            with patch.multiple(copy_polish,
+                load_job=lambda _: {}, load_template_env=lambda *a: {},
+                read_product_family=lambda _: {'family': {'children': children}},
+                copy_provider_configured=lambda _: True,
+                copy_request_fingerprint=lambda *a, **k: 'request',
+                _model_request_fingerprint=lambda **k: k['row_type'],
+                _group_request_fingerprint=lambda **k: k['row_type'],
+                _current_artifact=lambda *a, **k: None,
+            ), patch.object(copy_polish, '_rewrite_group', side_effect=[child_copy, row]) as rewrite:
+                copy_polish.run_copy_polish(job_dir=root, plugin=load_plugin('medicine_cabinet'), limit=2)
+                data = read_json(root / 'reports' / 'copy_v1.json')
+                self.assertEqual('B1', data['groups'][0]['source_asin'])
+                self.assertTrue(all(value['copy_group_source_asin'] == 'B1' for key, value in data['rows'].items() if key != '__parent__'))
+                copy_polish.run_copy_polish(job_dir=root, plugin=load_plugin('medicine_cabinet'), limit=2)
+                self.assertEqual(2, rewrite.call_count)  # Both child and empty-highlight parent fragments reused.
+
     def test_multiple_item_highlights_and_brandless_size_first_title(self) -> None:
         payload = {
             "title": "24 Inch Wall Mount Medicine Cabinet with Mirror",
@@ -125,6 +163,29 @@ class CopyV1ContractTests(unittest.TestCase):
         for wrong in ('Total load capacity is 66 pounds.', 'Load capacity is 120 pounds, with 11 pounds per shelf and 22 pounds for the drawer.'):
             with self.subTest(wrong=wrong), self.assertRaisesRegex(CopyWriterError, 'capacity value'):
                 _parse_copy_response(_body({**payload, 'description': wrong}), product_specific=facts)
+
+        from core.copy_writer import _validate_copy_compliance
+        for claim, facts, accepted in (
+            ('waterproof', {'waterproof': False, 'source_description': 'Waterproof cabinet'}, False),
+            ('waterproof', {'waterproof': True}, True),
+            ('waterproof', {'description': 'This cabinet is not waterproof'}, False),
+            ('waterproof', {'waterproof': 'unknown'}, False),
+            ('waterproof', {'waterproof': 'water-resistant'}, False),
+            ('recyclable packaging', {'packaging': {'recyclable': True}}, True),
+            ('shatterproof', {'glass': 'tempered'}, False),
+            ('shatterproof', {'shatterproof': True}, True),
+            ('biodegradable', {'eco': True}, False),
+            ('recyclable', {'packaging': {'recyclable': True}}, False),
+            ('recyclable', {'recyclable': True}, True),
+            ('rust-proof', {'rust': 'resistant'}, False),
+        ):
+            with self.subTest(claim=claim, facts=facts):
+                output = {'title': 'Bathroom Cabinet with Door', 'bullets': ['Adjustable Shelf'], 'description': claim}
+                if accepted:
+                    _validate_copy_compliance(output, category='bathroom_cabinet', product_specific=facts)
+                else:
+                    with self.assertRaises(CopyWriterError):
+                        _validate_copy_compliance(output, category='bathroom_cabinet', product_specific=facts)
 
     def test_model_repairs_all_reported_copy_errors_in_one_followup(self) -> None:
         invalid = {
@@ -227,6 +288,21 @@ class CopyV1ContractTests(unittest.TestCase):
         self.assertEqual("55 characters or fewer", title_repair["title_only_contract"]["target"])
         self.assertIn("standalone measurement", title_repair["title_only_contract"]["ending"])
         self.assertIn("Preserve exact product structure nouns", title_post.call_args_list[1].args[1]["messages"][0]["content"])
+        for invalid_parent, repair in (
+            ({**title_only_invalid, "item_highlights": []}, {"title": valid["title"]}),
+            ({**valid, "item_highlights": ["Green"]}, {"item_highlights": []}),
+        ):
+            with self.subTest(parent_repair=repair), patch(
+                "core.copy_writer._post_chat_completion", side_effect=[_body(invalid_parent), _body(repair)]
+            ) as parent_post:
+                parent = _rewrite_listing_copy_with_openai(
+                    config=config, category="medicine_cabinet", brand="safeplus", row_type="parent",
+                    source_title="Wall Mount Medicine Cabinet", source_bullets=[], source_description="",
+                    product_specific={"mounting_type": "wall mount", "shelf": "adjustable"},
+                )
+                self.assertEqual([], parent["item_highlights"])
+                self.assertEqual(2, parent_post.call_count)
+
         highlight_only_invalid = {**valid, "item_highlights": ["Adjustable Shelf"]}
         with patch(
             "core.copy_writer._post_chat_completion",

@@ -279,11 +279,8 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                     status="queue_unavailable",
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                # Capacity is not provider health, but it is still a valid
-                # reason to use this task's already-assigned backup. Holding
-                # the task on the same saturated provider made independent
-                # jobs wait until the batch stall budget expired even when a
-                # configured reserve was idle.
+                # Capacity waits may use another normal route; failure-only
+                # backups remain reserved for an actual failure or authorized unknown resend.
                 continue
             attempted_failures.append({
                 "provider": provider,

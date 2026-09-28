@@ -15,6 +15,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 
+from .product_family import supports_fact, fact_statement_issues
 from .title_quality import listing_title_quality_issues
 from .text_evidence import extract_measurements, us_measurement_text, measurement_values_match
 
@@ -44,7 +45,7 @@ class CopyWriterConfig:
 COPY_CACHE_MAX_ENTRIES = 256
 _LOGGER = logging.getLogger(__name__)
 COPY_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
-COPY_WRITER_PROMPT_VERSION = "copy-writer-v26-scoped-capacity"
+COPY_WRITER_PROMPT_VERSION = "copy-writer-v27-authorized-facts"
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TITLE_PREFERRED_CHARS = 68
 TITLE_MAX_CHARS = 75
@@ -455,7 +456,8 @@ def _rewrite_listing_copy_with_openai(
                 "role": "system",
                 "content": (
                     "You write compliant Amazon US listing copy that is ready for Amazon upload. Return JSON only. "
-                    "Use only facts supplied by the user. Do not invent certifications, materials, sizes, capacities, included accessories, or safety claims. "
+                    "Use only supplied facts. _fact_resolutions override raw source prose: omit conflicted facts and use confirmed values. "
+                    "Do not invent certifications, materials, sizes, capacities, included accessories, or safety claims. "
                     "Apify source item_highlights is optional and may be absent or combined with commas/semicolons. Use it as evidence when present, but do not copy the source title or item highlights verbatim. If the source title is missing or overlong, write a new brandless title from the supplied product facts; never truncate the source mechanically. If source item_highlights are absent, synthesize short highlights from supplied product facts without blocking. Use plain ASCII punctuation. Do not use brackets, numbering, markdown, or emoji. "
                     "Item Weight or product weight means the product's own mass. It never authorizes a weight capacity, load capacity, supports-up-to, or holds-up-to claim; only an explicit supplied load_capacity fact does. "
                     "Output must be in English. Return exactly four keys: title, item_highlights, bullets, description. Put the final JSON object in assistant message.content; do not leave content empty or put the answer only in reasoning_content.\n"
@@ -612,6 +614,7 @@ def _rewrite_listing_copy_with_openai(
             if _only_title_validation_errors(error_text):
                 result = _repair_title_only_with_ai(
                     config=config,
+                    row_type=row_type,
                     invalid_body=body,
                     validation_error=error_text,
                     category=category,
@@ -624,6 +627,7 @@ def _rewrite_listing_copy_with_openai(
             if _only_item_highlight_validation_errors(error_text):
                 result = _repair_item_highlights_only_with_ai(
                     config=config,
+                    row_type=row_type,
                     invalid_body=body,
                     source_item_highlights=list(_copy_payload_user(payload).get("source", {}).get("item_highlights") or []),
                     category=category,
@@ -636,6 +640,7 @@ def _rewrite_listing_copy_with_openai(
             if _only_bullet_length_errors(error_text):
                 result = _repair_long_bullets_with_ai(
                     config=config,
+                    row_type=row_type,
                     invalid_body=body,
                     validation_error=error_text,
                     category=category,
@@ -684,7 +689,7 @@ def _copy_json_repair_payload(
     user_payload["output_contract"] = {
         "required_keys": ["title", "item_highlights", "bullets", "description"],
         "title": "string only",
-        "item_highlights": f"array of {ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} strings whose comma-separated total is under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters",
+        "item_highlights": ("empty array allowed for Parent; otherwise " if str(user_payload.get("row_type", "")).lower() == "parent" else "") + f"array of {ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} strings whose comma-separated total is under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters",
         "bullets": "array of exactly five strings",
         "description": "string only",
         "forbidden_output": [
@@ -757,11 +762,11 @@ def _copy_validation_repair_payload(
         }
     if "item highlight" in error_text.lower() or "item_highlights" in error_text.lower():
         user_payload["item_highlights_repair_contract"] = {
-            "shape": f"{ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} distinct concrete source-supported phrases",
+            "shape": ("empty array allowed for Parent; otherwise " if str(user_payload.get("row_type", "")).lower() == "parent" else "") + f"{ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} distinct concrete source-supported phrases",
             "word_limit": f"2-{ITEM_HIGHLIGHT_MAX_WORDS} words per phrase",
             "joined_character_limit": f"under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters including comma-and-space separators",
             "source": "synthesize only from source.item_highlights and confirmed product facts",
-            "forbidden": "Do not return sentences, duplicate phrases, copied source statements, unsupported claims, or an empty array.",
+            "forbidden": "Do not return sentences, duplicate phrases, copied source statements, unsupported claims, or an empty Child array.",
         }
     user_payload["repair_rules"] = [
         "Return exactly title, item_highlights, bullets, and description as JSON.",
@@ -805,6 +810,7 @@ def _only_item_highlight_validation_errors(error_text: str) -> bool:
 def _repair_long_bullets_with_ai(
     *,
     config: CopyWriterConfig,
+    row_type: str,
     invalid_body: str,
     validation_error: str,
     category: str,
@@ -878,6 +884,7 @@ def _repair_long_bullets_with_ai(
         return _parse_copy_response(
             merged_body,
             category=category,
+            row_type=row_type,
             product_specific=product_specific,
             brand=brand,
             market_context=market_context,
@@ -891,6 +898,7 @@ def _repair_long_bullets_with_ai(
 def _repair_title_only_with_ai(
     *,
     config: CopyWriterConfig,
+    row_type: str,
     invalid_body: str,
     validation_error: str,
     category: str,
@@ -950,6 +958,7 @@ def _repair_title_only_with_ai(
             return _parse_copy_response(
                 merged_body,
                 category=category,
+                row_type=row_type,
                 product_specific=product_specific,
                 brand=brand,
                 market_context=market_context,
@@ -977,6 +986,7 @@ def _repair_title_only_with_ai(
 def _repair_item_highlights_only_with_ai(
     *,
     config: CopyWriterConfig,
+    row_type: str,
     invalid_body: str,
     source_item_highlights: list[str],
     category: str,
@@ -1006,7 +1016,7 @@ def _repair_item_highlights_only_with_ai(
                         "invalid_item_highlights": invalid.get("item_highlights"),
                         "source_item_highlights": source_item_highlights,
                         "contract": {
-                            "count": f"{ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT}",
+                            "count": ("0 or " if row_type.lower() == "parent" else "") + f"{ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT}",
                             "words_per_phrase": f"2-{ITEM_HIGHLIGHT_MAX_WORDS}",
                             "joined_limit": f"under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters including comma-and-space separators",
                             "separator": ITEM_HIGHLIGHT_SEPARATOR,
@@ -1040,6 +1050,7 @@ def _repair_item_highlights_only_with_ai(
         return _parse_copy_response(
             merged_body,
             category=category,
+            row_type=row_type,
             product_specific=product_specific,
             brand=brand,
             market_context=market_context,
@@ -1280,7 +1291,7 @@ def _flatten_spec_mapping(value: Any) -> dict[str, Any]:
             return
         for key, nested in item.items():
             normalized = re.sub(r"[^a-z0-9]+", "_", str(key or "").lower()).strip("_")
-            if not normalized or re.search(r"(?:brand|manufacturer|seller|asin|sku|review|rating|rank|source)", normalized):
+            if str(key).startswith("_") or not normalized or re.search(r"(?:brand|manufacturer|seller|asin|sku|review|rating|rank|source)", normalized):
                 continue
             if isinstance(nested, dict):
                 visit(nested, depth + 1)
@@ -1608,16 +1619,11 @@ def _validate_copy_compliance(
     product_specific: dict[str, Any],
 ) -> None:
     title = str(result.get("title") or "")
-    text = " ".join(
-        [
-            title,
-            " ".join(str(item) for item in result.get("item_highlights", []) if item),
-            " ".join(str(item) for item in result.get("bullets", []) if item),
-            str(result.get("description") or ""),
-        ]
-    )
+    fields = [title, *result.get("item_highlights", []), *result.get("bullets", []),
+              str(result.get("description") or "")]
+    text = "\n".join(str(value) for value in fields if value)
     fact_text = json.dumps(product_specific or {}, ensure_ascii=False, sort_keys=True, default=str).lower()
-    violations: list[str] = []
+    violations: list[str] = ["resolved fact contradiction: " + key for key in fact_statement_issues(text, product_specific.get("_fact_resolutions") or {})]
     for pattern in HARD_SUBJECTIVE_FORBIDDEN_PATTERNS:
         match = pattern.search(text)
         if match:
@@ -1630,16 +1636,12 @@ def _validate_copy_compliance(
         match = pattern.search(text)
         if match:
             violations.append(f"external reference: {match.group(0)}")
-    environmental_fact = re.search(
-        r"\b(?:eco|biodegradable|organic|sustainable|recyclable|carbon|environmentally?\s+friendly)\b",
-        fact_text,
-        re.I,
-    )
     for pattern in ENVIRONMENTAL_FORBIDDEN_PATTERNS:
-        match = pattern.search(text)
-        if match and not environmental_fact:
-            violations.append(f"unsupported environmental claim: {match.group(0)}")
-    if re.search(r"\bpatent(?:ed| pending)?\b", text, re.I) and "patent" not in fact_text:
+        for sentence in re.split(r'[.;\n]', text):
+            match = pattern.search(sentence)
+            if match and not supports_fact(product_specific, pattern.pattern, claim_context=sentence):
+                violations.append(f"unsupported environmental claim: {match.group(0)}")
+    if re.search(r"\bpatent(?:ed| pending)?\b", text, re.I) and not supports_fact(product_specific, r"\bpatent(?:ed| pending)?\b"):
         violations.append("unsupported patent claim")
     price_match = re.search(
         r"(?:[$]\s*\d+(?:\.\d{2})?|\b(?:only|just)\s+[$]\s*\d+(?:\.\d{2})?|\b\d+(?:\.\d{2})?\s*(?:usd|dollars?)\b)",
@@ -1658,15 +1660,23 @@ def _validate_copy_compliance(
     for word in re.findall(r"\b[A-Z][A-Z0-9-]{4,}\b", title):
         if word not in ALLOWED_TITLE_ACRONYMS and word != first_title_word:
             violations.append(f"all-caps title word: {word}")
-    if re.search(r"\b(?:guarantee|guaranteed|warranty|warranties)\b", text, re.I) and not re.search(r"\b(?:guarantee|warranty)\b", fact_text, re.I):
-        violations.append("unsupported warranty/guarantee")
-    if re.search(r"\bwaterproof\b", text, re.I) and not re.search(r"\b(?:waterproof|ipx)\b", fact_text, re.I):
-        violations.append("unsupported waterproof")
-    if re.search(r"\b(?:safety certified|child-safe|non-toxic|cpsc compliant|ul listed)\b", text, re.I) and not re.search(
-        r"\b(?:certif|cpsc|ul listed|non-toxic|child-safe)\b", fact_text,
-        re.I,
-    ):
-        violations.append("unsupported certification/safety claim")
+    guarded = (
+        (r"\b(?:guarantee|guaranteed|warranty|warranties)\b", "warranty/guarantee"),
+        (r"\bwaterproof\b", "waterproof"),
+        (r"\b(?:safety certified|child-safe|non-toxic|cpsc compliant|ul listed)\b", "certification/safety claim"),
+        (r"\bergonomic\b", "ergonomic"),
+        (r"\brust[- ]?proof\b", "rust-proof"),
+        (r"\bshatterproof\b", "shatterproof"),
+        (r"\buv[- ]?resistan(?:t|ce)\b", "UV resistance"),
+        (r"\b(?:fire[- ]?retardant|flame[- ]?resistant|hypoallergenic|allergen[- ]?free)\b", "safety/material claim"),
+    )
+    for pattern, label in guarded:
+        for sentence in re.split(r'[.;\n]', text):
+            for claim in re.finditer(pattern, sentence, re.I):
+                # Matching a different property or component cannot authorize this claim.
+                exact = r"\b" + re.escape(claim[0]).replace(r"\-", "[- ]?") + r"\b"
+                if not supports_fact(product_specific, exact, claim_context=sentence):
+                    violations.append("unsupported " + label)
     capacity_claim = re.search(r"\b(?:weight capacity|load capacity|supports up to|holds up to|up to \d+ ?(?:lb|lbs|pounds|kg))\b", text, re.I)
     capacity_fact = re.search(
         r"\b(?:weight_capacity|load_capacity|maximum_weight|max_weight|weight capacity|load capacity|capacity of|supports up to|holds up to)\b",
@@ -1681,7 +1691,7 @@ def _validate_copy_compliance(
             if isinstance(value, dict):
                 numbers = []
                 for key, item in value.items():
-                    if str(key).endswith('_unit'):
+                    if str(key).startswith('_') or str(key).endswith('_unit'):
                         continue
                     unit = value.get(f'{key}_unit')
                     if unit and not isinstance(item, (dict, list)) and not extract_measurements(item):
@@ -1720,16 +1730,6 @@ def _validate_copy_compliance(
         if known_capacities and any(not any(owner == scope and measurement_values_match('Capacity: ' + known, value)
                        for owner, known in known_capacities) for scope, value in claimed_capacities):
             violations.append("weight capacity value contradicts product facts")
-    if re.search(r"\bergonomic\b", text, re.I) and not re.search(r"\b(?:ergonomic|ansi|bifma)\b", fact_text, re.I):
-        violations.append("unsupported ergonomic")
-    if re.search(r"\brust[- ]?proof\b", text, re.I) and "rust" not in fact_text:
-        violations.append("unsupported rust-proof")
-    if re.search(r"\bshatterproof\b", text, re.I) and not re.search(r"\b(?:shatterproof|tempered)\b", fact_text, re.I):
-        violations.append("unsupported shatterproof")
-    if re.search(r"\buv[- ]?resistan(?:t|ce)\b", text, re.I) and "uv" not in fact_text:
-        violations.append("unsupported UV resistance")
-    if re.search(r"\b(?:fire[- ]?retardant|flame[- ]?resistant|hypoallergenic|allergen[- ]?free)\b", text, re.I) and not re.search(r"\b(?:fire|flame|hypoallergenic|allergen)\b", fact_text, re.I):
-        violations.append("unsupported safety/material claim")
     if violations:
         unique = ", ".join(dict.fromkeys(violations))
         raise CopyWriterError(f"Copy AI response contains forbidden Amazon claim: {unique}")

@@ -69,6 +69,10 @@ def verify_review_projection(test):
     source['measurements'] = current_measurement_rows()
     draft['image_direction']['measurement_ids'] = ['source_00:width']
     request = design_binding_request(draft, raw['family_art_direction'], source=source)
+    test.assertEqual({'title': '', 'labels': ['Adjustable Shelf']}, request['role_design']['display_copy'])
+    changed_copy = deepcopy(draft)
+    changed_copy['display_copy']['labels'][0]['text'] = 'Height-adjustable shelf'
+    test.assertNotEqual(request['key'], design_binding_request(changed_copy, raw['family_art_direction'], source=source)['key'])
     test.assertEqual('Cabinet', request['required_facts']['measurements'][0]['measured_part'])
     test.assertNotEqual(previous_request['key'], request['key'])
     from core.visual_design_kit import _finish_image_briefs
@@ -81,7 +85,7 @@ def verify_review_projection(test):
                 'core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as review:
             result = _finish_image_briefs(malformed, output_inventory=initial_output_inventory(sources), job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame',
                 source_paths=[], source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
-        review.assert_called_once()
+        test.assertEqual([['main', 'scene'], ['func']], [[r['role_design']['role'] for r in call.args[0]] for call in review.call_args_list])
         test.assertEqual(['func'], [r['role_design']['role'] for r in review.call_args.args[0]])
         test.assertEqual({'main': 'ready', 'scene': 'ready', 'func': 'ready', 'size': 'pending'},
                          {row['role']: row['status'] for row in result['image_briefs']})
@@ -108,7 +112,7 @@ def verify_shared_repair(test):
         result = _finish_image_briefs(raw, output_inventory=initial_output_inventory(sources), job=Path(tmp), child='B1', source_manifest=sources, category_id='bed_frame', source_paths=[],
             source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
     test.assertEqual(1, remote.call_count)
-    test.assertEqual([['func_02'], ['func']], [[r['role_design']['role'] for r in c.args[0]] for c in review.call_args_list])
+    test.assertEqual([['main', 'scene', 'func_02'], ['func']], [[r['role_design']['role'] for r in c.args[0]] for c in review.call_args_list])
     test.assertEqual('ready', _brief(result, 'func')['status'])
     test.assertEqual(raw['family_art_direction'], result['family_art_direction'])
     for sibling in ('main', 'scene', 'func_02', 'size'):
@@ -121,7 +125,7 @@ def verify_shared_repair(test):
             source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
         test.assertIn('outside the current repair contract', (Path(tmp) / 'brief_repair_error.txt').read_text())
     review.assert_called_once()
-    test.assertEqual(['func_02'], [r['role_design']['role'] for r in review.call_args.args[0]])
+    test.assertEqual(['main', 'scene', 'func_02'], [r['role_design']['role'] for r in review.call_args.args[0]])
     test.assertEqual(before, result)
     alternate = deepcopy(valid_raw)
     _brief(alternate, 'func')['image_direction'] = current_image_direction(source_id='source_01')
@@ -172,7 +176,7 @@ def verify_observation_feedback(test):
     unreviewed_copy = deepcopy(raw)
     _brief(unreviewed_copy, 'func')['display_copy']['labels'][0]['text'] = 'Shelf height adjusts'
     combined = compile_visual_design_kit_response(unreviewed_copy, output_inventory=initial_output_inventory([source]), source_manifest=[source], claim_reviews=reviews)
-    test.assertEqual('observation', _brief(combined, 'func')['failure_owner'])
+    test.assertEqual('review', _brief(combined, 'func')['failure_owner'])
     changed = deepcopy(kit)
     changed['children']['B1']['source_references'][0]['input_revision_id'] = 'changed'
     test.assertEqual({}, observation_corrections(changed))

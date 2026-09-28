@@ -278,6 +278,14 @@ class FreezeRecoveryTests(unittest.TestCase):
             with self.assertRaises(RunScopeError):
                 ensure_run_scope(job_dir=tmp, child_ids=('B3',))
 
+            family['family']['children'].append({'asin': 'B4', 'reference_images': ['first']})
+            self.assertEqual(['B2', 'B1'], ensure_run_scope(job_dir=tmp)['selected_children'])
+        with tempfile.TemporaryDirectory() as tmp, patch('core.run_scope.read_product_family', return_value=family):
+            ensure_run_scope(job_dir=tmp, production=True)
+            family['family']['children'].append({'asin': 'B5', 'reference_images': ['first']})
+            with self.assertRaisesRegex(RunScopeError, 'full family'):
+                ensure_run_scope(job_dir=tmp, production=True)
+
 
 if __name__ == "__main__":
     unittest.main()

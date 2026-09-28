@@ -164,8 +164,7 @@ def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[
     actual = {row["source_id"] for row in references if row["kind"] == "design_reference"}
     if actual != set(decisions):
         raise ValueError("Selected design references do not match generation attachments")
-    lines = [('Original product attachments supply facts, not a replacement composition.' if targeted_edit else
-              'Product attachments identify the product; ROLE defines the intended output, not source graphics or styling.')]
+    lines = []
     if actual:
         lines.append('Design attachments authorize reviewed styling only, never product, branding, copy or dimensions.')
     for index, row in enumerate(references, 1):
@@ -178,9 +177,9 @@ def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[
         elif row['kind'] == 'measurement_evidence':
             purpose = 'Measurement verification only: quantities, measured objects and endpoints; not styling or an extra output panel.'
         elif row['kind'] == 'product_evidence':
-            purpose = 'Supplementary identity/structure evidence; its photographed state does not override the target state.'
+            purpose = 'Supplementary facts or depicted details only.'
         elif not targeted_edit:
-            purpose = 'Primary edit evidence for the target structure and state; source graphics are not the target layout.'
+            purpose = 'Photograph to edit; source graphics are not the target layout.'
         else:
             purpose = "Selected candidate: retain its design and physical state except for the requested correction."
         identity = row['source_id']

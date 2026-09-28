@@ -28,15 +28,15 @@ from .io import file_sha256, read_json, write_json
 from .job import load_job
 from .paths import FACTORY_ROOT
 from .plugin import ProductPlugin
-from .product_family import read_product_family
+from .product_family import read_product_family, effective_product_facts, fact_resolutions, fact_statement_issues
 from .status import input_revision_id, logical_task_id
 from .template_runtime import child_sku, load_template_env, normalize_template_mode
 
 
 COPY_SCHEMA_VERSION = "copy-v1"
 COPY_ARTIFACT = "copy_v1.json"
-COPY_GROUP_POLICY_VERSION = "copy-group-v5-retryable-ai-output"
-COPY_VALIDATION_POLICY_VERSION = "copy-validation-v10-parent-highlight-contract"
+COPY_GROUP_POLICY_VERSION = "copy-group-v6-effective-facts"
+COPY_VALIDATION_POLICY_VERSION = "copy-validation-v11-effective-facts"
 PARENT_COPY_KEY = "__parent__"
 COPY_IGNORED_FACT_KEYS = {"fabric_type"}
 
@@ -112,7 +112,7 @@ def run_copy_polish(
             row_type="Child",
             model_request_fingerprint=model_request_fingerprint,
         )
-        source_asin = str(source.get("asin") or "")
+        source_asin = str(members[0].get("asin") or "")
         member_skus = [
             child_sku(job, child, children.index(child) + 1)
             for child in members
@@ -190,7 +190,7 @@ def run_copy_polish(
         )
         parent_revision = _task_success(PARENT_COPY_KEY, parent_fingerprint)["input_revision_id"]
         prior_parent_failure = previous_failures.get(parent_revision)
-        parent_fragment = None if prior_parent_failure else _load_fragment(job_path, parent_fingerprint)
+        parent_fragment = None if prior_parent_failure else _load_fragment(job_path, parent_fingerprint, row_type="Parent")
         if prior_parent_failure:
             failures.append(dict(prior_parent_failure))
         if parent_fragment is None:
@@ -405,15 +405,24 @@ def _copy_groups(children: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
 
 
 def _copy_group_key(child: dict[str, Any], **_: Any) -> str:
-    return _fingerprint({"policy": COPY_GROUP_POLICY_VERSION, "source": _source_copy(child)})
+    facts = _copy_facts(child)
+    # Color/style are removed from shared source text; structural and size facts remain identity.
+    for key in ("color", "color_name", "style", "style_name"):
+        facts.pop(key, None)
+    return _fingerprint({"policy": COPY_GROUP_POLICY_VERSION, "source": _source_copy(child), "facts": facts})
 
 
 def _source_copy(child: dict[str, Any]) -> dict[str, Any]:
+    resolutions = fact_resolutions(child)
+    def authorized(value: str) -> str:
+        # Raw records remain in ProductFamily; only supported clauses reach the writer.
+        return ' '.join(part for part in re.split(r'(?<=[.;])\s+|\n', value)
+                        if not fact_statement_issues(part, resolutions))
     item_highlights = child.get("item_highlights") or child.get("bullets") or child.get("features") or []
     return {
-        "title": _normalize_text(child.get("title")),
-        "item_highlights": _normalize_item_highlights(item_highlights),
-        "description": _normalize_text(child.get("description")),
+        "title": authorized(_normalize_text(child.get("title"))),
+        "item_highlights": [text for value in _normalize_item_highlights(item_highlights) if (text := authorized(value))],
+        "description": authorized(_normalize_text(child.get("description"))),
     }
 
 
@@ -477,18 +486,12 @@ def _family_common_specific(children: list[dict[str, Any]], *_: Any) -> dict[str
 
 
 def _copy_facts(child: dict[str, Any]) -> dict[str, Any]:
-    facts: dict[str, Any] = {}
-    specs = child.get("specs") if isinstance(child.get("specs"), dict) else {}
-    for key, value in specs.items():
-        normalized = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
-        if normalized not in {"source_title", "source_bullets", "source_description", *COPY_IGNORED_FACT_KEYS} and value not in (None, "", [], {}):
-            facts[normalized] = value
-    specific = child.get("product_specific") if isinstance(child.get("product_specific"), dict) else {}
-    for category, values in specific.items():
-        if isinstance(values, dict):
-            cleaned = {key: value for key, value in values.items() if str(key) not in COPY_IGNORED_FACT_KEYS}
-            if cleaned:
-                facts[str(category)] = cleaned
+    facts = {key: value for key, value in effective_product_facts(child).items() if key not in COPY_IGNORED_FACT_KEYS}
+    resolutions = fact_resolutions(child)
+    if 'sold_unit_count' not in resolutions and child.get('sold_unit_count_source') in {'amazon_single_unit_listing_policy', 'apify_invalid_pack_count_default'}:
+        facts.pop('sold_unit_count', None)
+    if resolutions:
+        facts['_fact_resolutions'] = resolutions
     return facts
 
 
@@ -695,7 +698,7 @@ def _fragment_path(job_path: Path, fingerprint: str) -> Path:
     return job_path / "cache" / "copy_fragments" / f"{fingerprint}.json"
 
 
-def _load_fragment(job_path: Path, fingerprint: str) -> dict[str, Any] | None:
+def _load_fragment(job_path: Path, fingerprint: str, *, row_type: str = "Child") -> dict[str, Any] | None:
     path = _fragment_path(job_path, fingerprint)
     if not path.is_file():
         return None
@@ -704,7 +707,7 @@ def _load_fragment(job_path: Path, fingerprint: str) -> dict[str, Any] | None:
         if row.get("schema_version") != COPY_SCHEMA_VERSION or row.get("fingerprint") != fingerprint:
             return None
         copy = row.get("copy") if isinstance(row.get("copy"), dict) else {}
-        _validate_copy_row(copy)
+        _validate_copy_row(copy, row_type=row_type)
         return copy
     except Exception:
         return None

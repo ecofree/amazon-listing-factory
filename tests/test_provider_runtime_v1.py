@@ -441,6 +441,17 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertIsInstance(normalized, ProviderConfigurationError)
         self.assertEqual("configuration", provider_failure_class(normalized))
 
+        from core.image_provider_transport import _raise_image_rejection
+        from core.image_provider_common import ProviderTransportError
+        with self.assertRaises(ProviderTransportError) as busy:
+            _raise_image_rejection('qc_yc_fixed', '{"error":{"code":"image_account_selection_timeout","type":"invalid_request_error"}}', 400)
+        self.assertEqual('transient', provider_failure_class(busy.exception))
+        self.assertFalse(busy.exception.ambiguous)
+        with self.assertRaises(ProviderConfigurationError):
+            _raise_image_rejection('qc_yc_fixed', '{"error":{"code":"invalid_api_key"}}', 400)
+        self.assertEqual('configuration', provider_failure_class(normalize_provider_error(
+            'qc_yc_fixed', ImageGenerationError('HTTP 400: invalid image size'))))
+
     def test_explicit_revision_recovers_corrupt_state_and_uses_an_alternate_provider(self) -> None:
         task = current_image_task("main", category_id="bed_frame")
         captured: dict = {}

@@ -49,7 +49,6 @@ def current_art_direction() -> dict[str, Any]:
         "audience_and_market": "US homeowners seeking calm, practical bathroom storage with a residential rather than commercial impression.",
         "palette_direction": {"room": {"wall": "#F4F2EE matte mineral paint, solid", "floor": "#B9A88D oak, natural grain"}, "bath": {"towels": "#8A999E cotton, solid"}},
         "photography_direction": "Bright clear exposure, neutral white balance, soft contrast and truthful painted-wood response.",
-        "environment_and_staging": "Restrained US bathroom styling with newly selected towels and ceramic containers; do not copy source props.",
         "typography_direction": {"font_family": "Inter", "title_style": "Semibold sentence case", "body_style": "Regular with readable spacing", "numeric_style": "Tabular figures with unit spacing"},
         "graphic_direction": {"text_color": "#303634", "line_color": "#637470", "icon_color": "#303634", "backing_color": "#F4F2EE", "backed_symbol_color": "#303634", "icon_style": "outline", "line_style": "fine"},
     }

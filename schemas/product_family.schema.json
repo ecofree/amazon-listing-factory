@@ -16,7 +16,7 @@
         "type": { "const": "apify" },
         "seed_asin": { "type": "string", "pattern": "^[A-Z0-9]{10}$" },
         "fetched_at": { "type": "string", "minLength": 1 },
-        "policy_version": { "const": "product-family-v3-resolved-facts-v10-child-scoped" },
+        "policy_version": { "const": "product-family-v3-resolved-facts-v12-scoped-counts-color" },
         "raw_dir": { "type": "string", "minLength": 1 },
         "raw_dirs": {
           "type": "object",

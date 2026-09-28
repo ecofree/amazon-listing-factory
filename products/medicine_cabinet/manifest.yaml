@@ -139,25 +139,26 @@ image_generation:
     - part: electrical controls
       unless_source_visible: true
   visual_context:
-    primary_setting: modern US bathroom vanity area
-    buyer: homeowners and renters organizing daily grooming storage
-    user: household members using a mirror and bathroom cabinet
+    primary_setting: modern US bathroom, or another room supported by this child's source evidence
+    buyer: homeowners and renters organizing compact wall storage
+    user: household members using the evidenced wall cabinet
     required_cues:
-      - mirror, vanity, and grooming scale
+      - appropriate household scale for the evidenced room and cabinet face
       - believable wall relationship for the source-visible cabinet
-      - restrained toiletries and clean counter organization
+      - restrained accessories appropriate to the planned room; mirror and grooming cues only for supported vanity use
     allowed_alternates:
       - compact powder room vanity
       - shared family bathroom with practical storage
+      - source-supported kitchen, dining, or entry storage
     avoid:
       - freestanding floor-cabinet treatment
-      - bedroom, kitchen, or living-room staging
+      - room or installation use unsupported by this child's evidence
       - decorative props that hide the mirror, doors, or storage state
   role_specific_rules:
     main:
       - Use a white external canvas and preserve the source-visible frame, door or panel face, hinge, and shelf geometry
     scene:
-      - Show vanity use without changing the source-visible door or panel face and opening orientation
+      - Preserve the source-visible mounting, door or panel face and opening orientation in the planned evidenced setting
     size:
       - Preserve confirmed cabinet dimensions and any source-visible face dimensions
     func:

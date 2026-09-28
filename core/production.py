@@ -869,10 +869,13 @@ def _assert_production_entry_requirements(request: JobRunRequest, selected_stage
     )
     job = template_job_with_defaults(job, env=env)
     if "template" in stages:
-        if not isinstance(job.get("gtin_exempt"), bool):
-            raise ProductionPipelineError("Production requires gtin_exempt to resolve to a boolean")
-        if job["gtin_exempt"] is False and (not job.get("product_id_type") or not job.get("product_id")):
-            raise ProductionPipelineError("Non-exempt production requires product_id_type and product_id")
+        from .template_engine import _assert_submit_ready_job_contract, TemplateEngineError
+        family_path = request.job_dir / 'source' / 'product_family_v3.json'
+        child_count = len(read_product_family(request.job_dir)['family']['children']) if family_path.is_file() else None
+        try:
+            _assert_submit_ready_job_contract(job, mode='submit_ready', child_count=child_count)
+        except TemplateEngineError as exc:
+            raise ProductionPipelineError(str(exc)) from exc
         template_path = resolve_template_path(
             request.plugin,
             job,
@@ -975,10 +978,20 @@ def _write_summary(
     publish_mode = _publish_mode(request.job_dir, publish_ran=publish_ran)
     source_scope = _source_scope_counts(request)
     missing_candidate_count = max(0, len(release_rows) - candidate_count)
-    image_completion_status = (
-        "incomplete" if missing_candidate_count else "not_run" if not release_rows else "success"
-    )
     stage_rows = state.get("stages") if isinstance(state.get("stages"), dict) else {}
+    image_started = bool(release_rows) or any(name in stage_rows for name in ('brief', 'generate'))
+    missing_children, image_scope_error = [], ''
+    if (request.job_dir / 'reports' / 'run_scope_v5.json').is_file():
+        try:
+            from .run_scope import read_run_scope
+            selected_children = set(read_run_scope(request.job_dir)['selected_children'])
+            missing_children = sorted(selected_children - {str(row.get('child') or '') for row in release_rows})
+        except Exception as exc:
+            image_scope_error = str(exc)[:300]
+    image_completion_status = (
+        'not_run' if not image_started else 'incomplete'
+        if missing_candidate_count or missing_children or image_scope_error or not release_rows else 'success'
+    )
     completed_stages = [
         stage for stage in PRODUCTION_STAGES
         if stage in timings and isinstance(stage_rows.get(stage), dict)
@@ -996,7 +1009,8 @@ def _write_summary(
             status == "success"
             and (
                 active_failure_count
-                or ('generate' in timings and (image_completion_status == "incomplete" or source_scope['source_unresolved_count']))
+                or (image_started and image_completion_status == 'incomplete')
+                or ('generate' in timings and source_scope['source_unresolved_count'])
                 or (downstream_ran and str(effective_release.get("status") or "") in {"failed", "partial_success"})
                 or ('template' in timings and 'template' not in completed_stages)
             )
@@ -1022,6 +1036,8 @@ def _write_summary(
         "release_status": str(effective_release.get("status") or "not_run"),
         "planned_image_completion_status": image_completion_status,
         "planned_image_unresolved_count": missing_candidate_count,
+        "planned_image_missing_children": missing_children if image_started else [],
+        "planned_image_scope_error": image_scope_error if image_started else '',
         "publish_mode": publish_mode,
         "template_status": template_status,
         "workflow_reason": ('selected_stages_completed_downstream_not_requested'

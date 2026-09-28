@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import math
 from typing import Any
 
 from .copy_writer import (
@@ -334,7 +335,7 @@ def compile_field_decisions(
                 if required_kind == "optional"
                 else "invalid_allowed_value"
             )
-        elif value and field_expects_number(field) and not looks_numeric(value):
+        elif value and field_expects_number(field) and not looks_numeric(value, field=field):
             validation = "invalid_numeric"
         else:
             validation = "pass"
@@ -569,12 +570,16 @@ def field_expects_number(field: str) -> bool:
     )
 
 
-def looks_numeric(value: Any) -> bool:
+def looks_numeric(value: Any, *, field: str = "") -> bool:
     if value in (None, ""):
         return True
     try:
-        float(str(value).strip())
-        return True
+        number = float(str(value).strip())
+        if not math.isfinite(number):
+            return False
+        if any(token in field.casefold() for token in ('number_of_items', 'item_package_quantity', 'fulfillment_availability#1.quantity')):
+            return number >= 0 and number.is_integer()
+        return not field or number >= 0
     except (TypeError, ValueError):
         return False
 
@@ -601,20 +606,20 @@ def _value_hints(value: Any) -> list[str]:
     return list(dict.fromkeys(hints))
 
 
-def fit_template_image_slots(others: list[dict[str, str]], *, limit: int = 8) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def fit_template_image_slots(others: list[dict[str, str]], *, required_counts: dict[str, int], limit: int = 8) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    minima = {role: count for role, count in required_counts.items() if role != 'main'}
+    if sum(minima.values()) > limit:
+        raise ValueError('Template image capacity is smaller than required role coverage')
     kept = list(others)
     omitted: list[dict[str, str]] = []
-    for prefix in ("scene", "func", "size"):
-        while len(kept) > limit:
-            index = next(
-                (idx for idx in range(len(kept) - 1, -1, -1) if str(kept[idx].get("role") or "").startswith(prefix)),
-                -1,
-            )
-            if index < 0:
+    for prefix in ('scene', 'func', 'size', ''):
+        for index in range(len(kept) - 1, -1, -1):
+            if len(kept) <= limit:
                 break
-            omitted.insert(0, kept.pop(index))
-    while len(kept) > limit:
-        omitted.insert(0, kept.pop())
+            role = str(kept[index].get('role') or '').split('_', 1)[0]
+            count = sum(str(row.get('role') or '').split('_', 1)[0] == role for row in kept)
+            if (not prefix or role == prefix) and count > minima.get(role, 0):
+                omitted.insert(0, kept.pop(index))
     return kept, omitted
 
 

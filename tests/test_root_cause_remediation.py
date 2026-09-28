@@ -35,6 +35,70 @@ class RootCauseRemediationTests(unittest.TestCase):
         )
         self.assertEqual("", apify._source_description({"aPlusContent": {"rawImages": [{"name": "2 Door Cabinet"}]}}))
 
+        from copy import deepcopy
+        from core.copy_polish import _copy_facts, _source_copy
+        from core.visual_semantics import source_fact_records
+        from core.template_engine import _family_specific
+        from core.plugin import load_plugin
+        from core.visual_design_kit import compact_product_claims
+        from core.visual_design_kit_compiler import _bind_display_text, _available_claims, VisualDesignKitCompileError
+        for count, title, expected in ((1, 'Set of 2 Cabinets', [1, 2]), (2, 'Set of 2 Cabinets', []), (1, 'Storage Cabinet', [])):
+            result = apify._source_sold_unit_count({'title': title, 'productDetails': {'Number of Items': str(count)}}, {}, {})
+            self.assertEqual(expected, result[2])
+        from products.generic_extractors import extract_variations
+        # Container disagreement is evidence of an unresolved discovery limit, not permission to expand a frozen family.
+        variants = extract_variations({'dimensionValuesDisplayData': {'B1': ['White']}, 'variantAsins': ['B1', 'B2']}, 'B1', ['color'])
+        self.assertEqual(['B1'], [row['asin'] for row in variants['variants']])
+        subject = {'title': 'Wood Cabinet with 3 Doors', 'bullets': ['3 Doors for Storage', 'Easy access'],
+                   'specs': {'material': 'Wood', 'number_of_doors': 3, 'waterproof': False, 'load_capacity': 0},
+                   'product_specific': {'bathroom_cabinet': {'number_of_doors': 3}},
+                   'normalized_facts': {'resolved_facts': {'material': {'status': 'conflicted'},
+                       'number_of_doors': {'status': 'confirmed', 'value': 2, 'candidates': [2, 3]}}}}
+        original = deepcopy(subject)
+        template = _family_specific(subject, load_plugin('bathroom_cabinet'))
+        copy = _copy_facts(subject)
+        visual = source_fact_records(subject)
+        for facts in (template, copy):
+            self.assertNotIn('material', facts)
+            self.assertEqual(2, facts['number_of_doors'])
+            self.assertIs(False, facts['waterproof'])
+            self.assertEqual(0, facts['load_capacity'])
+        self.assertNotIn('product.specs.material', visual)
+        self.assertEqual('2', visual['product.specs.number_of_doors'])
+        self.assertEqual(['Easy access'], _source_copy(subject)['item_highlights'])
+        self.assertEqual(original, subject)
+        claims = compact_product_claims(subject)
+        # Exact OCR text may not bypass a confirmed correction via the no-review shortcut.
+        available = {'ocr': '3 Doors', **_available_claims([], claims)}
+        with self.assertRaisesRegex(VisualDesignKitCompileError, 'resolved facts'):
+            _bind_display_text({'text': '3 Doors', 'evidence_ids': ['ocr']}, available, product_claims=claims)
+        self.assertFalse(any(row['evidence_id'] in available for row in claims if row['type'] == 'fact_resolution'))
+        from core.product_family import fact_statement_issues
+        resolved = {'number_of_doors': {'status': 'confirmed', 'value': 3}}
+        for statement in ('2-Door Lower Cabinet', 'Lower compartment: two doors', '2 upper doors'):
+            self.assertEqual([], fact_statement_issues(statement, resolved))
+        for statement in ('2-Door Cabinet', 'Three shelves and two doors', '2 doors total, with lower storage'):
+            self.assertEqual(['number_of_doors'], fact_statement_issues(statement, resolved))
+        # Scoped quantities remain subject to source review; bypassing a global total is not approval.
+        with self.assertRaisesRegex(VisualDesignKitCompileError, 'independent evidence review'):
+            _bind_display_text({'text': '2-Door Lower Cabinet', 'evidence_ids': ['physical:doors']},
+                              {'physical:doors': 'A lower storage compartment'}, product_claims=claims)
+        color_args = dict(title='Kids Bed White', bullets=[], description='',
+                          variation={'color': 'Natural'}, specs={'color': 'Natural', 'model_number': 'GX11001NA-T-UH'}, specific={})
+        decision = apify._resolve_structured_facts(**color_args)
+        self.assertEqual(('confirmed', 'Natural'), (decision['color']['status'], decision['color']['value']))
+        natural = {'title': color_args['title'], 'variation_values': color_args['variation'], 'specs': color_args['specs'],
+                   'normalized_facts': {'resolved_facts': decision}}
+        import json
+        record = json.loads(source_fact_records(natural)['product.fact_resolutions.color'])
+        self.assertEqual('Natural', record['value'])
+        self.assertEqual({'spec', 'variation'}, {row['source'] for row in record['evidence']})
+        color_args['specs'] = {'color': 'White'}
+        self.assertEqual('conflicted', apify._resolve_structured_facts(**color_args)['color']['status'])
+        counts = apify._resolve_structured_facts(title='3 Door Cabinet', bullets=['2-Door Lower Cabinet'],
+                    description='', variation={}, specs={'number_of_doors': 3}, specific={})
+        self.assertEqual([3], counts['number_of_doors']['candidates'])
+
     def test_proxy_fake_ip_is_allowed_only_for_hostname_resolution(self) -> None:
         with patch(
             "core.url_safety._resolved_addresses",

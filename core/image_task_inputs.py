@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from .status import input_revision_id
+from .product_family import effective_product_facts, fact_resolutions
 from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding, us_measurement_text, measurement_values_match
 
 
@@ -25,8 +26,6 @@ def role_art_direction(art: dict[str, Any], direction: dict[str, Any], role: str
         group: chosen for group, parts in art['palette_direction'].items()
         if (chosen := {part: value for part, value in parts.items()
                        if (environment or group != 'room') and f'{group}.{part}' in selected})}
-    if environment:
-        result['environment_and_staging'] = art['environment_and_staging']
     if role.split('_', 1)[0] in {'func', 'size'}:
         result.update({key: art[key] for key in ('typography_direction', 'graphic_direction')})
     return result
@@ -132,6 +131,8 @@ def visual_product_color(child: dict[str, Any]) -> str:
     # Image planning must never infer the product colour from bedding, props,
     # walls, or other staging visible in a reference image.
     candidates = [spec_color, str(normalized.get("color") or "").strip(), str(child.get("color") or "").strip()]
+    if 'color' in fact_resolutions(child):
+        candidates = [str(effective_product_facts(child).get('color') or '')]
     polluted = re.compile(
         r"\b(?:with|without|over|under|full|twin|queen|king|trundle|bed|frame|cabinet|drawer|door|pack|set|count|size)\b",
         re.IGNORECASE,
@@ -147,6 +148,13 @@ def visual_variation_values(child: dict[str, Any]) -> dict[str, Any]:
     normalized = child.get("normalized_facts") if isinstance(child.get("normalized_facts"), dict) else {}
     raw = normalized.get("variation") if isinstance(normalized.get("variation"), dict) else child.get("variation_values")
     values = dict(raw) if isinstance(raw, dict) else {}
+    resolutions = fact_resolutions(child)
+    for key in list(values):
+        decision = resolutions.get(str(key).casefold())
+        if decision:
+            values.pop(key)
+            if decision['status'] == 'confirmed':
+                values[key] = decision.get('value')
     color = visual_product_color(child)
     if color:
         for key in list(values):
@@ -337,14 +345,13 @@ def task_specs(child: dict[str, Any], sources: list[dict[str, Any]], *, inventor
 
 
 def task_facts(child: dict[str, Any], *, product_type: str) -> dict[str, Any]:
-    normalized = child.get("normalized_facts") if isinstance(child.get("normalized_facts"), dict) else {}
     return {
         "asin": str(child.get("asin") or ""),
         "product_type": str(product_type or ""),
         "color": visual_product_color(child),
-        "size": str(normalized.get("size") or "")[:120],
+        "size": str(effective_product_facts(child).get("size") or "")[:120],
         "variation": visual_variation_values(child),
-        "sold_unit_count": child.get("sold_unit_count") if child.get("sold_unit_count_source") == "apify_explicit_pack_count" and child.get("sold_unit_count_status") != "conflicted" else None,
+        "sold_unit_count": fact_resolutions(child).get("sold_unit_count", {}).get("value"),
     }
 
 

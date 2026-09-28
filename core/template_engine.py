@@ -19,8 +19,9 @@ from .io import file_sha256, read_json, write_json
 from .job import load_job
 from .paths import FACTORY_ROOT
 from .plugin import ProductPlugin
-from .product_family import read_product_family
+from .product_family import read_product_family, effective_product_facts
 from .run_scope import read_run_scope, scoped_family_children
+from .required_role_policy import required_role_policy
 from .template_contract import template_input_fingerprint
 from .template_field_plan import (
     compile_field_coverage,
@@ -228,7 +229,7 @@ class TemplateInfo:
 class TemplateEngineError(RuntimeError):
     pass
 
-def _assert_submit_ready_job_contract(job: dict[str, Any], *, mode: str) -> None:
+def _assert_submit_ready_job_contract(job: dict[str, Any], *, mode: str, child_count: int | None = None) -> None:
     if mode != "submit_ready":
         return
     if not isinstance(job.get("gtin_exempt"), bool):
@@ -238,6 +239,8 @@ def _assert_submit_ready_job_contract(job: dict[str, Any], *, mode: str) -> None
         or not str(job.get("product_id") or "").strip()
     ):
         raise TemplateEngineError("non-exempt submit_ready job requires product_id_type and product_id")
+    if job['gtin_exempt'] is False and child_count is not None and child_count > 1:
+        raise TemplateEngineError('Non-exempt multi-child submit_ready cannot reuse one job product_id; this input supports only a single child')
 
 def _template_scope_children(job_path: Path, family: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
     scope = read_run_scope(job_path)
@@ -278,7 +281,7 @@ def build_template_plan(
     if family.get("category_id") != plugin.category_id:
         raise TemplateEngineError("ProductFamilyV3 category does not match active template plugin")
     job = template_job_with_defaults(job, env=env)
-    _assert_submit_ready_job_contract(job, mode=mode)
+    _assert_submit_ready_job_contract(job, mode=mode, child_count=len(family["family"]["children"]))
     if mode == "submit_ready":
         child_fetch_errors = list((family.get("source") or {}).get("child_fetch_errors") or [])
         if child_fetch_errors:
@@ -665,7 +668,7 @@ def _export_final_template(path: Path, parent_asin: str, job_id: str = "") -> Pa
 def _workbook_cell_value(field: str, value: Any) -> Any:
     if value in (None, ""):
         return value
-    if field_expects_number(field) and looks_numeric(value):
+    if field_expects_number(field) and looks_numeric(value, field=field):
         text = str(value).strip()
         if re.fullmatch(r"[+-]?\d+", text):
             try:
@@ -1099,7 +1102,10 @@ def _published_image_plan(job_path: Path, *, plugin: ProductPlugin) -> tuple[dic
                 "message": "Published rows have no main role; source images remain draft references and scene is not promoted to main",
             })
             continue
-        kept, omitted = _fit_template_image_slots([row for row in rows if row is not main])
+        try:
+            kept, omitted = _fit_template_image_slots([row for row in rows if row is not main], required_counts=required_role_policy(plugin).counts)
+        except ValueError as exc:
+            raise TemplateEngineError(str(exc)) from exc
         if omitted:
             audit.append({
                 "severity": "warning",
@@ -1439,41 +1445,7 @@ def _parent_family_values(children: list[dict[str, Any]], plugin: ProductPlugin)
     return values
 
 def _family_specific(child: dict[str, Any], plugin: ProductPlugin) -> dict[str, Any]:
-    facts = dict(child.get("specs") or {}) if isinstance(child.get("specs"), dict) else {}
-    product_specific = child.get("product_specific") if isinstance(child.get("product_specific"), dict) else {}
-    category_facts = product_specific.get(plugin.category_id)
-    if isinstance(category_facts, dict):
-        facts.update(category_facts)
-    normalized = child.get("normalized_facts") if isinstance(child.get("normalized_facts"), dict) else {}
-    normalized_variation = normalized.get("variation") if isinstance(normalized.get("variation"), dict) else {}
-    for key in ("color", "size", "style"):
-        if not facts.get(key):
-            facts[key] = normalized.get(key) or normalized_variation.get(key) or ""
-    for key in (
-        "dimensions", "product_dimensions", "physical_dimensions",
-        "length", "width", "height", "item_depth",
-        "length_unit", "width_unit", "height_unit", "item_depth_unit",
-        "item_weight", "item_weight_unit", "weight",
-    ):
-        if facts.get(key) in (None, "", [], {}) and normalized.get(key) not in (None, "", [], {}):
-            facts[key] = normalized[key]
-    facts["sold_unit_count"] = normalized.get("sold_unit_count") or child.get("sold_unit_count")
-    facts["package_quantity"] = normalized.get("package_quantity") or child.get("package_quantity")
-    resolved = normalized.get("resolved_facts") if isinstance(normalized.get("resolved_facts"), dict) else {}
-    for fact_name, record in resolved.items():
-        if not isinstance(record, dict):
-            continue
-        status = str(record.get("status") or "")
-        value = record.get("value")
-        if status == "confirmed" and value not in (None, "", []):
-            facts[str(fact_name)] = value
-        elif status == "conflicted":
-            # A conflicting raw spec must never fall through to a template
-            # column.  Keep the conflict in ProductFamily for audit/review.
-            normalized_name = re.sub(r"[^a-z0-9]+", "_", str(fact_name).casefold()).strip("_")
-            for raw_key in list(facts):
-                if re.sub(r"[^a-z0-9]+", "_", str(raw_key).casefold()).strip("_") == normalized_name:
-                    facts.pop(raw_key, None)
+    facts = effective_product_facts(child, plugin.category_id)
     facts = _normalized_template_fact_keys(facts)
     facts.update(template_dimensions_from_facts(facts, category_id=plugin.category_id))
     if not facts.get("frame_material") and facts.get("material"):

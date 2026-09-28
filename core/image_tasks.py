@@ -24,7 +24,7 @@ from .visual_design_kit import read_visual_design_kits, visual_design_kit_row_cu
 
 
 IMAGE_TASK_SCHEMA_VERSION = "image-task-v13"
-IMAGE_TASK_POLICY_VERSION = "output-evidence-child-direction-v44-original-sources"
+IMAGE_TASK_POLICY_VERSION = "output-evidence-child-direction-v47-scoped-relations"
 IMAGE_TASK_ARTIFACT = "image_tasks_v13.jsonl"
 _TASK_BASE_FIELDS = {"schema_version", "policy_version", "category_id", "child", "role", "role_family", "logical_task_id", "output_dir", "prompt_contract_version", "category_image_policy", "formation_status", "formation_reason", "source_path", "source_sha256", "task_fingerprint", "input_revision_id"}
 _TASK_READY_FIELDS = _TASK_BASE_FIELDS | {"family_design_id", "family_art_direction", "source_intent_revision_id", "source_index", "generation_references", "edit_base_sha256", "reference_mode", "product_facts", "measurement_authority", "display_copy_contract", "renderable_text_contract", "image_direction", "edit_contract", "execution_profile"}
@@ -354,22 +354,20 @@ def _edit_contract(
     family: str, measurement: dict[str, Any], policy: dict[str, Any],
     *, reference_completeness: str = "",
 ) -> dict[str, Any]:
-    create = {
-        "main": "Create one square Amazon US main image.",
-        "scene": "Create one square Amazon US lifestyle image.",
-        "func": "Create one square Amazon US function image.",
-        "size": "Create one square Amazon US size image.",
-    }[family]
-    reference = "Product attachments supply same-child evidence; the first is the transport edit base, not a layout template."
+    label = {"main": "main", "scene": "lifestyle", "func": "function", "size": "size"}[family]
+    create = f"Edit attachment 1 directly into one square Amazon US {label} image. Adapt non-product design to retain the pictured product."
+    reference = "The first attachment fixes the depicted product view; auxiliary same-child evidence verifies facts, not permission to reconstruct or combine product viewpoints."
     preserve = [
-        "Sold-product geometry, proportions, finish and parts, using this child's evidenced structures and operating states",
+        "The visible sold product's geometry, part count, spacing, joins, proportions, viewpoint, color, material, finish and surface texture",
     ]
-    preserve.extend('Preserve where evidenced and depicted: ' + str(value) for value in policy.get('structure_invariants', []))
+    preserve.extend('Source-visible ' + str(value) for value in policy.get('structure_invariants', []))
     replace: list[str] = []
     if family == "func":
         preserve.append(
             "The image's necessary functional evidence and qualifiers, not the source's inset inventory"
         )
+    if family in {'func', 'size'}:
+        preserve.append("Evidenced mounting faces and connections; no invented hidden geometry")
     staging = "; ".join(str(value) for value in policy.get("replaceable_staging") or []) or "non-sold room surfaces and loose props"
     if family == "main":
         if policy.get("main_image_policy") == "white_background":
@@ -390,12 +388,12 @@ def _edit_contract(
         replace.append(
             "Redesign the measurement composition, labels, lines and typography; retain the correct measured objects, quantities and physical endpoint associations"
         )
-    replace.append("Use the planned target components, not the source prop inventory; remove people and reflected people")
+    replace.append("Use planned non-sold components, including surroundings seen through product gaps and reflections; retain product surfaces and necessary functional demonstrations, not source decor; remove people and reflected people")
     allowed_props = [str(value) for value in policy.get("allowed_internal_props") or [] if str(value).strip()]
     if allowed_props and family != "size":
         replace.append(
-            "Where the selected child evidence supports the shown compartment, "
-            "non-sold staging may use: " + "; ".join(allowed_props)
+            "Optional non-sold props, only when appropriate to the planned setting and evidenced compartment, "
+            "not a required inventory or a room instruction: " + "; ".join(allowed_props)
         )
     role_rules = [
         str(value) for value in (policy.get("role_specific_rules") or {}).get(family) or []

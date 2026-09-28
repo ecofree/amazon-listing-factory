@@ -30,13 +30,13 @@ def check_child_components(case):
     raw = {'family_art_direction': art, 'image_briefs': [
         {'role': role, 'source_id': source['source_id'], 'image_direction': deepcopy(direction)} for role in ('main', 'scene')]}
     request = design_binding_request(raw['image_briefs'][1], art, source=source)
-    case.assertEqual([], request['physical_operations'])
+    case.assertEqual(['product_depiction'], request['physical_operations'])
     with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as reviewer, patch(
             'core.visual_design_kit.gemini_stream_generate') as repair:
         planned = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame',
             source_paths=[], source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+5, cached=None)
         case.assertTrue(all(row['status'] == 'ready' for row in planned['image_briefs'] if row['role'] in {'main', 'scene'}))
-        reviewer.assert_not_called()
+        reviewer.assert_called_once()
         repair.assert_not_called()
     unknown = deepcopy(raw)
     unknown['image_briefs'][1]['image_direction']['unowned_design'] = 'A second per-image palette'
@@ -64,7 +64,6 @@ def check_child_components(case):
         for component in art['palette_direction']['bedding']:
             case.assertNotIn('bedding.' + component + ' =', canvas)
         case.assertNotIn('Target components:', canvas)
-        case.assertNotIn(art['environment_and_staging'], canvas)
         if role == 'main':
             task['category_image_policy']['main_image_policy'] = 'white_background'
             task['image_direction']['environment_mode'] = 'designed_environment'
@@ -72,7 +71,6 @@ def check_child_components(case):
     white = design_binding_request(raw['image_briefs'][0], art, source=source, main_policy='white_background')
     lifestyle = design_binding_request(raw['image_briefs'][0], art, source=source, main_policy='product_first_lifestyle')
     case.assertNotIn('room', white['shared_design']['palette_direction'])
-    case.assertNotIn('environment_and_staging', white['shared_design'])
     case.assertIn('room', lifestyle['shared_design']['palette_direction'])
     altered_room = deepcopy(art)
     altered_room['palette_direction']['room']['wall'] = '#DDCCBB paint'
@@ -233,6 +231,9 @@ def _check_p4_contracts(case):
     whole = _evidence_source('main', source_id='source_07')
     direction['presentation']['scope'] = 'whole_product'
     direction['product_sources'].append('source_07')
+    with case.assertRaisesRegex(ValueError, 'complete edit base'):
+        validate_image_brief_draft(draft, source, art, [source, whole], 'bed_frame')
+    direction['product_sources'] = ['source_07', source['source_id']]
     validate_image_brief_draft(draft, source, art, [source, whole], 'bed_frame')
     earlier = _evidence_source('size', source_id='source_01')
     case.assertEqual('source_07', task_specs({}, [earlier, whole], inventory=initial_output_inventory([earlier, whole]))[0]['source']['source_id'])

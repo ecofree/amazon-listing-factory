@@ -252,7 +252,7 @@ def _raise_image_rejection(provider_name: str, text: str, status: int) -> Any:
     code = code if isinstance(code, str) else ''
     if code in {'model_not_found', 'invalid_api_key', 'insufficient_quota', 'permission_denied'}:
         raise ProviderConfigurationError(provider_name, f'Image request rejected: {code}')
-    if status == 429 or code in {'rate_limit_exceeded', 'no_available_channel'}:
+    if status == 429 or code in {'rate_limit_exceeded', 'no_available_channel', 'image_account_selection_timeout'}:
         raise ProviderTransportError(provider_name, f'Image request rejected before generation: HTTP {status}: {code}')
     if status == 408 or status >= 500:
         raise ProviderTransportError(provider_name, f'Remote image result unknown after HTTP {status}: {text[:800]}', ambiguous=True)

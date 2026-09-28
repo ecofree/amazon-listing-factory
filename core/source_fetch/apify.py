@@ -12,11 +12,11 @@ from ..price import normalize_price_value
 from ..job import load_job
 from ..paths import FACTORY_ROOT
 from ..plugin import ProductPlugin
-from ..product_family import PRODUCT_FAMILY_POLICY_VERSION
+from ..product_family import PRODUCT_FAMILY_POLICY_VERSION, whole_part_counts
 from ..schema import validate_data
 from ..text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding
 from .apify_client import ApifyClient
-from products.generic_extractors import explicit_item_count, explicit_package_quantity, parse_pack_count
+from products.generic_extractors import explicit_item_counts, explicit_package_quantity, parse_pack_count
 
 
 def env_any(values: dict[str, str], *names: str, required: bool = False, default: str = "") -> str:
@@ -232,10 +232,7 @@ def fetch_family(
 def _source_sold_unit_count(
     raw: dict[str, Any], specs: dict[str, Any], specific: dict[str, Any]
 ) -> tuple[int, str, list[int]]:
-    raw_count = explicit_item_count(raw)
-    if raw_count is not None:
-        return raw_count, "apify_explicit_pack_count", []
-    explicit: set[int] = set()
+    explicit = explicit_item_counts(raw)
     invalid_explicit = False
     for facts in (specs, specific):
         for field in ("number_of_items",):
@@ -548,20 +545,23 @@ def _resolve_structured_facts(
     *, title: str, bullets: list[Any], description: str,
     specs: dict[str, Any], specific: dict[str, Any], variation: dict[str, Any],
 ) -> dict[str, Any]:
-    """Resolve repeatable structural facts once, with provenance.
-
-    Downstream copy/template/image code must consume this result instead of
-    independently choosing between a title, a spec field, and OCR-like text.
-    The resolver is intentionally conservative: only facts with a clear
-    numeric/product-part vocabulary are included here.
-    """
+    """Resolve structured child identity and whole-product counts once, with provenance."""
     text = " ".join([str(title or ""), *(str(value or "") for value in bullets), str(description or "")])
     fact_patterns = {
-        "number_of_drawers": r"(?<!\d)(\d{1,2})\s*(?:deep\s+)?drawers?\b",
-        "number_of_doors": r"(?<!\d)(\d{1,2})\s*doors?\b",
-        "number_of_shelves": r"(?<!\d)(\d{1,2})\s*(?:adjustable\s+|fixed\s+)?shelves?\b",
+        "number_of_drawers": r"drawers?",
+        "number_of_doors": r"doors?",
+        "number_of_shelves": r"shel(?:f|ves)",
     }
     resolved: dict[str, Any] = {}
+    colors = [{'value': value, 'source': origin, 'field': 'color'}
+              for origin, container in (('variation', variation), ('spec', specs), ('specific', specific))
+              if (value := _first_clean(container, keys=('color', 'colour', 'color_name')))
+              and _looks_like_color_value(value) and not _looks_like_measurement_or_pack(value)]
+    if colors:
+        choices = {row['value'].casefold() for row in colors}
+        resolved['color'] = {'status': 'confirmed' if len(choices) == 1 else 'conflicted',
+                             'value': colors[0]['value'] if len(choices) == 1 else '',
+                             'candidates': list(dict.fromkeys(row['value'] for row in colors)), 'evidence': colors}
     for fact_name, pattern in fact_patterns.items():
         candidates: list[dict[str, Any]] = []
         for container_name, container in (("variation", variation), ("spec", specs), ("specific", specific)):
@@ -576,7 +576,7 @@ def _resolve_structured_facts(
                 match = re.search(r"(?<!\d)(\d{1,2})(?!\d)", str(value or ""))
                 if match:
                     candidates.append({"value": int(match.group(1)), "source": container_name, "field": str(key)})
-        text_values = sorted({int(match.group(1)) for match in re.finditer(pattern, text, flags=re.I)})
+        text_values = sorted({int(value) for value in whole_part_counts(text, pattern)})
         if text_values:
             for value in text_values:
                 candidates.append({"value": value, "source": "listing_text", "field": "title_bullets_description"})

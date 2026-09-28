@@ -146,18 +146,23 @@ def searchable_text(raw: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def explicit_item_count(raw: dict[str, Any]) -> int | None:
+def explicit_item_counts(raw: dict[str, Any]) -> set[int]:
     details = detail_map(raw)
-    number_of_items = _explicit_count_value(detail_value(details, "Number of Items"), label="Number of Items", strict=True)
-    if number_of_items is not None:
-        return number_of_items
-    title_pack = parse_pack_count(str(raw.get("title") or raw.get("productTitle") or ""))
-    if title_pack:
-        return int(title_pack)
-    includes_count = parse_pack_count(searchable_text(raw))
-    if includes_count:
-        return int(includes_count)
-    return _explicit_count_value(detail_value(details, "Unit Count"), label="Unit Count", strict=False)
+    count = _explicit_count_value(detail_value(details, "Number of Items"), label="Number of Items", strict=True)
+    counts = {count} if count is not None else set()
+    bullets = raw.get('bulletPoints') or raw.get('features') or raw.get('bullet_points') or []
+    if isinstance(bullets, str):
+        bullets = [bullets]
+    for text in [raw.get('title') or raw.get('productTitle') or '',
+                 raw.get('description') or raw.get('productDescription') or '', *bullets]:
+        pack = parse_pack_count(str(text))
+        if pack:
+            counts.add(int(pack))
+    if not counts:
+        unit = _explicit_count_value(detail_value(details, "Unit Count"), label="Unit Count", strict=False)
+        if unit is not None:
+            counts.add(unit)
+    return counts
 
 
 def _explicit_count_value(value: str, *, label: str, strict: bool) -> int | None:

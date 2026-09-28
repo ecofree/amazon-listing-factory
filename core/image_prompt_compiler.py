@@ -13,10 +13,10 @@ from .paths import resolve_job_owned_path
 from .status import input_revision_id, logical_task_id
 
 
-PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v96-physical-relations"
+PROMPT_CONTRACT_VERSION = "child-direction-gpt-design-v101-scoped-relations"
 PROMPT_HARD_LIMIT_CHARS = 8000
 IMAGE_PROMPT_SCHEMA_VERSION = "image-prompt-v2"
-IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v78-physical-relations"
+IMAGE_PROMPT_POLICY_VERSION = "faithful-art-direction-projection-v83-scoped-relations"
 IMAGE_PROMPT_ARTIFACT = "image_prompts_v2.jsonl"
 _RENDER_TEXT_BEGIN = "<RENDERABLE_TEXT>"
 _RENDER_TEXT_END = "</RENDERABLE_TEXT>"
@@ -204,30 +204,30 @@ def compile_task_prompt(
     art_direction = role_art_direction(art_direction, image_direction, role, main_policy=main_policy)
     renderable = task_renderable_text(task)
     if renderable:
-        text_rule = "The renderable-text block is the complete authored copy, including inset captions. Render those strings once; composition prose and source marketing supply no additional display text."
+        text_rule = "Render the authored strings below once each; goals and reference text are not additional copy."
         if task["measurement_authority"].get("mode") == "source_image":
-            text_rule += " Measurement labels are separately authorized in ROLE."
+            text_rule += " Also render ROLE's selected measurement labels at each associated location."
     elif task["measurement_authority"].get("mode") == "source_image":
         text_rule = "Use only the measurement labels authorized in ROLE, with readable unit spacing."
     else:
         text_rule = "No added marketing text, captions or decorative overlays."
+    if role in {'func', 'size'} and task['measurement_authority'].get('mode') != 'source_image':
+        text_rule += " No measurements are selected for this output: no source dimensions or measurement arrows; retain quantities in authored copy."
     text_rule += (
-        " Preserve factual product-surface markings, but do not transfer third-party logos or promotional branding. "
-        "Ordinary unbranded prop text is allowed where this role permits props; never treat it as product evidence. "
-        "Do not invent brands, model labels or unreadable pseudo-text."
+        " Retain factual product markings; omit third-party branding. "
+        "Ordinary unbranded prop text is allowed on permitted props, not as product evidence. No invented brands, model labels or pseudo-text."
     )
     if role in {'func', 'size'}:
-        text_rule += (" Copy roles (instructions, not visible text): the first string is the title; remaining strings are labels."
+        text_rule += (" Copy roles: first string is the title; remaining strings are labels."
                       if task['display_copy_contract'].get('title') else
-                      " Copy roles (instructions, not visible text): no title; all authored strings are labels.")
+                      " Copy roles: no title; all authored strings are labels.")
     prompt = "\n\n".join((
         f"IMAGE EDIT BRIEF {PROMPT_CONTRACT_VERSION}",
-        "[ROLE]\nImage goal: " + image_direction["visual_goal"]
-        + "\nAudience and market: " + art_direction["audience_and_market"] + "\n"
-        + ("Repair the selected candidate in place; preserve its correct composition, staging and product pixels. Original-source coordinates do not apply to this candidate.\n"
+        "[ROLE]\n" + ("Repair the selected candidate in place; preserve its correct composition, staging and product pixels. Original-source coordinates do not apply to this candidate.\n"
                        + (_measurement_content(task["measurement_authority"], task['generation_references'], authored_text=renderable) if task["measurement_authority"].get("mode") == "source_image" else "")
-                       if targeted_edit else str(edit.get("create") or "").strip()
-        + "\nDesign framing, lighting and information layout within the following product scope and shared child direction.\n" + _role_content(task, role)),
+                       if targeted_edit else str(edit.get("create") or "").strip())
+        + "\n" + _line("Preserve", edit.get("preserve"))
+        + ("" if targeted_edit else ("\nImage goal: " + image_direction["visual_goal"] if role in {'func', 'size'} else "") + "\n" + _role_content(task, role)),
         "[REFERENCE]\n" + reference_prompt(task["generation_references"], design_transfer=image_direction["design_transfer"], targeted_edit=targeted_edit) + "\n" + _product_constraints(task, edit, targeted_edit=targeted_edit),
         "[STYLE]\n" + _family_art_direction(
             art_direction, role,
@@ -235,7 +235,7 @@ def compile_task_prompt(
             environment_mode=image_direction['environment_mode'],
         ) + "\n" + _presentation_system(
             art_direction,
-            role=role,
+            role=role, has_measurements=task['measurement_authority'].get('mode') == 'source_image',
         ),
         "[TEXT]\n" + text_rule + ("\n" + _render_text_block(renderable) if renderable else ""),
         "[OUTPUT]\nReturn one square Amazon US image only. No commentary, watermark, or unapproved content.",
@@ -358,7 +358,6 @@ def _product_constraints(task: dict[str, Any], edit: dict[str, Any], *, targeted
     )
     rows = [
         f"Reference authority: {authority} Identity: {identity}.",
-        _line("Preserve", edit.get("preserve")),
         "" if targeted_edit else _line("Edit", edit.get("replace")),
         _line("Category constraints", edit.get("forbid")),
     ]
@@ -370,22 +369,12 @@ def _role_content(task: dict[str, Any], role: str) -> str:
     presentation = direction['presentation']
     scope = ("Depict only the selected product details, not a reconstructed whole product or all units in the package. Design a close-up composition."
              if presentation['scope'] == 'detail_only' else
-             "Depict the complete product structure supported by the whole-product evidence.")
+             "Retain the complete product depicted in the edit photograph; arrange it proportionally without rebuilding it.")
     if (task.get('measurement_authority') or {}).get('mode') == 'source_image':
         scope += " Measurement views may show a representative unit, not the full package quantity."
-    rows = [scope, f"Target product state/use: {presentation['state']}",
-            "The following are observations of each source, not additional output states. Preserve evidenced structure; "
-            "depict the target state supported by the selected references, not every source state simultaneously."]
-    if role in {'func', 'size'}:
-        rows.append("Alternative positions of the same part are mutually exclusive; indicate unoccupied positions as diagram notation, "
-                    "never extra solid parts. Preserve the evidenced mounting faces and connections. Where another view would require "
-                    "inventing a hidden connection, retain the source-supported view and redesign its surrounding layout only.")
-    for ref in task['generation_references']:
-        if ref['kind'] not in {'edit_base', 'product_evidence'}:
-            continue
-        features = '; '.join(f"{item['object_id']}: " + ', '.join(item['physical_facts'])
-                             for item in ref.get('visible_evidence', []))
-        rows.append(f"Observed in {ref['source_id']}: {features}")
+    rows = [scope, f"Target product state/use: {presentation['state']}"]
+    if role not in {'func', 'size'}:
+        rows.append("Apply this use within the edit photograph's visible product state; adapt staging rather than invent hidden surfaces or connections.")
     if (task.get("measurement_authority") or {}).get("mode") == "source_image":
         rows.append(_measurement_content(task.get("measurement_authority"), task['generation_references'], authored_text=task_renderable_text(task)))
     return "\n".join(row for row in rows if row)
@@ -398,7 +387,7 @@ def _family_art_direction(
     main_policy: str = "",
     environment_mode: str,
 ) -> str:
-    rows = ["Photography standard: " + _compact_token_direction(direction.get("photography_direction"))]
+    rows = ["Photography standard for editable surroundings (do not recolor or retexture the product): " + _compact_token_direction(direction.get("photography_direction"))]
     if role == "main" and main_policy == "white_background":
         rows += [
             "Main image requires a white external background with no room or lifestyle staging. "
@@ -408,12 +397,10 @@ def _family_art_direction(
         rows.append("Use a technical canvas, without room staging or inherited source graphic framing.")
     elif environment_mode == 'source_setting':
         rows.append("Retain only necessary product installation relationships; source decor is not a design requirement.")
-    else:
-        rows.append("Shared atmosphere (ROLE owns the concrete room and product state): " + _compact_token_direction(direction.get("environment_and_staging")))
     return "\n".join(row for row in rows if row)
 
 
-def _presentation_system(direction: dict[str, Any], *, role: str) -> str:
+def _presentation_system(direction: dict[str, Any], *, role: str, has_measurements: bool) -> str:
     """Emit Gemini's one child-wide palette and component system once."""
     assignments = []
     for group, parts in sorted(direction['palette_direction'].items()):
@@ -424,10 +411,11 @@ def _presentation_system(direction: dict[str, Any], *, role: str) -> str:
         rows.append("Apply these core appearances where depicted; they do not add objects or change the product presentation. Design secondary decor freely.")
     if role in {"func", "size"}:
         rows += [
-            "Typography: " + "; ".join(f"{key} = {value}" for key, value in sorted(direction["typography_direction"].items())),
+            "Typography: " + "; ".join(f"{key} = {value}" for key, value in sorted(direction["typography_direction"].items())
+                                      if key != 'numeric_style' or has_measurements),
             "Graphic roles: " + "; ".join(f"{key} = {value}" for key, value in sorted(direction["graphic_direction"].items()))
-            + ". Use the same flat text ink for every title, caption and dimension; icon/line inks belong to symbols/leaders, not substitute text colors. "
-            "Design hierarchy and line breaks freely. Text sits in open space; only small local legibility backing is permitted, not large pill titles or capsule label systems.",
+            + ". Use text_color for all text, icon/line inks for symbols/leaders. "
+            "Design hierarchy and line breaks freely. Text in open space; only small local legibility backing is permitted, not large pill titles or capsule label systems.",
         ]
     return "\n".join(row for row in rows if row)
 
@@ -447,8 +435,8 @@ def _measurement_content(value: Any, references: list[dict[str, Any]], *, author
         label = f"TEXT item {authored_text.index(row['render_text']) + 1}" if row['render_text'] in authored_text else row['render_text']
         rows.append(f"{row['measured_part']} / {row['axis']}: {label} (association {row['id']}; source attachment {attachment}; {row['evidence_type']})")
     return ('Measurement associations: preserve each selected physical relationship; equal labels do not merge different locations. '
-            'IDs identify evidence, not drawable text or proof of location; use the source view and described part/state. '
-            'Design positions and arrows for the output geometry, not source pixels. Written properties or limits need no dimension arrow. '
+            'IDs are not visible text. Place each label and arrow on its measured object and evidenced endpoint surfaces in this view. '
+            'Written limits need no dimension arrow. '
             + '; '.join(rows))
 
 
