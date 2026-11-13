@@ -36,3 +36,11 @@ The GitHub editing environment cannot execute the Python interpreter, subprocess
 - Dispatcher restart while workers are running; expired lease and stale process tree fencing.
 - Inject process death after HTTP headers, during body receipt, after saved native response, after artifact commit, after R2 PUT and before local URL commit.
 - 72-hour resource and queue soak with disk/memory/SAM metrics.
+
+## CI execution evidence (2026-11-13)
+
+- Run `43369739969` on commit `442ac759`: failed. The curated 100-case suite had two concurrency failures under four simultaneous test processes; the targeted tests exposed two fixture defects; the synthetic ledger drill exposed missing price evidence.
+- Run `43370016275` on `ca567581`: curated suite still exposed the executor over-admission bug and cooldown fixture identity mismatch; targeted 5-case suite passed; ledger drill exposed missing synthetic ASIN identity.
+- Run `43370344665` on `a64a3ccd`: curated 100-case suite passed in 29.401 seconds and targeted 5-case process/provider suite passed in 1.134 seconds. The 100-order drill reached its explicit human-requeue assertion but passed a non-prefixed revision without `explicit=True`; the drill fixture is being corrected to model the authorized human decision API accurately.
+
+These are real GitHub Actions executions using Python 3.11 on Ubuntu, with no paid provider calls or live uploads. The overall gate remains failed until the synthetic 100-order drill and subsequent complete run pass.

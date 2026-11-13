@@ -69,7 +69,7 @@ def run():
         assert ledger.cost()['admitted_requests'] == 100
         assert ledger.cost()['reserved_microunits'] == 10000
         exception = next(row for row in ledger.rows() if row['state'] == 'exception')
-        assert ledger.requeue(exception['id'], review_revision='explicit human resolution')
+        assert ledger.requeue(exception['id'], review_revision='explicit human resolution', explicit=True)
         resumed = ledger.claim(ttl=30)
         assert resumed['id'] == exception['id']
         try:
