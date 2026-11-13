@@ -75,3 +75,7 @@ After code changes, Codex should run these separately and preserve each exit cod
 3. Synthetic 100-order ledger/lease/budget drill: `python -B scripts/check_unattended_acceptance.py`.
 
 The targeted process-crash test uses a real local child process but no external request. These three commands are still engineering/synthetic gates, not live production acceptance. Do not run a paid provider smoke test or live upload without separate operator authorization.
+
+## 6. Single-command offline engineering gate
+
+`python -B scripts/run_readiness_checks.py --report test_runs/production_readiness_offline_report.json` runs the curated production suite, targeted unattended process/provider tests, and the synthetic 100-order ledger drill. It returns non-zero if any gate fails and records stdout/stderr/elapsed time. It explicitly reports live provider calls/uploads as zero and marks real image quality, four-category delivery and long-running soak as untested. This command is not production acceptance.

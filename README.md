@@ -294,6 +294,16 @@ A full source gallery is still planned before selecting generated test outputs.
 
 ## Production Readiness 1.0 — engineering plan
 
+### Phase 6 offline acceptance runner
+
+Run the curated suite, targeted unattended process/provider contracts and synthetic 100-order ledger drill together with:
+
+```powershell
+& $env:AMAZON_FACTORY_PYTHON -B D:\Amazon_pics\amazon_listing_factory\scripts\run_readiness_checks.py --report test_runs\production_readiness_offline_report.json
+```
+
+This runner never performs live provider calls or uploads. Its report explicitly marks real image quality, four-category live delivery and long-running soak as untested.
+
 ### Phase 5 implementation
 
 QA/release/template/delivery gates were reviewed and retained: uncertainty remains human-review, submit-ready remains full-family, URLs remain candidate-SHA/retention bound, and package commit remains hash verified. No real-output quality claim is made. See [Phase 5 quality and delivery gate audit](docs/production_readiness_1/PHASE5_IMPLEMENTATION.md).
