@@ -2,7 +2,7 @@
 
 **Repository:** `ecofree/amazon-listing-factory`  
 **Branch:** `codex/model-native-image-refactor`  
-**Code acceptance baseline:** `c36f7bf750225e22713b0da4513d9cbbff1a474b` (documentation updates may follow without changing runtime code).  
+**Code acceptance baseline:** `82bc0e20c4db630e10e79ee2ffece1a01dcdeb02` (documentation updates may follow without changing runtime code).  
 **Purpose:** validate the implementation locally and perform separately authorized live acceptance. Do not assume this document means the tests have passed.
 
 ## 1. Safety rules
@@ -21,7 +21,7 @@
 - Fetch latest origin.
 - Confirm branch is `codex/model-native-image-refactor`.
 - Confirm HEAD is this baseline or a descendant that contains it. The baseline includes the real eight-child-process dispatcher drill.
-- Inspect the `Production Readiness (offline)` GitHub Actions run for the current HEAD and download its JSON artifact. Last verified Linux pass: run `43373829371` on `7ced838b` (100 curated cases, 6 targeted tests at that time, 100 synthetic ledger orders, and eight real local child processes launched by the dispatcher). The code baseline `c36f7bf` adds a descendant-process termination test and the workflow adds a Windows process/ledger job; neither change has a verified CI result yet. Require both Ubuntu and Windows jobs to pass for the current revision.
+- Inspect the `Production Readiness (offline)` GitHub Actions run for the current HEAD and download its JSON artifact. Last verified Linux pass: run `43373829371` on `7ced838b` (100 curated cases, 5 targeted tests at that time, 100 synthetic ledger orders, and eight real local child processes launched by the dispatcher). The code baseline `82bc0e2` adds a descendant-process termination test and expands the dispatcher drill to twelve orders/two isolated failures; the Windows process/ledger job was added in the preceding commit. These changes have not yet produced a verified CI result. Require both Ubuntu and Windows jobs to pass for the current revision.
 - Record `git status --short`, commit SHA and remote SHA.
 - Inspect `git log --oneline --decorate -15`.
 - Do not overwrite uncommitted user work.

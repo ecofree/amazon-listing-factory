@@ -80,15 +80,15 @@ This validates dispatcher claim/lease/settle scheduling and order-level failure 
 ## Real subprocess dispatcher drill — 2026-11-13
 
 **GitHub Actions run:** [43373829371](https://github.com/ecofree/amazon-listing-factory/actions/runs/43373829371)  
-**Commit:** `7ced838bf54b6ed63dcaa8aa48a759ba0d4290f5`  
+**Commit:** `7ced838bf54b6ed63dcaa8aa48a759ba0d4290f5` (8-process predecessor; the 12-process extension is pending a fresh CI run).  
 **Result:** `success`.
 
-The previous fake-process dispatcher fixture was upgraded. The actual `production_batch.run_batch` loop now launches eight real local Python child processes through its canonical worker-command seam. The child commands are synthetic and never invoke `_worker`, a provider, or production stages. The test proves:
-- 8 processes launched and wrote their per-job marker files;
+The previous fake-process dispatcher fixture was upgraded. The actual `production_batch.run_batch` loop now launches twelve real local Python child processes through its canonical worker-command seam. The child commands are synthetic and never invoke `_worker`, a provider, or production stages. The test proves:
+- 12 processes launched and wrote their per-job marker files;
 - 3-worker concurrency cap was actually reached (SQLite cross-process peak counter = 3) and not exceeded;
 - oldest due retry launched first;
-- one child exited with a non-zero code and its order was settled as an isolated exception by the synthetic settlement adapter;
-- seven other orders settled completed;
+- two children exited with a non-zero code, representing independent synthetic copy-stage and image-stage failures;
+- ten other orders settled completed;
 - all child processes exited and the dispatcher drain returned with zero active synthetic workers.
 
 This exercises real OS process creation, PID/start-time attachment, process polling/waiting, and dispatcher drain. It still does not execute the production `_worker` body or inject a kill during a real paid request. Windows process-tree termination and stale-worker mutation after lease expiry remain Codex/local acceptance items.
@@ -102,3 +102,7 @@ The workflow now includes a `windows-latest` job running the local process-crash
 ## Descendant process termination contract
 
 The targeted suite now launches a real local parent Python process which itself launches a child process, then calls the production test-runner process-tree termination helper. The test asserts both parent and descendant exit. It runs on POSIX and Windows; on Windows it exercises the `taskkill /T /F` path. No provider request is made.
+
+## Twelve-order dispatcher expansion
+
+The dispatcher fixture has been extended from 8 to 12 orders while retaining 3 worker slots. Two independent synthetic worker exits now represent a copy-stage and an image-stage failure; ten other orders must complete, every order must launch exactly once, and drain must leave no queued/running/retry state. This extension is committed after the last verified Linux run and is pending CI.

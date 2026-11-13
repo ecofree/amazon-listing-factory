@@ -112,3 +112,7 @@ Run [43373829371](https://github.com/ecofree/amazon-listing-factory/actions/runs
 ## 9. Windows process validation
 
 The workflow now includes a `windows-latest` job for targeted process-crash/provider tests and the synthetic ledger drill, including descendant process-tree termination. Require this job to pass as well as the Ubuntu curated suite. It does not replace full local Windows testing of SAM, Blender, Excel, provider integrations, or the production workspace.
+
+## 10. Expanded dispatcher acceptance
+
+The current synthetic dispatcher fixture now uses 12 orders, 3 worker slots, two independent synthetic worker failures (copy-stage and image-stage), ten completed orders, exactly-once launch checks, and a no-queued/running/retry drain assertion. This is still a synthetic worker command, not the production worker body. The extension must pass the current Ubuntu CI before it is treated as verified.
