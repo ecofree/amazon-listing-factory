@@ -127,6 +127,39 @@ def verify_terminal_image_receipts_do_not_hold_resource_leases(test):
                          'Unfinalized response bytes must remain reserved')
 
 
+def verify_provider_cooldown_wakeup(test):
+    from core.production_batch import review_revision
+    from core.io import write_json
+    provider={'name':'fixture-image','family':'image_generation','scope':'image_generation',
+        'model':'gpt-image-2','api_type':'openai_images_edit',
+        'url':'https://fixture.invalid/v1/images/edits','api_key':'synthetic',
+        'capabilities':['image_edit','reference_image','square_output']}
+    with TemporaryDirectory() as tmp:
+        job=Path(tmp);(job/'reports').mkdir()
+        write_json(job/'job.json',{'config_path':''})
+        write_json(job/'job_state.json',{'tasks':{'generate:B000000001/main':{
+            'status':'retryable','owner_stage':'generate','reason_code':'provider_circuit_open',
+            'remote_request_allowed':True,
+        }}})
+        health_path=job/'model_health.json'
+        write_json(health_path,{'entries':{
+            'image_generation|fixture-image|gpt-image-2':{
+                'configuration_revision':'fixture-revision','last_status':'timeout_failure',
+                'last_updated':'2026-11-13T00:00:00Z',
+            }
+        }})
+        env={'AMAZON_FACTORY_API_REGISTRY':json.dumps({'providers':[provider]})}
+        with (
+            patch('core.io.environment_values',return_value=env),
+            patch('core.model_call_health.model_call_health_ledger_path',return_value=health_path),
+            patch('core.model_call_health.model_provider_cooldown_active',side_effect=[True,False]),
+        ):
+            active_revision=review_revision(job)
+            recovered_revision=review_revision(job)
+        test.assertNotEqual(active_revision,recovered_revision,
+            'A provider cooldown expiring must wake the original retryable order without a config change')
+
+
 def verify_initialization(test):
     from core import job as jobs
     from core.plugin import load_plugin

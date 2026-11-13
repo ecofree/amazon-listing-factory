@@ -62,6 +62,8 @@ The current batch dispatcher owns admission, leases, and spending. Queue fairnes
 
 The image resource ledger reserves host memory and response-volume headroom across processes. Terminal receipt bytes remain immutable audit files but must not remain counted as in-flight reservations; actual filesystem free space continues to gate new admissions.
 
+Provider health/cooldown is shared across worker processes through the existing health ledger. The dispatcher wake revision must include the time-dependent active state for providers required by failed retryable tasks; otherwise an order can remain in exception after a cooldown expires. This wake never authorizes a new request by itself: the original owner still passes ledger admission and receipt checks.
+
 ## 4. Completion is a projection, not one boolean
 
 Expose separate states/counts for:

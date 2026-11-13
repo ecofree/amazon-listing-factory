@@ -66,6 +66,8 @@ Evidence:
 
 | G23 | P2/C | `image_resources._pending_response_bytes` excluded terminal native `.bin` bytes but continued counting terminal `.http`/`.partial` envelopes. After a worker exited, finalized candidates could therefore leave stale disk reservations in the shared image resource ledger indefinitely. Phase 3 now excludes all response payload files for terminal receipt states while preserving their bytes on disk. | image_resources.py | Finalized/rejected/known-failure receipts contribute zero pending reservation; received/submitted payloads remain counted; actual free disk still gates new work |
 
+| G24 | P1/C | Provider cooldowns were persisted across processes, but `review_revision()` did not include cooldown state. An order that exhausted automatic retries during a provider outage could remain in `exception` after the cooldown expired if credentials/configuration had not changed and no new provider event occurred. Phase 4 adds the scoped cooldown-active bit to the wake revision for failed service stages. | production_batch.py, model_call_health.py, vision_gemini_client.py, image_provider_routing.py | At cooldown active, review revision is stable; when the same configured provider cooldown expires, revision changes and the original order is requeued once without creating a new order or budget |
+
 ## 4. Scope boundaries and non-goals
 
 - Do not redesign or replace the production controller.

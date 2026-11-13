@@ -198,6 +198,31 @@ def review_revision(job, *, ledger=None):
         prefixes=tuple(prefix for stage,prefixes in {'fetch':('APIFY_',),'copy':('COPY_','DEEPSEEK_'),'classify':('OCR_',),
                          'publish':('R2_','OCI_','ORACLE_')}.items() if stage in connection_stages for prefix in prefixes)
         decisions['failed_service_connections']=identity({'entries':entries,'values':{k:v for k,v in connections.items() if k in variables or prefixes and k.startswith(prefixes)}})
+        # A provider cooldown is time-dependent state. Include its active bit in
+        # the wake revision so an exception is requeued when the cooldown expires,
+        # even if credentials/configuration did not change and no new call occurred.
+        from .model_call_health import model_call_health_ledger_path, model_provider_cooldown_active
+        health_path=model_call_health_ledger_path()
+        health=read_json(health_path) if health_path.is_file() else {}
+        health_rows={}
+        for raw in entries:
+            entry=_normalize_entry(raw)
+            if not entry:
+                continue
+            for scope in set(entry.scopes).intersection(scopes):
+                health_key=f'{scope}|{entry.name}|{entry.model}'
+                health_row=(health.get('entries') or {}).get(health_key)
+                if not isinstance(health_row,dict):
+                    continue
+                revision=str(health_row.get('configuration_revision') or '')
+                health_rows[health_key]={
+                    'last_status':health_row.get('last_status'),
+                    'cooldown_active':model_provider_cooldown_active(
+                        scope=scope,provider=entry.name,model=entry.model,
+                        configuration_revision=revision,
+                    ),
+                }
+        decisions['provider_health_cooldowns']=identity(health_rows)
     # Owner receipts/local arrivals wake existing work for owner validation.
     # Polling never re-hashes all finalized images; a wake is not new permission.
     for path in authority_receipts(job):

@@ -294,6 +294,10 @@ A full source gallery is still planned before selecting generated test outputs.
 
 ## Production Readiness 1.0 — engineering plan
 
+### Phase 4 implementation
+
+Persistent provider cooldown state is now part of the original order's recovery revision for failed service-dependent tasks. When a cooldown expires, the existing dispatcher can wake that order without requiring a credential/configuration edit; unknown requests and local/contract blockers remain excluded. See the Phase 4 implementation record. This is synthetic state-transition coverage, not a live provider failover test.
+
 ### Phase 3 implementation
 
 Batch dispatch uses due time as an eligibility filter and admission order among eligible jobs, preventing retry starvation. Image resource accounting now releases terminal response-envelope reservations while preserving immutable receipt files; real free disk remains the final capacity check. See the Phase 3 implementation record. Fairness/resource assertions were added inside existing default-suite test methods; they have not been executed here.
