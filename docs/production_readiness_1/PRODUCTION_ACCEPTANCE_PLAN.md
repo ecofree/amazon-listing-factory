@@ -100,3 +100,7 @@ Run [43371675918](https://github.com/ecofree/amazon-listing-factory/actions/runs
 - 100/100 synthetic ledger families passed across four terminal outcomes.
 
 This does not close A3 actual multi-order dispatcher fault drill, A5 real-output adjudication, A6 four-category real workbook/package delivery, A7 72-hour soak or A8 live production canary. No paid calls or live uploads occurred.
+
+## 11. Synthetic batch dispatcher integration result
+
+Run [43372803029](https://github.com/ecofree/amazon-listing-factory/actions/runs/43372803029) on `f618b4d0fa9b151a477b0d4184c3801b9dbc6915` passed. In addition to the 100-case curated suite, 5 targeted process/provider cases and 100 synthetic ledger orders, the curated root-cause test exercised the real `production_batch.run_batch` loop with a temporary ledger and fake worker process adapter: 8 orders, 3 concurrent worker slots, one isolated exception, seven completed orders, oldest due retry first. This does not replace actual subprocess crash/Windows process-tree tests.

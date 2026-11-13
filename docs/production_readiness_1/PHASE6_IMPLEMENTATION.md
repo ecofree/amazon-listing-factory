@@ -61,3 +61,18 @@ All three offline gates passed:
 - Synthetic 100-order ledger drill: 100/100 synthetic families, 25 each in synthetic completion, unknown-result hold, cancellation and deadline-preserved outcomes; exit code 0. It exercises deduplication, lease fencing, unknown holds, restart/reopen, explicit human requeue and budget enforcement.
 
 The report explicitly records `live_provider_calls=0`, `live_uploads=0`, real image quality `not_tested`, four-category live delivery `not_tested`, and long-running soak `not_run`. This is an offline engineering pass only. The curated suite has about 5.15 seconds of headroom under its current 60-second wall budget, so monitor timing on future runner images rather than silently relaxing the budget.
+
+## Actual dispatcher-loop synthetic integration evidence — 2026-11-13
+
+**GitHub Actions run:** [43372803029](https://github.com/ecofree/amazon-listing-factory/actions/runs/43372803029)  
+**Commit:** `f618b4d0fa9b151a477b0d4184c3801b9dbc6915`  
+**Result:** `success`.
+
+The existing curated `test_dns_resolution_failure_is_retryable` path now also executes `production_batch.run_batch` against a temporary SQLite ledger with synthetic worker-process adapters (the dispatcher loop itself is real; provider calls and worker subprocess execution are replaced):
+- 8 production-purpose synthetic orders enrolled in one temporary workspace;
+- 3 configured workers; peak observed active worker slots = 3;
+- oldest admitted order preloaded as an already-due retry and observed to launch first;
+- one synthetic worker settlement forced to `exception`; seven other orders settled `completed`;
+- all 8 launched once; no queued/running order remained when drain returned.
+
+This validates dispatcher claim/lease/settle scheduling and order-level failure isolation. It does **not** prove real child-process creation/termination, Windows process-tree cleanup, or provider request behavior; those remain separate acceptance items. The default curated test count remains 100 because these assertions are folded into an existing test method.
