@@ -373,18 +373,23 @@ class UnattendedProductionContractTests(unittest.TestCase):
                 launched.append(current['id'])
                 return [sys.executable, '-B', '-c', worker_code, current['path']]
             package = {'context': {'delivery': {'completion': 'order_complete'}}, 'revision': 'synthetic-delivery'}
+            from concurrent.futures import ThreadPoolExecutor
             with (patch.object(BatchLedger, 'require_workspace'),
                   patch.object(batch, 'production_revision', return_value='review-fixture'),
                   patch.object(batch, 'refresh_operational_alerts'),
                   patch.object(batch, '_worker_command', side_effect=command),
                   patch('core.delivery_package.current_delivery', return_value=package)):
-                result = batch.run_batch(ledger.path, drain=True, poll_seconds=0.05)
-            self.assertEqual([row['id']], launched, 'the original order, not a replacement, must resume')
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(batch.run_batch, ledger.path, drain=True, poll_seconds=0.05)
+                               for _ in range(2)]
+                    results = [future.result(timeout=15) for future in futures]
+            self.assertEqual([row['id']], launched, 'two dispatchers must not launch the original order twice')
             self.assertEqual('full-production-resumed',
                 (job / 'reports' / 'downstream-resumed.txt').read_text(encoding='utf-8'))
-            self.assertEqual('delivered', result['jobs'][0]['state'])
-            self.assertEqual(2, result['jobs'][0]['attempt'])
-            self.assertEqual(0, result['cost']['admitted_requests'])
+            for result in results:
+                self.assertEqual('delivered', result['jobs'][0]['state'])
+                self.assertEqual(2, result['jobs'][0]['attempt'])
+                self.assertEqual(0, result['cost']['admitted_requests'])
 
     def test_publish_recovers_verified_remote_bytes_without_duplicate_put(self) -> None:
         import requests
