@@ -352,3 +352,7 @@ Phase 0 baseline specifications are maintained in [docs/production_readiness_1/]
 - [Production acceptance plan](docs/production_readiness_1/PRODUCTION_ACCEPTANCE_PLAN.md)
 
 The baseline is the `codex/model-native-image-refactor` branch at `a74dc61542360ca1ae8ccb30194380d2921cafc9`. Synthetic engineering tests, real-provider acceptance, four-category delivery, spend reconciliation and 72-hour operation are separate gates. No live paid requests or production uploads are authorized by these documents.
+
+### Offline CI
+
+The `Production Readiness (offline)` GitHub Actions workflow runs on pushes and pull requests to `codex/model-native-image-refactor`. It installs only `requirements.txt`, runs `scripts/run_readiness_checks.py`, and uploads the JSON report. It has no provider credentials, performs no live requests/uploads, and is not live-production acceptance.

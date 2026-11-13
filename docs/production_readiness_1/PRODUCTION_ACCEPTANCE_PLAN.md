@@ -86,4 +86,8 @@ See [CODEX_FINAL_ACCEPTANCE.md](CODEX_FINAL_ACCEPTANCE.md) for the exact branch 
 
 ## 8. Baseline CI note
 
-At the current branch baseline `15a9d5c2fe0b173845dfbadaca401da276213aff`, no `.github/workflows/` files exist and no GitHub Actions run/combined status is present. CI is unconfigured, not passing. The local unified offline runner is the required engineering gate.
+At baseline `15a9d5c2fe0b173845dfbadaca401da276213aff`, CI was unconfigured. Phase 6 now adds `.github/workflows/production-readiness.yml`, which runs the offline unified gate on pushes and pull requests to this branch. The first workflow run must be inspected before claiming CI passed. It has no live provider credentials and does not perform production acceptance.
+
+## 9. CI workflow
+
+`.github/workflows/production-readiness.yml` runs the offline readiness runner on pushes, pull requests and manual dispatch for this branch. The workflow is intentionally read-only and credential-free; inspect its first run and uploaded JSON report. CI success is only offline engineering evidence.

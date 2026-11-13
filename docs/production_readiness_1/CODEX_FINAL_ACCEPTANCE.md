@@ -20,7 +20,8 @@
 
 - Fetch latest origin.
 - Confirm branch is `codex/model-native-image-refactor`.
-- Confirm HEAD is this baseline or a descendant that contains it. The baseline includes the follow-up fixture correction `15a9d5c` (load the real bed-frame plugin rather than constructing an incomplete plugin stub).
+- Confirm HEAD is this baseline or a descendant that contains it.
+- Inspect the `Production Readiness (offline)` GitHub Actions run and download its JSON artifact; do not infer success from the workflow file existing. The baseline includes the follow-up fixture correction `15a9d5c` (load the real bed-frame plugin rather than constructing an incomplete plugin stub) and the offline CI workflow added after the original handoff.
 - Record `git status --short`, commit SHA and remote SHA.
 - Inspect `git log --oneline --decorate -15`.
 - Do not overwrite uncommitted user work.

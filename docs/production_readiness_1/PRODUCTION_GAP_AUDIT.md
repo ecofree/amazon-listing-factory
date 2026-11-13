@@ -70,6 +70,8 @@ Evidence:
 
 | G25 | P0/U | Hard-fact QA false-pass/false-block rate, real visual design quality and complete four-category delivery remain unverified. Existing code has source-bound hard-fact gates and human escalation; do not add aesthetic scoring or weaken factual gates to claim acceptance. | image_qa.py, qa_evidence.py, release_manifest.py, template_engine.py, delivery_package.py | Blind adjudicated real candidate set + four-category complete family package, URL byte verification and workbook opening |
 
+| G26 | P1/U | Offline test suite had no automated CI execution path on this branch, so pushed changes could remain untested until a local operator ran the suite. Phase 6 adds a credential-free GitHub Actions workflow; first run and subsequent required-check policy still need verification. | .github/workflows/production-readiness.yml, scripts/run_readiness_checks.py | First push workflow completes, artifact report retained, failed checks block merge when branch protection is configured |
+
 ## 4. Scope boundaries and non-goals
 
 - Do not redesign or replace the production controller.
