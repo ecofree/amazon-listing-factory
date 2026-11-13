@@ -369,20 +369,29 @@ class UnattendedProductionContractTests(unittest.TestCase):
                 "(Path(sys.argv[1])/'reports'/'downstream-resumed.txt').write_text('full-production-resumed',encoding='utf-8')"
             )
             launched = []
+            processes = []
+            real_popen = subprocess.Popen
             def command(_ledger, current):
                 launched.append(current['id'])
                 return [sys.executable, '-B', '-c', worker_code, current['path']]
+            def spawn(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                processes.append(process)
+                return process
             package = {'context': {'delivery': {'completion': 'order_complete'}}, 'revision': 'synthetic-delivery'}
             from concurrent.futures import ThreadPoolExecutor
             with (patch.object(BatchLedger, 'require_workspace'),
                   patch.object(batch, 'production_revision', return_value='review-fixture'),
                   patch.object(batch, 'refresh_operational_alerts'),
                   patch.object(batch, '_worker_command', side_effect=command),
+                  patch.object(batch.subprocess, 'Popen', side_effect=spawn),
                   patch('core.delivery_package.current_delivery', return_value=package)):
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     futures = [pool.submit(batch.run_batch, ledger.path, drain=True, poll_seconds=0.05)
                                for _ in range(2)]
                     results = [future.result(timeout=15) for future in futures]
+            self.assertEqual(1, len(processes))
+            processes[0].wait(timeout=5)
             self.assertEqual([row['id']], launched, 'two dispatchers must not launch the original order twice')
             self.assertEqual('full-production-resumed',
                 (job / 'reports' / 'downstream-resumed.txt').read_text(encoding='utf-8'))
