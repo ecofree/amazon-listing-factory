@@ -106,3 +106,12 @@ The targeted suite now launches a real local parent Python process which itself 
 ## Twelve-order dispatcher expansion
 
 The dispatcher fixture has been extended from 8 to 12 orders while retaining 3 worker slots. Two independent synthetic worker exits now represent a copy-stage and an image-stage failure; ten other orders must complete, every order must launch exactly once, and drain must leave no queued/running/retry state. This extension is committed after the last verified Linux run and is pending CI.
+
+## Phase 7 P0 OS-level crash drills (verified 2026-11-13)
+
+The isolated readiness runner now includes `tests.test_dispatcher_os_recovery`:
+- real OS dispatcher process is killed while the child Worker remains alive; a new dispatcher adopts the original lease and does not relaunch it;
+- a separate OS process invokes the real console review action; HumanReviewV5 is durably written and the process exits before ledger wake; a new process replays the same decision, reconciles the original owner and creates one wake;
+- two independent OS dispatcher processes compete for the resumed order and exactly one worker starts.
+
+GitHub Actions [43402323893](https://github.com/ecofree/amazon-listing-factory/actions/runs/43402323893) passed: Ubuntu 100/100 curated (55.505 s), 12/12 existing targeted, 2/2 OS-level recovery, 100 synthetic ledger orders; Windows 12/12 existing targeted, 2/2 OS-level recovery, 100 synthetic ledger orders. Zero live requests/uploads. The worker stage command and downstream completion are synthetic; actual production stage execution, live providers and 72-hour soak remain unverified.

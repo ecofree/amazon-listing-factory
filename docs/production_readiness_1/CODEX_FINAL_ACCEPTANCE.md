@@ -2,8 +2,8 @@
 
 **Repository:** `ecofree/amazon-listing-factory`  
 **Branch:** `codex/model-native-image-refactor`  
-**Verified code baseline:** `a8b1cf7d637d4bb98b19a4ed765d48d0cdf280d8`  
-**Evidence:** [Recovery boundary verification](RECOVERY_BOUNDARY_VERIFICATION_20261113.md), [Dispatcher restart and QA review wake verification](DISPATCHER_RESTART_AND_REVIEW_WAKE_20261113.md), GitHub Actions [43398018584](https://github.com/ecofree/amazon-listing-factory/actions/runs/43398018584).
+**Verified code baseline:** `0ab5e9f355b586849f134009a07f4a1a29a79feb`  
+**Evidence:** [Recovery boundary verification](RECOVERY_BOUNDARY_VERIFICATION_20261113.md), [Dispatcher restart and QA review wake verification](DISPATCHER_RESTART_AND_REVIEW_WAKE_20261113.md), [OS-level dispatcher and review crash verification](OS_LEVEL_DISPATCHER_AND_REVIEW_CRASH_20261113.md), GitHub Actions [43402323893](https://github.com/ecofree/amazon-listing-factory/actions/runs/43402323893).
 
 The verified baseline passes the scoped offline gates below. It is not live-production acceptance. Documentation-only descendants preserve that code evidence; any runtime, test, configuration or workflow change requires its own verified run.
 
@@ -31,6 +31,27 @@ GitHub Actions run [43398018584](https://github.com/ecofree/amazon-listing-facto
 The curated suite remains capped at 100 cases and 60 seconds. These durations are reported by the isolated runner, not full workflow/setup time. Both platforms report zero live provider requests and zero uploads. Real image quality, four-category delivery and long-running soak remain untested.
 
 The original `b2d79d1` run failed because a process-tree fixture omitted `sys`; `425ba9c` corrected it. The current result is tied to the exact `a8b1cf7` HEAD, not to those earlier runs.
+
+## 2A. Latest OS-level recovery evidence
+
+GitHub Actions run [43402323893](https://github.com/ecofree/amazon-listing-factory/actions/runs/43402323893) passed on exact code HEAD `0ab5e9f355b586849f134009a07f4a1a29a79feb`:
+
+| Gate | Ubuntu 26.04 / Python 3.11 | Windows Server 2025 / Python 3.11 |
+|---|---:|---:|
+| Curated suite | 100/100; 55.505 s; exit 0 | Not run in Windows job |
+| Existing unattended suite | 12/12; 2.639 s; exit 0 | 12/12; 7.515 s; exit 0 |
+| OS-level dispatcher/review crash suite | 2/2; 3.470 s; exit 0 | 2/2; 4.224 s; exit 0 |
+| Synthetic ledger drill | 100 orders; 2.524 s; exit 0 | 100 orders; 17.926 s; exit 0 |
+
+The curated suite remains exactly 100 cases under the 60-second limit, but this run used 55.505 seconds (4.495 seconds of headroom). Continue monitoring runtime variance; do not raise the budget. No ResourceWarning was emitted by the OS-level process suite after child pipe handles were changed to DEVNULL. Both platform reports recorded zero live provider requests and zero uploads.
+
+The new tests:
+- kill an actual OS dispatcher process while its worker subprocess remains alive, then start a second dispatcher and prove it adopts the original lease without launching a duplicate worker;
+- terminate an OS process after the actual HumanReviewV5 owner writes its artifact but before ledger wake; a new process replays the same decision, reconciles the original owner, creates one wake, and completes the pending action;
+- start two independent dispatcher OS processes against that same QA-woken order and prove only one worker is launched.
+
+The worker command and downstream stage completion are synthetic; this does not execute paid provider calls or real publish/template production.
+
 
 ## 3. Isolated local checks
 

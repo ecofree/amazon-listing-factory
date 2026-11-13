@@ -308,7 +308,7 @@ The branch subsequently advanced to `15a9d5c` with a test-fixture correction: th
 
 ### Phase 6 implementation
 
-Added targeted process-kill coverage for the request submission boundary and a single-command offline gate that runs the curated suite, targeted unattended tests and the synthetic 100-order ledger drill. See [Phase 6 implementation record](docs/production_readiness_1/PHASE6_IMPLEMENTATION.md). No Python suite has been executed by the GitHub editing environment.
+The offline gate now includes OS-level dispatcher kill/restart, HumanReviewV5 write-before-wake crash recovery, and two independent dispatcher processes competing for one resumed order. GitHub Actions run [43402323893](https://github.com/ecofree/amazon-listing-factory/actions/runs/43402323893) passed on Ubuntu and Windows; the curated suite passed 100/100 in 55.505 seconds. See [OS-level recovery report](docs/production_readiness_1/OS_LEVEL_DISPATCHER_AND_REVIEW_CRASH_20261113.md). This remains synthetic stage execution, not live production acceptance.
 
 The offline CI workflow is being extended to run process-recovery and synthetic ledger tests on `windows-latest`, matching the production operator environment. Both Ubuntu and Windows jobs must pass before the offline engineering gate is green.
 

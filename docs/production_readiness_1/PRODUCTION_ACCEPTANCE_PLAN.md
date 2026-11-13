@@ -116,3 +116,9 @@ The workflow now includes a `windows-latest` job for targeted process-crash/prov
 ## 10. Expanded dispatcher acceptance
 
 The current synthetic dispatcher fixture now uses 12 orders, 3 worker slots, two independent synthetic worker failures (copy-stage and image-stage), ten completed orders, exactly-once launch checks, and a no-queued/running/retry drain assertion. This is still a synthetic worker command, not the production worker body. The extension must pass the current Ubuntu CI before it is treated as verified.
+
+## 13. OS-level dispatcher and human-review crash acceptance
+
+Run [43402323893](https://github.com/ecofree/amazon-listing-factory/actions/runs/43402323893) on `0ab5e9f355b586849f134009a07f4a1a29a79feb` passed on Ubuntu and Windows. It verifies a real OS dispatcher kill with a surviving worker, replacement dispatcher adoption without duplicate launch, an actual HumanReviewV5 owner write followed by process death before ledger wake, fresh-process replay/reconciliation with one durable wake, and two independent OS dispatcher processes competing for the same resumed order with exactly one worker launch. See [OS-level recovery report](OS_LEVEL_DISPATCHER_AND_REVIEW_CRASH_20261113.md).
+
+The worker stage command remains synthetic. This does not prove actual production `_worker` execution across all stages, universal artifact-writer fencing, live provider request recovery, four-category quality/delivery, or 72-hour operation. The Ubuntu curated suite remains at 100/100 and 55.505 seconds against its 60-second ceiling; maintain runtime headroom.
