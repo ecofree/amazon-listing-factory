@@ -83,3 +83,7 @@ The targeted process-crash test uses a real local child process but no external 
 ## 7. Codex handoff and reporting
 
 See [CODEX_FINAL_ACCEPTANCE.md](CODEX_FINAL_ACCEPTANCE.md) for the exact branch baseline, safe local commands, required four-category/live order sequence, multi-order failure drill, 72-hour soak and mandatory report fields. Codex must not reset/recreate the fixed production ledger or treat this offline report as live acceptance.
+
+## 8. Baseline CI note
+
+At the current branch baseline `15a9d5c2fe0b173845dfbadaca401da276213aff`, no `.github/workflows/` files exist and no GitHub Actions run/combined status is present. CI is unconfigured, not passing. The local unified offline runner is the required engineering gate.

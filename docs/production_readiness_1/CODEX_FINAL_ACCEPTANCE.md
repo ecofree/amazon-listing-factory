@@ -2,7 +2,7 @@
 
 **Repository:** `ecofree/amazon-listing-factory`  
 **Branch:** `codex/model-native-image-refactor`  
-**Engineering baseline:** `c2edb4eea0afd2b769fd47d8d971fec70ee40232`  
+**Engineering baseline:** `15a9d5c2fe0b173845dfbadaca401da276213aff`  
 **Purpose:** validate the implementation locally and perform separately authorized live acceptance. Do not assume this document means the tests have passed.
 
 ## 1. Safety rules
@@ -20,7 +20,7 @@
 
 - Fetch latest origin.
 - Confirm branch is `codex/model-native-image-refactor`.
-- Confirm HEAD is this baseline or a descendant that contains it.
+- Confirm HEAD is this baseline or a descendant that contains it. The baseline includes the follow-up fixture correction `15a9d5c` (load the real bed-frame plugin rather than constructing an incomplete plugin stub).
 - Record `git status --short`, commit SHA and remote SHA.
 - Inspect `git log --oneline --decorate -15`.
 - Do not overwrite uncommitted user work.
@@ -43,7 +43,7 @@ If a targeted failure needs isolation:
 & $env:AMAZON_FACTORY_PYTHON -B -X utf8 -m unittest tests.test_template_field_plan_contracts
 ```
 
-Record test counts, durations, skips, errors and all warnings. Do not edit the test budget or remove failing tests to obtain green.
+Record test counts, durations, skips, errors and all warnings. The curated runner currently declares 100 cases across 18 modules (static AST inventory at baseline); verify the runtime-discovered count matches. Do not edit the test budget or remove failing tests to obtain green.
 
 ### Additional required offline drills
 
@@ -117,3 +117,7 @@ Include:
 - all unresolved P0/P1/P2 items.
 
 A successful offline report is not permission to begin live production. A 72-hour soak is not proof of visual quality. Production readiness requires all applicable gates and explicit operator approval.
+
+## 8. CI availability at baseline
+
+The branch has no `.github/workflows/` files, and the baseline commit has no GitHub Actions run or combined status check. Do not report CI as green or red; it is not configured for this branch. The local offline gate remains the required engineering check.

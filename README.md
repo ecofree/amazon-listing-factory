@@ -304,6 +304,8 @@ Run the curated suite, targeted unattended process/provider contracts and synthe
 
 This runner never performs live provider calls or uploads. Its report explicitly marks real image quality, four-category live delivery and long-running soak as untested.
 
+The branch subsequently advanced to `15a9d5c` with a test-fixture correction: the draft template integration test now loads the real `bed_frame` plugin. The final acceptance handoff uses this latest verified HEAD.
+
 ### Phase 6 implementation
 
 Added targeted process-kill coverage for the request submission boundary and a single-command offline gate that runs the curated suite, targeted unattended tests and the synthetic 100-order ledger drill. See [Phase 6 implementation record](docs/production_readiness_1/PHASE6_IMPLEMENTATION.md). No Python suite has been executed by the GitHub editing environment.
