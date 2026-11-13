@@ -35,15 +35,15 @@ def run_check(name: str, command: list[str], timeout: int) -> dict:
             "exit_code": result.returncode,
             "status": "passed" if result.returncode == 0 else "failed",
             "seconds": round(time.monotonic() - started, 3),
-            "stdout": result.stdout[-12000:],
-            "stderr": result.stderr[-12000:],
+            "stdout": result.stdout,
+            "stderr": result.stderr,
         }
     except subprocess.TimeoutExpired as exc:
         return {
             "name": name, "command": command, "exit_code": None,
             "status": "timed_out", "seconds": round(time.monotonic() - started, 3),
-            "stdout": str(exc.stdout or "")[-12000:],
-            "stderr": str(exc.stderr or "")[-12000:],
+            "stdout": str(exc.stdout or ""),
+            "stderr": str(exc.stderr or ""),
         }
 
 
