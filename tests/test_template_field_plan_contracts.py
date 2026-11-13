@@ -221,6 +221,36 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
                 asin="B000000001",
             )
 
+        # Exercise the actual template CopyV1 loader: draft may inspect a partial
+        # family artifact, while submit-ready must reject the identical artifact.
+        from core.plugin import ProductPlugin
+        from core.io import write_json
+        from core.copy_polish import CopyPolishError
+        with TemporaryDirectory() as tmp:
+            job_path = Path(tmp)
+            (job_path / "reports").mkdir()
+            write_json(job_path / "reports" / "copy_v1.json", {
+                "schema_version": "copy-v1", "job_id": "fixture",
+                "copy_request_fingerprint": "current-fingerprint",
+                "rows": {}, "groups": [],
+                "failures": [{"task": {"child": "B000000001"}, "error": "copy group pending"}],
+            })
+            plugin = ProductPlugin(category_id="bed_frame", root=Path("."), manifest={})
+            with (
+                patch("core.copy_polish.copy_request_fingerprint", return_value="current-fingerprint"),
+                patch("core.template_engine.child_sku", return_value="T-B000000001"),
+            ):
+                draft_copy = template_engine._load_copy_v1(
+                    job_path, env={}, mode="draft", children=[{"asin": "B000000001"}],
+                    plugin=plugin, job={},
+                )
+                self.assertEqual({}, draft_copy["rows"])
+                with self.assertRaises(CopyPolishError):
+                    template_engine._load_copy_v1(
+                        job_path, env={}, mode="submit_ready", children=[{"asin": "B000000001"}],
+                        plugin=plugin, job={},
+                    )
+
     def test_field_plan_splits_weight_value_and_unit(self) -> None:
         from tests.audit_delivery_fixture import verify_zero_and_template_validation
         verify_zero_and_template_validation(self)
