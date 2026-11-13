@@ -101,7 +101,7 @@ def _run_child(function: str, args: list[str], *, timeout: float = 15) -> subpro
     code = f"from tests.test_dispatcher_os_recovery import {function}; {function}()"
     return subprocess.Popen(
         [sys.executable, "-B", "-c", code, *args],
-        cwd=ROOT, env=_safe_env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        cwd=ROOT, env=_safe_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
 
