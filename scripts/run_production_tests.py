@@ -39,7 +39,7 @@ PRODUCTION_TEST_MODULES = (
 MAX_CASES = 100
 MAX_SECONDS = 60.0
 # Separate interpreters AND roots: patched globals/runtime ledgers cannot leak.
-GROUP_COUNT = 4
+GROUP_COUNT = 3
 # Measured contract costs only balance execution; every discovered case still runs.
 CASE_WEIGHTS = {
     'test_pipeline_stops_only_when_a_stage_has_no_usable_output': 26,
