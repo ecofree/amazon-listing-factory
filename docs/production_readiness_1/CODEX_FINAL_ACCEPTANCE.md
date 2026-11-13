@@ -2,8 +2,8 @@
 
 **Repository:** `ecofree/amazon-listing-factory`  
 **Branch:** `codex/model-native-image-refactor`  
-**Verified code baseline:** `ef5e97e8127f92f8a00377f36852d834b16476c6`  
-**Evidence:** [Recovery boundary verification](RECOVERY_BOUNDARY_VERIFICATION_20261113.md), GitHub Actions [43378288266](https://github.com/ecofree/amazon-listing-factory/actions/runs/43378288266).
+**Verified code baseline:** `a8b1cf7d637d4bb98b19a4ed765d48d0cdf280d8`  
+**Evidence:** [Recovery boundary verification](RECOVERY_BOUNDARY_VERIFICATION_20261113.md), [Dispatcher restart and QA review wake verification](DISPATCHER_RESTART_AND_REVIEW_WAKE_20261113.md), GitHub Actions [43398018584](https://github.com/ecofree/amazon-listing-factory/actions/runs/43398018584).
 
 The verified baseline passes the scoped offline gates below. It is not live-production acceptance. Documentation-only descendants preserve that code evidence; any runtime, test, configuration or workflow change requires its own verified run.
 
