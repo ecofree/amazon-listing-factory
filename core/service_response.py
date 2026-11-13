@@ -109,6 +109,16 @@ def _records(root,verify_owners, *, recover=True):
         relevant=bool(set(row['owners']) & set(verify_owners))
         if relevant and row.get('response_sha256') and (not body.is_file() or file_sha256(body)!=row['response_sha256']):
             raise ServiceOutcomeUnknown(f'Saved service response changed; no replacement authorized: {path}')
+        # A receipt is created before budget admission and before the transport
+        # checkpoint. If its owner process died while it still says "preparation",
+        # no HTTP call was entered; safely return this exact owner to retryable.
+        if (recover and relevant and row['status']=='submitted' and not body.is_file()
+                and row.get('submission_stage')=='preparation'
+                and isinstance(row.get('pid'),int) and row.get('process_start') is not None
+                and not _alive(row)):
+            row.update(status='known_failure',known_not_executed=True,
+                       submission_stage='not_sent',error_type='WorkerInterruptedBeforeSubmission')
+            write_json(path,row)
         if recover and relevant and row['status'] in {'submitted','unknown'} and body.is_file():
             if body.stat().st_size>16*1024*1024:raise ValueError(f'Saved service response exceeds limit: {path}')
             row.update(status='received',response_sha256=file_sha256(body),response_bytes=body.stat().st_size)
@@ -149,7 +159,9 @@ def retry_authorized(root: Path, owners: list[str], *, include_known_unsent: boo
     perform_request alone reserves/replaces, and transport still enforces the ledger.
     """
     owners = sorted(set(owners))
-    rows, consumed = _records(Path(root), owners, recover=False)
+    # Reconcile only provably orphaned pre-submission receipts before deciding
+    # whether this logical owner has safe retry permission.
+    rows, consumed = _records(Path(root), owners, recover=True)
     relevant = [row for _, row in rows if row['id'] not in consumed and set(row['owners']) & set(owners)]
     if any(row['status'] in {'submitted','unknown'} for row in relevant):return False
     grants = [row for row in relevant if row['status']=='retry_authorized']

@@ -60,6 +60,7 @@ Evidence:
 | G18 | P0/U | Hard-fact QA false-pass/false-block rate on real outputs is unknown. The README explicitly does not equate synthetic QA tests with real acceptance. | image_qa.py, qa_evidence.py, release_manifest.py | Blind adjudicated real candidate set; no uncertainty auto-pass |
 | G19 | P1/U | Real category workbook, URL retention, package download and complete family delivery are not proven by code presence. | template_engine.py, publish.py, delivery_package.py | Four-category complete local package with exact file/URL hashes |
 | G20 | P1/U | Continuous unattended operation and restart recovery have not been demonstrated for 72 hours. | entire dispatcher/worker/console/ledger path | 72-hour soak with injected outages, restarts, queue and resource metrics |
+| G21 | P1/C | Durable service receipts created before transport submission were left in `submitted` if the worker died while still at `submission_stage=preparation`. This is safely distinguishable from an unknown request, but was not automatically reconciled; copy/fetch/OCR recovery could require unnecessary manual intervention. Phase 2 now converts only dead, PID-bound preparation receipts with no response into known-unsent; later checkpoints remain unknown. | service_response.py and its perform_request owners | Kill between receipt creation and transport checkpoint; verify one safe retry, then kill after checkpoint and verify no retry |
 
 ## 4. Scope boundaries and non-goals
 

@@ -120,6 +120,18 @@ def verify_retry_grant(test):
         test.assertFalse(service.retry_authorized(root,owners))
         service.perform_request(root,owners,{'operation':'copy'},send)
         test.assertEqual(2,len(calls))
+        # A worker that died before the persisted submission checkpoint is
+        # provably unsent and must not require manual unknown-request resolution.
+        orphan_owners=['copy:B000000002']
+        orphan=root/'000001-orphan-preparation.json'
+        service.write_json(orphan,{'schema':service.SCHEMA,'id':orphan.stem,'sequence':1,'key':'orphan-key',
+            'owners':orphan_owners,'status':'submitted','pid':-1,'process_start':0,
+            'submitted_at':'2026-11-13T00:00:00+00:00','submission_stage':'preparation'})
+        with patch.object(service,'_alive',return_value=False):
+            test.assertTrue(service.retry_authorized(root,orphan_owners,include_known_unsent=True))
+            recovered=service.perform_request(root,orphan_owners,{'operation':'orphan-recovered'},send)
+        test.assertEqual(b'{"known":"malformed copy result"}',recovered)
+        test.assertEqual(3,len(calls))
 
 
 def verify_console_recovery(test):

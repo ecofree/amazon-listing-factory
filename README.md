@@ -294,6 +294,10 @@ A full source gallery is still planned before selecting generated test outputs.
 
 ## Production Readiness 1.0 — engineering plan
 
+### Phase 2 implementation
+
+The shared durable service receipt owner now recovers an orphaned request as known-unsent only when its receipt proves the worker died before `submission_call_started`, with no saved response. A request that crossed the persisted transport checkpoint remains unknown and fenced. See the Phase 2 implementation record. This is an offline recovery-path change; fault-injection tests have not been run here.
+
 ### Phase 1 implementation
 
 The first workflow change allows draft templates to expose current successful CopyV1 rows while keeping missing rows blank and audited; submit-ready still requires the complete family copy contract. A recorded stage failure also cannot be hidden by family release completion. See [Phase 1 implementation record](docs/production_readiness_1/PHASE1_IMPLEMENTATION.md). Runtime tests and workbook inspection remain required before acceptance.
