@@ -290,3 +290,19 @@ counts and selection SHA; full-job completeness remains separate. The generate s
 records the current invocation; partial coverage cannot mark the whole job complete. Unselected tasks stay in the inventory;
 existing candidates retain their task fingerprints and are reused on full-scope resume.
 A full source gallery is still planned before selecting generated test outputs.
+
+
+## Production Readiness 1.0 — engineering plan
+
+The target is safe unattended batch production: independent progress across copy and image work, bounded recovery, order isolation, verified listing delivery, and human escalation only when evidence or authority is missing. This is an engineering target, not a statement that live production has been accepted.
+
+Phase 0 baseline specifications are maintained in [docs/production_readiness_1/](docs/production_readiness_1/):
+
+- [Production architecture](docs/production_readiness_1/PRODUCTION_ARCHITECTURE.md)
+- [Task dependency map](docs/production_readiness_1/TASK_DEPENDENCY_MAP.md)
+- [State transition specification](docs/production_readiness_1/STATE_TRANSITION_SPEC.md)
+- [Failure and recovery matrix](docs/production_readiness_1/FAILURE_RECOVERY_MATRIX.md)
+- [Baseline gap audit](docs/production_readiness_1/PRODUCTION_GAP_AUDIT.md)
+- [Production acceptance plan](docs/production_readiness_1/PRODUCTION_ACCEPTANCE_PLAN.md)
+
+The baseline is the `codex/model-native-image-refactor` branch at `a74dc61542360ca1ae8ccb30194380d2921cafc9`. Synthetic engineering tests, real-provider acceptance, four-category delivery, spend reconciliation and 72-hour operation are separate gates. No live paid requests or production uploads are authorized by these documents.
