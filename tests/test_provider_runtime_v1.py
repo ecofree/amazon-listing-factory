@@ -257,6 +257,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             return task
         with (
             patch("core.image_generation._effective_generation_workers", return_value=2),
+            patch("core.image_generation._generation_worker_limit", return_value=2),
             patch("core.image_generation.provider_concurrency_limit", return_value=1),
             patch("core.image_generation.generate_one", side_effect=generate),
         ):
