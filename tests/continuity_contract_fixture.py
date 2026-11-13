@@ -87,6 +87,30 @@ def verify_export_versions(test):
         test.assertEqual(b'concurrent-foreign-bytes',race.read_bytes())
 
 
+def verify_batch_queue_fairness(test):
+    """Eligible retries keep admission-age order without blocking not-yet-due work."""
+    import time
+    from core.batch_ledger import BatchLedger
+    with TemporaryDirectory() as tmp:
+        root=Path(tmp);ledger=BatchLedger(root/'ledger.sqlite')
+        ledger.create(policy={'workers':1,'max_paid_calls':20,'fee_mode':'count_only_trial'},source_revision='fixture')
+        first=ledger.enqueue({'seed_asin':'B000000001','seller_id':'seller-a'},root/'jobs'/'first')
+        ledger.initialized(first['id'])
+        second=ledger.enqueue({'seed_asin':'B000000002','seller_id':'seller-a'},root/'jobs'/'second')
+        ledger.initialized(second['id'])
+        with ledger.transaction() as db:
+            db.execute("UPDATE jobs SET state='retry',due=? WHERE id=?",(time.time()+30,first['id']))
+        claimed=ledger.claim(ttl=60)
+        test.assertEqual(second['id'],claimed['id'],'A future retry must not block an eligible new order')
+        ledger.complete(claimed,state='completed')
+        third=ledger.enqueue({'seed_asin':'B000000003','seller_id':'seller-a'},root/'jobs'/'third')
+        ledger.initialized(third['id'])
+        with ledger.transaction() as db:
+            db.execute("UPDATE jobs SET due=? WHERE id=?",(time.time()-1,first['id']))
+        claimed=ledger.claim(ttl=60)
+        test.assertEqual(first['id'],claimed['id'],'An older retry must not starve behind later new orders')
+
+
 def verify_initialization(test):
     from core import job as jobs
     from core.plugin import load_plugin

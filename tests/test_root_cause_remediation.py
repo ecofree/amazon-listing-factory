@@ -158,8 +158,8 @@ class RootCauseRemediationTests(unittest.TestCase):
     def test_dns_resolution_failure_is_retryable(self, _paid) -> None:
         from tests.audit_recovery_fixture import verify_service_receipts, verify_upstream_unknown_post
         verify_service_receipts(self); verify_upstream_unknown_post(self)
-        from tests.continuity_contract_fixture import verify_retry_grant, verify_initialization
-        verify_retry_grant(self); verify_initialization(self)
+        from tests.continuity_contract_fixture import verify_retry_grant, verify_initialization, verify_batch_queue_fairness
+        verify_retry_grant(self); verify_initialization(self); verify_batch_queue_fairness(self)
         from core.source_fetch.apify_client import ApifyClient
         from core.asset_manager import _download_once
         from core.vision_gemini_client import gemini_stream_generate

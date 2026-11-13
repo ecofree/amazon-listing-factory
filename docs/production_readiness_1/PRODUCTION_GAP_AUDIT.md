@@ -62,6 +62,8 @@ Evidence:
 | G20 | P1/U | Continuous unattended operation and restart recovery have not been demonstrated for 72 hours. | entire dispatcher/worker/console/ledger path | 72-hour soak with injected outages, restarts, queue and resource metrics |
 | G21 | P1/C | Durable service receipts created before transport submission were left in `submitted` if the worker died while still at `submission_stage=preparation`. This is safely distinguishable from an unknown request, but was not automatically reconciled; copy/fetch/OCR recovery could require unnecessary manual intervention. Phase 2 now converts only dead, PID-bound preparation receipts with no response into known-unsent; later checkpoints remain unknown. | service_response.py and its perform_request owners | Kill between receipt creation and transport checkpoint; verify one safe retry, then kill after checkpoint and verify no retry |
 
+| G22 | P1/C | `BatchLedger.claim` ordered eligible jobs by `due,id`. New queued jobs use due=0 while retries have a later due timestamp, so a continuous stream of new orders could keep eligible older retries behind newer work. Phase 3 changes due to eligibility-only and dispatches eligible work in original admission order. | batch_ledger.py | Future retry does not block a new eligible order; once due, the older retry is selected before later arrivals; retry limit still bounds repeated attempts |
+
 ## 4. Scope boundaries and non-goals
 
 - Do not redesign or replace the production controller.

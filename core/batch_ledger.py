@@ -191,7 +191,10 @@ class BatchLedger:
         with self.transaction() as db:
             settings=db.execute('SELECT * FROM batch WHERE id=1').fetchone();policy=json.loads(settings['policy'])
             if settings['paused'] or db.execute("SELECT COUNT(*) FROM jobs WHERE state='running'").fetchone()[0]>=policy.get('workers',1):return None
-            rows=db.execute("SELECT * FROM jobs WHERE state IN ('queued','retry') AND due<=? ORDER BY due,id",(now,)).fetchall()
+            # Due time controls eligibility; admission order controls fairness.
+            # Ordering by due first lets an endless stream of new (due=0) orders
+            # starve an older retry as soon as that retry becomes eligible.
+            rows=db.execute("SELECT * FROM jobs WHERE state IN ('queued','retry') AND due<=? ORDER BY rowid",(now,)).fetchall()
             for row in rows:
                 spec=json.loads(row['spec'])
                 if key is not None and row['id']!=key:continue

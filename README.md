@@ -294,6 +294,10 @@ A full source gallery is still planned before selecting generated test outputs.
 
 ## Production Readiness 1.0 — engineering plan
 
+### Phase 3 implementation
+
+Batch dispatch now uses due time only as an eligibility filter and preserves original SQLite admission order among eligible orders. This prevents a constant stream of new due=0 orders from starving older retries, while future-due retries do not block new work. See the Phase 3 implementation record. Fairness tests were added inside an existing default-suite test method; they have not been executed here.
+
 ### Phase 2 implementation
 
 The shared durable service receipt owner now recovers an orphaned request as known-unsent only when its receipt proves the worker died before `submission_call_started`, with no saved response. A request that crossed the persisted transport checkpoint remains unknown and fenced. See the Phase 2 implementation record. This is an offline recovery-path change; fault-injection tests have not been run here.

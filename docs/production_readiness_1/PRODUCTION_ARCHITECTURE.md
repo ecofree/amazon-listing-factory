@@ -58,6 +58,8 @@ The target is dependency-aware progression across the existing owners:
 
 Copy and image production are independent branches until template assembly. Within each branch, child/group/role/candidate work must retain its own identity and terminal state. A sibling failure may prevent a family-level deliverable, but must not erase or re-run successful sibling work.
 
+The current batch dispatcher owns admission, leases, and spending. Queue fairness is by admission order among currently due jobs; due timestamps decide eligibility, not priority. A future retry must not block new work, and an eligible older retry must not be starved by a stream of later admissions.
+
 ## 4. Completion is a projection, not one boolean
 
 Expose separate states/counts for:
