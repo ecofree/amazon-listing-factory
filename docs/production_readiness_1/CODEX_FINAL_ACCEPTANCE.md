@@ -18,19 +18,19 @@ The verified baseline passes the scoped offline gates below. It is not live-prod
 
 ## 2. Verify checkout and executed evidence
 
-Record `git status --short`, `git rev-parse HEAD`, the remote SHA and recent commit history. Confirm the checkout contains the verified baseline. Review changes after it rather than assuming a newer commit is already tested.
+Record `git status --short`, `git rev-parse HEAD`, the remote SHA and recent commit history. Confirm the checkout is exactly the verified code baseline or a descendant containing it.
 
-Run `43378288266` checked out exactly `ef5e97e` and passed:
+GitHub Actions run [43398018584](https://github.com/ecofree/amazon-listing-factory/actions/runs/43398018584) checked out exact HEAD `a8b1cf7d637d4bb98b19a4ed765d48d0cdf280d8` and passed:
 
-| Gate | Ubuntu | Windows |
-|---|---|---|
-| Curated suite | 100/100, 55.705 s | Not run by this Windows job |
-| Targeted recovery suite | 10/10, 2.100 s | 10/10, 4.680 s |
-| Synthetic ledger drill | 100 orders, 2.215 s | 100 orders, 15.768 s |
+| Gate | Ubuntu 26.04 / Python 3.11 | Windows Server 2025 / Python 3.11 |
+|---|---:|---:|
+| Curated production suite | 100/100; 37.366 s; exit 0 | Not run in this Windows job |
+| Targeted unattended/restart/review suite | 12/12; 2.373 s; exit 0 | 12/12; 6.721 s; exit 0 |
+| Synthetic 100-order ledger drill | 100 orders; 2.024 s; exit 0 | 100 orders; 24.792 s; exit 0 |
 
-These are inner test durations, not total workflow/setup times. The curated suite retains its 100-case/60-second hard limit and has limited timing margin. Both reports explicitly mark live image quality, four-category delivery and 72-hour operation as untested.
+The curated suite remains capped at 100 cases and 60 seconds. These durations are reported by the isolated runner, not full workflow/setup time. Both platforms report zero live provider requests and zero uploads. Real image quality, four-category delivery and long-running soak remain untested.
 
-The original `b2d79d1` run failed because a process-tree fixture omitted `sys`; `425ba9c` corrected it. Do not reuse the old failure or an earlier pass as evidence for a different revision.
+The original `b2d79d1` run failed because a process-tree fixture omitted `sys`; `425ba9c` corrected it. The current result is tied to the exact `a8b1cf7` HEAD, not to those earlier runs.
 
 ## 3. Isolated local checks
 
@@ -48,13 +48,15 @@ For focused process/publication/ledger checks:
 
 Each gate runs in a disposable sanitized source copy. Production dotenv/jobs/runtime and inherited API credentials are excluded; the existing external-network guard is active. The runner writes only its requested final report back to the checkout. Prefer these commands over raw unittest execution in a production checkout.
 
-The full runner executes the curated 18-module/100-case suite, targeted 10-case suite and synthetic 100-order ledger drill. The focused runner does not run or certify the curated suite. Preserve logs, test counts, skips, exit codes and timing. Do not remove tests or extend their budgets to get green.
+The full runner executes the curated 18-module/100-case suite, targeted 12-case unattended/restart/review suite and synthetic 100-order ledger drill. The focused runner does not run or certify the curated suite. Preserve logs, test counts, skips, exit codes and timing. Do not remove tests or extend their budgets to get green.
 
 ## 4. What the new recovery tests establish
 
 - Actual `_worker` entry and durable request owner are exercised in killed local child processes, with synthetic stage/transport callbacks. Before-submission death is distinguished from unknown post-submission outcomes; changing request identity cannot evade the original owner fence.
 - The real dispatcher, ledger and settlement logic isolate missing worker logs, missing executables, malformed task evidence and an exit-before-PID-attachment race. Unrelated healthy stage work completes.
 - Actual worker bootstrap failures are recorded; expired/replaced workers cannot overwrite a newer `batch_failure.json`. Stale leases are rejected for worker admission and spending.
+- **Dispatcher restart / exited worker:** `_alive` now validates both PID creation identity and process status. A completed POSIX child can remain as a zombie while its former parent still owns the process table entry; the previous PID-plus-creation-time check treated that zombie as live until lease expiry. The new check treats zombie/dead processes as exited without weakening PID-reuse protection. The restart test interrupts the dispatcher loop after a worker is launched, then starts a fresh `run_batch` loop: it observes the same lease, does not relaunch the order, and settles the existing evidence.
+- **Human QA review wake:** the test invokes the real console `apply_action` and `record_human_review` owner, writes the HumanReviewV5 artifact, replays the same decision idempotently, and verifies the changed review revision requeues the same order. Two concurrent dispatcher loops then contend for that woken order; exactly one worker launch occurs and the original order reaches the synthetic delivery-complete boundary. The downstream worker command and final delivery receipt are synthetic; publish/template stage bodies are not run.
 - The production process-tree stop helper rejects a mismatched PID/start-time identity and terminates the correctly identified parent/descendant on both platforms.
 - Real publication/recovery logic consumes exact-byte GET evidence from mocked storage after a remote-write timeout or local receipt-write interruption, without a second PUT. Original uncertain billing receipts remain preserved.
 - Readiness child processes do not inherit synthetic test secrets or the production ledger path, and their runtime writes remain disposable.
@@ -65,8 +67,8 @@ The existing 12-order/3-slot dispatcher drill also passes within the curated sui
 
 Use isolated temporary workspaces and the same production owners, never the live ledger:
 
-- Restart the dispatcher with live workers still running; prove original leases/receipts survive and workers are not duplicated.
-- Exercise a complete QA human decision -> original order wake -> downstream resume cycle, including duplicate decisions and competing dispatchers.
+- Repeat dispatcher recovery with an actual OS-level dispatcher process termination/reparenting, not only a dispatcher-loop interruption in the test process. Exercise worker completion and lease expiry under both independent OS processes.
+- Crash between the durable HumanReviewV5 owner write and the ledger wake, then restart and prove reconciliation is idempotent across independent dispatcher processes. The current test verifies duplicate decisions and two concurrent dispatcher loops, but not this crash cut or separate OS processes.
 - Extend mixed-order fault injection to real fetch/copy/planning/image/QA stage bodies with mocked external services, retaining all targets and successful artifacts.
 - Inject failures across candidate/workbook/package commits and verify every affected writer's stale-lease behavior. The diagnostic-file fencing test does not prove universal artifact fencing.
 - Measure queue age, fairness, memory/disk backlog and process cleanup under prolonged load. Do not infer these from a short unit-test pass.
