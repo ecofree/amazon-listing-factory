@@ -23,7 +23,7 @@ from core.vision_gemini_client import gemini_stream_generate
 def _write_service_receipt_then_wait(root: str, stage: str, ready) -> None:
     import psutil
     from core.service_response import SCHEMA, write_json
-    path=Path(root)/'000001-crash.json'
+    path=Path(root)/'crash.json'
     write_json(path, {
         'schema':SCHEMA,'id':'crash','sequence':1,'key':'crash-request',
         'owners':['copy:crash'],'status':'submitted','pid':os.getpid(),
@@ -122,6 +122,8 @@ class UnattendedProductionContractTests(unittest.TestCase):
             patch("core.vision_gemini_client._openai_chat_payload", return_value={}),
             patch("core.vision_gemini_client._post_json_preserve_redirects", return_value=response),
             patch("core.vision_gemini_client._image_part", side_effect=AssertionError("native parts were eager")),
+            patch("core.batch_ledger.admit_paid_request", return_value="synthetic-admission"),
+            patch("core.service_response.prepare_request"),
         ):
             result = gemini_stream_generate(
                 "prompt", [Path("missing-reference.png")], client_scope="visual_planning",

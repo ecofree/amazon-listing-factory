@@ -16,7 +16,9 @@ def run():
         root = Path(tmp)
         ledger = BatchLedger(root / 'batch.sqlite')
         ledger.create(policy={'workers': 4, 'max_paid_calls': 100, 'currency': 'USD',
-            'budget_microunits': 10000, 'request_upper_bounds': {'image': 100}}, source_revision='synthetic-test-only')
+            'budget_microunits': 10000, 'request_upper_bounds': {'image': 100},
+            'price_evidence': {'image': 'Synthetic fixed per-call ceiling for offline ledger exercise'}},
+            source_revision='synthetic-test-only')
         for number in range(100):
             spec = {'family': number, 'synthetic': True}
             row = ledger.enqueue(spec, root / str(number))
