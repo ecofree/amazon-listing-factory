@@ -534,9 +534,11 @@ def run_batch(path, *, drain=False, poll_seconds=2, stop_event=None):
 
 
 def _alive(row):
+    if not row['pid']:
+        return False
     try:
         process=psutil.Process(row['pid'])
-        return bool(row['pid'] and process.create_time()==row['process_start']
+        return bool(process.create_time()==row['process_start']
                     and process.status() not in {psutil.STATUS_ZOMBIE,getattr(psutil,'STATUS_DEAD','dead')})
     except psutil.NoSuchProcess:
         return False
