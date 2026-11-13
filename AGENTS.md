@@ -60,6 +60,13 @@ These rules apply to every future change in this repository.
 - Program code controls facts and process. Gemini controls visual planning.
   The image model executes the validated edit contract. QA only evaluates hard
   factual and publishing gates.
+- The existing sole QA stage may call a model to compare candidate pixels with
+  bound same-child references and check hard facts: product structure, sold
+  quantity, color, authored text, dimensions, and publishing requirements.
+  Do not add another reviewer, aesthetic scoring, visual planning, or automatic
+  regeneration. Missing evidence and uncertain conclusions go to the existing
+  human-review authority; they must never become automatic passes. A missing
+  `vision_qa` route is not a prerequisite failure for a generation-only run.
 - Do not add a new fallback when a required stage fails. Fail explicitly and
   fix the responsible stage.
 
@@ -75,3 +82,19 @@ Every code-change completion report must state:
 
 Passing tests alone is not proof of image quality. Do not claim image-generation
 quality is fixed until actual generated images have been inspected.
+
+## 7. Final Delivery Directory Layout
+
+- Organize delivered images as `Fianl_pics/<family_key>/<child_asin>/<role>.<ext>`.
+  Use an already known parent ASIN as family_key, otherwise the existing local
+  parent SKU. Never fetch an external parent ASIN solely for export, or record
+  a local SKU/child ASIN as an Amazon parent ASIN. Preserve existing directories.
+  Preserve the existing `Fianl_pics` spelling. Never flatten child directories
+  directly under `Fianl_pics`; derive parent-child membership from the batch's
+  verified family mapping, not from filenames or visual similarity.
+- Organize family templates as `Final_templates/<family_key>/<template_file>`.
+  Keep each child's image URL manifest with that child's images.
+- Preserve original successful images and unrelated existing delivery files.
+  Do not regenerate images to reorganize delivery directories; verify copied
+  or moved files against their source hashes and never silently overwrite
+  different content with the same filename.

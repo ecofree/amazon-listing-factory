@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from .measurement_sources import statement_evidence
+
 from pathlib import Path
 from typing import Any
 
 from .asset_manager import read_download_manifest
-from .candidate_state import CandidateStateError, current_candidate, candidate_by_sha
+from .candidate_state import CandidateStateError, current_candidate, candidate_by_sha, candidate_prompt_current, production_candidate_error
 from .design_reference_library import production_reference_error
 from .final_source_intents import read_final_source_intents
 from .image_prompt_compiler import image_branch_currentness, read_image_prompts
@@ -31,16 +33,34 @@ class ReleaseManifestError(RuntimeError):
 
 def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit: int = 0,
                            candidate_choices: dict[tuple[str, str], str] | None = None,
-                           use_working_candidates: bool = False) -> dict[str, Any]:
+                           use_working_candidates: bool = False, work_children: tuple[str, ...] = ()) -> dict[str, Any]:
     del limit
     job_path = Path(job_dir).resolve()
     family = _product_family(job_path)
     family_children = scoped_family_children(family, job_path)
-    expected_children = [str(row["asin"]) for row in family_children]
+    expected_children = [str(row['asin']) for row in family_children]
+    if (family.get('source') or {}).get('child_fetch_errors'):
+        from .run_scope import scoped_children
+        expected_children = scoped_children(job_path)
+    goal_children=list(expected_children)
+    active=None;unit_tasks=None
+    if work_children:
+        from .run_scope import execution_children
+        active=execution_children(job_path,work_children)
+        expected_children=[child for child in expected_children if child in active]
+        unit_tasks=[task for task in _optional_image_tasks(job_path,plugin.category_id) if task['child'] in active]
     policy = required_role_policy(plugin)
-    branch_current, branch_reason = image_branch_currentness(job_path, plugin)
+    branch_current, branch_reason = image_branch_currentness(job_path, plugin,**({'task_keys':{(t['child'],t['role']) for t in unit_tasks}} if active is not None else {}))
+    branch_issues={}
     if not branch_current:
-        tasks = _optional_image_tasks(job_path, plugin.category_id)
+        available=unit_tasks if unit_tasks is not None else _optional_image_tasks(job_path,plugin.category_id)
+        for task in available:
+            key=(task['child'],task['role'])
+            current,reason=image_branch_currentness(job_path,plugin,task_keys={key})
+            if not current:branch_issues[key]=reason
+        branch_current=any((t['child'],t['role']) not in branch_issues for t in available)
+    if not branch_current:
+        tasks = unit_tasks if unit_tasks is not None else _optional_image_tasks(job_path, plugin.category_id)
         source_coverage = source_inventory_coverage(job_path=job_path, plugin=plugin, tasks=tasks)
         production_completion = _production_task_completion(
             [], source_coverage=source_coverage, image_branch_error=branch_reason,
@@ -68,16 +88,15 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
             "children": children,
             "rows": [],
         })
-        return payload if candidate_choices is not None or use_working_candidates else _persist_release_manifest(job_path, payload)
-    prompts = read_image_prompts(job_path, category_id=plugin.category_id)["prompts"]
-    prompt_by_key = {
-        (str(row.get("child") or ""), str(row.get("role") or "")): row
-        for row in prompts
-    }
+        if work_children:payload.update(execution_view=True,goal_children=goal_children)
+        return payload if work_children or candidate_choices is not None or use_working_candidates else _persist_release_manifest(job_path, payload)
     tasks = [
         row for row in read_image_tasks(job_path, category_id=plugin.category_id)["tasks"]
-        if role_prefix(row.get("role"))
+        if role_prefix(row.get('role')) and (active is None or row['child'] in active)
     ]
+    keys={(t['child'],t['role']) for t in tasks} - branch_issues.keys()
+    prompts=read_image_prompts(job_path,category_id=plugin.category_id,task_keys=keys)['prompts']
+    prompt_by_key={(r['child'],r['role']):r for r in prompts}
     validate_task_inventory(tasks, expected_children, policy.counts)
     qa_path = job_path / "reports" / "qa_evidence_v5.jsonl"
     evidence_rows = read_qa_evidence(job_path) if qa_path.is_file() else []
@@ -87,22 +106,23 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
     parent = str(family["family"]["parent_asin"])
     for task in tasks:
         key = (task["child"], task["role"])
-        candidate_error = ""
+        candidate_error = branch_issues.get(key, '')
         selected = next((review for review in reviews.values() if (review["child"], review["role"]) == key and review.get("selected") is True), None)
         choice = (candidate_choices or {}).get(key, "" if use_working_candidates else str((selected or {}).get("candidate_sha256") or ""))
         try:
             candidate = ((candidate_by_sha(job_path, task, choice) if choice else current_candidate(job_path, task))
-                         if task["formation_status"] == "ready" else {})
+                         if task['formation_status'] == 'ready' and not candidate_error else {})
         except CandidateStateError as exc:
             candidate = {}
             candidate_error = f"CandidateStateError: {exc}"
-        candidate_prompt_current = _candidate_prompt_current(
+        prompt_current = candidate_prompt_current(
             task=task,
             candidate=candidate,
             prompt=prompt_by_key.get(key),
         ) if candidate else False
-        stale_candidate_prompt = bool(candidate and not candidate_prompt_current)
+        stale_candidate_prompt = bool(candidate and not prompt_current)
         if stale_candidate_prompt:
+            candidate_error = 'Candidate has no verified binding to the current task prompt'
             candidate = {}
         evidence = evidence_by_key.get((*key, candidate.get("candidate_sha256", "")))
         evidence_current = bool(
@@ -112,7 +132,7 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
         review = reviews.get((*key, candidate.get("candidate_sha256", "")))
         review_current = _review_is_current(review, task=task, candidate=candidate, evidence=evidence if evidence_current else {})
         human = str(review.get("decision") or "") if review_current else ""
-        reference_error = production_reference_error(job_path, task)
+        reference_error = (production_candidate_error(candidate) if candidate else '') or production_reference_error(job_path, task)
         generation_state = task_record_current(job_path, task["logical_task_id"], task["input_revision_id"])
         if task["formation_status"] == "blocked":
             final = "blocked_task"
@@ -122,17 +142,24 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
             final = "awaiting_generation"
         elif not evidence_current:
             final = "awaiting_qa"
-        elif automatic == "fail":
+        elif automatic == "fail" and human != "approve":
             final = "blocked_auto"
         elif reference_error:
             final = "blocked_reference"
-        elif human == "approve":
-            final = "approved"
         elif human == "reject":
             final = "rejected_human"
+        elif human == "approve" or automatic == "pass":
+            final = "approved"
         else:
             final = "awaiting_review"
         human_requirements = list(evidence.get("human_review_checklist") or _human_review_requirements(task["role_family"])) if evidence_current else _human_review_requirements(task["role_family"])
+        references=[{k:r.get(k) for k in ('source_id','path','sha256','purpose','kind')}
+                    for r in task.get('generation_references',[]) if r.get('kind')!='design_reference']
+        if candidate.get('revision_mode')=='targeted_edit':
+            from .candidate_state import _manifest_path
+            original=read_json(_manifest_path(job_path,task,candidate['candidate_revision']))
+            parent_ref=original['generation_references'][0]
+            references.append({**parent_ref,'source_id':'edit_parent','purpose':'Earlier candidate, not independent product truth'})
         rows.append({
             "parent": parent,
             "child": task["child"],
@@ -150,12 +177,16 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
                 if evidence_current and gate.get("warning") is True
             ],
             "unresolved_checks": [gate["gate"] for gate in (evidence or {}).get("gates", []) if evidence_current and gate["status"] == "inconclusive"],
+            "failed_checks": [gate["gate"] for gate in (evidence or {}).get("gates", []) if evidence_current and gate["status"] == "fail"],
             "source_sha256": task["source_sha256"],
+            'statement_evidence':statement_evidence(task),
             "human_decision": human,
             "human_reason": str(review.get("reason") or "") if review_current else "",
             "final_decision": final,
             "formation_status": task["formation_status"],
             "task_state": str(generation_state.get("status") or ""),
+            'recovery': {key:generation_state[key] for key in ('reason_code','next_action','resume_condition','remote_request_allowed') if key in generation_state},
+            'request_outcome': generation_state.get('request_outcome', ''),
             "task_error": (
                 task.get("formation_reason")
                 or candidate_error
@@ -165,6 +196,7 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
                 or ""
             ),
             "human_review_requirements": list(dict.fromkeys(human_requirements)),
+            'reference_images':references,
         })
     _assign_required_slots(rows, policy.counts)
     children = _child_status(rows, policy.counts, expected_children)
@@ -184,20 +216,8 @@ def build_release_manifest(*, job_dir: str | Path, plugin: ProductPlugin, limit:
         "children": children,
         "rows": rows,
     }
-    return _with_release_diagnostics(payload) if candidate_choices is not None or use_working_candidates else _persist_release_manifest(job_path, _with_release_diagnostics(payload))
-
-
-def _candidate_prompt_current(
-    *,
-    task: dict[str, Any],
-    candidate: dict[str, Any],
-    prompt: dict[str, Any] | None,
-) -> bool:
-    if not candidate or not isinstance(prompt, dict) or prompt.get("status") != "ready":
-        return False
-    if prompt.get("task_fingerprint") != task.get("task_fingerprint"):
-        return False
-    return str(candidate.get("task_prompt_fingerprint") or "") == str(prompt.get("prompt_sha256") or "")
+    if work_children:payload.update(execution_view=True,goal_children=goal_children)
+    return _with_release_diagnostics(payload) if work_children or candidate_choices is not None or use_working_candidates else _persist_release_manifest(job_path, _with_release_diagnostics(payload))
 
 
 def record_human_review(
@@ -245,7 +265,7 @@ def record_human_reviews(
         for key in sorted(requested):
             target = available[key]
             automatic = target["automatic_decision"]
-            if automatic == "unavailable" or (decision == "approve" and automatic == "fail"):
+            if automatic == "unavailable" or (decision == "approve" and automatic == "fail" and not target.get('failed_checks')):
                 raise ReleaseManifestError(f"Candidate cannot be approved before a factual failure is resolved: {key}: {automatic}")
             if decision == "approve":
                 _validate_resolutions(resolutions or [], target)
@@ -310,16 +330,29 @@ def review_queue(manifest: dict[str, Any], *, scope: str = "required") -> list[d
 
 def release_submit_ready(manifest: dict[str, Any]) -> bool:
     return all((
+        manifest.get('execution_view') is not True,
         manifest.get("status") == "success",
         (manifest.get("production_task_completion") or {}).get("status") == "success",
-        (manifest.get("source_inventory_coverage") or {}).get("status") == "success",
     ))
+
+
+def required_task_keys(manifest: dict[str, Any], children=()) -> set[tuple[str,str]]:
+    """Use the same best-usable role slots for scheduling and release."""
+    selected=set(children)
+    return {(row['child'],row['role']) for row in manifest.get('rows',[])
+            if row.get('required_slot') is True and (not selected or row['child'] in selected)}
+
+
+def release_order_complete(manifest: dict[str, Any]) -> bool:
+    """All frozen outputs, not merely the minimum listing role coverage."""
+    rows = manifest.get('rows') or []
+    return release_submit_ready(manifest) and bool(rows) and all(row.get('final_decision')=='approved' for row in rows)
 
 
 def source_inventory_coverage(
     *, job_path: Path, plugin: ProductPlugin, tasks: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Audit every scoped source; unresolved evidence blocks submit-ready only."""
+    """Audit every scoped source; consumption validity stays with bound tasks."""
     authority_errors: list[str] = []
     try:
         downloads = [
@@ -490,12 +523,20 @@ def _review_is_current(
     review: dict[str, Any] | None, *, task: dict[str, Any],
     candidate: dict[str, Any], evidence: dict[str, Any],
 ) -> bool:
-    if not review or not candidate or not evidence:
+    if not review or not candidate:
+        return False
+    # A later model run or rule/credential change cannot overturn a human veto
+    # on these same pixels. A different selection or explicit new review can.
+    if review.get('decision') == 'reject':
+        return review.get('candidate_sha256') == candidate.get('candidate_sha256')
+    if not evidence:
         return False
     try:
         _validate_resolutions(review.get("resolutions", []), {
             "candidate_sha256": candidate["candidate_sha256"], "source_sha256": task["source_sha256"],
+            'statement_evidence':statement_evidence(task),
             "unresolved_checks": [gate["gate"] for gate in evidence["gates"] if gate["status"] == "inconclusive"] if review.get("decision") == "approve" else [],
+            "failed_checks": [gate['gate'] for gate in evidence['gates'] if gate['status'] == 'fail'],
         })
     except ReleaseManifestError:
         return False
@@ -774,7 +815,10 @@ def _validate_review_payload(data: Any, *, job_id: str, label: Path) -> None:
 
 
 def _validate_resolutions(resolutions: list[dict[str, Any]], target: dict[str, Any]) -> None:
-    required = set(target.get("unresolved_checks") or [])
+    failed = set(target.get('failed_checks') or [])
+    if failed - {'product_fidelity', 'unauthorized_text', 'dimension_accuracy', 'edit_scope', 'main_background'}:
+        raise ReleaseManifestError('Deterministic candidate/identity failures cannot be overridden by a visual review')
+    required = set(target.get("unresolved_checks") or []) | failed
     matched = set()
     for row in resolutions:
         if not isinstance(row, dict) or row.get("candidate_sha256") != target["candidate_sha256"]:
@@ -782,9 +826,12 @@ def _validate_resolutions(resolutions: list[dict[str, Any]], target: dict[str, A
         if row.get("check") in required:
             if row.get("source_sha256") != target["source_sha256"] or row.get("conclusion") != "confirmed" or not str(row.get("evidence") or "").strip():
                 raise ReleaseManifestError("Factual resolution needs matching candidate/source SHA, confirmed conclusion and concrete evidence")
+            declarations={identity:value['raw_source']['sha256'] for identity,value in (target.get('statement_evidence') or {}).items()}
+            if row['check']=='dimension_accuracy' and declarations and row.get('statement_sources')!=declarations:
+                raise ReleaseManifestError('Declared dimension resolution must bind the exact statement IDs and raw source SHAs')
             matched.add(row["check"])
     if required - matched:
-        raise ReleaseManifestError("Human verification is required for these inconclusive checks: " + ", ".join(sorted(required - matched)))
+        raise ReleaseManifestError("Human verification is required for these unresolved checks: " + ", ".join(sorted(required - matched)))
 
 
 def _review_rows(job_path: Path) -> dict[tuple[str, str, str], dict[str, Any]]:

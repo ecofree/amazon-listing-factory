@@ -15,16 +15,14 @@ from .paths import FACTORY_ROOT
 SCHEMA_VERSION = 1
 DEFAULT_SEARCH_TERM_DB = FACTORY_ROOT / "data" / "search_terms.sqlite"
 
-PROJECT_CATEGORY_TO_SEARCH_CATEGORIES = {
-    "bed_frame": ("bed",),
-    "bed frame": ("bed",),
-    "bathroom_cabinet": ("cabinet",),
-    "bathroom cabinet": ("cabinet",),
-    "medicine_cabinet": ("cabinet",),
-    "medicine cabinet": ("cabinet",),
-    "artificial_tree": ("tree", "plants"),
-    "artificial tree": ("tree", "plants"),
-}
+def category_search_policy(category: str) -> dict:
+    from .plugin import load_plugin
+    try:policy=load_plugin(_normalize_project_category(category)).merged_config().get('search_terms',{})
+    except KeyError:return {}
+    fields={'categories','backend_synonyms','excluded_tokens','unsupported_tokens','identity_tokens','preserve_tokens','excluded_all_tokens'}
+    if not isinstance(policy,dict) or set(policy)-fields or any(not isinstance(v,list) or any(not isinstance(s,str) or not s.strip() for s in v) for v in policy.values()):
+        raise ValueError('Invalid category search_terms declaration')
+    return policy
 
 COLOR_WORDS = {
     "black",
@@ -59,14 +57,6 @@ STOPWORDS = {
     "with",
 }
 
-CATEGORY_EXCLUDED_TERMS = {
-    "bed": {"dog", "cat", "pet", "sofa", "air", "flower"},
-    "cabinet": {"lighting", "light", "hinge", "knob", "paint"},
-    "tree": {"cat", "tea", "christmas", "storage", "saddle", "oil", "planter"},
-    "plants": {"cat", "tea", "christmas", "storage", "saddle", "oil", "planter"},
-}
-
-BED_SIZE_TOKENS = {"twin", "full", "queen", "king", "california"}
 REFERENCE_TITLE_CORE_STARTERS = {
     "adjustable",
     "arched",
@@ -293,14 +283,15 @@ def title_reference_context(
     db = Path(db_path) if db_path else default_search_term_db(values)
     if not db.exists():
         return {}
-    project_category = _normalize_project_category(category)
-    search_categories = PROJECT_CATEGORY_TO_SEARCH_CATEGORIES.get(project_category, (_normalize_search_category(category),))
+    policy=category_search_policy(category)
+    search_categories=policy.get('categories',[])
+    if not search_categories:return {}
     references = search_title_references(
         db_path=db,
         search_categories=search_categories,
         source_title=source_title,
         product_specific=product_specific or {},
-        limit=_coerce_context_limit(values, limit),
+        policy=policy,limit=_coerce_context_limit(values, limit),
     )
     if not references:
         return {}
@@ -325,6 +316,7 @@ def search_title_references(
     search_categories: Iterable[str],
     source_title: str,
     product_specific: dict[str, Any],
+    policy: dict,
     limit: int = 6,
 ) -> list[dict[str, Any]]:
     db = Path(db_path)
@@ -354,11 +346,11 @@ def search_title_references(
             term_tokens = _tokenize(term)
             if not term_tokens:
                 continue
-            if _excluded_search_term(str(row["category"] or ""), term_tokens):
+            if _excluded_search_term(policy,term_tokens,product_tokens):
                 continue
             if _brand_search_term(row, term_tokens):
                 continue
-            if _entity_conflict(str(row["category"] or ""), product_tokens, term_tokens):
+            if _entity_conflict(policy,product_tokens,term_tokens):
                 continue
             overlap = len(term_tokens & product_tokens)
             exact = term.lower() in product_text.lower()
@@ -499,14 +491,8 @@ def _infer_category_from_filename(path: Path) -> str:
 
 def _normalize_search_category(value: Any) -> str:
     text = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
-    aliases = {
-        "bed_frame": "bed",
-        "bathroom_cabinet": "cabinet",
-        "medicine_cabinet": "cabinet",
-        "artificial_tree": "tree",
-        "plant": "plants",
-    }
-    return aliases.get(text, text)
+    categories=category_search_policy(text).get('categories',[])
+    return categories[0] if categories else 'plants' if text=='plant' else text
 
 
 def _normalize_project_category(value: Any) -> str:
@@ -566,11 +552,10 @@ def _flatten_product_specific(value: Any, *, depth: int = 0) -> str:
     return str(value or "")
 
 
-def _excluded_search_term(category: str, term_tokens: set[str]) -> bool:
-    excluded = CATEGORY_EXCLUDED_TERMS.get(category, set())
-    if category in {"tree", "plants"} and {"pot", "artificial", "tree"} <= term_tokens:
-        return True
-    return bool(term_tokens & excluded)
+def _excluded_search_term(policy: dict, term_tokens: set[str], product_tokens: set[str]) -> bool:
+    combined=set(policy.get('excluded_all_tokens',[]))
+    return bool(term_tokens & set(policy.get('excluded_tokens',[])) or combined and combined<=term_tokens
+        or term_tokens & set(policy.get('unsupported_tokens',[]))-product_tokens)
 
 
 def _brand_search_term(row: sqlite3.Row, term_tokens: set[str]) -> bool:
@@ -585,17 +570,11 @@ def _brand_search_term(row: sqlite3.Row, term_tokens: set[str]) -> bool:
     return False
 
 
-def _entity_conflict(category: str, product_tokens: set[str], term_tokens: set[str]) -> bool:
-    if category == "bed":
-        product_sizes = product_tokens & BED_SIZE_TOKENS
-        term_sizes = term_tokens & BED_SIZE_TOKENS
-        if term_sizes and product_sizes and not term_sizes <= product_sizes:
-            return True
-        if "bunk" in product_tokens and "bunk" not in term_tokens and "loft" not in term_tokens:
-            return True
-        if "loft" in product_tokens and "loft" not in term_tokens and "bunk" not in term_tokens:
-            return True
-    return False
+def _entity_conflict(policy: dict, product_tokens: set[str], term_tokens: set[str]) -> bool:
+    identity=set(policy.get('identity_tokens',[]));preserve=set(policy.get('preserve_tokens',[]))
+    product_values=product_tokens & identity;term_values=term_tokens & identity
+    return bool(term_values and product_values and not term_values<=product_values
+        or product_tokens & preserve and not term_tokens & preserve)
 
 
 def _sanitize_reference_title(title: str, brands: list[str]) -> str:

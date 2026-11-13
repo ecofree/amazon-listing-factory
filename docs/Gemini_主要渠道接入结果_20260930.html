@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gemini 主要渠道接入结果 · 2026-09-30</title>
+<style>body{font:16px/1.75 system-ui,sans-serif;color:#23303e;background:#f5f7fa;margin:0}main{max-width:1050px;margin:32px auto;padding:32px;background:white;border-radius:12px}h1{font-size:27px}h2{margin-top:30px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #dde3e9;text-align:left;padding:10px}th{background:#f1f5f8}.pending{color:#a44712}code{overflow-wrap:anywhere}a{color:#1763a6}</style>
+<main>
+<h1>Gemini 主要渠道接入结果</h1>
+<p>2026-09-30 最新更新：Zivv 3.8 已通过文字和读图调用验证并启用为主渠道；Zivv 3.7 保留候补。Krill 3.7／3.8 的权限问题仍待排查，继续保持未启用状态。</p>
+<h2>一、已配置的模型及优先级</h2>
+<table><tr><th>顺序</th><th>Provider</th><th>型号</th><th>优先级</th><th>当前状态</th></tr>
+<tr><td>1</td><td>Zivv</td><td>gemini-3.8-flash-tiered</td><td>160</td><td>已通过文字／读图调用，启用为主渠道</td></tr>
+<tr><td>2</td><td>Krill</td><td>gemini-3.8-flash</td><td>158</td><td class="pending">已注册；权限拒绝，暂未启用</td></tr>
+<tr><td>3</td><td>Krill</td><td>gemini-3.7-flash</td><td>155</td><td class="pending">替换旧 3.6 记录；权限拒绝，暂未启用</td></tr>
+<tr><td>4</td><td>Zivv</td><td>gemini-3.7-flash-tiered</td><td>150</td><td>继续启用，候补渠道</td></tr></table>
+<p>以上属于现有 visual_planning 路由，覆盖源图观察、视觉规划及设计绑定／蒙版审查。权限恢复并启用后，Krill、Zivv 的四条记录均排在 Nuwa、Yunwu 之前。本轮没有新增路由控制器或失败处理分支。</p>
+<p>Zivv 3.8、3.7 都处于启用状态；现有调度仍按优先级先使用 3.8、再使用 3.7。这是两个模型同时可用，尚未实现它们自动并行分担任务。若以后需要并行，宜按不同子体固定分配模型，同一子体保持固定规划／审查路由。</p>
+<h2>二、实际接口返回</h2>
+<ul><li>Zivv 3.8：首次接入曾返回 HTTP 403 / PERMISSION_DENIED，<code>model 'gemini-3.8-flash-tiered' is not allowed for this API key</code>。用户确认已放行后，本轮文字请求 9.015 秒、读图请求 7.875 秒，均通过。</li>
+<li>Krill 3.7、3.8：HTTP 403，明确返回 <code>your token is not authorized for any channel serving this model</code>。</li>
+<li>首次接入时分别读取了 Krill 视觉规划密钥、Krill 通用密钥、Zivv 密钥的模型列表。两个 Krill 列表均没有指定的 3.7／3.8 型号；当时 Zivv 列表包含 3.7-tiered，没有 3.8-tiered。该历史列表不代表 Zivv 的最新权限，以本轮实际成功调用为准。</li>
+<li>首次接入共六次失败 POST、三次只读模型列表 GET；本轮仅向 Zivv 3.8 提交了两次成功 POST，没有继续重试 Krill。</li></ul>
+<p>首次拒绝明确指向密钥的型号／渠道权限，没有证据归因于余额。Zivv 3.8 当前已证明文字与图像输入调用可用；尚未证明完整产品规划、正式生图或最终画质。</p>
+<p>Krill 后续需在后台放行现有密钥，或在本机更新 <code>KRILL_VISUAL_PLANNING_API_KEY</code>；恢复后直接验证并启用现有注册记录。</p>
+<h2>三、修改范围与删除项</h2>
+<ul><li>生产 Python 文件：新增 0、删除 0、修改 0。</li>
+<li>生产配置：修改 <code>configs/api_registry.json</code>、<code>configs/api_registry.example.json</code>，约增加 75 行、删除 10 行。</li>
+<li>测试：修改 <code>tests/test_model_router.py</code>，约增加 26 行、删除 2 行；替换原先仅检查虚构 ccsub 顺序的断言，验证真实注册表的启用过滤和目标优先级，测试用例数量不变。</li>
+<li>文档：修改 README（约 +9／−1 行），新增本报告。</li>
+<li>已物理移除旧 <code>krill_gemini_35_flash_visual_planning</code>／<code>gemini-3.6-flash</code> 注册记录，示例中的旧 Zivv 3.5-high 记录被替换。未留下旧型号别名或兼容调用路径；没有删除生产模块或保留退役测试。</li></ul>
+<h2>四、验证结果与限制</h2>
+<ul><li>定向测试：<code>tests.test_model_router tests.test_provider_smoke tests.test_env_layout</code>，修改初稿后 11 项通过（0.374 秒），最终配置后 11 项通过（0.361 秒）。</li>
+<li>生产测试：<code>scripts/run_production_tests.py</code>，本轮仅运行一次，100 项全部通过，15.767 秒。</li>
+<li>注册表校验：零错误、零警告；逐项比较确认 image_generation 与 vision_qa 配置未改动。</li>
+<li>没有提交生图请求，没有生成新图。本轮 Zivv 文字／读图调用通过不代表图像质量或 SAM 保护效果已改善。</li></ul>
+<h2>五、Zivv 3.8 启用本轮的验证</h2>
+<ul><li>修改生产注册配置 <code>configs/api_registry.json</code> 与示例 <code>configs/api_registry.example.json</code>，各将 Zivv 3.8 的 enabled 改为 true，合计约 +2／−2 行；同步修改 README 与本报告。生产 Python 文件新增、删除、修改均为 0。</li>
+<li>本轮没有废弃运行路径或测试需要移除，也没有新增测试用例。</li>
+<li>定向测试 <code>tests.test_model_router tests.test_provider_smoke tests.test_env_layout</code>：11 项通过，0.352 秒；生产测试 <code>scripts/run_production_tests.py</code>：本轮运行一次，100 项通过，15.354 秒。</li>
+<li>注册表校验零错误、零警告；确认当前视觉路由首位为 Zivv 3.8，Krill 两条记录仍未启用；生图和 vision_qa 注册记录未改动。</li></ul>
+<h2>六、证据</h2>
+<p><a href="../test_runs/zivv38_activation_20260930/live_check.json">Zivv 3.8 最新成功调用</a> · <a href="../test_runs/zivv38_activation_20260930/incremental_changes.json">本轮启用增量</a> · <a href="../test_runs/zivv38_activation_20260930/targeted_tests.log">本轮定向测试</a> · <a href="../test_runs/zivv38_activation_20260930/production_suite.log">本轮生产测试</a> · <a href="../test_runs/gemini_primary_routes_20260930/live_checks.json">首次接入错误详情</a> · <a href="../test_runs/gemini_primary_routes_20260930/model_permissions.json">首次型号列表核查</a></p>
+</main></html>

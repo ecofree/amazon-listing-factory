@@ -6,48 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_TEMPLATE_BRAND = "safeplus"
-DEFAULT_TEMPLATE_MANUFACTURER = "safeplus"
-DEFAULT_TEMPLATE_COUNTRY = "China"
-DEFAULT_TEMPLATE_CONDITION = "New"
-DEFAULT_TEMPLATE_QUANTITY = "200"
-DEFAULT_TEMPLATE_FULFILLMENT = "Fulfillment by Merchant (Default)"
-DEFAULT_TEMPLATE_PRODUCT_ID_TYPE = "GTIN Exempt"
-DEFAULT_TEMPLATE_DANGEROUS_GOODS = "Not Applicable"
-DEFAULT_TEMPLATE_INVENTORY_AVAILABLE = "true"
-
-
-def load_template_env(*paths: str | Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for path in paths:
-        if path:
-            values.update(read_env_file(path))
-    for key, value in os.environ.items():
-        if not (
-            key.startswith("DEFAULT_")
-            or key.startswith("AMAZON_FACTORY_")
-            or key.startswith("COPY_AI_")
-            or key.startswith("DEEPSEEK_")
-        ):
-            continue
-        if str(value or "").strip() == "":
-            continue
-        values[key] = value
-    return values
-
-
-def read_env_file(path: str | Path) -> dict[str, str]:
-    env_path = Path(path)
-    if not env_path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for line in env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
+from .io import environment_values as load_template_env
 
 
 def normalize_template_mode(value: str) -> str:
@@ -92,6 +51,9 @@ def resolve_template_path(
 
 
 def template_job_with_defaults(job: dict[str, Any], *, env: dict[str, str]) -> dict[str, Any]:
+    if job.get('business_input'):
+        from .job import _validate_business_input
+        _validate_business_input(job['business_input'],job)
     updated = dict(job)
     overrides = {
         "brand": _first_env_value(
@@ -113,24 +75,14 @@ def template_job_with_defaults(job: dict[str, Any], *, env: dict[str, str]) -> d
     for field, value in overrides.items():
         if value and not str(updated.get(field) or "").strip():
             updated[field] = value
-    defaults = {
-        "brand": DEFAULT_TEMPLATE_BRAND,
-        "manufacturer": DEFAULT_TEMPLATE_MANUFACTURER,
-        "country": DEFAULT_TEMPLATE_COUNTRY,
-        "condition": DEFAULT_TEMPLATE_CONDITION,
-        "quantity": DEFAULT_TEMPLATE_QUANTITY,
-        "fulfillment": DEFAULT_TEMPLATE_FULFILLMENT,
-        "inventory_available": DEFAULT_TEMPLATE_INVENTORY_AVAILABLE,
-        "dangerous_goods": DEFAULT_TEMPLATE_DANGEROUS_GOODS,
-        "product_id_type": DEFAULT_TEMPLATE_PRODUCT_ID_TYPE,
-    }
-    for field, value in defaults.items():
+    # Only explicit job/config values are business evidence. Missing values stay
+    # missing for the field plan; brand/GTIN never imply stock, manufacture or safety.
+    for field in ('brand','manufacturer','country','condition','quantity','fulfillment','inventory_available',
+                  'dangerous_goods','batteries_required','batteries_included','contains_battery','is_fragile','package_level'):
         current = updated.get(field)
         if current is None or (isinstance(current, str) and not current.strip()):
-            current = value
+            current = ''
         updated[field] = str(current).lower() if isinstance(current, bool) else str(current)
-    if updated.get("gtin_exempt") is None:
-        updated["gtin_exempt"] = True
     return updated
 
 
@@ -155,7 +107,7 @@ def child_sku(job: dict[str, Any], child: dict[str, Any], index: int) -> str:
 
 def parent_sku(job: dict[str, Any], parent_asin: str, child_skus: list[str]) -> str:
     prefix = safe_component(str(job.get("sku_prefix") or ""), fallback="")
-    base_asin = str(parent_asin or "PARENT").strip() or "PARENT"
+    base_asin = str(parent_asin or job.get('seed_asin') or "PARENT").strip()
     base = f"{prefix}-PARENT-{base_asin}" if prefix else base_asin
     used = {str(item or "").strip() for item in child_skus}
     if base not in used:

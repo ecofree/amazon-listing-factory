@@ -1,0 +1,31 @@
+{
+  "schema": "business-input-v2",
+  "scope": {
+    "seller_id": "safeplus",
+    "brand": "safeplus",
+    "marketplace": "US",
+    "category_id": "artificial_tree"
+  },
+  "source": "用户确认：商家及制造商safeplus；库存默认200并自行补货；China、FBM、New；参考对应ASIN定价；2026-11-11指定Your Price同有效List Price，无参考标价时List Price填0且售价使用已授权同子体有效价格；不含电池、非危险品；使用现有上传空间，其长期可用性由用户管理。",
+  "maintenance": "operator_managed",
+  "values": {
+    "manufacturer": "safeplus",
+    "country": "China",
+    "fulfillment": "FBM",
+    "condition": "New",
+    "contains_battery": false,
+    "batteries_included": false,
+    "dangerous_goods": "Not Applicable",
+    "gtin_exempt": true,
+    "publication_policy": {
+      "retention_mode": "operator_managed",
+      "verification_max_age_seconds": 3600,
+      "source": "用户负责现有上传空间及URL的长期可用性；3600秒仅为当前字节验证缓存窗口，不是URL到期时间或保留期承诺。"
+    }
+  },
+  "sku_defaults": {
+    "quantity": 200,
+    "price_policy": "same_as_list_price"
+  },
+  "sku_values": {}
+}

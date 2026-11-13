@@ -10,7 +10,6 @@ from unittest.mock import patch
 from core.text_evidence import extract_measurements, us_measurement_text, measurement_values_match
 from tests.current_image_contract_fixture import current_product_feature
 from core.template_field_values import template_dimensions_from_facts
-from core.image_qa import _line_matches_any, _unsupported_contract_lines
 from core.visual_design_kit import compact_product_claims
 from core.visual_design_kit_compiler import _reject_renderable_copy_instruction, VisualDesignKitCompileError
 
@@ -29,6 +28,8 @@ class UsMeasurementContractTests(unittest.TestCase):
 
     def test_fraction_and_compound_length_preserve_the_whole_quantity(self):
         self.assertEqual('38.1', extract_measurements('1 1/2 in')[0]['canonical_value'])
+        for source, target in [('½ in', '0.5 in'), ('¼ in', '0.25 in'), ('¾ in', '0.75 in'), ('3½ in', '3.5 in'), ('-3½ in', '-3.5 in'), ('½ x 3½ in', '0.5 x 3.5 in')]:
+            self.assertTrue(measurement_values_match(source, target), source)
         self.assertTrue(measurement_values_match('5 ft 6 in', '66 in'))
         self.assertTrue(measurement_values_match('20 ft', '240 in'))
         self.assertFalse(measurement_values_match('-1.2 kg', '1.2 kg'))
@@ -40,11 +41,22 @@ class UsMeasurementContractTests(unittest.TestCase):
                                             ('Under Bed 6 in', 'Under-bed 6 in', True)]:
             with self.subTest(source=source, candidate=candidate):
                 self.assertEqual(matches, measurement_values_match(source, candidate))
-        self.assertFalse(_line_matches_any('6 in', ['\u2264 6 in']))
+        for invalid in ('1/0 in', '1//2 in', '1/2/3 in'):
+            with self.assertRaises(ValueError):
+                extract_measurements(invalid)
+        self.assertEqual([], extract_measurements('100/150/350/500/750/1000 LEDs; 300/600/900 tips'))
+        self.assertTrue(measurement_values_match('100/150/350 LEDs, height 7 ft', '84 in'))
 
     def test_template_accepts_inline_and_separate_units(self):
+        from tests.four_stage_fixture import verify_selected_measurements
+        verify_selected_measurements(self)
+        from tests.statement_measurement_fixture import verify_statement_measurements
+        for annotation_mode in ('text_only','declared_diagram'):
+            with self.subTest(annotation_mode=annotation_mode):verify_statement_measurements(self,annotation_mode=annotation_mode)
         from products.generic_extractors import extract_specs_by_fields
-        facts = extract_specs_by_fields({'productDetails': {'Product Dimensions': '100 x 50 x 40 cm'}}, {'dimensions': ('Product Dimensions',)})
+        from tests.four_category_fixture import verify_dimension_axes
+        verify_dimension_axes(self)
+        facts = extract_specs_by_fields({'productDetails': {'Item Dimensions L x W x H': '100 x 50 x 40 cm'}}, {'dimensions': ('Item Dimensions L x W x H',)})
         projected = template_dimensions_from_facts(facts)
         self.assertEqual('39.37', projected['length'])
         self.assertEqual('15.75', projected['height'])
@@ -57,11 +69,6 @@ class UsMeasurementContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Conflicting explicit units'):
             template_dimensions_from_facts({'height': '100 cm', 'height_unit': 'in'})
 
-    def test_text_matching_never_erases_numeric_punctuation(self):
-        self.assertFalse(_line_matches_any('Load Capacity: 12 kg', ['Load Capacity: 1.2 kg']))
-        self.assertFalse(_line_matches_any('1/2 in', ['12 in']))
-        self.assertEqual([], _unsupported_contract_lines(['Heavy Duty', 'Support'], ['Heavy Duty Support']))
-
     def test_equal_values_keep_their_source_properties(self):
         claims = compact_product_claims({'specs': {'number_of_doors': 2, 'number_of_drawers': 2}, 'description': 'Two separate storage sections.'})
         self.assertEqual(3, len(claims))
@@ -69,101 +76,48 @@ class UsMeasurementContractTests(unittest.TestCase):
         height = compact_product_claims({'specs': {'height': '100', 'height_unit': 'cm'}})
         self.assertEqual(1, len(height))
         self.assertEqual('height: 39.37 in', height[0]['text'])
+        from core.product_family import fact_statement_issues, whole_part_counts
+        counts = {'number_of_shelves': {'status': 'confirmed', 'value': 10}}
+        local = 'The interior holds four shelves, and the side adds six shelves.'
+        self.assertEqual([], whole_part_counts(local, r'shel(?:f|ves)'))
+        self.assertEqual([], fact_statement_issues('Ten shelves: ' + local, counts))
+        self.assertEqual([], fact_statement_issues('The interior holds four shelves; the sides add six shelves.', counts))
+        self.assertEqual([], fact_statement_issues('Side: six shelves.', counts))
+        actual_description = ('The single mirrored door provides a clear reflection for grooming, while '
+                              'the interior holds four shelves and the sides add six open shelves, for ten shelves in total.')
+        self.assertEqual(['10'], whole_part_counts(actual_description, r'shel(?:f|ves)'))
+        self.assertEqual([], fact_statement_issues(actual_description, counts))
+        for verb in ('holds', 'contains', 'includes', 'has', 'adds', 'features'):
+            with self.subTest(local_verb=verb):
+                self.assertEqual([], fact_statement_issues(f'The left compartment {verb} four shelves.', counts))
+        for text in ('Four shelves.', 'The cabinet has four shelves.',
+                     'The interior is spacious. The cabinet contains four shelves.',
+                     'The sides add storage. The cabinet contains six shelves.',
+                     'Ten shelves; the cabinet holds four shelves.'):
+            with self.subTest(whole_count=text):
+                self.assertEqual(['number_of_shelves'], fact_statement_issues(text, counts))
+        self.assertEqual(['number_of_shelves'], fact_statement_issues('Ten shelves.', {
+            'number_of_shelves': {'status': 'conflicted', 'value': None}}))
 
     def test_layout_language_does_not_authorize_literal_copy(self):
         _reject_renderable_copy_instruction('Place the title above the product with generous spacing.', 'direction')
         with self.assertRaises(VisualDesignKitCompileError):
             _reject_renderable_copy_instruction('Write the title: Best Product', 'direction')
 
-    def test_observer_cache_changes_with_model_without_image_generation(self):
-        from core.visual_semantics import observe_candidate
-        from core.io import file_sha256
-        from tests.test_qa_lite_v1 import _task, _observed
-        task = {**_task('main'), 'product_facts': {}}
-        task['generation_references'][0].update(kind='edit_base', path='source.png', sha256='a' * 64, purpose='Original view')
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(_observed(task))) as request:
-            (Path(tmp) / 'source.png').write_bytes(b'original source fixture')
-            task['generation_references'][0]['sha256'] = file_sha256(Path(tmp) / 'source.png')
-            candidate = {'candidate_path': 'image.png', 'candidate_sha256': 'c' * 64}
-            with patch('core.vision_gemini_client.gemini_scope_execution_revision', return_value='model1'):
-                observe_candidate(Path(tmp), task, candidate)
-                observe_candidate(Path(tmp), task, candidate)
-            with patch('core.vision_gemini_client.gemini_scope_execution_revision', return_value='model2'):
-                observe_candidate(Path(tmp), task, candidate)
-            self.assertEqual(2, request.call_count)
-            prompt = request.call_args.args[0]
-            output = json.loads(prompt.split('OUTPUT OBJECT (these fields are top-level):\n', 1)[1])
-            self.assertIn('text_coverage', output)
-            self.assertNotIn('schema', output)
-            self.assertIn('named {left,top,right,bottom}', prompt)
-        from core.io import file_sha256
-        from core.image_qa import _semantic_gates
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / 'source.png').write_bytes(b'original source fixture')
-            parent_path, prompt_path = Path(tmp) / 'parent.png', Path(tmp) / 'edit.txt'
-            parent_path.write_bytes(b'parent test bytes')
-            prompt_path.write_text('# Revision request\nFix title spacing only', encoding='utf-8')
-            candidate.update(revision_mode='targeted_edit', edit_parent_candidate_sha256=file_sha256(parent_path),
-                             prompt_path='edit.txt', request_prompt_fingerprint=file_sha256(prompt_path))
-            response = _observed(task)
-            response['edit_comparison'] = {**response['product_comparisons'][0], 'status': 'contradiction', 'evidence': 'Unrequested drawer removed'}
-            with patch('core.candidate_state.candidate_by_sha', return_value={'candidate_path': 'parent.png'}), patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)) as request:
-                observed = observe_candidate(Path(tmp), task, candidate)
-                self.assertIn('Fix title spacing only', request.call_args.args[0])
-                self.assertEqual(parent_path, request.call_args.args[1][-1])
-                self.assertEqual('fail', _semantic_gates(task, observed)[-1]['status'])
-        task = {**_task('size', 'source_image'), 'product_facts': {}}
-        task['generation_references'] = [
-            dict(kind='edit_base', source_id='source_00', path='source.png', purpose='Product original', sha256=''),
-            dict(kind='measurement_evidence', source_id='source_02', path='measurement.png', purpose='Measure only', sha256='')]
-        task['measurement_authority']['measurement_groups'] = [
-            dict(id='source_02:width', source_id='source_02', measured_part='Cabinet', axis='width', evidence_type='dimension_line')]
-        response = _observed(task)
-        response.update(measurement_coverage='complete', measurements=[{
-            'measurement_id': 'source_02:width', 'object': 'Cabinet width', 'source_id': 'source_02', 'attachment_index': 2,
-            'source_text': '17 in', 'candidate_text': '17 in', 'relationship': 'same', 'confidence': .99,
-            'source_region': dict(left=.1, top=.1, right=.3, bottom=.3),
-            'candidate_region': dict(left=.1, top=.1, right=.3, bottom=.3)}])
-        candidate = {'candidate_path': 'image.png', 'candidate_sha256': 'c'*64}
-        with tempfile.TemporaryDirectory() as tmp:
-            job = Path(tmp)
-            for reference in task['generation_references']:
-                path = job / reference['path']
-                path.write_bytes(reference['source_id'].encode())
-                reference['sha256'] = file_sha256(path)
-            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)):
-                with self.assertRaisesRegex(ValueError, 'different source attachment'):
-                    observe_candidate(job, task, candidate)
-            response['measurements'][0]['attachment_index'] = 3
-            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps(response)) as request:
-                observe_candidate(job, task, candidate)
-                context = json.loads(request.call_args.args[0].split('INPUT CONTEXT:\n')[1].split('\nOUTPUT OBJECT')[0])
-                binding = context['measurement_sources'][0]
-                self.assertEqual(3, binding['attachment_index'])
-                self.assertNotIn('source_region', binding)
-                self.assertEqual('size', context['required_targets'][0]['target_id'])
-                self.assertNotIn('source_text', binding)
-            path = next((job / 'reports/candidate_observations').glob('*.json'))
-            corrupted = json.loads(path.read_text(encoding='utf-8'))
-            corrupted['measurements'][0]['attachment_index'] = 2
-            path.write_text(json.dumps(corrupted), encoding='utf-8')
-            with patch('core.visual_semantics.gemini_stream_generate') as remote:
-                with self.assertRaisesRegex(ValueError, 'different source attachment'):
-                    observe_candidate(job, task, candidate)
-                remote.assert_not_called()
-
     def test_local_failure_is_current_evidence_without_remote_observation(self):
         from core.image_qa import _evaluate
         from core.qa_evidence import evidence_is_current
         from tests.test_qa_lite_v1 import _task
         task, candidate = _task('main'), {'candidate_path': 'image.png', 'candidate_sha256': 'c' * 64}
-        with tempfile.TemporaryDirectory() as tmp, patch('core.image_qa._local_gates', return_value=[{'gate': 'image_integrity', 'status': 'fail', 'evidence': 'Broken image'}]), patch('core.image_qa.observe_candidate') as remote:
+        with tempfile.TemporaryDirectory() as tmp, patch('core.image_qa._local_gates', return_value=[{'gate': 'image_integrity', 'status': 'fail', 'evidence': 'Broken image'}]), patch('core.vision_gemini_client.gemini_stream_generate', side_effect=AssertionError('Broken images must stop before paid QA')) as remote:
             evidence = _evaluate(Path(tmp), object(), task, candidate)
             self.assertTrue(evidence_is_current(evidence, task, candidate))
             self.assertEqual('fail', evidence['automatic_decision'])
             remote.assert_not_called()
 
     def test_source_disposition_is_explicit_and_sha_bound(self):
+        from tests.recovery_contract_fixture import verify_observation_scope
+        verify_observation_scope(self)
         from core.final_source_intents import record_source_intent_review, _current_source_intent_reviews
         downloads = [{'status': 'ok', 'child': 'B1', 'index': 1, 'source_sha256': 'a' * 64}]
         with tempfile.TemporaryDirectory() as tmp, patch('core.final_source_intents.ensure_run_scope'), patch('core.final_source_intents.row_in_scope', return_value=True), patch('core.final_source_intents.read_download_manifest', return_value={'rows': downloads}):

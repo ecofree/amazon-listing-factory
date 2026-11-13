@@ -6,10 +6,21 @@ lifecycle: production_ready
 amazon_category: Home & Kitchen > Bath > Bathroom Furniture > Medicine Cabinets
 browse_node_id: ""
 
+search_terms:
+  categories: [cabinet]
+  backend_synonyms: [medicine storage, bathroom cabinet, bathroom storage]
+  excluded_tokens: [hinge, knob, paint]
+  unsupported_tokens: [freestanding, pantry, drawer, drawers, mirror, mirrored, lighting, light]
+  identity_tokens: []
+  preserve_tokens: []
+  excluded_all_tokens: []
+
 template:
+  allowed_item_type_hints: ["Medical Cabinets (medicine-cabinets)"]
   engine: template_field_plan
   path_env: AMAZON_MEDICINE_CABINET_TEMPLATE
   default_path: templates/Medcine_CABINET.xlsm
+  product_type: CABINET
 
 variation_themes:
   - COLOR
@@ -27,9 +38,10 @@ extractors:
     material:
       - Material
       - Material Type
+    top_material:
       - Top Material Type
-      - Frame Material Type
-      - Frame Material
+      - Top Material
+      - Tabletop Material
     color:
       - Color
       - Colour
@@ -41,6 +53,9 @@ extractors:
     mounting_type:
       - Mounting Type
       - Installation Type
+    item_depth:
+      - Item Depth
+      - Product Depth
     dimensions:
       - Product Dimensions
       - Item Dimensions
@@ -70,12 +85,6 @@ extractors:
     room_type:
       - Room Type
       - Recommended Uses For Product
-competitor_keywords:
-  - medicine cabinet
-  - mirrored cabinet
-  - bathroom mirror cabinet
-  - recessed medicine cabinet
-  - wall mounted medicine cabinet
 
 category_match:
   require_positive_match: true
@@ -121,6 +130,17 @@ required_role_policy:
     func: 1
 
 image_generation:
+  statement_measurements:
+    item_depth:
+      subject: product
+      axis: depth
+      label: Declared cabinet depth
+      source_fields: [Item Depth, Product Depth]
+      tuple_fields: [Item Dimensions D x W x H, Product Dimensions, Item Dimensions]
+  planning_guidance:
+    - "A medicine cabinet may have mirror, clear glass or opaque doors. Only an observed mirror surface has an environment reflection; changing that reflection does not change its frame, hinges or door count."
+    - "Bind side cubbies, interior shelves and whole-cabinet totals separately. Preserve source-visible fixing plates, handles and metal colors; do not hardcode a historical example's compartment count."
+    - "Use observed door swing and surface/recessed mounting, without inventing hidden support or recess depth. Lighting, power and battery facts require evidence; kitchen or entryway use is allowed only when this child supports it."
   main_image_policy: white_background
   template_image_role_order: [main, scene, func, size]
   structure_invariants:
@@ -132,7 +152,31 @@ image_generation:
   allowed_internal_props:
     - small toiletries inside open shelves or compartments
   replaceable_staging:
-    - loose toiletries, towels, flowers, containers, wall decor, countertop props, and room surfaces not attached to the cabinet
+    - target_id: room.wall
+      physical_scope: Non-sold room wall surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: room.floor
+      physical_scope: Non-sold room floor or rug surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: bath.towels
+      physical_scope: Loose towels not sold with the cabinet
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: bath.toiletries
+      physical_scope: Loose toiletries not sold with the cabinet
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: decor.loose_props
+      physical_scope: Independent non-sold flowers, containers, countertop props and wall decor
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
   forbidden_additions:
     - part: lights
       unless_source_visible: true

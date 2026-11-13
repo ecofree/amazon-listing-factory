@@ -87,11 +87,13 @@ def discover_plugins(products_root: Path = PRODUCTS_ROOT) -> dict[str, ProductPl
 
 
 def load_plugin(category_id: str, products_root: Path = PRODUCTS_ROOT) -> ProductPlugin:
-    plugins = discover_plugins(products_root)
-    if category_id not in plugins:
-        available = ", ".join(sorted(plugins)) or "(none)"
-        raise KeyError(f"Unknown product category '{category_id}'. Available: {available}")
-    return plugins[category_id]
+    root = (products_root / category_id).resolve()
+    if not category_id or root.parent != products_root.resolve() or not (root / 'manifest.yaml').is_file():
+        raise KeyError(f"Unknown product category '{category_id}'")
+    manifest = load_yaml(root / 'manifest.yaml')
+    if not isinstance(manifest, dict) or manifest.get('category_id', root.name) != category_id:
+        raise ValueError(f"Plugin manifest identity does not match its directory: {root}")
+    return ProductPlugin(category_id=category_id, root=root, manifest=manifest)
 
 
 def _generic_extractors(plugin: ProductPlugin) -> Any:
@@ -125,6 +127,8 @@ def _generic_extractors(plugin: ProductPlugin) -> Any:
         return generic_extractors.extract_variations(raw, seed_asin, variation_dimensions)
 
     return SimpleNamespace(
+        contract={'fields': fields, 'aliases': _extractor_aliases(extractor_cfg), 'variation_dimensions': variation_dimensions,
+                  'category_id': plugin.category_id, 'product_type': plugin.product_type},
         extract_specs=extract_specs,
         product_specific=product_specific,
         extract_variations=extract_variations,

@@ -23,6 +23,46 @@ from core.plugin import discover_plugins, load_plugin
 from core.status import job_run_lock, load_status
 
 
+def cmd_workspace_init(args):
+    from core.batch_ledger import initialize_fresh_workspace
+    result=initialize_fresh_workspace(decision_id=args.decision_id,reason=args.reason,fresh=args.fresh)
+    print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+
+
+def cmd_batch(args):
+    from core.batch_ledger import BatchLedger
+    from core.production_batch import create_batch, run_batch
+    ledger = BatchLedger(args.state)
+    ledger.require_workspace()
+    if args.action == 'create':
+        if not args.input:
+            raise ValueError('batch create requires --input')
+        ledger = create_batch(args.state, read_json(args.input))
+    elif args.action == 'run':
+        run_batch(args.state, drain=args.drain)
+    elif args.action in {'pause', 'resume'}:
+        if args.action=='resume':ledger.require_workspace()
+        ledger.pause(args.action == 'pause')
+    elif args.action=='rebind-source':
+        from core.production_batch import production_revision
+        ledger.rebind_source(expected=args.expected_revision,revision=production_revision(),decision_id=args.decision_id,reason=args.reason)
+    elif args.action=='revise-order':
+        ledger.revise_order(args.order_id,spec=read_json(args.input),expected_spec=args.expected_revision,decision_id=args.decision_id,reason=args.reason)
+    elif args.action=='authorize-budget':
+        ledger.authorize_policy(read_json(args.input),expected_revision=args.expected_revision,decision_id=args.decision_id,reason=args.reason)
+    elif args.action == 'serve':
+        from core.batch_console import serve
+        serve(ledger.path, port=args.port, dispatch=args.dispatch)
+        return 0
+    rows = ledger.rows()
+    print(json.dumps({'state': str(ledger.path), 'paused': bool(ledger.settings()['paused']),
+        'enrollment_results':getattr(ledger,'enrollment_results',[]),
+        'counts': {state: sum(row['state'] == state for row in rows) for state in sorted({row['state'] for row in rows})},
+        'jobs': [{key: row[key] for key in ('id', 'path', 'state', 'attempt', 'reason', 'package')} for row in rows],
+        'cost': ledger.cost()}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -69,7 +109,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     plugins = discover_plugins()
     errors = []
     warnings = []
-    registry_errors, registry_warnings = api_registry.validate_registry()
+    registry_errors, registry_warnings = model_router.validate_routes()
     errors.extend(registry_errors)
     warnings.extend(registry_warnings)
     for plugin in plugins.values():
@@ -173,6 +213,9 @@ def cmd_new_job(args: argparse.Namespace) -> int:
         out_root=args.out_root,
         design_pack_path=args.design_pack,
         brand_brief_path=args.brand_brief,
+        business_input_path=getattr(args,'business_input',''),
+        seller_id=getattr(args,'seller_id',''),listing_intent=getattr(args,'listing_intent','standard'),
+        max_family_members=getattr(args,'max_family_members',None),
     )
     payload: dict[str, object] = {"job": str(job), "job_json": str(job / "job.json"), "category_id": plugin.category_id}
     if detected:
@@ -190,6 +233,15 @@ def cmd_classify_asin(args: argparse.Namespace) -> int:
 def _detect_category_for_asin(asin: str, *, marketplace: str = "US", config_path: str = "") -> dict[str, object]:
     from core.category_guard import guess_category_from_raw
     from core.io import load_env
+    from core.batch_ledger import BatchLedger, AdmissionDenied
+    database,key,lease=(os.environ.get(k) for k in ('FACTORY_BATCH_DB','FACTORY_BATCH_JOB','FACTORY_BATCH_LEASE'))
+    if not database or not key or not lease:
+        raise AdmissionDenied('Category discovery requires an explicit diagnostic budget before any remote lookup')
+    worker=BatchLedger(database).worker(key,lease)
+    spec=json.loads(worker['spec'])
+    if spec.get('purpose') != 'source_discovery' or str(spec.get('seed_asin') or '').upper()!=str(asin).strip().upper():
+        raise AdmissionDenied('Discovery authorization does not name this ASIN and purpose')
+    receipt_root=Path(worker['path'])/'source/apify_requests'
 
     errors: list[str] = []
     raw: dict[str, object] = {}
@@ -204,6 +256,7 @@ def _detect_category_for_asin(asin: str, *, marketplace: str = "US", config_path
             actor_id=env_any(env, "APIFY_ACTOR_ID", required=True),
             marketplace=marketplace,
             timeout_seconds=180,
+            receipt_root=receipt_root,
         )
         raw = client.fetch_product(asin)
     except Exception as exc:
@@ -237,8 +290,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     load_env(config_path, override=False)
     stages = [stage.strip() for stage in args.stages.split(",") if stage.strip()] if args.stages else None
     write_excel = bool(args.write_excel or (not args.production and (stages is None or "template" in stages)))
+    selection_path = getattr(args, 'generation_tasks', None)
+    if selection_path is not None and (not isinstance(selection_path, str) or not selection_path.strip()):
+        raise ValueError('--generation-tasks requires a nonempty JSON file path')
+    selection = json.loads(Path(selection_path).read_text(encoding='utf-8-sig')) if selection_path is not None else None
+    if selection_path is not None and (not isinstance(selection, list) or not selection):
+        raise ValueError('--generation-tasks requires a nonempty JSON list of current task identities')
+    planning_path=getattr(args,'planning_tasks',None)
+    planning=json.loads(Path(planning_path).read_text(encoding='utf-8-sig')) if planning_path is not None else None
+    if planning_path is not None and (not isinstance(planning,list) or not planning):
+        raise ValueError('--planning-tasks requires a nonempty JSON list of child/role/visual_design_kit_id')
     request = JobRunRequest(
         job_dir=job_dir,
+        planning_tasks=None if planning is None else tuple(planning),
+        generation_tasks=None if selection is None else tuple(selection),
+        all_generation_tasks=getattr(args, 'all_generation_tasks', False),
+        brand_brief_path=getattr(args, 'brand_brief', '') or '',
         plugin=plugin,
         config_path=config_path,
         workers=args.workers,
@@ -251,13 +318,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         resume=bool(args.resume),
         dry_run=bool(args.dry_run),
         retry_copy=bool(getattr(args, "retry_copy", False)),
+        execution_policy=getattr(args, 'execution_policy', 'progressive'),
     )
-    if getattr(args, "brand_brief", "") and not args.dry_run:
-        from core.design_reference_library import update_brand_design_brief
-
-        update_brand_design_brief(job_dir, brief_path=args.brand_brief)
     summary = run_job(request, stages=stages)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if selection is not None and not args.dry_run and not summary.get('error') and summary.get('workflow_status')!='failed':
+        return {'success':0,'partial_success':4}.get((summary.get('generation_invocation') or {}).get('status'),1)
     return {"success": 0, "pending": 1, "awaiting_review": 3, "partial_success": 4, "dry_run": 0}.get(
         str(summary.get("workflow_status") or ""), 1
     )
@@ -299,9 +365,6 @@ def cmd_review(args: argparse.Namespace) -> int:
         raise RuntimeError("--candidate-sha256 requires one child/role target")
     if bool(args.child) != bool(args.role):
         raise RuntimeError("Review requires both --child and --role, or neither for an explicit scoped batch")
-    quality_score = int(getattr(args, "quality_score", 0) or 0)
-    if quality_score and (not args.approve or not args.child):
-        raise RuntimeError("--quality-score is supported only for a single child/role approval")
     batch_targets: list[tuple[str, str]] = []
     if args.child:
         manifest = record_human_review(
@@ -333,19 +396,6 @@ def cmd_review(args: argparse.Namespace) -> int:
             decision=decision,
             reason=args.reason,
             resolutions=resolutions,
-        )
-    if quality_score:
-        from core.image_provider_routing import record_provider_quality_score
-
-        row = next((item for item in manifest.get("rows", []) if item.get("child") == args.child and item.get("role") == args.role), {})
-        record_provider_quality_score(
-            job_dir,
-            category_id=plugin.category_id,
-            child=args.child,
-            role=args.role,
-            candidate_path=str(row.get("local_path") or ""),
-            score=quality_score,
-            reason_tags=[item.strip() for item in str(getattr(args, "quality_tags", "") or "").split(",") if item.strip()],
         )
     result = manifest if args.child else {
         "status": "reviewed",
@@ -407,6 +457,7 @@ def cmd_revise(args: argparse.Namespace) -> int:
             config_path=config_path,
             production=bool(args.production),
             revision_mode=args.mode, candidate_sha256=args.candidate_sha256,
+            upscale_artifact_confirmed=args.upscale_artifact_confirmed,
         )
         attempt_id = uuid.uuid4().hex
         if result.get("tasks"):
@@ -415,6 +466,109 @@ def cmd_revise(args: argparse.Namespace) -> int:
             record_task_failures(job_dir, owner_stage="generate", attempt_id=attempt_id, failures=result["failures"])
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 1 if result.get("failures") else 0
+
+
+def cmd_update_business_inputs(args: argparse.Namespace) -> int:
+    from core.job import update_business_inputs
+    result=update_business_inputs(args.job,args.input,expected_job_sha256=args.expected_job_sha256,
+        decision_id=args.decision_id,reason=args.reason)
+    print(json.dumps(result,ensure_ascii=False,indent=2))
+    return 0
+
+
+def cmd_resolve_service_response(args: argparse.Namespace) -> int:
+    from core.service_response import resolve_service_response
+    receipt = Path(args.receipt).resolve()
+    job = Path(args.job).resolve()
+    allowed = receipt.is_relative_to(job / 'source') or receipt.is_relative_to(job / 'reports')
+    if not allowed:
+        raise ValueError('Service receipt must belong to the enrolled job/diagnostic source or reports directory')
+    with job_run_lock(job):
+        result = resolve_service_response(receipt, action=args.action, reason=args.reason)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_planning_status(args: argparse.Namespace) -> int:
+    from core.visual_design_kit import planning_status
+    job=Path(args.job).resolve()
+    plugin=load_plugin(load_job(job)['category_id'])
+    print(json.dumps(planning_status(job,plugin,child=args.child),indent=2,ensure_ascii=False))
+    return 0
+
+
+def cmd_resolve_planning_response(args: argparse.Namespace) -> int:
+    from core.planning_journal import PlanningJournal, journal_path
+    from core.planning_identity import journal_scope
+    job=Path(args.job).resolve()
+    with job_run_lock(job):
+        scope=journal_scope(job,args.child)
+        journal=PlanningJournal(journal_path(job,args.child),child=args.child,scope_key=scope,initialize=False)
+        row=journal.read()['requests'][args.request_id]
+        if row['status']!='retry_authorized':
+            journal.settle_attempt(args.request_id,job=job,trace=row['context']['trace'],known_unsent=row.get('physical_count')==0)
+        row=journal.read()['requests'][args.request_id]
+        if args.action=='accept_retry_risk' and row['status'] in {'unknown','retry_authorized'}:
+            row=journal.accept_retry_risk(args.request_id,reason=args.reason)
+        result={'request_id':args.request_id,'status':row['status'],'remaining':journal.remaining(row['kind']),
+                'resolution':row.get('resolution'),'requests_sent':0,'recovery_mode':'local_saved_response_only'}
+    print(json.dumps(result,indent=2,ensure_ascii=False))
+    return 0
+
+
+def cmd_measurement_source(args: argparse.Namespace) -> int:
+    from core.measurement_sources import configure_statement_measurements
+    job=Path(args.job).resolve();plugin=load_plugin(load_job(job)['category_id'])
+    result=configure_statement_measurements(job,plugin,read_json(args.input),apply=args.apply,
+        proposal_sha256=args.proposal_sha256,decision_id=args.decision_id,reason=args.reason)
+    print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+
+
+def cmd_recovery_contract(args: argparse.Namespace) -> int:
+    """Explicit local operations dispatched to their existing stage owners."""
+    from core.visual_semantics import reconcile_observation_scope
+    from core.image_response import finalize_received_result
+    from core.candidate_state import adopt_saved_candidate
+    from core.image_tasks import reproject_image_contracts
+    job=Path(args.job).resolve();request=read_json(args.input)
+    options=dict(apply=args.apply,proposal_sha256=args.proposal_sha256,decision_id=args.decision_id,reason=args.reason)
+    if args.command in {'adopt-saved-candidate','reproject-image-contracts'}:
+        owner=adopt_saved_candidate if args.command=='adopt-saved-candidate' else reproject_image_contracts
+        result=owner(job,load_plugin(load_job(job)['category_id']),request,**options)
+    else:
+        owner=reconcile_observation_scope if args.command=='reconcile-observation-scope' else finalize_received_result
+        result=owner(job,request,**options)
+    print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+
+
+def cmd_role_restoration(args: argparse.Namespace) -> int:
+    from core.visual_design_kit import restore_role_contract,cancel_role_restoration
+    job=Path(args.job).resolve()
+    if args.command=='cancel-role-restoration':
+        result=cancel_role_restoration(job,child=args.child,decision_id=args.decision_id,
+            expected_artifact_sha256=args.expected_artifact_sha256,reason=args.reason)
+    else:
+        plugin=load_plugin(load_job(job)['category_id'])
+        result=restore_role_contract(job,plugin,read_json(args.input),apply=args.apply,
+            decision_id=args.decision_id,reason=args.reason,proposal_sha256=args.proposal_sha256)
+    print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+
+
+def cmd_planning_action(args: argparse.Namespace) -> int:
+    """Current planning authorities only; no old-format conversion or model request."""
+    from core.visual_design_kit import require_current_plan_contract,adopt_planner_proposal
+    job=Path(args.job).resolve();require_current_plan_contract(job)
+    if args.command=='adopt-planning-proposal':
+        result=adopt_planner_proposal(job,child=args.child,role=args.role,response_path=args.response_path,
+            response_sha256=args.response_sha256,key=args.key,authorization_id=args.decision_id,reason=args.reason)
+    else:
+        from core.planning_journal import PlanningJournal,journal_path
+        from core.planning_identity import journal_scope
+        with job_run_lock(job):
+            journal=PlanningJournal(journal_path(job,args.child),child=args.child,scope_key=journal_scope(job,args.child),initialize=False)
+            state=journal.grant(kind=args.kind,additional=args.additional,reason=args.reason,grant_id=args.decision_id)
+            result={'child':args.child,'limits':state['limits'],'requests_sent':0}
+    print(json.dumps(result,ensure_ascii=False,indent=2));return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -428,6 +582,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 reason="Operator explicitly repaired stale running state from status command",
             )
     state = load_status(job_path)
+    from core.status import runtime_presence
+    from core.candidate_state import candidate_inventory
+    from core.image_response import response_submission_metrics
     release_path = job_path / "reports" / "release_manifest_v6.json"
     release = read_json(release_path) if release_path.is_file() else {}
     retryable_generation = [
@@ -448,6 +605,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         physical_files = None
     payload = {
         **state,
+        **runtime_presence(job_path,state),
+        **candidate_inventory(job_path,release.get('rows',[])),
+        **response_submission_metrics(job_path),
         "release_diagnostics": (release.get("diagnostics") or {}) if isinstance(release, dict) else {},
         "physical_candidate_file_count": physical_files,
         "candidate_count_scope": "Files on disk include old revisions; release diagnostics are the last evaluated snapshot, not a new acceptance.",
@@ -462,25 +622,35 @@ def cmd_validate_template(args: argparse.Namespace) -> int:
     job_dir = Path(args.job)
     plan_path = Path(args.plan) if args.plan else job_dir / "template" / "plan.json"
     try:
-        if not bool(getattr(args, "rebuild", False)) and plan_path.exists():
-            plan = read_json(plan_path)
-        else:
+        if plan_path.resolve() != (job_dir / 'template' / 'plan.json').resolve():
+            raise ValueError('Template validation requires this job\'s canonical plan; arbitrary unbound plans are not accepted')
+        mode = getattr(args, 'template_mode', '') or 'submit_ready'
+        plan_only = bool(getattr(args, 'rebuild', False))
+        job = load_job(job_dir)
+        plugin = _load_plugin_for_job(args, job)
+        if plan_only:
             from core.template_engine import build_template_plan
-
-            job = load_job(job_dir)
-            plugin = _load_plugin_for_job(args, job)
-            plan = build_template_plan(
-                job_dir=job_dir,
-                plugin=plugin,
-                config_path=args.config,
-                write_excel=False,
-                template_mode=getattr(args, "template_mode", ""),
-            )
-        audit = [item for item in plan.get("audit", []) if isinstance(item, dict)] if isinstance(plan, dict) else []
+            plan = build_template_plan(job_dir=job_dir, plugin=plugin, config_path=getattr(args, 'config', ''),
+                                       write_excel=False, template_mode=mode)
+        else:
+            plan = read_json(plan_path)
+        if not isinstance(plan, dict) or not isinstance(plan.get('audit'), list):
+            raise ValueError('Template plan is not a current plan object')
+        from core.template_contract import template_plan_current
+        current = template_plan_current(job_dir=job_dir, plugin=plugin, config_path=getattr(args, 'config', ''),
+                                        mode=mode, write_excel=not plan_only)
+        audit = [item for item in plan['audit'] if isinstance(item, dict)]
         errors = [item for item in audit if str(item.get("severity") or "").strip().lower() == "error"]
         warnings = [item for item in audit if str(item.get("severity") or "").strip().lower() == "warning"]
+        if current and not errors and not plan_only and mode == 'submit_ready':
+            from core.publish import assert_published_release_complete
+            assert_published_release_complete(job_dir=job_dir, plugin=plugin)
+        if not current:
+            errors.append({'severity': 'error', 'message': 'Template inputs, mode, permissions or output receipts are stale/missing'})
         result = {
             "ok": not errors,
+            "validation_scope": 'plan_only' if plan_only else 'workbook_and_current_contract',
+            "upload_ready": not errors and not plan_only and mode == 'submit_ready',
             "plan": str(plan_path),
             "errors": len(errors),
             "warnings": len(warnings),
@@ -515,6 +685,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Amazon multi-category listing factory.")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser('batch', help='Create, run, inspect or serve an explicitly enrolled persistent batch.')
+    p.add_argument('action', choices=('create','run','status','pause','resume','serve','rebind-source','revise-order','authorize-budget'))
+    from core.batch_ledger import workspace_ledger_path
+    p.add_argument('--state', default=str(FACTORY_ROOT/'runtime/production.sqlite'), help='Only the configured workspace ledger is executable; no independent spending domains.')
+    p.add_argument('--input', default='', help='Explicit job manifest, seller bindings or full revised execution spec.')
+    p.add_argument('--drain', action='store_true', help='Exit after runnable work drains; default dispatcher stays resident.')
+    p.add_argument('--decision-id', default='')
+    p.add_argument('--reason', default='')
+    p.add_argument('--expected-revision', default='')
+    p.add_argument('--order-id', default='')
+    p.add_argument('--existing-job',default='',help='Exact original job path for explicitly scoped enrollment; never copied or scanned.')
+    p.add_argument('--port', type=int, default=8766)
+    p.add_argument('--dispatch',action='store_true',help='Explicitly run the existing resident dispatcher alongside the console; UI alone sends no work.')
+    p.set_defaults(func=cmd_batch)
+
     p = sub.add_parser("plugins", help="List product plugins.")
     p.set_defaults(func=cmd_plugins)
 
@@ -539,7 +724,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--write", action="store_true")
     p.set_defaults(func=cmd_normalize_env)
 
+    p=sub.add_parser('workspace-init',help='Explicit fresh installation only; never replaces existing financial configuration or creates spending permission.')
+    p.add_argument('--fresh',action='store_true')
+    p.add_argument('--decision-id',required=True);p.add_argument('--reason',required=True)
+    p.set_defaults(func=cmd_workspace_init)
+
+    p = sub.add_parser('update-business-inputs', help='Apply one scoped, evidence-backed business decision; no requests or budget changes.')
+    p.add_argument('--job', required=True)
+    p.add_argument('--input', required=True)
+    p.add_argument('--expected-job-sha256', required=True)
+    p.add_argument('--decision-id', required=True)
+    p.add_argument('--reason', required=True)
+    p.set_defaults(func=cmd_update_business_inputs)
+
     p = sub.add_parser("new-job", help="Create a product-neutral factory job.")
+    p.add_argument('--business-input', default='', help='Scoped business-input-v2 JSON; SKU inventory/price require seller and expiry.')
+    p.add_argument('--seller-id', default='')
+    p.add_argument('--listing-intent', default='standard')
     p.add_argument("--category", required=True, help="Product plugin category, or 'auto' to classify the ASIN first.")
     p.add_argument("--asin", required=True)
     p.add_argument("--brand", required=True)
@@ -561,6 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--product-id-type", default="")
     p.add_argument("--product-id", default="")
     p.add_argument("--out-root", default=str(Path(__file__).resolve().parents[1] / "jobs"))
+    p.add_argument("--max-family-members", type=int, help="For candidate selection only: skip an oversized family after the seed response.")
     p.add_argument("--design-pack", default="", help="Optional approved local design-pack JSON; imported into this job.")
     p.add_argument("--brand-brief", default="", help="Optional brand design brief JSON; does not change product facts or seller defaults.")
     p.set_defaults(func=cmd_new_job)
@@ -580,11 +782,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=0, help="Generation concurrency cap; 0 selects a hardware/provider-aware limit.")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument('--children', default='', help='Explicit comma-separated child ASINs for a new frozen debug scope; all source images are selected')
+    generation_scope = p.add_mutually_exclusive_group()
+    p.add_argument('--planning-tasks', default=None, help='Brief-only selection of {child,role,visual_design_kit_id}; optional revision_note asks the planner to reconsider that role against specific audit feedback')
+    generation_scope.add_argument('--generation-tasks', default=None, help='Nonempty JSON list of {child,role,task_fingerprint}; generate-only debug execution, validated before state changes')
+    generation_scope.add_argument('--all-generation-tasks', action='store_true', help='Explicitly return from limited testing to all tasks in the current RunScope; does not clear receipts or expand RunScope')
     p.add_argument("--upload", action="store_true")
     p.add_argument("--write-excel", action="store_true", help="Write XLSM; enabled automatically whenever the selected stages include template.")
     p.add_argument("--resume", action="store_true", help="Resume from the current job_state.json stage state.")
+    p.add_argument('--execution-policy', choices=('progressive', 'strict'), default='progressive', help='Progressive: defer future prerequisites; strict: require immediate-delivery readiness before starting.')
     p.add_argument("--retry-copy", action="store_true", help="Explicitly retry terminal copy failures for the current input revision.")
-    p.add_argument("--dry-run", action="store_true", help="Print the resolved stage plan without executing network calls.")
+    p.add_argument("--dry-run", action="store_true", help="Preview stages; explicit task selections also validate current tasks/prompts without provider calls or receipt recovery.")
     p.add_argument("--production", action="store_true", help="Run the canonical production flow through human review, publish, and template.")
     p.add_argument(
         "--template-mode",
@@ -595,8 +802,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("review", help="List or review current candidates; required rows are the default queue.")
-    p.add_argument("--response-receipt", default="", help="Resolve one unknown paid-request receipt; never sends an image request.")
-    p.add_argument("--response-action", choices=["confirmed_not_generated", "approve_one_resend"], default="")
+    p.add_argument("--response-receipt", default="", help="Resolve one unknown or rejected paid-output receipt; never sends an image request.")
+    p.add_argument("--response-action", choices=["confirmed_not_generated", "approve_one_resend", "approve_unavailable_result_resend"], default="", help="Unavailable-result replacement requires recorded 404/410, retained envelope, no native bytes and operator risk confirmation.")
     p.add_argument("--candidate-sha256", default="", help="Explicit candidate selection for one child/role.")
     p.add_argument("--resolutions", default="", help="JSON list of source/candidate-bound resolutions for inconclusive facts.")
     p.add_argument("--job", required=True)
@@ -609,8 +816,6 @@ def build_parser() -> argparse.ArgumentParser:
     decision.add_argument("--approve", action="store_true")
     decision.add_argument("--reject", action="store_true")
     p.add_argument("--reason", default="")
-    p.add_argument("--quality-score", type=int, default=0, choices=[0, 1, 2, 3, 4, 5], help="Optional human image-quality score for provider routing statistics; 1-5, single child/role approval only.")
-    p.add_argument("--quality-tags", default="", help="Optional comma-separated provider quality tags such as good_style,bad_text.")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser(
@@ -624,8 +829,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", required=True)
     p.set_defaults(func=cmd_review_source)
 
-    p = sub.add_parser("revise", help="Edit a selected candidate, or explicitly request a full redraw.")
-    p.add_argument("--mode", choices=["targeted_edit", "full_redraw"], default="targeted_edit")
+    p = sub.add_parser("revise", help="Revise a candidate; publication_reprocess is local Lanczos recovery for confirmed upscale artifacts only.")
+    p.add_argument("--mode", choices=["targeted_edit", "full_redraw", "publication_reprocess"], default="targeted_edit")
+    p.add_argument("--upscale-artifact-confirmed", action="store_true", help="Confirm an observed upscale artifact on --candidate-sha256; required only for publication_reprocess, not a QA approval.")
     p.add_argument("--candidate-sha256", default="")
     p.add_argument("--job", required=True)
     p.add_argument("--category", default="")
@@ -635,6 +841,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", required=True)
     p.add_argument("--production", action="store_true")
     p.set_defaults(func=cmd_revise)
+
+    p = sub.add_parser('resolve-service-response', help='Resolve one scoped fetch/copy/OCR/observation/QA/diagnostic receipt; no request or candidate approval.')
+    p.add_argument('--job', required=True)
+    p.add_argument('--receipt', required=True)
+    p.add_argument('--action', required=True, choices=['recover_saved_response', 'confirmed_not_executed', 'approve_one_retry', 'approve_received_retry'])
+    p.add_argument('--reason', required=True)
+    p.set_defaults(func=cmd_resolve_service_response)
+
+    p = sub.add_parser('planning-status', help='Read-only current evidence/contract issues, child allowances and original pending request IDs; no recovery or POST.')
+    p.add_argument('--job', required=True)
+    p.add_argument('--child', default='')
+    p.set_defaults(func=cmd_planning_status)
+
+    p = sub.add_parser('resolve-planning-response', help='Recover a locally saved planning reply or explicitly accept unknown-result retry risk; does not query the provider, send a request or replenish budget.')
+    p.add_argument('--job', required=True)
+    p.add_argument('--child', required=True)
+    p.add_argument('--request-id', required=True)
+    p.add_argument('--action', required=True, choices=['recover_received', 'accept_retry_risk'])
+    p.add_argument('--reason', required=True)
+    p.set_defaults(func=cmd_resolve_planning_response)
+
+    p=sub.add_parser('configure-measurement-source',help='Preview an explicit size-only product-statement permission or revocation. No invented facts, model request, QA approval or receipt settlement.')
+    p.add_argument('--job',required=True);p.add_argument('--input',required=True,help='JSON child/role/action; authorize also requires source_id and declared fact fields')
+    p.add_argument('--apply',action='store_true')
+    for field in ('proposal-sha256','decision-id','reason'):p.add_argument('--'+field,default='')
+    p.set_defaults(func=cmd_measurement_source)
+
+    for command in ('reproject-image-contracts','adopt-saved-candidate','finalize-received-result','reconcile-observation-scope'):
+        p=sub.add_parser(command,help='Explicit local-only recovery through the current owner. Default preview; no model request, new allowance, QA approval or publication.')
+        p.add_argument('--job',required=True);p.add_argument('--input',required=True,help='Exact scope and SHA-bound evidence JSON')
+        p.add_argument('--apply',action='store_true')
+        for field in ('proposal-sha256','decision-id','reason'):p.add_argument('--'+field,default='')
+        p.set_defaults(func=cmd_recovery_contract)
+
+    p=sub.add_parser('restore-role-contract',help='Preview one pending role against exact saved acceptance/candidate evidence; --apply is a local zero-request transaction, not QA approval.')
+    p.add_argument('--job',required=True);p.add_argument('--input',required=True,help='JSON request with child/role/expected_kit_id and immutable snapshot/origin/candidate references')
+    p.add_argument('--apply',action='store_true')
+    for field in ('decision-id','reason','proposal-sha256'):p.add_argument('--'+field,default='')
+    p.set_defaults(func=cmd_role_restoration)
+
+    p=sub.add_parser('cancel-role-restoration',help='Cancel only an unfinished local restoration with exact plan SHA; remote requests and spending are never cancelled or reset.')
+    for field in ('job','child','decision-id','expected-artifact-sha256','reason'):p.add_argument('--'+field,required=True)
+    p.set_defaults(func=cmd_role_restoration)
+
+    for command in ('grant-planning','adopt-planning-proposal'):
+        p=sub.add_parser(command,help='Explicit current planning authority; no migration, remote request or candidate approval.')
+        for field in ('job','child','decision-id','reason'):p.add_argument('--'+field,required=True)
+        if command=='grant-planning':
+            p.add_argument('--kind',choices=['plan','tool_calls'],required=True)
+            p.add_argument('--additional',type=int,required=True)
+        else:
+            for field in ('role','response-path','response-sha256','key'):p.add_argument('--'+field,required=True)
+        p.set_defaults(func=cmd_planning_action)
 
     p = sub.add_parser("status", help="Print job status.")
     p.add_argument("--job", required=True)
@@ -724,7 +983,31 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        return int(args.func(args))
+        reviewed=None
+        if getattr(args,'job',None) and not getattr(args,'list',False) and args.func in {cmd_review,cmd_review_source,cmd_update_business_inputs,
+                cmd_resolve_service_response,cmd_resolve_planning_response,cmd_measurement_source,
+                cmd_recovery_contract,cmd_role_restoration,cmd_planning_action}:
+            from core.batch_ledger import BatchLedger,workspace_ledger_path
+            from core.production_batch import review_revision
+            from sqlite3 import Error as LedgerError
+            try:
+                path=workspace_ledger_path()
+                if path.is_file():
+                    ledger=BatchLedger(path)
+                    row=next((r for r in ledger.rows() if r['state']=='exception' and Path(r['path']).resolve()==Path(args.job).resolve()),None)
+                    if row:
+                        reviewed=(ledger,row['id'],None)
+                        reviewed=(ledger,row['id'],review_revision(Path(args.job),ledger=ledger))
+            except (OSError,ValueError,KeyError,TypeError,LedgerError):pass  # Evidence repair must remain possible even when old evidence is unreadable.
+        code=int(args.func(args))
+        if code==0 and reviewed:
+            ledger,key,before=reviewed
+            try:
+                after=review_revision(Path(args.job),ledger=ledger)
+                if after!=before:ledger.requeue(key,review_revision=after,explicit=True)
+            except (OSError,ValueError,KeyError,TypeError,LedgerError) as exc:
+                print(f'Owner action saved; automatic queue notification unavailable: {type(exc).__name__}',file=sys.stderr)
+        return code
     except Exception as exc:
         from core.status import JobLockError
 

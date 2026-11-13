@@ -36,11 +36,55 @@ class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def authorize_download_recheck(job_dir, targets, *, decision_id, reason):
+    """One bounded source-GET retry, bound to current failed rows, not all URLs."""
+    from .job import load_job
+    from .status import job_run_lock
+    from .io import write_json
+    job=Path(job_dir).resolve()
+    if not decision_id or not str(reason).strip() or not isinstance(targets,list) or not targets:raise ValueError('Explicit failed-source selection and reason required')
+    with job_run_lock(job):
+        metadata=load_job(job);grants=metadata.setdefault('download_rechecks',[])
+        prior=next((r for r in grants if r['id']==decision_id),None)
+        if prior:
+            if prior['targets']!=targets or prior['reason']!=reason:raise ValueError('Recheck decision reused with different content')
+            return prior
+        failed={(r['child'],r['index']):r for r in read_download_manifest(job)['rows'] if r['status']=='failed'}
+        inventory={_inventory_key(r) for r in _expected_inventory(job)};requests=[];seen=set()
+        for target in targets:
+            if set(target)!={'child','index'} or type(target['index']) is not int:raise ValueError('Select child/index from failed downloads')
+            key=(target['child'],target['index'])
+            if key in seen or key not in failed:raise ValueError('Recheck selection is repeated or not a current failure')
+            seen.add(key);row=failed[key]
+            if _inventory_key(row) not in inventory:raise ValueError('Source URL changed; rebuild the current download inventory')
+            requests.append({'child':row['child'],'index':row['index'],'url':row['url'],'attempts':row.get('attempts',0)})
+        grant={'id':decision_id,'reason':reason,'targets':targets,'requests':requests,'consumed_urls':[]}
+        grants.append(grant);write_json(job/'job.json',metadata);return grant
+
+
+def _download_recheck(job, rows, *, consume=False):
+    from .process_lock import process_file_lock
+    from .io import read_json,write_json
+    path=job/'job.json'
+    if not path.is_file():return False
+    with process_file_lock(job/'.download-rechecks.lock'):
+        metadata=read_json(path)
+        for grant in metadata.get('download_rechecks',[]):
+            for request in grant['requests']:
+                if request['url'] in grant['consumed_urls']:continue
+                if any(all(row.get(k,0 if k=='attempts' else None)==v for k,v in request.items()) for row in rows):
+                    if consume:
+                        grant['consumed_urls'].append(request['url']);write_json(path,metadata)
+                    return True
+    return False
+
+
 def download_reference_images(
     *,
     job_dir: str | Path,
     plugin: ProductPlugin,
     max_images: int = 0,
+    work_children: tuple[str, ...] = (),
     force: bool = False,
     workers: int = 0,
     deadline_monotonic: float | None = None,
@@ -48,9 +92,11 @@ def download_reference_images(
     job_path = Path(job_dir).resolve()
     inventory = _expected_inventory(job_path, max_images=max_images)
     previous = {} if force else _previous_download_rows(job_path)
+    from .run_scope import execution_children
+    selected=execution_children(job_path,work_children)
     groups: dict[str, list[dict[str, Any]]] = {}
     for item in inventory:
-        groups.setdefault(item["url"], []).append(item)
+        if item['child'] in selected:groups.setdefault(item['url'], []).append(item)
 
     def execute(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reusable = next(
@@ -62,6 +108,7 @@ def download_reference_images(
             ),
             None,
         )
+        recheck = _download_recheck(job_path,[previous.get(_inventory_key(item),{}) for item in group])
         active = [
             item
             for item in group
@@ -69,6 +116,7 @@ def download_reference_images(
                 previous.get(_inventory_key(item), {}).get("status") == "failed"
                 and not bool(previous.get(_inventory_key(item), {}).get("retryable"))
                 and previous.get(_inventory_key(item), {}).get("input_revision_id") == _download_input_revision(item["url"])
+                and not recheck
             )
         ]
         if reusable is not None:
@@ -85,7 +133,7 @@ def download_reference_images(
                 )
                 for item in group
             ]
-        if not active:
+        if not active or recheck and not _download_recheck(job_path,[previous.get(_inventory_key(item),{}) for item in group],consume=True):
             return [dict(previous[_inventory_key(item)]) for item in group]
         object_name = hashlib.sha256(group[0]["url"].encode("utf-8")).hexdigest()
         try:
@@ -114,6 +162,7 @@ def download_reference_images(
                 if previous.get(_inventory_key(item), {}).get("status") == "failed"
                 and not bool(previous.get(_inventory_key(item), {}).get("retryable"))
                 and previous.get(_inventory_key(item), {}).get("input_revision_id") == _download_input_revision(item["url"])
+                and not recheck
                 else _download_failure_row(
                     item=item, exc=exc, previous=previous.get(_inventory_key(item))
                 )
@@ -131,7 +180,13 @@ def download_reference_images(
     else:
         for group in grouped:
             rows.extend(execute(group))
-    rows.sort(key=lambda row: (str(row["child"]), int(row["index"])))
+    active_rows=list(rows)
+    for item in inventory:
+        if item['child'] in selected:continue
+        rows.append(previous.get(_inventory_key(item),{**item,'status':'deferred','raw_path':'','source_sha256':'',
+            'logical_task_id':_download_task_id(item['child'],item['url']),'input_revision_id':_download_input_revision(item['url']),
+            'attempts':0,'retryable':False,'error':'Not requested in this work unit'}))
+    rows.sort(key=lambda row: (str(row['child']), int(row['index'])))
     artifact = {
         "schema_version": DOWNLOAD_MANIFEST_SCHEMA_VERSION,
         "inventory_fingerprint": _inventory_fingerprint(inventory),
@@ -139,10 +194,10 @@ def download_reference_images(
         "rows": rows,
     }
     write_json(_manifest_file(job_path), artifact)
-    failures = [row for row in rows if row.get("status") != "ok"]
+    failures = [row for row in active_rows if row.get('status') != 'ok']
     return {
         "schema_version": DOWNLOAD_MANIFEST_SCHEMA_VERSION,
-        "tasks": rows,
+        "tasks": active_rows,
         "failures": [
             {
                 "task": {
@@ -176,7 +231,7 @@ def read_download_manifest(job_dir: str | Path) -> dict[str, Any]:
         if status == "ok":
             if _manifest_path(job_path, raw_path) is None:
                 raise ValueError(f"Download manifest row {index} has an unsafe raw_path: {raw_path!r}")
-        elif status == "failed":
+        elif status in {'failed','deferred'}:
             if raw_path:
                 raise ValueError(f"Failed download manifest row {index} must not retain raw_path")
         else:
@@ -184,7 +239,8 @@ def read_download_manifest(job_dir: str | Path) -> dict[str, Any]:
     return data
 
 
-def download_artifacts_current(job_dir: str | Path, *, max_issues: int = 20) -> tuple[bool, list[str]]:
+def download_artifacts_current(job_dir: str | Path, *, max_issues: int = 20, children: set[str] | None = None,
+                               source_keys: set[tuple[str,int]] | None = None) -> tuple[bool, list[str]]:
     """Validate inventory provenance, not whether every download succeeded."""
     job_path = Path(job_dir).resolve()
     try:
@@ -194,22 +250,27 @@ def download_artifacts_current(job_dir: str | Path, *, max_issues: int = 20) -> 
         return False, [f"invalid download authority: {type(exc).__name__}: {exc}"]
     issues: list[str] = []
     rows = artifact["rows"]
-    if artifact.get("inventory_fingerprint") != _inventory_fingerprint(expected):
-        issues.append("download inventory fingerprint does not match current image URLs")
-    actual_keys = [_inventory_key(row) for row in rows]
-    expected_keys = [_inventory_key(row) for row in expected]
-    if len(actual_keys) != len(set(actual_keys)):
+    if artifact.get('inventory_fingerprint') != _inventory_fingerprint(rows):
+        issues.append('download inventory fingerprint does not match its recorded rows')
+    all_keys = [_inventory_key(row) for row in rows]
+    def consumed(row):
+        return ((children is None or row['child'] in children)
+                and (source_keys is None or (row['child'],row['index']) in source_keys))
+    actual_keys = [_inventory_key(row) for row in rows if consumed(row)]
+    expected_keys = [_inventory_key(row) for row in expected if consumed(row)]
+    if len(all_keys) != len(set(all_keys)):
         issues.append("download manifest contains duplicate inventory rows")
     if set(actual_keys) != set(expected_keys):
         issues.append("download inventory does not match ProductFamilyV3 image URLs")
     for row in rows:
+        if not consumed(row):continue
         label = f"{row.get('child', '?')}/source_{row.get('index', '?')}"
         if row.get("input_revision_id") != _download_input_revision(str(row.get("url") or "")):
             issues.append(f"{label}: download validation policy changed")
         if row.get("status") == "ok":
             if not _download_row_reusable(job_path, row):
                 issues.append(f"{label}: successful row has a missing, invalid, or changed image")
-        elif row.get("status") != "failed":
+        elif row.get('status') not in {'failed','deferred'}:
             issues.append(f"{label}: invalid status {row.get('status')!r}")
         elif not str(row.get("error") or "").strip():
             issues.append(f"{label}: failure has no recorded error")
@@ -242,7 +303,8 @@ def _inventory_key(row: dict[str, Any]) -> tuple[str, int, str]:
 
 def _inventory_fingerprint(rows: Iterable[dict[str, Any]]) -> str:
     return input_revision_id(
-        [{"child": child, "index": index, "url": url} for child, index, url in map(_inventory_key, rows)]
+        sorted(({"child": child, "index": index, "url": url} for child, index, url in map(_inventory_key, rows)),
+               key=lambda row: (row['child'], row['index'], row['url']))
     )
 
 
@@ -411,7 +473,7 @@ def _download_once(url: str, out_no_ext: Path, *, deadline_monotonic: float | No
     with urllib.request.build_opener(_PublicRedirectHandler()).open(request, timeout=timeout) as response:
         # Re-check the connected peer to close the DNS-rebinding gap between
         # assert_public_http_url() and urllib's actual socket connection.
-        assert_response_peer_public(response, hostname=urlparse(url).hostname or "")
+        assert_response_peer_public(response, hostname=urlparse(url).hostname or '', url=url)
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0]
         maximum = _maximum_download_bytes()
         declared = int(response.headers.get("Content-Length") or 0)

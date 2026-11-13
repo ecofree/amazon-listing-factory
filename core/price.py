@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import re
 from typing import Any
 
@@ -9,7 +10,7 @@ _NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d{1,7})(?:\.\d{1,2})?"
 _PRICE = re.compile(rf"^(?:US\$|\$|USD\s*)?\s*({_NUMBER})\s*(?:USD)?$", re.IGNORECASE)
 
 
-def normalize_price_value(value: Any) -> str:
+def normalize_price_value(value: Any, *, allow_zero: bool = False) -> str:
     """Normalize one Apify/template price value or return an empty value.
 
     Only one standalone amount is accepted.  Ranges, prose such as ``Was
@@ -19,7 +20,7 @@ def normalize_price_value(value: Any) -> str:
 
     if isinstance(value, dict):
         for key in ("value", "amount", "salePrice", "currentPrice", "price", "raw", "list_price"):
-            normalized = normalize_price_value(value.get(key))
+            normalized = normalize_price_value(value.get(key), allow_zero=allow_zero)
             if normalized:
                 return normalized
         return ""
@@ -30,8 +31,8 @@ def normalize_price_value(value: Any) -> str:
             amount = float(value)
         except (TypeError, ValueError):
             return ""
-        return f"{amount:.2f}" if amount > 0 else ""
-    text = html.unescape(str(value or "")).strip()
+        return f"{amount:.2f}" if math.isfinite(amount) and (round(amount, 2) > 0 or allow_zero and amount == 0) else ""
+    text = html.unescape(str(value if value is not None else "")).strip()
     if not text:
         return ""
     match = _PRICE.fullmatch(text)
@@ -41,4 +42,4 @@ def normalize_price_value(value: Any) -> str:
         amount = float(match.group(1).replace(",", ""))
     except ValueError:
         return ""
-    return f"{amount:.2f}" if amount > 0 else ""
+    return f"{amount:.2f}" if amount > 0 or allow_zero and amount == 0 else ""

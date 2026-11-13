@@ -15,6 +15,17 @@ from core.url_safety import UrlResolutionError, UnsafeUrlError, assert_public_ht
 
 class RootCauseRemediationTests(unittest.TestCase):
     def test_apify_normalized_facts_match_product_family_schema(self) -> None:
+        from tests.continuity_flow_fixture import verify_partial_scope
+        from tests.continuity_contract_fixture import verify_scope_promotion
+        verify_partial_scope(self); verify_scope_promotion(self)
+        from tests.unit_work_fixture import verify_fetch_unit
+        verify_fetch_unit(self)
+        from tests.four_category_fixture import verify_identity_and_variants
+        verify_identity_and_variants(self)
+        from tests.christmas_recovery_fixture import verify_equivalent_facts
+        verify_equivalent_facts(self)
+        from tests.audit_source_fixture import verify_source_identity_and_facts, verify_fetch_recovery_binding
+        verify_source_identity_and_facts(self); verify_fetch_recovery_binding(self)
         from products.generic_extractors import image_urls
         own = [f"https://m.media-amazon.com/images/I/own{i}._AC_SL1500_.jpg" for i in range(8)]
         mixed = "https://m.media-amazon.com/images/I/81mdYYNNueL._AC_SL1500_.jpg"
@@ -22,15 +33,16 @@ class RootCauseRemediationTests(unittest.TestCase):
                "variations": [{"asin": "B0FFMWB9XV", "highResolutionImages": ["https://example.com/sibling.jpg"]}]}
         self.assertEqual([*own, mixed], image_urls(raw))
         normalized = apify._normalized_child_facts(variation_values={"Size": "Full"}, specs={"Product Dimensions": '78" L x 56" W x 65" H'}, specific={}, offer={"list_price": "199.99", "currency": "USD"}, sold_unit_count=1, package_quantity=1)
-        child = {"asin": "B000000001", "variation_values": {"Size": "Full"}, "title": "Full Size Bunk Bed", "bullets": [], "description": "Bed frame.", "specs": {"Product Dimensions": '78" L x 56" W x 65" H'}, "normalized_facts": normalized, "sold_unit_count": 1, "sold_unit_count_source": "amazon_single_unit_listing_policy", "package_quantity": 1, "package_quantity_source": "amazon_single_package_policy", "reference_images": [{"url": "https://example.com/image.jpg", "source": "apify"}], "risk_flags": [], "product_specific": {"bed_frame": {}}, "status": "ok"}
+        child = {"asin": "B000000001", "variation_values": {"Size": "Full"}, "title": "Full Size Bunk Bed", "bullets": [], "description": "Bed frame.", "specs": {"Product Dimensions": '78" L x 56" W x 65" H'}, "normalized_facts": normalized, "sold_unit_count": 1, "sold_unit_count_source": "apify_explicit_pack_count", "package_quantity": 1, "package_quantity_source": "apify_explicit_package_quantity", "reference_images": [{"url": "https://example.com/image.jpg", "source": "apify"}], "risk_flags": [], "product_specific": {"bed_frame": {}}, "status": "ok"}
         from core.product_family import PRODUCT_FAMILY_POLICY_VERSION
         family = {"protocol_version": "3.0", "product_type": "bed_frame", "category_id": "bed_frame", "source": {"type": "apify", "seed_asin": "B000000001", "fetched_at": "2026-06-30T00:00:00Z", "policy_version": PRODUCT_FAMILY_POLICY_VERSION, "raw_dir": "source/apify_raw", "raw_dirs": {"apify": "source/apify_raw"}, "child_fetch_errors": [], "expected_child_count": 1}, "family": {"parent_asin": "B000000001", "brand": "Giantex", "sku_prefix": "TEST", "marketplace": "US", "variation_theme": "Size", "variation_dimensions": ["Size"], "children": [child]}, "product_specific": {"bed_frame": {"extractor": "test"}}}
+        family['source'].update(request_identity={'seed_asin':'B000000001','marketplace':'US','category_id':'bed_frame','extractor_sha256':'a'*64}, raw_sha256={'B000000001':'a'*64})
         validate_data(family, "product_family.schema.json", label="ProductFamilyV3")
         family["family"]["children"][0]["asin"] = "../escaped"
         with self.assertRaises(SchemaValidationError):
             validate_data(family, "product_family.schema.json", label="ProductFamilyV3")
         self.assertEqual(
-            (1, "apify_invalid_pack_count_default", []),
+            (None, "apify_invalid_pack_count", []),
             apify._source_sold_unit_count({}, {"number_of_items": "not stated"}, {}),
         )
         self.assertEqual("", apify._source_description({"aPlusContent": {"rawImages": [{"name": "2 Door Cabinet"}]}}))
@@ -41,14 +53,44 @@ class RootCauseRemediationTests(unittest.TestCase):
         from core.template_engine import _family_specific
         from core.plugin import load_plugin
         from core.visual_design_kit import compact_product_claims
-        from core.visual_design_kit_compiler import _bind_display_text, _available_claims, VisualDesignKitCompileError
+        from core.visual_design_kit_compiler import _available_claims
         for count, title, expected in ((1, 'Set of 2 Cabinets', [1, 2]), (2, 'Set of 2 Cabinets', []), (1, 'Storage Cabinet', [])):
             result = apify._source_sold_unit_count({'title': title, 'productDetails': {'Number of Items': str(count)}}, {}, {})
             self.assertEqual(expected, result[2])
+
+        for title, bullets, expected in [
+            ('Storage Cabinet', ['Includes a pack of 4 mounting screws'], (None, 'apify_missing_pack_count', [])),
+            ('Storage Cabinet', ['This is not a set of 2 cabinets.'], (None, 'apify_missing_pack_count', [])),
+            ('Storage Cabinet', ['No tools required for a set of 2 cabinets.'], (2, 'apify_explicit_pack_count', [])),
+            ('Set of 2 Cabinets', ['Includes a pack of 4 mounting screws'], (2, 'apify_explicit_pack_count', [])),
+            ('2 Pack 4FT Artificial Cedar Trees', [], (2, 'apify_explicit_pack_count', [])),
+            ('7ft Artificial Christmas Tree', ['Package includes: 1 x Christmas tree 1 x stand'], (1, 'apify_explicit_pack_count', [])),
+            ('Christmas Tree', ['Package includes: 2 x Christmas tree stands, 5 x tree branches'], (None, 'apify_missing_pack_count', [])),
+            ('Set of 0 Cabinets', [], (None, 'apify_invalid_pack_count', [])),
+            ('Storage Cabinet', ['Set of 2 cabinets or set of 3 cabinets'], (None, 'apify_conflicted_pack_count', [2, 3]))]:
+            self.assertEqual(expected, apify._source_sold_unit_count({'title': title, 'bulletPoints': bullets}, {}, {}))
+        from core.product_family import effective_product_facts
+        family['family']['children'][0]['asin'] = 'B000000001'
+        for source, status in [('apify_invalid_pack_count', 'unconfirmed'), ('apify_conflicted_pack_count', 'conflicted')]:
+            child['sold_unit_count_source'] = source
+            child['sold_unit_count'] = child['normalized_facts']['sold_unit_count'] = None
+            child['normalized_facts']['sold_unit_count_status'] = status
+            validate_data(family, 'product_family.schema.json', label='ProductFamilyV3')
+            self.assertNotIn('sold_unit_count', effective_product_facts(child))
         from products.generic_extractors import extract_variations
-        # Container disagreement is evidence of an unresolved discovery limit, not permission to expand a frozen family.
-        variants = extract_variations({'dimensionValuesDisplayData': {'B1': ['White']}, 'variantAsins': ['B1', 'B2']}, 'B1', ['color'])
+        raw = {'dimensionValuesDisplayData': {'B1': ['White']}, 'variantAsins': ['B1', 'B2']}
+        variants = extract_variations(raw, 'B1', ['color'])
         self.assertEqual(['B1'], [row['asin'] for row in variants['variants']])
+        self.assertEqual(['B2'], variants['unconfirmed_variant_asins'])
+        raw['variantDetails'] = [{'asin':'B1','color':'White'},{'asin':'B2','color':'Black'}]
+        self.assertEqual({'B1','B2'}, {r['asin'] for r in extract_variations(raw,'B1',['color'])['variants']})
+        self.assertEqual('', variants['parent_asin'])
+        variants = extract_variations({'asin':'B1','variantAttributes':[{'key':'Size','value':'7 ft'}],
+            'variantDetails':[{'asin':'B1','name':'7 ft'},{'asin':'B2','name':'6 ft'}]}, 'B1', ['color','size'])
+        self.assertEqual(['size'], variants['dimensions'])
+        self.assertEqual('SIZE', variants['variation_theme'])
+        self.assertEqual({'B1':'7 ft','B2':'6 ft'}, {v['asin']:v['size'] for v in variants['variants']})
+        self.assertTrue(all('color' not in v for v in variants['variants']))
         subject = {'title': 'Wood Cabinet with 3 Doors', 'bullets': ['3 Doors for Storage', 'Easy access'],
                    'specs': {'material': 'Wood', 'number_of_doors': 3, 'waterproof': False, 'load_capacity': 0},
                    'product_specific': {'bathroom_cabinet': {'number_of_doors': 3}},
@@ -68,21 +110,21 @@ class RootCauseRemediationTests(unittest.TestCase):
         self.assertEqual(['Easy access'], _source_copy(subject)['item_highlights'])
         self.assertEqual(original, subject)
         claims = compact_product_claims(subject)
-        # Exact OCR text may not bypass a confirmed correction via the no-review shortcut.
+        # Fact-resolution metadata remains a constraint, never selectable claim evidence.
+        # Image-copy semantics now belong to the planner (test_visual_flow_contract).
         available = {'ocr': '3 Doors', **_available_claims([], claims)}
-        with self.assertRaisesRegex(VisualDesignKitCompileError, 'resolved facts'):
-            _bind_display_text({'text': '3 Doors', 'evidence_ids': ['ocr']}, available, product_claims=claims)
         self.assertFalse(any(row['evidence_id'] in available for row in claims if row['type'] == 'fact_resolution'))
         from core.product_family import fact_statement_issues
         resolved = {'number_of_doors': {'status': 'confirmed', 'value': 3}}
-        for statement in ('2-Door Lower Cabinet', 'Lower compartment: two doors', '2 upper doors'):
+        for statement in ('2-Door Lower Cabinet', 'Lower compartment: two doors', '2 upper doors',
+                          'Enclosed two-door base cabinet', 'Enclosed two-door lower cabinet',
+                          'Base cabinet has two doors'):
             self.assertEqual([], fact_statement_issues(statement, resolved))
-        for statement in ('2-Door Cabinet', 'Three shelves and two doors', '2 doors total, with lower storage'):
+        for statement in ('2-Door Cabinet', 'Three shelves and two doors', '2 doors total, with lower storage',
+                          'The whole cabinet has two doors and a base cabinet',
+                          'Overall cabinet has two doors with base storage',
+                          'Two doors total, including the base cabinet', '2 doors for base plate'):
             self.assertEqual(['number_of_doors'], fact_statement_issues(statement, resolved))
-        # Scoped quantities remain subject to source review; bypassing a global total is not approval.
-        with self.assertRaisesRegex(VisualDesignKitCompileError, 'independent evidence review'):
-            _bind_display_text({'text': '2-Door Lower Cabinet', 'evidence_ids': ['physical:doors']},
-                              {'physical:doors': 'A lower storage compartment'}, product_claims=claims)
         color_args = dict(title='Kids Bed White', bullets=[], description='',
                           variation={'color': 'Natural'}, specs={'color': 'Natural', 'model_number': 'GX11001NA-T-UH'}, specific={})
         decision = apify._resolve_structured_facts(**color_args)
@@ -100,23 +142,30 @@ class RootCauseRemediationTests(unittest.TestCase):
         self.assertEqual([3], counts['number_of_doors']['candidates'])
 
     def test_proxy_fake_ip_is_allowed_only_for_hostname_resolution(self) -> None:
-        with patch(
-            "core.url_safety._resolved_addresses",
-            return_value={"198.18.0.106", "fdfe:dcba:9876::106"},
-        ):
-            assert_public_http_url("https://m.media-amazon.com/image.jpg")
+        with patch('core.url_safety._resolved_addresses',return_value={'198.18.0.106','fdfe:dcba:9876::106'}):
+            with patch.dict('os.environ',{'HTTPS_PROXY':'http://127.0.0.1:7890','NO_PROXY':''},clear=True):
+                assert_public_http_url('https://m.media-amazon.com/image.jpg')
+            with patch.dict('os.environ',{'HTTPS_PROXY':'http://127.0.0.1:7890','NO_PROXY':'m.media-amazon.com'},clear=True):
+                with self.assertRaises(UnsafeUrlError):assert_public_http_url('https://m.media-amazon.com/image.jpg')
+            with patch.dict('os.environ',{},clear=True),patch('urllib.request.getproxies',return_value={}):
+                with self.assertRaises(UnsafeUrlError):assert_public_http_url('https://m.media-amazon.com/image.jpg')
         with self.assertRaises(UnsafeUrlError):
             assert_public_http_url("https://198.18.0.106/image.jpg")
         with self.assertRaises(UnsafeUrlError):
             assert_public_http_url("https://[fdfe:dcba:9876::106]/image.jpg")
 
-    def test_dns_resolution_failure_is_retryable(self) -> None:
+    @patch('core.batch_ledger.admit_paid_request',return_value='mock-network-admission')
+    def test_dns_resolution_failure_is_retryable(self, _paid) -> None:
+        from tests.audit_recovery_fixture import verify_service_receipts, verify_upstream_unknown_post
+        verify_service_receipts(self); verify_upstream_unknown_post(self)
+        from tests.continuity_contract_fixture import verify_retry_grant, verify_initialization
+        verify_retry_grant(self); verify_initialization(self)
         from core.source_fetch.apify_client import ApifyClient
         from core.asset_manager import _download_once
         from core.vision_gemini_client import gemini_stream_generate
         from core.vision_errors import VisionQAError
         from core.copy_writer import CopyWriterConfig, CopyWriterError, _post_chat_completion
-        from core.publish import _put_file_with_retries, PublishError
+        from core.publish import _put_file_once, PublishError
         with patch("urllib.request.urlopen") as http, patch("requests.put") as upload:
             with self.assertRaises(TimeoutError):
                 ApifyClient(tokens="test", actor_id="test", deadline_monotonic=0)._json_request("https://example.test")
@@ -128,7 +177,7 @@ class RootCauseRemediationTests(unittest.TestCase):
                 _post_chat_completion(CopyWriterConfig(True, "test", "https://example.test", "test", 30, deadline_monotonic=0), {})
             self.assertTrue(error.exception.retryable)
             with self.assertRaises(PublishError):
-                _put_file_with_retries("https://example.test", headers={}, image_path=Path("unused"), deadline_monotonic=0)
+                _put_file_once("https://example.test", headers={}, image_path=Path("unused"), deadline_monotonic=0)
             http.assert_not_called()
             upload.assert_not_called()
         with patch("core.url_safety._resolved_addresses", return_value=set()):
@@ -146,6 +195,8 @@ class RootCauseRemediationTests(unittest.TestCase):
             self.assertEqual("SUCCEEDED", client._wait_for_run("run", token="token")["status"])
 
     def test_download_authority_invalidates_policy_and_unsafe_paths(self) -> None:
+        from tests.continuity_flow_fixture import verify_download_recheck
+        verify_download_recheck(self)
         from core.ocr_scanner import scan_image
         with patch('core.ocr_scanner.requests.post') as submitted:
             self.assertEqual('timeout', scan_image('unused', deadline_monotonic=0).error)
@@ -155,6 +206,8 @@ class RootCauseRemediationTests(unittest.TestCase):
         from core.status import input_revision_id
         self.assertNotEqual(input_revision_id({"url": "https://m.media-amazon.com/image.jpg", "validation_policy": "image-validation-v2-aspect-aware"}), _download_input_revision("https://m.media-amazon.com/image.jpg"))
         inventory = [{"child": "B1", "index": index, "url": f"https://example.com/{index}.jpg"} for index in range(2)]
+        self.assertEqual(_inventory_fingerprint(inventory), _inventory_fingerprint(list(reversed(inventory))))
+        self.assertNotEqual(_inventory_fingerprint(inventory), _inventory_fingerprint(inventory[:-1]))
         rows = [{**item, "input_revision_id": _download_input_revision(item["url"]),
                  "status": "ok" if item["index"] == 0 else "failed", "retryable": True,
                  "error": "temporary network failure" if item["index"] else ""} for item in inventory]
@@ -229,6 +282,9 @@ class RootCauseRemediationTests(unittest.TestCase):
             self.assertTrue(output.is_file())
 
     def test_pipeline_stops_only_when_a_stage_has_no_usable_output(self) -> None:
+        from tests.continuity_contract_fixture import verify_admission
+        from tests.unit_work_fixture import verify_controller_units,verify_cached_unit_with_zero_budget
+        verify_admission(self); verify_controller_units(self);verify_cached_unit_with_zero_budget(self)
         failed = {"tasks": [{"status": "failed"}], "failures": [{"error": "DNS failed"}]}
         partial = {"tasks": [{"status": "failed"}, {"status": "ok", "source_sha256": "a" * 64}], "failures": [{"error": "one child failed"}]}
         blocked = {"image_tasks": {"tasks": [{"formation_status": "blocked"}]}, "failures": [{"error": "no image input"}]}

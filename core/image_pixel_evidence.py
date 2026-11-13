@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 
-PIXEL_EVIDENCE_VERSION = "white-background-v6-external-canvas"
+PIXEL_EVIDENCE_VERSION = "white-background-v7-edge-signal-only"
 
 
 def inspect_image_pixel_evidence(path: Path) -> dict[str, Any]:
@@ -43,30 +43,6 @@ def inspect_image_pixel_evidence(path: Path) -> dict[str, Any]:
         "external_white_ratio": round(external_white_ratio, 6),
         "white_background": white_border_ratio >= 0.6 and white_corner_count == 4 and external_white_ratio >= 0.08,
     }
-
-
-def white_main_model_support(
-    observation: dict[str, Any],
-    *,
-    pixel_evidence: dict[str, Any] | None,
-    main_image_policy: str,
-) -> bool:
-    if main_image_policy != "white_background" or not (pixel_evidence or {}).get("white_background"):
-        return False
-    environment = " ".join(
-        str(item.get("name") or item.get("item") or "")
-        for item in observation.get("environment_objects") or []
-        if isinstance(item, dict)
-    ).lower()
-    if any(token in environment for token in (
-        "wall", "floor", "room", "tile", "vanity", "sink", "window", "furniture", "bathroom", "bedroom"
-    )):
-        return False
-    composition = observation.get("composition") if isinstance(observation.get("composition"), dict) else {}
-    coverage = str(composition.get("product_coverage") or "").strip().lower()
-    composition_text = " ".join(str(value or "") for value in composition.values()).lower()
-    catalog_signal = any(token in composition_text for token in ("white", "isolated", "catalog", "plain", "studio"))
-    return bool(observation.get("product_components")) and catalog_signal and coverage not in {"tiny", "minimal", "background"}
 
 
 def _edge_connected_white_ratio(image: Any) -> float:

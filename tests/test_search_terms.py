@@ -34,11 +34,20 @@ class SearchTermDatabaseTests(unittest.TestCase):
             first = context["references"][0]["top_clicked_titles"][0]
             self.assertIn("Bathroom Storage Cabinet", first["reference_title"])
             self.assertEqual(8.5, first["conversion_share"])
+            import sqlite3
+            from contextlib import closing
+            with closing(sqlite3.connect(db_path)) as db:
+                db.execute("INSERT INTO search_terms(category,search_term,search_term_norm,search_frequency_rank) VALUES('cabinet','medicine mirror cabinet','medicine mirror cabinet',1)")
+                db.commit()
+            bath=title_reference_context(category='bathroom_cabinet',source_title='Bathroom storage cabinet',product_specific={},db_path=db_path)
+            med=title_reference_context(category='medicine_cabinet',source_title='Medicine mirror cabinet',product_specific={},db_path=db_path)
+            self.assertNotIn('medicine mirror cabinet',[r['search_term'] for r in bath['references']])
+            self.assertIn('medicine mirror cabinet',[r['search_term'] for r in med['references']])
 
         from core.backend_keywords import generate_backend_keywords
         for mount, wall in (('Floor Mount', False), ('Wall Mounted', True)):
             keywords = generate_backend_keywords(category_id='bathroom_cabinet', title='Storage Cabinet', bullets=[], description='',
-                product_specific={'mounting_type': mount}, competitor_keywords=['wall cabinet', 'recessed cabinet'], extra_terms=['over toilet storage'])
+                product_specific={'mounting_type': mount}, extra_terms=['wall cabinet', 'recessed cabinet','over toilet storage'])
             self.assertEqual(wall, 'wall cabinet' in keywords)
             self.assertNotIn('recessed', keywords)
             self.assertNotIn('over toilet', keywords)

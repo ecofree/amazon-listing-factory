@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import csv
+import asyncio
+import httpx
 import hashlib
 import hmac
 import mimetypes
 import os
-import random
 import re
-import shutil
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +30,78 @@ from .url_safety import request_public_url, assert_response_peer_public
 
 class PublishError(RuntimeError):
     pass
+
+
+def validate_publication_policy(policy):
+    if isinstance(policy,dict) and policy.get('retention_mode')=='operator_managed':
+        if set(policy)!={'retention_mode','verification_max_age_seconds','source'} or type(policy['verification_max_age_seconds']) is not int or policy['verification_max_age_seconds']<=0 or not isinstance(policy['source'],str) or not policy['source'].strip():
+            raise PublishError('Operator-managed URLs require explicit responsibility and a positive verification cache window')
+        return policy
+    if not isinstance(policy,dict) or set(policy)!={'minimum_validity_seconds','verification_max_age_seconds','retained_until','source'}:
+        raise PublishError('Explicit publication retention and verification policy required')
+    for key in ('minimum_validity_seconds','verification_max_age_seconds'):
+        if type(policy[key]) is not int or policy[key]<=0:raise PublishError('Publication time windows must be positive integer seconds')
+    try:until=datetime.fromisoformat(policy['retained_until'])
+    except (TypeError,ValueError) as exc:raise PublishError('Invalid retention expiry') from exc
+    if until.tzinfo is None or not isinstance(policy['source'],str) or not policy['source'].strip():
+        raise PublishError('Retention needs timezone and evidence source')
+    if until.timestamp()<time.time()+policy['minimum_validity_seconds']:raise PublishError('Retention does not cover the required delivery lifetime')
+    return policy
+
+
+def url_record_current(row,policy, *, now=None):
+    """Read-only eligibility; a dashboard view never triggers GET/PUT."""
+    now=time.time() if now is None else now
+    try:
+        validate_publication_policy(policy)
+        verified=(row.get('verified_sha256')==(row.get('upload_sha256') or row['candidate_sha256'])
+            and row.get('publication_policy_sha256')==input_revision_id(policy)
+            and 0<=now-float(row['verified_at'])<=policy['verification_max_age_seconds'])
+        if policy.get('retention_mode')=='operator_managed':
+            return verified and (not row.get('valid_until') or float(row['valid_until'])>now)
+        return verified and float(row['valid_until'])>=now+policy['minimum_validity_seconds']
+    except (KeyError,TypeError,ValueError,PublishError):return False
+
+
+def verify_publication_row(job_path,row, *, force=False):
+    """One bounded, budgeted GET under the existing service receipt authority."""
+    from .service_response import perform_request
+    from .batch_ledger import admit_paid_request
+    import json
+    job_path=Path(job_path);policy=validate_publication_policy(load_job(job_path).get('publication_policy'))
+    if not force and url_record_current(row,policy):return True
+    url=str(row['url']);digest=str(row.get('upload_sha256') or row['candidate_sha256'])
+    bucket=int(time.time()//policy['verification_max_age_seconds'])
+    key=input_revision_id({'url':url,'sha256':digest})
+    def send():
+        admit_paid_request('storage_get');audit={}
+        ok=published_url_accessible(url,timeout=8,expected_sha256=digest,audit=audit)
+        safe=audit.get('http_status') in {404,410} or (audit.get('complete') is True and audit.get('received_sha256')!=digest)
+        return json.dumps({'ok':ok,'at':time.time(),'replacement_safe':safe}).encode()
+    receipt={}
+    value=json.loads(perform_request(job_path/'reports/storage_verifications'/key,[f'publish-check:{key}'],
+        {'operation':'storage_get','url_sha256':input_revision_id(url),'candidate':digest,'window':bucket},send,
+        retry_received=force,receipt_observer=lambda data:receipt.update(data)))
+    row.update(verification_receipt=receipt['receipt'],replacement_safe=value['replacement_safe'])
+    if not value['ok']:return False
+    from urllib.parse import parse_qs
+    query={k.casefold():v[0] for k,v in parse_qs(urlparse(url).query).items()}
+    expiries=[] if policy.get('retention_mode')=='operator_managed' else [datetime.fromisoformat(policy['retained_until']).timestamp()]
+    try:
+        if 'x-amz-expires' in query:
+            created=datetime.strptime(query['x-amz-date'],'%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+            expiries.append(created.timestamp()+int(query['x-amz-expires']))
+        if 'expires' in query:expiries.append(float(query['expires']))
+        if 'se' in query:expiries.append(datetime.fromisoformat(query['se'].replace('Z','+00:00')).timestamp())
+    except (KeyError,ValueError):return False
+    row.update(verified_at=str(value['at']),verified_sha256=digest,valid_until=str(min(expiries)) if expiries else '',
+        retention_source=policy['source'],publication_policy_sha256=input_revision_id(policy))
+    return url_record_current(row,policy)
+
+
+class StorageResponseRejected(PublishError):
+    def __init__(self,status,message):
+        super().__init__(message);self.status=status
 
 
 class PublishBatchError(PublishError):
@@ -83,46 +155,72 @@ def assert_published_release_complete(*, job_dir: str | Path, plugin: ProductPlu
         url = str(row.get("url") or "").strip()
         if not url:
             raise PublishError(f"Published image has no public URL: {key[0]}/{key[1]}")
-        public_base_url = str(os.environ.get("R2_PUBLIC_BASE_URL") or "").strip()
         object_key = str(row.get("object_key") or "").strip()
         expected_key = _build_key(
-            _r2_prefix(job), str(expected.get("parent") or ""), key[0], local_path, expected_sha,
+            _r2_prefix(job), str(expected.get("parent") or ""), key[0], _uploaded_path(job_path, row), expected_sha,
         )
         if object_key != expected_key:
-            raise PublishError(f"Published object key is stale for the current R2 prefix: {key[0]}/{key[1]}")
-        if public_base_url and (not object_key or url != _public_url(public_base_url, object_key)):
-            raise PublishError(f"Published URL is stale for the current public base: {key[0]}/{key[1]}")
-        if not published_url_accessible(url):
+            raise PublishError(f"Published object key is stale for the current prefix: {key[0]}/{key[1]}")
+        if not _public_url_matches_key(url, object_key):
+            raise PublishError(f"Published URL does not match the public object key: {key[0]}/{key[1]}")
+        if not verify_publication_row(job_path,row):
             raise PublishError(f"Published URL is not accessible as an image: {url}")
+    _write_manifest(manifest,published,job_path=job_path)
 
 
-def published_url_accessible(url: str, *, timeout: int = 20) -> bool:
-    text = str(url or "").strip()
-    if not text.startswith(("http://", "https://")):
+def published_url_accessible(url: str, *, timeout: int = 20, expected_sha256: str = '', audit: dict | None = None) -> bool:
+    """Bounded public image verification against the actual uploaded bytes."""
+    from io import BytesIO
+    from .imagegen_artifacts import IMAGE_OUTPUT_MAX_BYTES
+    text = str(url or '').strip()
+    if not text.startswith(('http://', 'https://')) or (expected_sha256 and not re.fullmatch('[0-9a-f]{64}', expected_sha256)):
         return False
-    headers = {"User-Agent": "amazon-listing-factory/1.0"}
-    for method in ("HEAD", "GET"):
+    deadline = time.monotonic() + timeout
+    try:
+        response = request_public_url('GET', text, timeout=timeout,
+            headers={'User-Agent': 'amazon-listing-factory/1.0'}, stream=True)
         try:
-            current_headers = dict(headers)
-            if method == "GET":
-                current_headers["Range"] = "bytes=0-0"
-            response = request_public_url(
-                method,
-                text,
-                timeout=timeout,
-                headers=current_headers,
-                stream=method == "GET",
-            )
-            try:
-                assert_response_peer_public(response, hostname=urlparse(text).hostname or "")
-                content_type = str(response.headers.get("Content-Type") or "").lower()
-                if response.status_code < 400 and content_type.startswith("image/"):
-                    return True
-            finally:
-                response.close()
-        except requests.RequestException:
-            continue
-    return False
+            assert_response_peer_public(response, hostname=urlparse(text).hostname or '')
+            if audit is not None:audit['http_status']=response.status_code
+            if response.status_code != 200 or not str(response.headers.get('Content-Type') or '').lower().startswith('image/'):
+                return False
+            declared = response.headers.get('Content-Length')
+            if declared and (not str(declared).isdigit() or int(declared) > IMAGE_OUTPUT_MAX_BYTES):
+                return False
+            chunks, size = [], 0
+            stream = iter(response.iter_content(chunk_size=65536))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                sock = getattr(getattr(getattr(response, 'raw', None), '_connection', None), 'sock', None)
+                if sock is not None:
+                    sock.settimeout(remaining)
+                try:
+                    chunk = next(stream)
+                except StopIteration:
+                    break
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > IMAGE_OUTPUT_MAX_BYTES:
+                    return False
+                chunks.append(chunk)
+            data = b''.join(chunks)
+            if time.monotonic() >= deadline or (declared and not response.headers.get('Content-Encoding') and size != int(declared)):
+                return False
+            if audit is not None:audit.update(complete=True,received_sha256=hashlib.sha256(data).hexdigest())
+            if expected_sha256 and hashlib.sha256(data).hexdigest() != expected_sha256:
+                return False
+            with Image.open(BytesIO(data)) as image:
+                if image.format not in {'PNG', 'JPEG'} or image.size != (PUBLIC_IMAGE_SIZE, PUBLIC_IMAGE_SIZE):
+                    return False
+                image.verify()
+            return True
+        finally:
+            response.close()
+    except (requests.RequestException, OSError, ValueError):
+        return False
 
 
 def published_rows_current(*, job_dir: str | Path, plugin: ProductPlugin, workers: int = 4) -> bool:
@@ -134,13 +232,11 @@ def published_rows_current(*, job_dir: str | Path, plugin: ProductPlugin, worker
     approved = approved_release_rows(release)
     if not approved:
         return False
-    public_base = str(os.environ.get("R2_PUBLIC_BASE_URL") or "").strip()
     rows = _reusable_publish_rows(
         job_path,
         approved,
         _load_partial_publish_rows(job_path),
         upload=True,
-        public_base_url=public_base,
     )
     required, missing = _required_rows_from_published(
         release,
@@ -154,7 +250,7 @@ def published_rows_current(*, job_dir: str | Path, plugin: ProductPlugin, worker
         row for row in rows
         if (str(row.get("child") or ""), str(row.get("role") or "")) in required_keys
     ]
-    accessible, inaccessible = _verify_public_rows(required_publish_rows, workers=max(1, int(workers or 1)))
+    accessible, inaccessible = _verify_public_rows(required_publish_rows, workers=max(1, int(workers or 1)), job_path=job_path)
     return len(accessible) == len(required) and not inaccessible
 
 
@@ -166,14 +262,29 @@ def publish_approved_release(
     upload: bool = False,
     workers: int = 4,
     deadline_monotonic: float | None = None,
+    work_children: tuple[str, ...] = (), required_only: bool = False,
 ) -> dict[str, list[dict[str, str]]]:
     from .release_manifest import approved_release_rows, build_release_manifest
 
     job_path = Path(job_dir).resolve()
     job = load_job(job_path)
     _load_publish_env(config_path, str(job.get("config_path") or ""))
-    release = build_release_manifest(job_dir=job_path, plugin=plugin)
+    if upload:validate_publication_policy(job.get('publication_policy'))
+    release = build_release_manifest(job_dir=job_path, plugin=plugin,work_children=work_children)
     rows = approved_release_rows(release)
+    retained_rows=[];work_keys=None
+    if work_children or required_only:
+        from .run_scope import execution_children
+        from .release_manifest import required_task_keys
+        selected=execution_children(job_path,work_children)
+        required=required_task_keys(release,selected) if required_only else None
+        active=[row for row in rows if row['child'] in selected and (required is None or (row['child'],row['role']) in required)]
+        work_keys={(row['child'],row['role']) for row in release['rows'] if row['child'] in selected and (required is None or (row['child'],row['role']) in required)}
+        # Retain the publisher's unselected snapshots without re-verifying or
+        # re-uploading them here. Every final consumer still binds SHA/QA/URLs.
+        retained_rows=[row for row in _load_publish_rows(job_path,job_path/'images/_r2_image_urls.csv') if (row['child'],row['role']) not in work_keys]
+        rows=active
+        release={**release,'children':{key:value for key,value in release['children'].items() if key in selected}}
     if not rows:
         raise PublishError("Publish requires at least one current approved candidate")
     valid_rows: list[dict[str, str]] = []
@@ -194,14 +305,12 @@ def publish_approved_release(
             })
             continue
         valid_rows.append(row)
-    public_base_url = _env_any("R2_PUBLIC_BASE_URL", required=True) if upload else ""
     existing_rows = _load_partial_publish_rows(job_path)
     reusable_rows = _reusable_publish_rows(
         job_path,
         valid_rows,
         existing_rows,
         upload=upload,
-        public_base_url=public_base_url,
     )
     reusable_keys = {(row["child"], row["role"]) for row in reusable_rows}
     tasks = [
@@ -234,7 +343,8 @@ def publish_approved_release(
             remaining = deadline_monotonic - time.monotonic() if deadline_monotonic is not None else 5.0
             if remaining <= 0:
                 raise PublishError("Publish execution deadline exhausted before upload")
-            _preflight_upload_endpoint(_env_any("R2_ENDPOINT", "R2_S3_ENDPOINT", required=True), timeout=min(5.0, remaining))
+            storage = publish_upload_config()
+            _preflight_upload_endpoint(storage["endpoint"], timeout=min(5.0, remaining))
         except PublishError as exc:
             _write_partial_publish_ledger(job_path, _merge_publish_rows(existing_rows, reusable_rows))
             preflight_failures = [
@@ -255,7 +365,7 @@ def publish_approved_release(
                 current_rows=reusable_rows,
                 failures=[*failures, *preflight_failures],
                 fatal_message=str(exc),
-                cause=exc,
+                cause=exc,retained_rows=retained_rows,work_keys=work_keys,
             )
         new_rows = _upload_rows(
             publish_rows,
@@ -264,15 +374,13 @@ def publish_approved_release(
             workers=max(1, int(workers or 1)),
             persisted_rows=existing_rows,
             failures=failures,
-            public_base_url=public_base_url,
+            storage=storage,
             deadline_monotonic=deadline_monotonic,
         )
     elif publish_rows:
         new_rows = [_local_row(row, job, job_id=job_path.name) for row in publish_rows]
     else:
         new_rows = []
-    if new_rows:
-        _export_final_pics(new_rows, job_path=job_path, shared=upload)
     merged = _merge_publish_rows(existing_rows, [*reusable_rows, *new_rows])
     _write_partial_publish_ledger(job_path, merged)
     current_rows = [*reusable_rows, *new_rows]
@@ -284,9 +392,10 @@ def publish_approved_release(
             current_rows=current_rows,
             failures=failures,
             fatal_message=f"Publish completed only {len(new_rows)}/{len(tasks)} new approved rows",
+            retained_rows=retained_rows,work_keys=work_keys,
         )
     if upload:
-        accessible, inaccessible = _verify_public_rows(current_rows, workers=max(1, int(workers or 1)))
+        accessible, inaccessible = _verify_public_rows(current_rows, workers=max(1, int(workers or 1)), job_path=job_path)
         if inaccessible:
             return _finish_publish_attempt(
                 job_path=job_path,
@@ -295,8 +404,12 @@ def publish_approved_release(
                 current_rows=accessible,
                 failures=inaccessible,
                 fatal_message=f"{len(inaccessible)} uploaded object(s) do not yet have an accessible public image URL",
+                retained_rows=retained_rows,work_keys=work_keys,
             )
-    _finalize_partial_publish_manifest(job_dir=job_path, allowed_rows=current_rows)
+    _write_partial_publish_ledger(job_path,_merge_publish_rows(merged,current_rows))
+    _finalize_partial_publish_manifest(job_dir=job_path, allowed_rows=[*retained_rows,*current_rows],work_keys=work_keys)
+    # Remote success is already durable: a local export collision must never cause another PUT.
+    _export_final_pics(current_rows,job_path=job_path,shared=upload)
     _write_optional_publish_failures(job_path, [])
     return {
         "tasks": [{**row, **_publish_task_identity(row)} for row in current_rows],
@@ -313,7 +426,7 @@ def _finish_publish_attempt(
     current_rows: list[dict[str, str]],
     failures: list[dict[str, str]],
     fatal_message: str,
-    cause: Exception | None = None,
+    cause: Exception | None = None, retained_rows=(),work_keys=None,
 ) -> dict[str, list[dict[str, str]]]:
     _, missing = _required_rows_from_published(
         release,
@@ -329,7 +442,7 @@ def _finish_publish_attempt(
         if cause is not None:
             raise error from cause
         raise error
-    _finalize_partial_publish_manifest(job_dir=job_path, allowed_rows=current_rows)
+    _finalize_partial_publish_manifest(job_dir=job_path, allowed_rows=[*retained_rows,*current_rows],work_keys=work_keys)
     _write_optional_publish_failures(job_path, failures)
     return {
         "tasks": [{**row, **_publish_task_identity(row)} for row in current_rows],
@@ -404,7 +517,7 @@ def _publish_task_identity(row: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _finalize_partial_publish_manifest(*, job_dir: str | Path, allowed_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+def _finalize_partial_publish_manifest(*, job_dir: str | Path, allowed_rows: list[dict[str, str]],work_keys=None) -> list[dict[str, str]]:
     job_path = Path(job_dir)
     all_rows = _load_partial_publish_rows(job_path)
     allowed = {
@@ -430,7 +543,7 @@ def _finalize_partial_publish_manifest(*, job_dir: str | Path, allowed_rows: lis
         in allowed
     ]
     if not rows:
-        raise PublishError("No partial R2 image URL rows found to finalize")
+        raise PublishError("No partial image URL rows found to finalize")
     kept_keys = {str(row.get("object_key") or "") for row in rows}
     superseded = [
         {
@@ -450,7 +563,8 @@ def _finalize_partial_publish_manifest(*, job_dir: str | Path, allowed_rows: lis
     })
     manifest = job_path / "images" / "_r2_image_urls.csv"
     _write_manifest(manifest, rows, job_path=job_path)
-    _write_partial_publish_ledger(job_path, rows)
+    unselected=[row for row in all_rows if (row['child'],row['role']) not in work_keys] if work_keys is not None else []
+    _write_partial_publish_ledger(job_path,_merge_publish_rows(unselected,rows))
     return rows
 
 
@@ -479,6 +593,17 @@ def _publish_candidate_row(task: tuple[str, str, str, Path, str]) -> dict[str, s
     return row
 
 
+def _uploaded_path(job_path: Path, row: dict) -> Path:
+    if not row.get('upload_path'):
+        if row.get('upload_sha256'):
+            raise PublishError('Upload digest without a bound file')
+        return _publish_local_path(job_path, row.get('local_path'))
+    path = _publish_local_path(job_path, row['upload_path'])
+    if not path.is_file() or file_sha256(path) != row.get('upload_sha256'):
+        raise PublishError('Upload copy is missing or changed; original candidate remains intact')
+    return path
+
+
 def _upload_rows(
     rows: list[dict[str, str]],
     job: dict,
@@ -487,14 +612,9 @@ def _upload_rows(
     workers: int,
     persisted_rows: list[dict[str, str]] | None = None,
     failures: list[dict[str, str]] | None = None,
-    public_base_url: str,
+    storage: dict[str, str],
     deadline_monotonic: float | None = None,
 ) -> list[dict[str, str]]:
-    endpoint = _env_any("R2_ENDPOINT", "R2_S3_ENDPOINT", required=True)
-    access_key_id = _env_any("R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID", required=True)
-    secret_access_key = _env_any("R2_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", required=True)
-    bucket = _env_any("R2_BUCKET", required=True)
-    region = _env_any("R2_REGION", "AWS_REGION", default="auto")
     prefix = _r2_prefix(job)
     uploaded: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -503,9 +623,15 @@ def _upload_rows(
             image_path = _publish_local_path(job_path, row.get("local_path"))
             if not image_path.exists():
                 raise PublishError(f"Generated image not found before upload: {image_path}")
+            if job.get("upload_encoding"):
+                from .image_upload import UPLOAD_ENCODING, prepare_upload_copy
+                if job['upload_encoding'] != UPLOAD_ENCODING:
+                    raise PublishError('Unsupported upload encoding policy')
+                row = {**row, **prepare_upload_copy(job_path, image_path, row['candidate_sha256'])}
+                image_path = _uploaded_path(job_path, row)
             object_key = _build_key(prefix, row["parent"], row["child"], image_path, row["candidate_sha256"])
-            public_url = _public_url(public_base_url, object_key)
-            future = executor.submit(_upload_one_s3, endpoint, access_key_id, secret_access_key, bucket, object_key, image_path, region, deadline_monotonic=deadline_monotonic)
+            public_url = _public_url(storage["public_base_url"], object_key)
+            future=executor.submit(_upload_bound,job_path,storage,object_key,image_path,public_url,deadline_monotonic)
             futures[future] = (row, image_path, object_key, public_url)
         for future in as_completed(futures):
             row, image_path, object_key, public_url = futures[future]
@@ -518,7 +644,7 @@ def _upload_rows(
                             **row,
                             "object_key": object_key,
                             "url": public_url,
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": str(exc) if isinstance(exc, PublishError) else f"Upload failed: {type(exc).__name__}",
                         }
                     )
                 _write_partial_publish_ledger(job_path, _merge_publish_rows(persisted_rows or [], uploaded))
@@ -532,27 +658,57 @@ def _upload_rows(
                     "width": str(result["width"]),
                     "height": str(result["height"]),
                     "bytes": str(result["bytes"]),
-                    "local_sha256": file_sha256(image_path),
+                    "local_sha256": row["candidate_sha256"],
                     "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                    "storage_provider": storage["provider"],
                 }
             )
             _write_partial_publish_ledger(job_path, _merge_publish_rows(persisted_rows or [], uploaded))
     return uploaded
 
 
+def _upload_bound(job_path,storage,object_key,image_path,public_url,deadline):
+    from .service_response import perform_request
+    import json
+    digest=file_sha256(image_path);key=input_revision_id(object_key)
+    root=job_path/'reports/storage_requests'/key
+    recovery=''
+    # Reconcile a prior PUT with GET of the desired bytes, never another unknown PUT.
+    if root.is_dir() and any(root.glob('*.json')):
+        row={'url':public_url,'candidate_sha256':digest}
+        if verify_publication_row(job_path,row,force=True):
+            with Image.open(image_path) as image:width,height=image.size
+            return {'width':width,'height':height,'bytes':image_path.stat().st_size}
+        if not row.get('replacement_safe'):raise PublishError('Remote object state is uncertain; retain original PUT, do not repurchase')
+        recovery=file_sha256(Path(row['verification_receipt']))
+    def send():
+        try:
+            if storage['provider']=='oci_par':
+                result=_upload_one_oci(storage['endpoint'],object_key,image_path,deadline_monotonic=deadline)
+            else:
+                result=_upload_one_s3(storage['endpoint'],storage['access_key_id'],storage['secret_access_key'],
+                    storage['bucket'],object_key,image_path,storage['region'],deadline_monotonic=deadline)
+        except StorageResponseRejected as exc:result={'error':str(exc),'status':exc.status}
+        return json.dumps(result).encode()
+    result=json.loads(perform_request(root,[f'publish-put:{key}'],
+        {'operation':'storage_put','object':object_key,'sha256':digest,'storage_revision':input_revision_id(storage),'verified_recovery':recovery},send))
+    if result.get('error'):raise PublishError(result['error'])
+    return result
+
+
 def _preflight_upload_endpoint(endpoint: str, *, timeout: float = 5.0) -> None:
     parsed = urlparse(str(endpoint or "").strip())
     host = parsed.hostname
     if not host:
-        raise PublishError("R2 endpoint is invalid; set R2_ENDPOINT to a reachable http(s) endpoint")
+        raise PublishError("Storage endpoint is invalid; configure a reachable http(s) endpoint")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return
     except OSError as exc:
         if _is_socket_permission_error(exc):
-            raise PublishError(f"R2 endpoint socket access is blocked in this environment: {host}:{port}: {exc}") from exc
-        raise PublishError(f"R2 endpoint is unreachable before upload: {host}:{port}: {exc}") from exc
+            raise PublishError(f"Storage endpoint socket access is blocked in this environment: {host}:{port}") from None
+        raise PublishError(f"Storage endpoint is unreachable before upload: {host}:{port}") from None
 
 
 def _local_row(row: dict[str, str], job: dict, *, job_id: str = "") -> dict[str, str]:
@@ -632,7 +788,7 @@ def current_published_release_rows(job_dir: str | Path, release_rows: list[dict[
             if local_path != release_path or row.get("local_sha256") != key[2] or not local_path.is_file() or file_sha256(local_path) != key[2]:
                 continue
             expected_key = _build_key(
-                _r2_prefix(job), str(release.get("parent") or ""), key[0], release_path, key[2],
+                _r2_prefix(job), str(release.get("parent") or ""), key[0], _uploaded_path(job_path, row), key[2],
             )
             if str(row.get("object_key") or "").strip("/") != expected_key:
                 continue
@@ -646,7 +802,6 @@ def _reusable_publish_rows(
     existing_rows: list[dict[str, str]],
     *,
     upload: bool,
-    public_base_url: str = "",
 ) -> list[dict[str, str]]:
     job = load_job(job_path)
     by_key = {
@@ -677,33 +832,30 @@ def _reusable_publish_rows(
         object_key = str(row.get("object_key") or "").strip().strip("/")
         expected_object_key = _build_key(
             _r2_prefix(job), str(release.get("parent") or ""), str(release.get("child") or ""),
-            release_path, str(release.get("candidate_sha256") or ""),
+            _uploaded_path(job_path, row), str(release.get("candidate_sha256") or ""),
         )
         if expected_key_fragment not in object_key or object_key != expected_object_key:
             continue
         if upload:
-            url_path = unquote(urlparse(str(row.get("url") or "")).path).rstrip("/")
-            if not url_path.endswith("/" + object_key):
+            if not _public_url_matches_key(str(row.get("url") or ""), object_key):
                 continue
-            if public_base_url:
-                row = {**row, "url": _public_url(public_base_url, object_key)}
             # Do not trust a stale CSV/object key as proof that the remote
             # object still exists.  Reuse only after the current public URL
             # passes the same image-content check used by final publish.
-            if not published_url_accessible(str(row.get("url") or ""), timeout=8):
+            if not verify_publication_row(job_path,row):
                 continue
         reusable.append(row)
     return reusable
 
 
 def _verify_public_rows(
-    rows: list[dict[str, str]], *, workers: int
+    rows: list[dict[str, str]], *, workers: int, job_path: Path
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     accessible: list[dict[str, str]] = []
     failures: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(published_url_accessible, str(row.get("url") or ""), timeout=8): row
+            executor.submit(verify_publication_row, job_path, row,force=not bool(row.get('verified_at'))): row
             for row in rows
         }
         for future in as_completed(futures):
@@ -738,60 +890,133 @@ def _publish_row_with_local_hash(job_path: Path, row: dict[str, str]) -> dict[st
     return enriched
 
 
-def _export_final_pics(
-    rows: list[dict[str, str]],
-    *,
-    job_path: Path,
-    shared: bool,
-) -> list[str]:
-    exported: list[str] = []
-    local_root = job_path / "Final_pics"
-    local_root.mkdir(parents=True, exist_ok=True)
-    shared_root = FACTORY_ROOT / "Final_pics"
-    if shared:
-        shared_root.mkdir(parents=True, exist_ok=True)
+def _export_final_pics(rows: list[dict[str,str]], *, job_path: Path, shared: bool) -> list[str]:
+    """One-way exports, never a source of approval or parent/child identity."""
+    from .product_family import read_product_family
+    from .paths import resolve_job_owned_path
+    from .template_runtime import parent_sku, child_sku
+    import json
+    family=read_product_family(job_path)['family'];parent=family['parent_asin']
+    if not rows:
+        return []
+    metadata = load_job(job_path) if not parent else {}
+    folder=parent or parent_sku(metadata,'',[child_sku(metadata,c,i) for i,c in enumerate(family['children'],1)])
+    children={c['asin'] for c in family['children']};seen=set();prepared=[]
+    roots=[job_path/'Fianl_pics']+([FACTORY_ROOT/'Fianl_pics'] if shared else [])
+    policy=load_job(job_path).get('publication_policy') if shared else None
     for row in rows:
-        parent = str(row.get("parent") or "")
-        child = str(row.get("child") or "")
-        role = str(row.get("role") or "")
-        source = _publish_local_path(job_path, row.get("local_path"))
-        if not parent or not child or not role or not source.exists():
-            continue
-        filename = f"{_safe_component(role)}_{_safe_component(job_path.name)}.png"
-        local_dir = local_root / _safe_component(parent) / _safe_component(child)
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_target = local_dir / filename
-        shutil.copy2(source, local_target)
-        target = local_target
-        if shared:
-            child_dir = shared_root / _safe_component(parent) / _safe_component(child)
-            child_dir.mkdir(parents=True, exist_ok=True)
-            target = _atomic_copy(local_target, child_dir / filename)
-        row["final_export_path"] = str(target)
-        exported.append(str(target))
+        child,role=str(row.get('child') or ''),str(row.get('role') or '')
+        if row.get('parent')!=parent or child not in children or not re.fullmatch(r'(?:main|scene|func|size)(?:_[0-9]+)?',role) or (child,role) in seen:
+            raise ValueError('Delivery needs unique roles under the verified family mapping')
+        seen.add((child,role));source=_publish_local_path(job_path,row.get('local_path'))
+        digest=str(row.get('candidate_sha256') or '')
+        if file_sha256(source)!=digest:raise ValueError('Delivery candidate bytes changed')
+        if shared and (not str(row.get('url') or '').startswith('https://') or not url_record_current(row,policy)):
+            raise ValueError('Shared delivery requires current verified publication URLs')
+        targets=[resolve_job_owned_path(root,Path(folder)/child/(role+source.suffix.lower())) for root in roots]
+        prepared.append((row,source,digest,targets))
+    exported=[];manifests={}
+    for row,source,digest,targets in prepared:
+        data=source.read_bytes()
+        for target in targets:_commit_export(data,target,digest,owner=job_path)
+        row['final_export_path']=str(targets[-1]);exported.append(str(targets[-1]))
+        manifests.setdefault(row['child'],[]).append({key:row.get(key,'') for key in
+            ('role','candidate_sha256','upload_sha256','upload_encoding','url','verified_sha256','valid_until','retention_source','publication_policy_sha256')})
+    for child,images in manifests.items():
+        payload={'schema':'child-image-url-snapshot-v1','parent':parent,'child':child,
+            'kind':'verified_publication' if shared else 'local_export_only',
+            'images':sorted(images,key=lambda r:r['role']),
+            'eligibility':'Immutable URL snapshot; current eligibility remains with the publisher.'}
+        data=(json.dumps(payload,ensure_ascii=False,sort_keys=True,indent=2)+'\n').encode('utf-8');digest=hashlib.sha256(data).hexdigest()
+        for root in roots:
+            target=resolve_job_owned_path(root,Path(folder)/child/('image_urls.'+digest+'.json'))
+            _commit_export(data,target,digest)
     return exported
 
 
-def _atomic_copy(source: Path, target: Path) -> Path:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.parent / f".{target.name}.{os.getpid()}.tmp"
-    try:
-        shutil.copy2(source, tmp)
-        os.replace(tmp, target)
-        return target
-    except PermissionError:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        fallback = target.with_name(f"{target.stem}_{timestamp}{target.suffix}")
-        tmp = fallback.parent / f".{fallback.name}.{os.getpid()}.tmp"
-        shutil.copy2(source, tmp)
-        os.replace(tmp, fallback)
-        return fallback
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+def export_final_template(job_path: Path,plan: dict) -> str:
+    from .product_family import read_product_family
+    from .paths import resolve_job_owned_path
+    from .template_runtime import parent_sku, child_sku
+    family=read_product_family(job_path)['family'];parent=family['parent_asin']
+    metadata = load_job(job_path) if not parent else {}
+    folder=parent or parent_sku(metadata,'',[child_sku(metadata,c,i) for i,c in enumerate(family['children'],1)])
+    if plan.get('artifact_state')!='submit_ready' or plan.get('template_mode')!='submit_ready' or plan.get('parent_asin')!=parent:
+        raise ValueError('Only the canonical submit-ready family workbook may be exported')
+    source=resolve_job_owned_path(job_path,plan['output_path'])
+    target=resolve_job_owned_path(FACTORY_ROOT/'Final_templates',Path(folder)/source.name)
+    return str(_commit_export(source.read_bytes(),target,plan['workbook_sha256'],owner=job_path))
+
+
+def _commit_export(data: bytes,target: Path,expected_sha256: str, *, owner: Path | None = None) -> Path:
+    """Fenced publisher CAS. Only this job's recorded output may change versions."""
+    import tempfile
+    from .io import read_json, write_bytes_atomic
+    from .process_lock import process_file_lock
+    if hashlib.sha256(data).hexdigest()!=expected_sha256:raise ValueError('Export source changed before commit')
+    target=Path(target).absolute();target.parent.mkdir(parents=True,exist_ok=True)
+    binding={'target':str(target),'owner':str(Path(owner).resolve())} if owner is not None else None
+    journal=Path(owner)/'reports/delivery_exports'/input_revision_id(binding)/'current.json' if binding else None
+    with process_file_lock(target.parent/'.delivery.lock'):
+        if target.is_symlink() or target.exists() and not target.is_file():raise ValueError('Export destination is not a regular managed file')
+        current=file_sha256(target) if target.exists() else None
+        prior=read_json(journal) if journal and journal.is_file() else {}
+        if prior and (prior.get('schema')!='managed-export-v1' or prior.get('binding')!=binding):
+            raise ValueError('Export ownership record differs')
+        if prior.get('status')=='prepared':
+            swap=Path(prior['swap_path']) if prior.get('swap_path') else None
+            if current is None and swap and swap.is_file() and file_sha256(swap)==prior['previous_sha256']:
+                try:os.link(swap,target)
+                except FileExistsError:pass
+                current=file_sha256(target)
+            if current==prior['sha256']:
+                prior={**prior,'status':'committed'};write_json(journal,prior)
+            elif current==prior['previous_sha256']:
+                # Before-image unchanged: abandon only this uncommitted preparation.
+                write_json(journal.parent/(prior['sha256']+'.cancelled.json'),{**prior,'status':'cancelled'})
+                prior={**prior,'status':'committed','sha256':current}
+            else:raise ValueError('Prepared export has unrelated later writes')
+        if current==expected_sha256:
+            return target  # Identical foreign bytes do not transfer ownership.
+        if current is not None and (not prior or prior.get('status')!='committed' or prior.get('sha256')!=current):
+            raise ValueError('Different delivery content is not owned by this order: '+str(target))
+        if journal:
+            if current is not None:
+                before=target.read_bytes()
+                if hashlib.sha256(before).hexdigest()!=current:raise ValueError('Export before-image changed')
+                write_bytes_atomic(journal.parent/(current+'.before'),before)
+            swap=target.with_name('.'+target.name+'.'+input_revision_id({'binding':binding,'before':current,'after':expected_sha256})+'.previous')
+            pending={'schema':'managed-export-v1','binding':binding,'previous_sha256':current,
+                     'sha256':expected_sha256,'status':'prepared','swap_path':str(swap)}
+            write_json(journal,pending)
+        fd,name=tempfile.mkstemp(prefix='.'+target.name+'.',suffix='.tmp',dir=target.parent);tmp=Path(name)
+        try:
+            with os.fdopen(fd,'wb') as handle:handle.write(data);handle.flush();os.fsync(handle.fileno())
+            if current is None:
+                try:os.link(tmp,target)
+                except FileExistsError:
+                    if not target.is_file() or file_sha256(target)!=expected_sha256:raise ValueError('Delivery destination changed during commit')
+            else:
+                if not target.is_file() or file_sha256(target)!=current:raise ValueError('Export CAS before-image changed')
+                if swap.exists():
+                    if not swap.is_file() or file_sha256(swap)!=current:raise ValueError('Export swap contains unrelated bytes')
+                    swap.unlink()
+                os.rename(target,swap)
+                if file_sha256(swap)!=current:
+                    try:os.link(swap,target)
+                    except FileExistsError:pass
+                    raise ValueError('Concurrent external writer preserved; export CAS refused')
+                try:os.link(tmp,target)
+                except FileExistsError:
+                    if not target.is_file() or file_sha256(target)!=expected_sha256:
+                        raise ValueError('Concurrent export destination preserved; original remains in the recorded backup')
+            if file_sha256(target)!=expected_sha256:raise ValueError('Export bytes changed during commit')
+            if journal:
+                committed={**pending,'status':'committed'}
+                write_json(journal.parent/(expected_sha256+'.committed.json'),committed);write_json(journal,committed)
+                if swap.is_file() and file_sha256(swap)==current:swap.unlink()
+            return target
+        finally:tmp.unlink(missing_ok=True)
 
 
 def _upload_one_s3(endpoint: str, access_key_id: str, secret_access_key: str, bucket: str, object_key: str, image_path: Path, region: str, *, deadline_monotonic: float | None = None) -> dict[str, int | str]:
@@ -818,15 +1043,34 @@ def _upload_one_s3(endpoint: str, access_key_id: str, secret_access_key: str, bu
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
     }
-    response = _put_file_with_retries(url, headers=headers, image_path=image_path, deadline_monotonic=deadline_monotonic)
-    if not response.ok:
+    response = _put_file_once(url, headers=headers, image_path=image_path, deadline_monotonic=deadline_monotonic)
+    if not 200 <= response.status_code < 300:
         hint = ""
-        if _is_retryable_signature_error(response.status_code, response.text):
-            hint = " HINT: R2 rejected the request signature; check local clock sync and retry."
-        raise PublishError(f"R2 upload failed status={response.status_code}: {response.text[:500]}{hint}")
+        if response.status_code==403:
+            hint = " Check credentials, clock and permissions; resolve the original receipt before retry."
+        response.close()
+        raise StorageResponseRejected(response.status_code,f"R2 upload failed status={response.status_code}.{hint}")
+    response.close()
     with Image.open(image_path) as image:
         width, height = image.size
     return {"width": width, "height": height, "bytes": size, "content_type": content_type}
+
+
+def _upload_one_oci(upload_base: str, object_key: str, image_path: Path, *, deadline_monotonic: float | None = None) -> dict[str, int | str]:
+    content_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
+    response = _put_file_once(
+        _public_url(upload_base, object_key), headers={"Content-Type": content_type, "Content-Length": str(image_path.stat().st_size)},
+        image_path=image_path, deadline_monotonic=deadline_monotonic,
+    )
+    try:
+        if not 200 <= response.status_code < 300:
+            # PAR credentials can be echoed by servers; never persist bodies or URLs.
+            raise StorageResponseRejected(response.status_code,f"OCI upload failed status={response.status_code}; check PAR permissions, expiry and bucket capacity")
+        with Image.open(image_path) as image:
+            width, height = image.size
+        return {"width": width, "height": height, "bytes": image_path.stat().st_size, "content_type": content_type}
+    finally:
+        response.close()
 
 
 def _sha256_file(path: Path) -> str:
@@ -837,50 +1081,26 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _put_file_with_retries(url: str, *, headers: dict[str, str], image_path: Path, deadline_monotonic: float | None = None) -> requests.Response:
-    attempts = 3
-    last: requests.Response | None = None
-    for attempt in range(1, attempts + 1):
-        timeout = min(120.0, deadline_monotonic - time.monotonic()) if deadline_monotonic is not None else 120.0
-        if timeout <= 0:
-            raise PublishError("Publish execution deadline exhausted before request")
-        try:
-            with image_path.open("rb") as f:
-                response = requests.put(url, headers=headers, data=f, timeout=timeout)
-        except requests.RequestException as exc:
-            if _is_socket_permission_error(exc):
-                raise PublishError(f"R2 upload blocked by local socket permissions: {exc}") from exc
-            if attempt >= attempts:
-                raise PublishError(f"R2 upload failed after {attempts} attempts: {exc}") from exc
-            delay = _retry_delay(attempt)
-            if deadline_monotonic is not None and time.monotonic() + delay >= deadline_monotonic:
-                raise PublishError("Publish execution deadline exhausted before retry") from exc
-            time.sleep(delay)
-            continue
-        last = response
-        if response.ok or not _retryable_status(response.status_code, response.text) or attempt >= attempts:
-            return response
-        delay = _retry_delay(attempt)
-        if deadline_monotonic is not None and time.monotonic() + delay >= deadline_monotonic:
-            raise PublishError("Publish execution deadline exhausted before retry")
-        time.sleep(delay)
-    return last if last is not None else requests.Response()
-
-
-def _retryable_status(status: int, body: str = "") -> bool:
-    del body
-    return status == 429 or 500 <= status <= 599
-
-
-def _is_retryable_signature_error(status: int, body: str) -> bool:
-    if status != 403:
-        return False
-    lowered = body.lower()
-    return "signaturedoesnotmatch" in lowered or "requesttimetoo" in lowered or "request time too skewed" in lowered
-
-
-def _retry_delay(attempt: int) -> float:
-    return min(30.0, (2 ** (attempt - 1)) + random.uniform(0, 0.5))
+def _put_file_once(url: str, *, headers: dict[str,str], image_path: Path, deadline_monotonic=None):
+    from .batch_ledger import admit_paid_request
+    from .service_response import prepare_request,start_submission
+    end=min(time.monotonic()+120,deadline_monotonic if deadline_monotonic is not None else float('inf'))
+    if end<=time.monotonic():raise PublishError('Publish execution deadline exhausted before request')
+    admit_paid_request('storage_put')
+    async def send():
+        async def chunks():
+            with image_path.open('rb') as handle:
+                while chunk:=handle.read(65536):yield chunk
+        async with asyncio.timeout(max(0,end-time.monotonic())),httpx.AsyncClient(timeout=None,follow_redirects=False,trust_env=True) as client:
+            start_submission()
+            async with client.stream('PUT',url,headers=headers,content=chunks()) as response:
+                # Subsequent full public-image GET proves publish success, not this header.
+                result=requests.Response();result.status_code=response.status_code;result._content=b'';result._content_consumed=True
+                return result
+    try:
+        with prepare_request():return asyncio.run(send())
+    except (httpx.HTTPError,OSError,TimeoutError) as exc:
+        raise PublishError(f'Storage PUT outcome unavailable ({type(exc).__name__}); original receipt retained') from None
 
 
 def _is_socket_permission_error(exc: BaseException) -> bool:
@@ -906,7 +1126,7 @@ def _aws_signing_key(secret_key: str, date_stamp: str, region: str, service: str
 
 
 def _write_manifest(path: Path, rows: list[dict[str, str]], *, job_path: Path) -> None:
-    fields = ["job_id", "parent", "child", "role", "candidate_sha256", "local_path", "final_export_path", "object_key", "url", "width", "height", "bytes", "local_sha256", "uploaded_at"]
+    fields = ["upload_path", "upload_sha256", "upload_encoding", "upload_encoder", "upload_bytes", "upload_mime", "job_id", "parent", "child", "role", "candidate_sha256", "local_path", "final_export_path", "object_key", "url", "width", "height", "bytes", "local_sha256", "uploaded_at", "storage_provider", "verified_at", "verified_sha256", "valid_until", "retention_source", "publication_policy_sha256"]
     ordered = sorted((_manifest_row_with_current_local_metadata(job_path, row, fields) for row in rows), key=lambda item: (item["parent"], item["child"], item["role"]))
     write_csv(path, ordered, fields)
 
@@ -932,7 +1152,7 @@ def _publish_local_path(job_path: Path, value: object) -> Path:
 def _build_key(prefix: str, parent: str, child: str, image_path: Path, candidate_sha256: str) -> str:
     digest = str(candidate_sha256 or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise PublishError("R2 object key requires the approved candidate SHA-256")
+        raise PublishError("Storage object key requires the approved candidate SHA-256")
     return "/".join(part.strip("/") for part in (prefix, parent, child, digest[:20], image_path.name) if part)
 
 
@@ -955,21 +1175,59 @@ def _load_publish_env(*paths: str) -> None:
             load_env(path)
 
 
-def _r2_config_present() -> bool:
-    required = ("R2_BUCKET", "R2_PUBLIC_BASE_URL")
-    key_groups = (
-        ("R2_ENDPOINT", "R2_S3_ENDPOINT"),
-        ("R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
-        ("R2_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
-    )
-    if any(not os.environ.get(name) for name in required):
+def publish_upload_config(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Resolve the one selected destination; credentials never enter manifests."""
+    values = os.environ if env is None else env
+    provider = str(values.get("IMAGE_PUBLISH_STORAGE") or "r2").strip().lower()
+    if provider not in {"r2", "oci_par"}:
+        raise PublishError("IMAGE_PUBLISH_STORAGE must be r2 or oci_par")
+    names = ("OCI_PAR_UPLOAD_URL", "OCI_PUBLIC_BASE_URL") if provider == "oci_par" else ("R2_ENDPOINT", "R2_PUBLIC_BASE_URL")
+    endpoint = _env_any(names[0], *(("R2_S3_ENDPOINT",) if provider == "r2" else ()), required=True, env=values)
+    public_base = _env_any(names[1], required=True, env=values)
+    try:
+        parsed, public = urlparse(endpoint), urlparse(public_base)
+        for url in (parsed, public):
+            if url.scheme not in {"https", "http"} or not url.hostname or url.username or url.password or url.query or url.fragment:
+                raise ValueError()
+            _ = url.port
+        if re.match(r"^/p/[^/]+/n/", public.path):
+            raise ValueError()
+        if provider == "oci_par":
+            match = re.fullmatch(r"/p/[^/]+(/n/[^/]+/b/[^/]+/o/)(.*)", parsed.path)
+            if (parsed.scheme != "https" or public.scheme != "https" or not match
+                    or not parsed.hostname.endswith((".oraclecloud.com", ".customer-oci.com"))
+                    or public.path.rstrip("/") != (match[1] + match[2]).rstrip("/")):
+                raise ValueError()
+    except ValueError:
+        raise PublishError("Storage URL configuration is invalid; OCI requires an HTTPS PAR upload URL and matching public object base without credentials") from None
+    config = {"provider": provider, "endpoint": endpoint, "public_base_url": public_base}
+    if provider == "r2":
+        config.update(
+            access_key_id=_env_any("R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID", required=True, env=values),
+            secret_access_key=_env_any("R2_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", required=True, env=values),
+            bucket=_env_any("R2_BUCKET", required=True, env=values),
+            region=_env_any("R2_REGION", "AWS_REGION", default="auto", env=values),
+        )
+    return config
+
+
+def _public_url_matches_key(url: str, object_key: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return bool(
+            parsed.scheme in {"https", "http"} and parsed.hostname
+            and not (parsed.username or parsed.password or parsed.query or parsed.fragment)
+            and not re.match(r"^/p/[^/]+/n/", parsed.path)
+            and unquote(parsed.path).rstrip("/").endswith("/" + object_key)
+        )
+    except ValueError:
         return False
-    return all(any(os.environ.get(name) for name in group) for group in key_groups)
 
 
-def _env_any(*names: str, required: bool = False, default: str = "") -> str:
+def _env_any(*names: str, required: bool = False, default: str = "", env: dict[str, str] | None = None) -> str:
+    values = os.environ if env is None else env
     for name in names:
-        value = os.environ.get(name)
+        value = str(values.get(name) or "").strip()
         if value:
             return value
     if required:

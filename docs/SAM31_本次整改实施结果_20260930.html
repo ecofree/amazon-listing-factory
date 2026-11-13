@@ -1,0 +1,58 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SAM 3.1 审计整改实施结果 · 2026-09-30</title><style>
+body{margin:0;background:#f1f4f6;color:#243545;font:16px/1.8 "Microsoft YaHei",sans-serif}main{max-width:1060px;margin:28px auto;padding:32px 40px;background:white;border:1px solid #dce3e9;border-radius:12px}h1{font-size:28px}h2{font-size:22px;margin-top:30px;border-top:1px solid #dde4ea;padding-top:18px}p{margin:12px 0}table{border-collapse:collapse;width:100%;font-size:14px}th,td{padding:9px 12px;border:1px solid #dce4ea;text-align:left;vertical-align:top}th{background:#edf4f7}code{font:13px/1.6 Consolas,monospace;overflow-wrap:anywhere}a{color:#245e7d}.note{padding:14px 18px;border-left:4px solid #2f6581;background:#edf5f8}.pending{background:#fff6e8;border-left-color:#b97924}img{max-width:100%;height:auto}li{margin:6px 0}@media(max-width:700px){main{margin:0;padding:20px 16px}table{display:block;overflow:auto}}
+</style></head><body><main>
+<p>2026-09-30 · 项目 D:\Amazon_pics\amazon_listing_factory</p>
+<h1>SAM 3.1 本次审计整改实施结果</h1>
+<div class="note"><strong>代码整改已实施；实际验证完成了白床规划与部分分区审查。</strong>前轮 Zivv 主服务先成功两次，后因两次超时在当轮被暂时排除；Nuwa 备用账户剩余额度不足预扣，Krill 备用账户模型未授权，四组生图对照与完整冻结尚未执行。本轮新增生图请求为 0，未运行 QA 或发布。</div>
+<h2>一、已经修改的共同原因</h2>
+<table><tr><th>原问题</th><th>实施结果</th></tr>
+<tr><td>规划只看一张外观图，其它底图用“没看见”逃逸保护。</td><td>现有 child 请求附上所有有产品证据的编辑底图，按 SHA 去重。实际上传和 source_id 映射使用同一清单；相同图片可对应多个证据 ID。</td></tr>
+<tr><td>产品归属、目标可见性、正常遮挡混淆。</td><td>规划与绑定审查统一要求：构件始终属于产品；区域保护目标中仍需外露的构件。裸架尺寸图保护承托板和中撑，普通床品允许正常覆盖承托板。</td></tr>
+<tr><td>只按主色和整件轮廓判断；玻璃使整图不保护。</td><td>在现有区域意图中限定销售成员、异色／细杆／内侧部件及正负点；审查使用原图与候选证据。玻璃或镜面保护可分离的实体框架，反射及背景继续进入已有材料／关系合同。</td></tr>
+<tr><td>固定蒙版同时要求移动、缩放产品。</td><td>带固定蒙版的编译文本保持原位置、尺度、机位与透视；图文和环境修改在其余空间执行。尺寸端点、门覆盖和安装面关系仍保留。</td></tr>
+<tr><td>SAM／审查更新导致整份视觉规划重发。</td><td>同一 kit 读取中区分不可变规划来源与当前批准。相同有效规划可以重新编译区域和审查；当前内容指纹与原始回执仍必须匹配。</td></tr>
+<tr><td>修订编号单独使物理绑定失效。</td><td>绑定依赖实际图像、选中对象、物理特征、事实、目标和区域；无关修订编号不单独撤销批准。改变实体证据或销售对象仍使绑定失效。</td></tr>
+<tr><td>实测发现过期批准仍写回整批文件。</td><td>保留的规划草稿不再将过期批准写回当前 artifact；失败归属留在原有 brief。已增加到现有行为用例验证，不新增控制器或恢复分支。</td></tr>
+</table>
+<p>业务顺序仍为现有观察 → 分类 → brief 内规划／分区／审查 → 提示词编译 → 生图。没有新增阶段、服务、全局调用硬上限、人工逐图涂蒙版要求或生产回退。</p>
+<h2>二、范围与物理删除</h2>
+<p><strong>本轮生产文件：新增 0、删除 0、修改 6；约 +87 / -45 行，净增 42 行。</strong>测试修改 4 个已有文件，约 +54 / -5 行；新增测试模块及用例均为 0。以上以本轮开工副本比较，未把原有未提交变更算作本轮修改。</p>
+<table><tr><th>文件</th><th>操作</th><th>近似增删行数</th><th>行数</th></tr><tr><td><code>core/image_reference_context.py</code></td><td>修改</td><td>+12 / -5</td><td>267 → 274</td></tr><tr><td><code>core/visual_design_kit.py</code></td><td>修改</td><td>+50 / -28</td><td>1288 → 1310</td></tr><tr><td><code>core/visual_design_kit_compiler.py</code></td><td>修改</td><td>+3 / -2</td><td>811 → 812</td></tr><tr><td><code>core/visual_semantics.py</code></td><td>修改</td><td>+14 / -7</td><td>1008 → 1015</td></tr><tr><td><code>core/image_prompt_compiler.py</code></td><td>修改</td><td>+6 / -2</td><td>452 → 456</td></tr><tr><td><code>core/image_tasks.py</code></td><td>修改</td><td>+2 / -1</td><td>460 → 461</td></tr><tr><td><code>tests/test_visual_design_remediation.py</code></td><td>修改</td><td>+11 / -1</td><td>895 → 905</td></tr><tr><td><code>tests/product_region_fixture.py</code></td><td>修改</td><td>+14 / -0</td><td>123 → 137</td></tr><tr><td><code>tests/remediation_recheck_fixture.py</code></td><td>修改</td><td>+25 / -1</td><td>632 → 656</td></tr><tr><td><code>tests/test_image_branch_v1.py</code></td><td>修改</td><td>+4 / -3</td><td>1052 → 1053</td></tr></table>
+<ul>
+<li>物理替换单外观附件选择路径及其旧编号断言；同一函数负责新的去重附件。</li>
+<li>删除“未见底图／含玻璃等即可不适用”的规划许可，删除固定蒙版下的裁切／比例放置许可。</li>
+<li>替换“不得遮挡任何源图可见部件”的旧生成与测试要求。</li>
+<li>删除审查政策变化就丢弃有效规划的旧 reader 行为；删除保存过期批准的旧写回路径。</li>
+<li>从物理绑定键中删除仅修订编号的依赖；源观察反馈的版本血缘仍保留，混合版本反馈不会被采用。</li>
+</ul>
+<p>没有遗留默认关闭的旧分支、兼容 controller 或新 fallback。所有修改生产文件均低于 2,000 行；本轮未修改本地 SAM 权重、模型转换或数值实现。</p>
+<h2>三、离线验证记录</h2>
+<table><tr><th>实际命令</th><th>结果／时长</th></tr>
+<tr><td><code>D:\anaconda\python.exe -m unittest tests.test_visual_design_remediation tests.test_image_branch_v1.ImageBranchCurrentBehaviorTests.test_compiled_prompt_preserves_design_facts_and_units tests.test_provider_runtime_v1.ProviderRuntimeV1Tests.test_protected_reference_mask_is_passed_to_mask_capable_provider tests.test_generation_state_contract -v</code></td><td>14 项全部通过，11.320 秒。</td></tr>
+<tr><td><code>D:\anaconda\python.exe scripts/run_production_tests.py</code></td><td>运行一次：100 项，16.184 秒；99 项通过，1 项失败。失败来自旧 fake_planner 的“只收一张图”断言。</td></tr>
+<tr><td><code>D:\anaconda\python.exe -m unittest tests.test_image_branch_v1.ImageBranchCurrentBehaviorTests.test_current_artifact_chain_has_one_fact_authority_and_typed_references -v</code></td><td>删除旧单图断言后，该完整 artifact 链用例单独复测通过，1.724 秒。依照单次整套预算保留原始套件日志。</td></tr>
+</table>
+<p>覆盖了多底图与别名对应、固定蒙版几何、原生 mask 传递、实例归属与有害删除、无关版本复用、SAM／审查更新时规划调用为 0、当前批准重新绑定、失败刷新不写回旧批准。测试数量仍为 100；未运行历史全发现套件。</p>
+<p>过程中出现的失败日志没有删除。原始日志：<a href="../test_runs/sam31_audit_remediation_20260930/targeted_final.log">定向测试</a> · <a href="../test_runs/sam31_audit_remediation_20260930/production_suite.log">生产套件</a> · <a href="../test_runs/sam31_audit_remediation_20260930/retired_attachment_assertion_recheck.log">旧断言修正后的复测</a>。</p>
+<h2>四、实际分区结果与调用效率</h2>
+<p>在独立验证目录复用当前 4 类、8 子体现有原图及事实，并保留全部 73 个正式槽位清单；原冻结输出未覆盖，没有重抓 ASIN、迁移旧 schema 或扫描项目历史 jobs。</p>
+<table><tr><th>实测项目</th><th>实际证据</th></tr>
+<tr><td>白床 B0GY4GCTQT 规划输入</td><td>9 个不同编辑底图一次进入 child 请求，附件路径与 SHA 全部核实。10 个输出槽位保留，10 个都有 protect_visible 意图。</td></tr>
+<tr><td>SAM 分区</td><td>8 个不同底图形成候选／蒙版；区域推理回执合计 12.219 秒，包含 21 次图像编码、22 次语义查询、0 次交互查询。该推理时间不含全部冷启动、Gemini 等待或文件处理。</td></tr>
+<tr><td>审查检查点</td><td>7 个槽位形成当时的 ready 检查点；main 尚需当前合并 mask 的复核；func_03、size 的数字写入文案区被现有测量合同拒绝。最终当前绑定需恢复接口后继续完成。</td></tr>
+<tr><td>实际 Gemini 请求</td><td>6 次：初次规划 3（白床成功 1，胡桃床主备各失败 1），绑定审查 2（成功 1、超时 1），局部修订 1（超时）。合计成功 2、失败 4；新增观察请求 0。按每份轨迹累计物理计数的最大值汇总，不重复累加尝试序号。</td></tr>
+<tr><td>后续限制</td><td>胡桃床请求转入 Nuwa 备用账户，HTTP 403 insufficient_user_quota：当时剩余 $0.001396，需预扣 $0.018628。Krill 备用账户 HTTP 403，token 未获当前模型渠道权限。该回执不能证明 Zivv 主账户余额不足。超时审查没有可用返回，保留原始回执。</td></tr>
+<tr><td>生图、QA、发布</td><td>全部新增请求为 0。没有执行四组 A/B，完整 73 槽位冻结尚未执行。</td></tr>
+</table>
+<p>接触表显示场景中的外露床头、框架和床腿开始进入保护区，床品／房间仍可编辑。裸架、尺寸和未完成审查的区域不能作为最终通过证据；绿色覆盖不证明模型会完全保真。</p>
+<p><a href="../test_runs/sam31_audit_remediation_20260930/white_bed_regions.jpg">白床原图—区域接触表</a> · <a href="../test_runs/sam31_audit_remediation_20260930/real_validation.json">逐项分区与调用证据</a> · <a href="../test_runs/sam31_audit_remediation_20260930/incremental_changes.json">本轮文件增删统计</a>。</p>
+<h2>五、主服务复核与继续验证</h2><p><strong>2026-09-30 16:35 复测结果：</strong>Zivv 在恢复中成功返回 3 次（审查两次、局部修订一次），明确证实请求可以通过。床架 brief 共运行 222.234 秒；白床仍有当前区域批准待完成，胡桃床规划仍发生读超时。新增生图为 0。<a href="../test_runs/sam31_audit_remediation_20260930/balance_route_recheck.json">本轮路由复核回执</a>。</p><p><strong>2026-09-30 16:32 更新：</strong>Zivv 主服务已通过现有 brief 成功返回一次真实床架绑定审查，耗时 30.672 秒，当前请求可用。未查询账户余额；这一实际成功回执撤销了“必须先恢复主账户额度”的判断。床架组继续沿用现有规划验证，尚未提交生图。</p>
+<ol>
+<li>先通过现有 brief 确认 Zivv 主服务当前可用性；复用白床有效规划，在原有预算内完成区域复核与数字文案修订。其它 7 子体按同批既有输入完成。</li>
+<li>检查当前首图／mask、主要构件、目标成员与正常遮挡；仍有明确错误时先修正责任环节。</li>
+<li>按批准方案做白床 scene、胡桃床 size、原木柜 scene、双树 scene 的四组同源／同提示／同模型 A/B。无蒙版控制图保持隔离。</li>
+<li>沿用有效 kit 完成 4 类、8 子体、73 槽位冻结，仅到生图并逐图对照。仅 CXK；func／size 用 sunburst，其它角色沿用当前分配与候补。</li>
+</ol>
+<div class="note pending"><strong>未验证事项：</strong>真实生图保真、A/B 提升、其它三个品类的新保护区，以及正常完整批次 24／16 次 Gemini 设计基线均未完成实测。离线“恢复时规划 0 重发”已通过行为验证，但不能宣称实际 99 次调用已降低到某个固定数字。</div>
+<p>本轮不作“全部图像质量修复”“通用品类完全通过”或“正确蒙版保证模型绝不重绘”的结论。主服务当前可用性确认后，继续已批准验证顺序；本轮不要求先为备用账户充值。</p>
+</main></body></html>

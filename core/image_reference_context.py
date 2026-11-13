@@ -31,6 +31,13 @@ def source_point(value: Any) -> tuple[float, float]:
     return value['x'], value['y']
 
 
+def feature_for_part(part_id: str, features: list[dict]) -> dict | None:
+    """Resolve explicit feature/view names; feature IDs themselves may contain '/'."""
+    exact=next((f for f in features if part_id==f['feature_id']),None)
+    return exact or max((f for f in features if part_id.startswith(f['feature_id']+'/')),
+                        key=lambda f:len(f['feature_id']),default=None)
+
+
 def product_features(observation: dict[str, Any]) -> list[dict[str, Any]]:
     """Product evidence describes facts, not crop geometry or output panels."""
     if observation.get('product_extent') not in ('whole_view', 'detail', 'none'):
@@ -51,16 +58,53 @@ def product_features(observation: dict[str, Any]) -> list[dict[str, Any]]:
                 or not feature['physical_facts'] or any(not isinstance(f, str) or not f.strip() for f in feature['physical_facts'])):
             raise ValueError('Product feature needs unique identity, object and visible physical facts')
         seen.add(feature['feature_id'])
-    if set(purposes) & {'appearance', 'feature'} and (not features or observation['product_extent'] == 'none'):
-        raise ValueError('Selected product references need visible product evidence')
+    if 'feature' in purposes and (not features or observation['product_extent'] == 'none'):
+        raise ValueError('Feature references need visible functional evidence')
     return features
 
 
+def source_usability(observation: dict[str, Any]) -> dict:
+    """One readiness predicate for source settlement, attachment admission and plans."""
+    if not isinstance(observation, dict) or observation.get('status') != 'success':
+        return {'status':'needs_source','code':'observation_unresolved'}
+    try:
+        features = product_features(observation)
+    except (ValueError, TypeError, KeyError):
+        return {'status':'needs_source','code':'observation_contract_invalid'}
+    if (observation.get('variant_identity') or {}).get('status') == 'contradiction':
+        return {'status':'needs_source','code':'variant_conflict'}
+    if observation['product_extent'] == 'none':
+        return {'status':'not_product','code':'no_visible_product'}
+    visible = any(isinstance(obj, dict) and obj.get('visibility') == 'visible'
+        and obj.get('sale_membership') in {'product','included_accessory'}
+        and isinstance(obj.get('membership_evidence'), list) and obj['membership_evidence']
+        for obj in observation.get('objects', []))
+    if not features and not visible:
+        return {'status':'needs_source','code':'visible_product_index_missing'}
+    return {'status':'ready','code':''}
+
+
+def has_visible_product_evidence(observation: dict[str, Any]) -> bool:
+    return source_usability(observation)['status'] == 'ready'
+
+
+def appearance_eligible(observation: dict[str, Any]) -> bool:
+    return (observation.get('status') == 'success' and observation.get('product_extent') == 'whole_view'
+            and observation.get('variant_identity', {}).get('status') != 'contradiction'
+            and has_visible_product_evidence(observation))
+
+
 def planning_reference_inputs(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected = [source for source in sources if 'appearance' in source['observation']['reference_purposes']]
-    if len(selected) != 1 or selected[0]['observation']['product_extent'] != 'whole_view':
+    appearance = [source for source in sources if 'appearance' in source['observation']['reference_purposes'] and has_visible_product_evidence(source['observation'])]
+    if len(appearance) != 1 or appearance[0]['observation']['product_extent'] != 'whole_view':
         raise ValueError('Child observation must select one reliable whole-product appearance reference')
-    return [{'attachment_number': 1, 'source_id': selected[0]['source_id']}]
+    selected = [appearance[0], *(source for source in sources if source is not appearance[0]
+                                and has_visible_product_evidence(source['observation']))]
+    numbers, inputs = {}, []
+    for source in selected:
+        number = numbers.setdefault(source['source_sha256'], len(numbers) + 1)
+        inputs.append({'attachment_number': number, 'source_id': source['source_id']})
+    return inputs
 
 
 def prepare_planning_references(job: Path, sources: list[dict[str, Any]], directory: Path,
@@ -75,9 +119,10 @@ def prepare_planning_references(job: Path, sources: list[dict[str, Any]], direct
         path = resolve_job_owned_path(job, source['source_path'])
         if not path.is_file() or file_sha256(path) != source['source_sha256']:
             raise ValueError('Source changed before planning')
-        paths.append(path)
+        if item['attachment_number'] > len(paths):
+            paths.append(path)
         manifest.append({**item, 'path': source['source_path'], 'sha256': source['source_sha256']})
-    write_json(directory / 'manifest.json', {'attachments': manifest, 'selection': 'observed_primary_appearance_original',
+    write_json(directory / 'manifest.json', {'attachments': manifest, 'selection': 'observed_edit_bases_with_primary_appearance',
         'context_limit': 'Original source graphics may remain; reference selection is not background removal.'})
     return paths
 
@@ -101,10 +146,31 @@ def measurement_attachment(row: dict[str, Any], references: list[dict[str, Any]]
     raise ValueError('Selected measurement is missing its original source attachment')
 
 
-def reference_semantics(reference: dict[str, Any]) -> dict[str, Any]:
-    """Consumed reference evidence, independent of paths and approval history."""
-    return {**{key: reference[key] for key in ('kind', 'sha256', 'source_id', 'extent', 'visible_evidence') if key in reference},
+def reference_semantics(reference: dict[str, Any], *, execution=False) -> dict[str, Any]:
+    """Execution attachments. Observations remain evidence; authored constraints are in the brief."""
+    keys = ('kind', 'sha256', 'source_id', 'extent') + (() if execution else ('visible_evidence',))
+    return {**{key: reference[key] for key in keys if key in reference},
         'mask_sha256': (reference.get('protected_mask') or {}).get('sha256')}
+
+
+def canonical_selection_text(text: str) -> str:
+    """Canonicalize only machine-authored selection JSON, never copy or free prose."""
+    import json
+    import re
+    pattern = r'(Keep these selected instances from attachment 1 \([^\n]+?\): | Remove these unselected primary instances: )'
+    for match in reversed(list(re.finditer(pattern, text))):
+        start = match.end()
+        try:
+            value, length = json.JSONDecoder().raw_decode(text[start:])
+        except ValueError:
+            continue
+        if isinstance(value, list):
+            text = text[:start] + json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + text[start+length:]
+    return text
+
+
+def generation_attachment_count(references: list[dict[str, Any]]) -> int:
+    return len(references) + int(bool(references and references[0].get('protected_mask')))
 
 
 def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str) -> None:
@@ -136,9 +202,9 @@ def validate_reference_set(references: Any, *, child: str, edit_base_sha256: str
 
 
 def resolve_edit_references(brief: dict[str, Any], sources: list[dict[str, Any]], *, job: Path, child: str,
-                            design_references: list[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+                            design_references: list[dict[str, Any]] = (), edit_contract: dict | None = None, product_claims=()) -> list[dict[str, Any]]:
     """One projection of actual original attachments, including selected measurements."""
-    from .image_task_inputs import measurement_authority
+    from .measurement_sources import measurement_authority
     catalog = {source['source_id']: source for source in sources}
     direction = brief['image_direction']
     selected = direction['product_sources']
@@ -146,8 +212,9 @@ def resolve_edit_references(brief: dict[str, Any], sources: list[dict[str, Any]]
         raise ValueError('Select unique original product references from this child')
     refs = [source_reference(catalog[key], job=job, child=child, kind='edit_base' if i == 0 else 'product_evidence')
             for i, key in enumerate(selected)]
-    measurements = measurement_authority(brief['role'].split('_', 1)[0], direction, sources)
+    measurements = measurement_authority(brief['role'], direction, sources, product_claims)
     for row in measurements.get('measurement_groups', []):
+        if row.get('origin_kind')=='product_statement':continue
         if row['source_id'] not in {ref['source_id'] for ref in refs}:
             refs.append(source_reference(catalog[row['source_id']], job=job, child=child, kind='measurement_evidence'))
     available = {row['source_id']: row for row in design_references}
@@ -156,6 +223,53 @@ def resolve_edit_references(brief: dict[str, Any], sources: list[dict[str, Any]]
         if key not in available or brief['role'].split('_', 1)[0] not in available[key]['roles']:
             raise ValueError('Selected design reference is not approved for this role')
         refs.append(available[key])
+    if brief.get('product_region'):
+        from PIL import Image
+        from .product_region import read_region
+        region = read_region(brief['product_region'], job=job, child=child, base=refs[0])
+        with Image.open(resolve_job_owned_path(job, refs[0]['path'])) as image:
+            if list(image.size) != region['base']['size']:
+                raise ValueError('Product region edit-base dimensions changed')
+        refs[0]['protected_mask'] = region['mask']
+    if edit_contract is not None:
+        import json
+        protected=[{'source_id':ref['source_id'],**{k:obj[k] for k in ('object_id','kind','sale_membership')}}
+            for ref in refs if ref['kind']!='design_reference' and ref['source_id'] in catalog
+            for obj in catalog[ref['source_id']]['observation'].get('objects',[])
+            if obj['sale_membership'] in {'product','included_accessory','unknown'}]
+        edit_contract['preserve'].append('Non-sold staging colors never authorize restyling these registered instances, regardless of their description or resemblance to a prop: '
+            +json.dumps(protected,ensure_ascii=False,separators=(',',':'))+'. Product instance removal is authorized only by the explicit product selection, never by a staging slot.')
+    if edit_contract is not None and brief['region_intent']['targets']:
+        import json
+        intent = brief['region_intent']
+        objects = catalog[refs[0]['source_id']]['observation'].get('objects', [])
+        membership = {obj['object_id']: obj['sale_membership'] for obj in objects}
+        targets = [{key: target[key] for key in ('object_id', 'query', 'crop')}
+                   | {'sale_membership': membership.get(target['object_id'], 'observed_owned_target'), 'components': [{key: part[key] for key in ('part_id', 'query', 'crop')} for part in target['parts']]}
+                   for target in intent['targets']]
+        selection = (f"Keep these selected instances from attachment 1 ({refs[0]['source_id']}): "
+                     + json.dumps(targets, ensure_ascii=False, separators=(',', ':'))
+                     + '. Coordinates are normalized windows identifying the original instances, not output crop/rebuild commands. '
+                     'Editable objects: ' + json.dumps(intent['editable_objects'], ensure_ascii=False, separators=(',', ':')) + '.')
+        if brief['role'].split('_', 1)[0] in {'main', 'scene'} and direction['presentation']['scope'] == 'whole_product':
+            selected_ids = {target['object_id'] for target in targets}
+            excluded = [{key: obj[key] for key in ('object_id', 'kind', 'state')}
+                        for obj in objects if obj['visibility'] == 'visible'
+                        and obj['sale_membership'] == 'product' and obj['object_id'] not in selected_ids]
+            if excluded:
+                selection += (' Remove these unselected primary instances: '
+                              + json.dumps(excluded, ensure_ascii=False, separators=(',', ':'))
+                              + '. Continue the non-product surroundings where they stood.')
+            primary = [target for target in targets if target['sale_membership'] == 'product']
+            known = all(target['sale_membership'] in {'product', 'included_accessory'} for target in targets)
+            count = len(primary) if known else len(targets)
+            noun = 'primary product assembly/assemblies' if known else 'owned target group(s)'
+            selection += (f' Retain exactly {count} selected source-visible {noun}. '
+                          'Accessories and repeated detail views do not add primary units; package quantity is a separate fact.')
+        edit_contract['product_selection'] = {'source_id': refs[0]['source_id'], 'selected': targets,
+            'excluded': [{key: obj[key] for key in ('object_id', 'kind', 'state')} for obj in objects
+                if obj['sale_membership'] == 'product' and obj['object_id'] not in {t['object_id'] for t in targets}]}
+        edit_contract['create'] = str(edit_contract['create']).rstrip() + '\n' + selection
     return refs
 
 
@@ -177,13 +291,22 @@ def reference_prompt(references: list[dict[str, Any]], *, design_transfer: list[
         elif row['kind'] == 'measurement_evidence':
             purpose = 'Measurement verification only: quantities, measured objects and endpoints; not styling or an extra output panel.'
         elif row['kind'] == 'product_evidence':
-            purpose = 'Supplementary facts or depicted details only.'
+            purpose = ('Original product facts and depicted details; source position or scale may guide only an explicitly requested restoration, never unrelated redesign.'
+                       if targeted_edit else 'Supplementary facts or depicted details only.')
         elif not targeted_edit:
-            purpose = 'Photograph to edit; source graphics are not the target layout.'
+            purpose = 'Photograph to edit; restyle graphic decoration only within ROLE, preserving the selected product views and their approved locations.'
         else:
             purpose = "Selected candidate: retain its design and physical state except for the requested correction."
         identity = row['source_id']
         lines.append(f"Attachment {index}: {row['kind']} ({identity}). {purpose}")
+    if not targeted_edit and references[0].get('protected_mask'):
+        number = generation_attachment_count(references)
+        lines.append(
+            f"Attachment {number} is an opaque black-and-white region map aligned exactly with attachment 1. "
+            "WHITE identifies protected product regions: preserve their source structure, position, scale, colors, materials and visible details. "
+            "BLACK identifies space available for the edits already authorized in ROLE; it does not authorize changing product structures, including visible parts missed by the map. "
+            "The map is supporting guidance, not output artwork or another product. Do not render its black-and-white colors. "
+            "Apply the brief to attachment 1 and return only the edited image.")
     return "\n".join(lines)
 
 
@@ -224,12 +347,12 @@ def generation_reference_primary_path(
     return references[0]["path"]
 
 
-def generation_reference_mask_bytes(
+def generation_reference_region_map_bytes(
     task: dict[str, Any],
     *,
     plugin: ProductPlugin,
 ) -> bytes | None:
-    """Read an optional native edit mask attached to the editable reference."""
+    """Project the existing SAM alpha mask into an opaque reference; no new segmentation."""
     references = generation_reference_sources(task, plugin=plugin)
     reference = references[0]
     mask = reference.get("protected_mask")
@@ -254,6 +377,8 @@ def generation_reference_mask_bytes(
                         f"protected mask size differs from editable reference: "
                         f"{mask_image.size} != {source_image.size}"
                     )
+            out = BytesIO()
+            mask_image.getchannel('A').convert('RGB').save(out, format='PNG')
     except Exception as exc:
         raise ValueError(f"Invalid ImageTask protected mask: {exc}") from exc
-    return data
+    return out.getvalue()

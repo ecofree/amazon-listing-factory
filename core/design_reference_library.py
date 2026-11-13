@@ -126,7 +126,10 @@ def import_design_inputs(job: Path, *, category: str, pack_path: str = "", brief
                     data = output.getvalue()
         row["sha256"] = hashlib.sha256(data).hexdigest()
         row["path"] = f"inputs/design/{row['sha256']}.png"
-        write_bytes_atomic(job / row["path"], data)
+        target = job / row['path']
+        if target.is_file() and file_sha256(target) != row['sha256']:
+            raise ValueError('Design import cannot overwrite unrelated bytes')
+        if not target.is_file():write_bytes_atomic(target, data)
     return {"brand_brief": brief, "pack": {"id": pack["pack_id"], "version": pack["version"], "sha256": file_sha256(path),
             'approval_scope': pack['approval_scope'], 'production_ready': pack['production_ready']},
             "references": [row for _, row in rows]}
@@ -138,21 +141,21 @@ def brand_design_brief(job: Path) -> dict[str, Any]:
 
 
 def update_brand_design_brief(job: Path, *, brief_path: str) -> None:
+    """Update under the production controller's existing job lock."""
     from .job import load_job
     from .progress_trace import record_progress
-    from .status import input_revision_id, job_run_lock
+    from .status import input_revision_id
 
     brief = _brief(read_json(Path(brief_path).resolve()))
-    with job_run_lock(job):
-        metadata = load_job(job)
-        inputs = metadata.get("design_inputs", {})
-        old_fingerprint = input_revision_id(inputs.get("brand_brief", {}))
-        new_fingerprint = input_revision_id(brief)
-        if old_fingerprint == new_fingerprint:
-            return
-        metadata["design_inputs"] = {**inputs, "brand_brief": brief}
-        write_json(job / "job.json", metadata)
-        record_progress(job, "brand_brief_updated", old_fingerprint=old_fingerprint, new_fingerprint=new_fingerprint)
+    metadata = load_job(job)
+    inputs = metadata.get("design_inputs", {})
+    old_fingerprint = input_revision_id(inputs.get("brand_brief", {}))
+    new_fingerprint = input_revision_id(brief)
+    if old_fingerprint == new_fingerprint:
+        return
+    metadata["design_inputs"] = {**inputs, "brand_brief": brief}
+    write_json(job / "job.json", metadata)
+    record_progress(job, "brand_brief_updated", old_fingerprint=old_fingerprint, new_fingerprint=new_fingerprint)
 
 
 def approved_design_references(job: Path, child: str, *, source_ids: set[str] | None = None) -> list[dict[str, Any]]:

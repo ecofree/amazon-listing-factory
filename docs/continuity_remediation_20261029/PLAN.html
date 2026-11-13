@@ -1,0 +1,675 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'"><link rel="icon" href="data:,"><title>持续运行整改方案 · Amazon Listing Factory</title><style>
+:root{--bg:#f3f1e9;--paper:#fffef9;--ink:#18343b;--muted:#53676c;--teal:#176b70;--line:#c8d3cd;--accent:#9a5a27}*{box-sizing:border-box}html{scroll-padding-top:82px}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.9 "Segoe UI","Microsoft YaHei",sans-serif}a{color:var(--teal);text-underline-offset:3px}h1,h2,h3{line-height:1.45;text-wrap:balance}h1{font:700 clamp(32px,4.2vw,53px)/1.45 Georgia,"SimSun",serif;letter-spacing:-1px}h2{font:700 28px/1.5 Georgia,"SimSun",serif;border-top:2px solid var(--ink);padding-top:28px;margin:52px 0 20px}h3{font-size:20px;margin:32px 0 12px}p{margin:14px 0}li{margin:7px 0}strong{color:#163139}code{font: .88em/1.7 Consolas,monospace;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;overflow:auto}aside{position:fixed;inset:0 auto 0 0;width:254px;background:var(--ink);color:#dfeae3;padding:30px 22px;overflow:auto}aside .brand{font:700 17px/1.7 Consolas,monospace;color:white;letter-spacing:1px}aside p{font-size:12px;color:#b3cbc3}aside ul{list-style:none;padding:0}aside li{margin:0}aside a{display:block;color:#d4e4dc;text-decoration:none;font-size:13px;padding:9px 0;border-bottom:1px solid #365157}aside ul ul{display:none}.layout{margin-left:254px}.bar{position:sticky;top:0;z-index:2;background:#f3f1e9f5;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:15px;padding:12px 4vw}.bar span{font:12px Consolas,monospace;color:var(--muted)}button{cursor:pointer;border:1px solid var(--ink);background:var(--ink);color:white;border-radius:3px;padding:9px 16px;min-height:44px;font:14px "Microsoft YaHei",sans-serif}button:hover{background:var(--teal)}:focus-visible{outline:3px solid #b3782d;outline-offset:4px}main{max-width:1180px;margin:auto;padding:34px clamp(22px,4vw,58px) 70px;overflow-wrap:anywhere}.eyebrow{font:12px Consolas,monospace;letter-spacing:2px;color:var(--teal)}.lead{font-size:19px;max-width:850px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:28px 0;border-block:1px solid var(--line)}.metrics div{padding:17px;border-right:1px solid var(--line)}.metrics div:first-child{padding-left:0}.metrics div:last-child{border:0}.metrics b{display:block;font:38px/1.3 Georgia,serif}.metrics small{font-size:13px;color:var(--muted)}.note{font-size:14px;color:var(--muted);padding-bottom:22px;border-bottom:1px solid var(--line)}blockquote{margin:24px 0;padding:20px 25px;background:#e4ede6;border:1px solid #b7cec0;font-size:19px}blockquote p{margin:0}.table-scroll{max-width:100%;overflow:auto;margin:24px 0;border:1px solid var(--line)}table{border-collapse:collapse;width:100%;min-width:720px;font-size:14px}th,td{padding:12px;vertical-align:top;text-align:left;border-bottom:1px solid var(--line)}th{background:#e5ebe3;color:var(--muted);font-weight:600}tbody tr:nth-child(even){background:#fffdf7}td:first-child{min-width:60px}footer{border-top:2px solid var(--ink);margin-top:40px;padding-top:20px;font-size:13px;color:var(--muted)}.summary{border:1px solid var(--line);background:var(--paper);padding:22px;margin:20px 0}.summary p{margin:8px 0}.screen-only{display:initial}@media(max-width:900px){aside{position:relative;width:auto;padding:20px}aside .toc ul{display:flex;overflow:auto;gap:18px}aside .toc li{flex-shrink:0}aside a{white-space:nowrap;min-height:44px}aside ul ul{display:none!important}.layout{margin:0}main{padding:25px 20px 50px}.bar{padding:10px 20px}.bar span{max-width:180px;font-size:11px}h1{font-size:35px}h2{font-size:26px}.lead{font-size:17px}.metrics b{font-size:30px}.metrics div{padding:13px 9px}.metrics small{font-size:12px}blockquote{padding:17px;font-size:17px}}@media print{@page{size:A4;margin:15mm}body{background:white;font-size:12pt;line-height:1.7}aside,.bar,.screen-only{display:none!important}.layout{margin:0}main{padding:0;max-width:none}h1{font-size:27pt}h2{font-size:21pt;break-after:avoid}h3{font-size:16pt;break-after:avoid}.table-scroll{overflow:visible}table{min-width:0;font-size:12pt}th,td{padding:7px}code,footer{font-size:12pt}blockquote{font-size:14pt}.note,.metrics small{font-size:12pt}}
+</style></head><body>
+<aside><div class="brand">ALF / CONTINUITY</div><p>当前项目核查与整改方案<br>不是再增加一组运行限制</p><div class="toc">
+<ul>
+<li><a href="#1">1. 先纠正整改方向</a></li>
+<li><a href="#2">2. 本次核查做了什么</a><ul>
+<li><a href="#_2">本次查出的同类问题</a></li>
+</ul>
+</li>
+<li><a href="#3">3. 新的阻塞准则：安全与可继续性一起设计</a><ul>
+<li><a href="#31">3.1 每个门必须回答五个问题</a></li>
+<li><a href="#32">3.2 区分四种处理，而不是统一失败</a></li>
+</ul>
+</li>
+<li><a href="#4">4. 必要设计冗余：优先复用现有能力</a><ul>
+<li><a href="#41">4.1 先识别需要哪种工作，再要求资源</a></li>
+<li><a href="#42">4.2 不把完整交付放弃，而是分开三种完成度</a></li>
+<li><a href="#43">4.3 有界自动续做，而不是每个细节都找人</a></li>
+</ul>
+</li>
+<li><a href="#5">5. 六个实施包</a><ul>
+<li><a href="#b1">B1：改对合同，改准入顺序，不加全局否决</a></li>
+<li><a href="#b2">B2：把局部成功接通到控制器与最终完成定义</a></li>
+<li><a href="#b3">B3：把恢复做成正常续做，而不是新增一堆手工命令</a></li>
+<li><a href="#b4">B4：缓存优先，把“连接健康”从“事实/质量证据”中拿出去</a></li>
+<li><a href="#b5">B5：让版本修订与正式交付能闭合</a></li>
+<li><a href="#b6">B6：安全与维护做成支持能力，不做额外停产条件</a></li>
+</ul>
+</li>
+<li><a href="#6">6. 实施顺序：按可交付增量，而不是按问题编号</a></li>
+<li><a href="#7">7. 验收：必须同时证明“不会乱做”和“不会误停”</a><ul>
+<li><a href="#_3">可继续性场景</a></li>
+<li><a href="#_4">安全场景</a></li>
+<li><a href="#_5">工程与真实验证</a></li>
+</ul>
+</li>
+<li><a href="#8-33">8. 原 33 项审计逐项处置</a></li>
+<li><a href="#9">9. 证据与交付边界</a></li>
+</ul>
+</div>
+<p>保留事实、费用和发布底线<br>让合法工作持续推进</p></aside><div class="layout"><header class="bar"><span>REMEDIATION PLAN / 2026-10-29</span><button id="print" type="button">打印完整方案</button></header><main>
+<div class="eyebrow">SAFE PROGRESS, NOT MORE GATES</div><h1>让正确的工作继续，<br>而不是让所有工作一起等待。</h1><p class="lead">从点状审计回到完整业务流程：收窄误伤、打通恢复、保留必要冗余，不降低真实交付标准。</p>
+<div class="metrics"><div><b>17</b><small>新建连通性与边界场景</small></div><div><b>11</b><small>新增同源问题类别</small></div><div><b>6</b><small>收敛后的实施包</small></div></div>
+<div class="summary"><strong>本次最重要的调整</strong><p>先复用，再判断缺什么工作；只在真正需要的边界检查条件；局部失败局部等待；最终按真实业务目标收口。</p><p>原 33 项处置：直接修正 7 项、打通流程 12 项、收窄建议 10 项、后置优化 4 项。不是 33 个新闸门。</p></div>
+<p class="note">只读核查已完成，整改尚未实施。17 个场景包含合成供应商/视觉回复，不能证明真实图片质量。生产代码、旧作业与账本均未修改，真实付费调用为 0。</p>
+
+<p>日期：2026-10-29<br />
+适用源码：<code>4af6909c5bb172e817b9de9c43cc6ef3b5482b8656eee09c5caba394663ea425</code><br />
+状态：<strong>已做当前项目核查，尚未实施；不处理过去作业，不发付费请求。</strong></p>
+<h2 id="1">1. 先纠正整改方向</h2>
+<p>上一份审计证明了不少边界问题，但“某个反例成立”不等于“正常流程必须再加一道否决门”。原建议对<strong>允许继续的路径、已有容错能力、人工成本和业务阶段</strong>强调不够；若把 33 项逐条做成强校验，确实会把项目越修越难运行。这部分需要纠正。</p>
+<p>本方案不再追求“所有东西先完美，项目才能启动”，而采用：</p>
+<blockquote>
+<p><strong>只阻止当前不安全的动作；让已授权、证据足够、资源可用的工作继续。成功产物先保存，局部失败局部处理，最终交付按真实业务目标收口。</strong></p>
+</blockquote>
+<ul>
+<li>不把 33 项审计变成 33 个运行闸门，收敛为 <strong>6 个实施包</strong>。</li>
+<li>不把每条警告都变成人工审批；正常缓存复用、本地幂等恢复、既定预算内的合法重试应自动推进。</li>
+<li>不以“更细 schema / 更多 SHA / 更多模型评审”替代可靠的业务流程。</li>
+<li>不伪造事实、不发布未获资格的图片、不重发真实未知请求、不借新作业或新账本清消费。</li>
+<li>保留完整家族目标，但<strong>完整目标不等于所有子体必须同时就绪，更不等于每张参考图都必须成功</strong>。</li>
+</ul>
+<p>这里的“降级继续”指排队、部分成果、待 QA、待业务资料、可选项暂缺等明确状态，<strong>不是</strong>把失败偷偷变成通过、把尺寸图改成本地拼图、把未知数量补成 1，或无授权换生成路径。</p>
+<h2 id="2">2. 本次核查做了什么</h2>
+<p>这轮没有重新盘点旧任务，也没有再次堆独立的细碎错误。核查重点是：<strong>原本可运行的工作，在哪个上层或后置连接处又被拦住。</strong></p>
+<ul>
+<li>构造了 <strong>17 个全新场景</strong>：真实抓取 owner、ProductFamily、RunScope、下载、观察、规划、SAM 工具接口、任务/提示词、候选、QA、release、发布/归档、worker 与回执授权之间的连接。</li>
+<li>其中模型回复、供应商数据、图像字节及 SAM 后端是合成素材；相关验证器、文件提交、当前性、发布判定等尽量走实际代码。每个场景单独记录 mock 边界。</li>
+<li>还运行 <strong>8 个现有正面对照测试</strong>，确认项目已经具有部分发布、备用合格角色、原回执复用、局部重试和不盲目重复调用等能力。结果：8/8，unittest 20.986 秒，外层 23.203 秒。</li>
+<li>源码未改变。本轮没有重跑全部默认套件；同一源码最近的默认套件记录为上一轮审计的 100/100、51.657 秒，不能称作本轮又跑了一遍。</li>
+<li>场景核查完成不等于整改后验收，更不等于真实图片质量已通过。实施后仍需默认准入及另行授权的新任务小样。</li>
+</ul>
+<h3 id="_2">本次查出的同类问题</h3>
+<p>以下 <strong>11 类</strong>与原审计一起合并处理，不另建 11 套控制器。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>编号</th>
+<th>当前项目中的具体表现</th>
+<th>整改后应允许什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>N01</td>
+<td>两个子体中一个已获得事实、一个抓取失败，生产 RunScope 仍不能建立</td>
+<td>保留两个目标，正常子体先做资产，缺失子体继续等待；不能把家族当成已完成</td>
+</tr>
+<tr>
+<td>N02</td>
+<td>未知 GTIN 在 fetch 前拦默认全链；后续 QA 路由缺失又拦生成</td>
+<td>按明示的分阶段策略先完成可做部分，业务/QA 门只作用于依赖它们的动作</td>
+</tr>
+<tr>
+<td>N03</td>
+<td>四类必需角色已有通过记录，未消费参考图的 404 仍阻模板资格；可选上传 warning 又被归档升级为失败</td>
+<td>统一“目标、证据需求、选用素材、可选项”的完成定义，缺可选项不反向否决必需成果</td>
+</tr>
+<tr>
+<td>N04</td>
+<td>实际 CopyV1 仍当前，但缺密钥时入口拒绝复用；已核验 URL 不需网络，入口仍要求上传凭据</td>
+<td>先复用/收口，只有真要远端调用才检查其凭据与费用</td>
+</tr>
+<tr>
+<td>N05</td>
+<td>仅轮换 QA 密钥，图与合同未变，旧 QA 变旧；同检查重出证据后，原人工 reject 也不再当前</td>
+<td>凭据/路由健康与证据有效性分开；不因换密钥重审全部图片或冲掉人工决定</td>
+</tr>
+<tr>
+<td>N06</td>
+<td>回执已允许一次重试，copy 仍被 blocked 缓存跳过；worker 又没转交 retry_copy</td>
+<td>一个真实许可由同一个 owner 消费，不要求用户再补第二个开关</td>
+</tr>
+<tr>
+<td>N07</td>
+<td>安全 GET 曾 404 后，正常重跑不再重查；内部 force 能力没有正常选择性入口</td>
+<td>允许有界重查特定失败来源，不重下成功图、不重发付费 POST</td>
+</tr>
+<tr>
+<td>N08</td>
+<td>非豁免多子体不能共用一个商品 ID，但也没有逐 SKU 标识输入通道</td>
+<td>补正确的 SKU 级标识，不强迫用户改成豁免或拆碎家族</td>
+</tr>
+<tr>
+<td>N09</td>
+<td>明确只选择正常 A，范围外 B 的混类信息仍阻断 A 下载</td>
+<td>隔离争议对象；独立可信 A 可做资产，共享父体/整家族资格仍待澄清</td>
+</tr>
+<tr>
+<td>N10</td>
+<td>有效 QA 主路由存在，坏备用或未用 scope 的配置使预检整体失败</td>
+<td>坏条目退出候选并告警，合法主路由继续；不能用配置巡检替代运行准入</td>
+</tr>
+<tr>
+<td>N11</td>
+<td>新订单初始化在提交标记前中断，同订单重试因目录存在而停住</td>
+<td>核对受控半成品后在原身份下补完，不手改状态或另建订单</td>
+</tr>
+</tbody>
+</table></div>
+<p>补充确认：原 DA11 不只是 reader 的局部反例。实际构建两子体的 8 个 ready 角色后，只变 B 的描述，A/main 在自身依赖内仍当前，但真实生成预检仍被 B 的事实变化挡住。</p>
+<p>同时找到可复用的正确模式：现有规划/通用回执 owner 已能把 scene 的未知限制在其作用域，并允许独立 main 继续；下载清单的“当前”也不要求每次下载都成功。<strong>应该把这些正确规则接通到上层，而不是推翻它们再写一套。</strong></p>
+<h2 id="3">3. 新的阻塞准则：安全与可继续性一起设计</h2>
+<h3 id="31">3.1 每个门必须回答五个问题</h3>
+<ol>
+<li>它保护的具体风险是什么？</li>
+<li>它阻断哪个动作、哪些对象，而不是笼统“全项目失败”？</li>
+<li>哪些工作不依赖这个条件，仍可以继续？</li>
+<li>什么证据/资源/决定变化后能够恢复？</li>
+<li>这是机器能自动解决的问题，还是确实需要人授权/补事实？</li>
+</ol>
+<p><strong>答不出来的门，不得作为新增生产阻断。</strong> 可以是诊断、警告或开发检查。</p>
+<p>不另建状态控制器。沿用现有 <code>pending/running/retryable/blocked/review/success</code>，把作用域、恢复条件和下一步作为原 owner 的结果字段；由现有 production/batch 控制器消费。</p>
+<h3 id="32">3.2 区分四种处理，而不是统一失败</h3>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>情形</th>
+<th>默认处理</th>
+<th>可以继续的工作</th>
+<th>必须保留的边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>明确事实错误、越权、输入归属不明、文件被篡改</td>
+<td>停止依赖它的动作；必要时人工核对</td>
+<td>不引用该证据的任务、其它子体/订单、只读检查</td>
+<td>不能用默认值/相似图片补真相；共享身份不明时应扩大暂停范围</td>
+</tr>
+<tr>
+<td>真正未知的 POST 结果</td>
+<td>冻结同一未决副作用及确实耦合的动作，保留预占</td>
+<td>独立任务、已收字节的本地处理、允许的状态查询</td>
+<td>超时/500/没日志不是未执行证明；不自动换网关再 POST</td>
+</tr>
+<tr>
+<td>已证明未发送的暂时错误、资源忙、本地可恢复 IO</td>
+<td>在原授权/预算/deadline 内排队、退避和幂等续做</td>
+<td>其它就绪工作；成功产物始终保留</td>
+<td>没有无限重试；不同传输阶段不能凭异常字符串混判</td>
+</tr>
+<tr>
+<td>业务资料暂缺、可选资源失败、非语义诊断缺项、代码风格/性能风险</td>
+<td>记录待办或警告，到真正需要的边界再检查</td>
+<td>已授权且不依赖这些条件的资产生产与本地整理</td>
+<td>未具备最终字段/质量资格时不能假称正式交付</td>
+</tr>
+</tbody>
+</table></div>
+<p>真正的全局停止保留给全局风险，例如：工作区/租约无合法授权而将要发起费用、订单/共享身份无法确定、共享权威工件损坏无法安全读取、严重数据安全问题。不是任何一个子体失败都升级为全局停止。</p>
+<h2 id="4">4. 必要设计冗余：优先复用现有能力</h2>
+<h3 id="41">4.1 先识别需要哪种工作，再要求资源</h3>
+<p>每次进入阶段先由其现有 owner 给出：</p>
+<ul>
+<li>已有结果可复用；</li>
+<li>已有响应只需本地收口；</li>
+<li>有明确的新远端工作；</li>
+<li>等资源/等事实/等业务资料；</li>
+<li>仅可选项暂缺。</li>
+</ul>
+<p>只有“新的远端工作”检查该路由的凭据、当次费用准入；本地收口需要的能力按实际任务检查。不能为了读取现有文案、复用已核验 URL、整理原生结果而要求所有远端服务都在线。</p>
+<p>全配置巡检仍可报错，但运行时只剔除不合格路由。有效主路由存在时，坏备用不应阻断它；反之，不得把不合格或未授权网关偷偷当备用。</p>
+<h3 id="42">4.2 不把完整交付放弃，而是分开三种完成度</h3>
+<ol>
+<li><strong>资产进度</strong>：哪些来源、计划、候选和质量证据已具备。</li>
+<li><strong>listing-ready</strong>：完整目标家族中，每个子体的必需角色、实际模板选图、有效 URL 和业务字段已经满足。</li>
+<li><strong>order-complete</strong>：listing-ready 加上用户另行承诺的全图库、附加资产或证据包目标也完成。</li>
+</ol>
+<p>这些都由原 release/production 结果投影，不是三个可独立改写的主状态。</p>
+<p>“先做可用部分”也不能变成把所有子体各做一点、耗尽预算后留下一堆无法使用的半成品。现有调度器应优先完成已接近收口的必需产物，再开启新的可选工作；订单一次说明最小可用单元，例如一个子体的可审核完整图片组与文案，或一个完整小家族。为确认、QA及必要发布留出原预算内的余量，不让前面的生成阶段抢光后面的完成能力。明显无法覆盖最小可用单元时，应先说明限制或取得新的目标/预算授权，而非默默铺开；这也不要求预先覆盖全家族理论最坏成本。</p>
+<ul>
+<li>所有目标 ASIN、冻结输出和失败记录继续可见，不能缩小分母。</li>
+<li>所有参考图都要登记，但“已登记/已解释失败”不等于“必须成功才可上架”。实际被选作商品事实、尺寸、归属证据的来源必须有效。</li>
+<li>已有 <code>func_02</code> 合格并满足必需 func 的机制应继续使用，不要因另一个 func 失败追加否决。</li>
+<li>如果业务明确要求全部图库交付，那些图仍属于 order 的必需目标；可以先形成合格 listing 部分，但不得宣称整个订单已完成。</li>
+<li>默认不因本方案擅自减图或改成只做 4 张/9 张。先保留现有目标，提前说明模板槽位和额外图库去向。</li>
+</ul>
+<h3 id="43">4.3 有界自动续做，而不是每个细节都找人</h3>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>应采用的冗余</th>
+<th>停下条件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已证实未发送的连接失败</td>
+<td>复用现有传输退避/重试上限；需要时使用已授权备用</td>
+<td>达到次数/时间/费用上限，或已经进入无法证明未执行的阶段</td>
+</tr>
+<tr>
+<td>完整返回但结构可修复的模型结果</td>
+<td>原 planner/copy owner 的有限修正；先用原授权中的修正容量</td>
+<td>同输入无进展重复、事实缺口、预算不足；不加第二裁判</td>
+</tr>
+<tr>
+<td>本地提交中断</td>
+<td>自动完成同一已准备事务，复用已落盘字节</td>
+<td>前后像无法对应、出现无关写入或真正输入冲突；转安全结束/新准备</td>
+</tr>
+<tr>
+<td>GPU/上传槽暂忙</td>
+<td>保留 ready 工作并排队，继续其它可做任务</td>
+<td>超过明确等待期限或实际依赖不可用；仅相关任务等待</td>
+</tr>
+<tr>
+<td>native 已经达到输出规格</td>
+<td>走已有合法 CPU/透传/降采样路径</td>
+<td>不得虚构超分记录；也不得为了复用而强制再放大</td>
+</tr>
+<tr>
+<td>native 需后处理但暂不可做</td>
+<td>原字节保全，进入明确的延后收口状态</td>
+<td>未收口不能假装候选 ready；不靠重新生图解决</td>
+</tr>
+<tr>
+<td>普通来源 GET 曾失败</td>
+<td>有界重查指定失败 URL，或接收合法新来源</td>
+<td>安全地址、大小、次数等限制仍有效；不强刷全部成功来源</td>
+</tr>
+<tr>
+<td>一张可选图上传失败</td>
+<td>主交付继续，可选图列待办/本地附件</td>
+<td>如果它实际是模板选图或用户必需交付，则该交付项仍等待</td>
+</tr>
+</tbody>
+</table></div>
+<p>运行授权在订单/阶段策略层一次说明：允许的角色范围、供应商候选、修正容量、总请求/金额上限、等待与退出规则。<strong>不要求运营人员每次输入底层 SHA、每张图再建一份决定。</strong> 程序在操作确认时带入当前 ID/SHA；只有新增费用、改变范围、真实未知重发风险、事实冲突等需要新的明确许可。</p>
+<p>修正/确认余量应从原总预算里留出，不是额外赠送。例如优先完成已有计划的确认，再开启新修改；具体比例依据小样请求分布设置，不把“必须足够支付理论最坏全家族”作为启动条件。预算只够做一部分时，可以按既定优先级完成这部分并诚实保留剩余待办。</p>
+<p>“暂停新增费用”与“暂停全部派工”应在 UI 上说清。允许的本地清理/收口也要有资源与时间边界，不应无限计算；不得擅自违反用户的全部停止指令。</p>
+<h2 id="5">5. 六个实施包</h2>
+<h3 id="b1">B1：改对合同，改准入顺序，不加全局否决</h3>
+<p><strong>目标：先让正常路由、已有资产和不依赖缺项的工作能够进入流程。</strong></p>
+<ul>
+<li>修 DA01：同一个 <code>annotation_mode</code> 控制生成与 QA 解释。声明式示意可有合法箭头；它不是图上校准测量。只删矛盾，不另加评审。</li>
+<li>修 DA02：明确 false 优先；默认值来自后端已核证 seller/brand/site/category 档案。已经确认的业务信息不重复索取，不能只凭品牌推豁免。</li>
+<li>将 <code>production._assert_production_entry_requirements</code> 的“所有选中阶段必须先齐备”替换为分阶段/按实际工作需要的检查。</li>
+<li>提供明示的“可用工作先行”策略，同时保留需要一次性严格交付前检的业务模式。不能运行失败后悄悄换模式。</li>
+<li>缺 GTIN/价格/库存等业务字段不应阻断不依赖它的已授权图像工作；缺 QA 路由不等于不能生成，但未审候选不能发布。</li>
+<li>QA 服务不可用时，唯一 QA 阶段仍可完成本地检查并准确列出未决硬事实；在既有人审机制内，有足够来源的事项可以由操作者实际核实，不必等待另一个模型先给 pass。缺证据仍未决，这不是跳过 QA 或批量假审批。</li>
+<li><code>validate_routes(required_scopes)</code> 不再被无关坏条目全盘否决。录入时可报告所有问题，实际路由选择仅用合法、已授权、能力匹配的候选。</li>
+<li>并发等资源建议可以按明确范围限幅并告警；模型身份、预算、权限和商品事实的错误不能猜。</li>
+<li>批量录入默认可逐项接收，但必须返回接收/复用/拒绝/初始化未完成的逐项回执。明确 atomic 的请求才要求全有全无。</li>
+</ul>
+<p><strong>现有落点</strong>：<code>core/production.py</code>、<code>core/model_router.py</code>、<code>core/api_registry.py</code>、<code>core/job.py</code>、<code>core/batch_console.py</code>、<code>core/assets/batch_console.html</code>、<code>core/image_qa.py</code>。</p>
+<p><strong>替换/删除</strong>：矛盾的 text-only 总规则、前端 GTIN 品牌推断、把全配置巡检直接当运行失败的路径、重复且意义不同的配置校验。不得并存旧/new 两个准入控制器。</p>
+<p><strong>验收</strong>：合法主路由+坏备用仍可工作；缺后置业务字段不会产生错误模板但可以完成独立资产；真实缺关键事实、禁用路由、超费用许可仍拒绝对应动作。</p>
+<h3 id="b2">B2：把局部成功接通到控制器与最终完成定义</h3>
+<p><strong>目标：没有可执行安全工作时才整单等待。</strong></p>
+<ul>
+<li>在原 RunScope 中分开“已确认的完整目标成员”和“当前已取得事实/来源的成员”。已知父子清单中某子体抓取失败，目标保留，正常子体可先工作。</li>
+<li>若父子清单本身尚不明确，明确标注目标未闭合；只能对归属和身份明确的对象做受控资产工作，不能宣布完整家族交付。</li>
+<li><code>selected_task_source_intents</code> 等先做全局结构/身份清单核对，再只对实际消费对象做执行当前性核对。共享事实仍正确扩大依赖范围。</li>
+<li>类目 guard 分清共享类目错误与单子体异常；范围外争议不能无条件连坐范围内已证实对象。</li>
+<li>统一使用原 release owner 的 required/optional/实际选图/所需证据结果；控制器、publish、template、delivery 不各自再加一层“全部成功”。</li>
+<li>batch <code>_settle</code> 使用合法任务状态和真实恢复条件，计算可运行任务；不能一个 blocked 冻住所有 retryable，也不能忽略 review 后盲重试。</li>
+<li>试验到正式目标在原订单下有明确升级动作；保留原预算、工件和未知，不改用新订单逃限制。</li>
+</ul>
+<p><strong>现有落点</strong>：<code>core/run_scope.py</code>、<code>core/source_fetch/apify.py</code>、<code>core/category_guard.py</code>、<code>core/final_source_intents.py</code>、<code>core/production.py</code>、<code>core/production_batch.py</code>、<code>core/release_manifest.py</code>。</p>
+<p><strong>重要约束</strong>：release 的目标子体集合必须来自完整目标，不得改成“当前读到的成功 children”。缺 B 时 A 可完成，但最终统计仍是 A/B，不是把分母变成 A。</p>
+<p><strong>替换/删除</strong>：全家族当前性先验套在单对象读取前的路径、只按已成功事实计算完成分母的路径、各层重复的完成判定集合。</p>
+<p><strong>验收</strong>：C01/C04/C05/C09/C15 的正常部分持续推进；需要的事实损坏仍只停止真实依赖范围；任何情况下不丢目标成员、来源失败记录或已保存产物。</p>
+<h3 id="b3">B3：把恢复做成正常续做，而不是新增一堆手工命令</h3>
+<p><strong>目标：同一合法意图能结束，不悬空、不重复付费。</strong></p>
+<ul>
+<li>本地 prepared 事务输入未变时自动续做；输入确已变化时能核对前后像并安全结束或重新准备。不能覆盖不属于本事务的后来写入。</li>
+<li>新订单 initializing 的受控半成品可在同一预留路径补完；目录含未知内容时只暂停该订单，不自动删除。</li>
+<li>控制台 pending 决定查询原 owner 的结果并补结算；保留客户端 decision_id，正常重试不造新许可。</li>
+<li>允许验真的结果到达、资源恢复、已完成的本地操作唤醒<strong>既有授权</strong>的下游。修改日志时间不算进展；唤醒不授予新预算。</li>
+<li>copy 终止缓存、回执许可、worker 参数改为同一个许可闭环。只消费一次、只影响相应分组，不能持久化一个无限 <code>retry=True</code>。</li>
+<li>来源观察纠正和安全 GET 重查纳入现有 owner 的有限授权，补齐耗尽后的合法出口；不通过换缓存键刷新次数。</li>
+<li>明确预算预占与实际发送阶段；已有完整已知返回、明确未发送与真正 unknown 不能混为一种错误。</li>
+<li>沿用现有本地/远端队列、冷却和 no-progress 保护；为提交/确认留正常资源余量，不依靠用户手调状态文件。</li>
+</ul>
+<p><strong>现有落点</strong>：<code>core/planning_journal.py</code>、<code>core/service_response.py</code>、<code>core/image_response.py</code>、<code>core/image_tasks.py</code>、<code>core/copy_polish.py</code>、<code>core/asset_manager.py</code>、<code>core/batch_ledger.py</code>、<code>core/batch_console.py</code>、<code>core/production_batch.py</code>。</p>
+<p><strong>替换/删除</strong>：<code>pending_reconciliation</code> 无出口、固定初始化路径无续做、许可已存在却被另一缓存提前跳过、重复审查的开关。不是增加第二个恢复调度器。</p>
+<p><strong>验收</strong>：每个提交断点都能以同意图结束；对同一个已收结果远端发送数不增加；独立任务可继续；无进展/未知同作用域不自动新 POST。</p>
+<h3 id="b4">B4：缓存优先，把“连接健康”从“事实/质量证据”中拿出去</h3>
+<p><strong>目标：不因无关变化重做已完成工作。</strong></p>
+<ul>
+<li>纯检查与提交副作用在同一 owner 内分开。程序可自动调用合法提交动作，但状态/预览不能偷偷写文件。</li>
+<li>CopyV1、候选、已保存响应、有效 URL 先核证复用，再判断缺少的远端工作。不能先因缺密钥拦住本地复用。</li>
+<li>QA 当前性只绑定候选、实际事实/引用和有意义的 QA 规则。当前可用路由列表、备用顺序、凭据摘要属于执行/健康记录，不应撤销原 QA。</li>
+<li>人工否决不能因密钥轮换或重复 QA 自动失效；换候选或明确撤回才处理否决。事实真正更正时应重新呈现相关决定，不偷偷覆盖。</li>
+<li>语义规则真的升级需要重核相应对象；仅 UI、日志、凭据轮换、无害格式差异不重开全部规划/生图/QA。</li>
+<li>格式容忍只限机器可证明的无害差异：已有的单位等价、大小写/换行政策、对象字段顺序、可选诊断。对象归属、数值、数量、限定词和使用权限不能模糊匹配。</li>
+<li>不要求一开始建立庞大的字段依赖平台。先修实证的跨子体、凭据与 UI 连坐；真实执行代码变化仍保留部署切换保护。</li>
+</ul>
+<p><strong>现有落点</strong>：<code>core/qa_evidence.py</code>、<code>core/release_manifest.py</code>、<code>core/vision_gemini_client.py</code>、<code>core/copy_polish.py</code>、<code>core/candidate_state.py</code>、<code>core/planning_identity.py</code>、<code>core/production_batch.py</code>。</p>
+<p><strong>替换/删除</strong>：QA 有效性中混入当前 credential/route 健康版本的路径、在复用前必需远端凭据的路径、不必要的全仓/全家族失效。旧接受、真实请求和原字节不改号。</p>
+<p><strong>验收</strong>：只换密钥，图像/事实/规则不变时，QA 与人工决定不失效；改真正的数量、颜色、来源字节或硬规则时，相关资格仍正确失效。</p>
+<h3 id="b5">B5：让版本修订与正式交付能闭合</h3>
+<p><strong>目标：允许正常迭代，不把“禁止静默覆盖”变成“永远不能更新”。</strong></p>
+<ul>
+<li>一次已授权的候选版本选择，驱动 publisher 对已知自己管理的旧出口做 CAS 替换：旧 SHA、新 SHA、备份和提交回执由程序带入。</li>
+<li>不属于当前订单/发布记录的目标内容，不自动覆盖；只阻该出口，已上传 URL 和其它成果仍保留。重复执行不再次 PUT。</li>
+<li>归档只要求当前交付合同真正使用的 URL；明确可选且未上传的图可作为本地额外资产或待办，不反向否决必需成果。</li>
+<li>流式打包、按真实体积检查、清理本次失败 staging；若包装失败，已生成图片与合规工作簿仍是可用成果，但不得称完整包已交付。</li>
+<li>在现有 SKU 业务资料中补 <code>product_id</code> / <code>product_id_type</code> 的合法通道。缺哪个 SKU 的标识就等哪个正式行，不编造豁免、复制 UPC 或阻断全部图像。</li>
+<li>分发包做脱敏投影，原始私有证据保留与可核验；不因为私有 trace 有敏感字段就删除照片。</li>
+</ul>
+<p><strong>现有落点</strong>：<code>core/publish.py</code>、<code>core/delivery_package.py</code>、<code>core/template_engine.py</code>、<code>core/template_contract.py</code>、<code>core/job.py</code>。</p>
+<p><strong>替换/删除</strong>：只有 no-clobber 拒绝而无正常版本更新出口、归档对所有 approved 的额外 URL 强要求、全量内存汇集、只允许单个 job product_id 代替 SKU 输入的限制。</p>
+<p><strong>目录约束保留</strong>：<code>Fianl_pics/&lt;parent&gt;/&lt;child&gt;/&lt;role&gt;.&lt;ext&gt;</code>；<code>Final_templates/&lt;parent&gt;/&lt;template_file&gt;</code>。不靠改名或另放目录掩盖冲突。</p>
+<h3 id="b6">B6：安全与维护做成支持能力，不做额外停产条件</h3>
+<ul>
+<li>代理/CDN：保留正常受支持路径；明确危险地址、错误重定向和越权才阻对应动作。不能把缺少某个私有 socket 属性等诊断能力直接升级为全项目失败。</li>
+<li>工作区：一次性确定合法费用域。全新无前账安装可以有明确初始化路径；存在原消费约束时不能伪装成无前账。本方案不复查过去作业，不重置账本。</li>
+<li>费用：继续允许明示、有限次数的 <code>count_only_trial</code>。没有精确实扣不妨碍合法试验或零费操作；需要严格货币上限时必须有可用成本边界，不能假称能保证实扣。</li>
+<li>测试：只用脱敏/合成配置，默认阻外网；新增“应该继续”的验收，与“必须拒绝”同等重要。保留合法 loopback、NUL 等基础能力。</li>
+<li>清理退休代码、拆大函数、锁读写分离、依赖锁定、并发优化按收益排后；不以未完成这些工程优化为运行前提。</li>
+<li>文档/UI只呈现当前可行的业务路径、缺项及影响范围；不要求普通运营人员编辑 JSON、手抄 SHA 或理解每个底层状态。</li>
+</ul>
+<p><strong>现有落点</strong>：<code>core/url_safety.py</code>、<code>core/batch_ledger.py</code>、<code>core/production_batch.py</code>、<code>core/batch_console.py</code>、测试 runner、当前操作文档。保持单执行链；不增加另一套费用/规划/QA 权威。</p>
+<h2 id="6">6. 实施顺序：按可交付增量，而不是按问题编号</h2>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>迭代</th>
+<th>本期做什么</th>
+<th>必须看到的运行改善</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>I：先疏通正常路径</td>
+<td>B1 + B4 中缓存/QA凭据隔离 + B2 中最直接的局部选择和可选完成定义</td>
+<td>合法主路由能用；已有文案/URL能复用；无关 B 不误伤 A；密钥轮换不使图重审；未审图仍不能发</td>
+</tr>
+<tr>
+<td>II：再闭合故障与版本</td>
+<td>B3 + B5 的版本导出/可选归档 + B2 的整单调度</td>
+<td>初始化和提交中断可续；明确许可真正生效；同输入无进展不循环；版本更新能交付；局部失败不冻结整单</td>
+</tr>
+<tr>
+<td>III：补完整业务面与维护</td>
+<td>B2 的目标升级/部分家族 + B5 的逐SKU标识/流式包 + B6</td>
+<td>完整家族分母始终保留；有用资产先做；最终条款不假满足；界面能解释为什么等、还能做什么</td>
+</tr>
+</tbody>
+</table></div>
+<p>这不是要求先完成全部重构才允许试运行。每个迭代在隔离验证通过后，用<strong>明确授权的新小任务</strong>验证改过的连接，再推进下一包。不处理过去作业，不全量 resume，不拿新费用域做实验。</p>
+<h2 id="7">7. 验收：必须同时证明“不会乱做”和“不会误停”</h2>
+<h3 id="_3">可继续性场景</h3>
+<ul>
+<li>两子体中 B 暂无事实：A 可以产出合法资产；B 仍在目标中，整家族交付仍未完成。</li>
+<li>A/main 的依赖未变，B 描述变化：A 继续；真正共享事实变化才扩大暂停。</li>
+<li>合格主路由 + 坏备用/未用路由：主路由能处理已授权动作，坏路由不被调用。</li>
+<li>业务资料暂缺：依赖齐备的图像可做；不伪造库存、价格、GTIN 或正式工作簿。</li>
+<li>缓存文案/已核验 URL 可用但上传/模型密钥暂缺：复用成功，不尝试网络。</li>
+<li>仅密钥轮换：原 QA、原人工否决保持语义有效；没有额外重审请求。</li>
+<li>已有原生响应、本地提交失败：同意图能收口，新增远端请求为 0。</li>
+<li>四类必需产物齐备、未消费来源 404 或可选上传失败：不再被后置“全部资源成功”条件连坐；额外承诺仍在订单目标中。</li>
+<li>初始化中断、控制台回执中断：同一身份/决定能得出明确结果，不生成新订单或重复授权。</li>
+<li>人工给出一次合法 copy/观察重试许可：实际只消费该次许可，正常接续不再需要另一个隐藏开关。</li>
+</ul>
+<h3 id="_4">安全场景</h3>
+<ul>
+<li>source/candidate 字节变了、跨子体、关键数量/归属冲突：相应动作仍拒绝；不能默认填 1 或从相似图片借事实。</li>
+<li>原 POST outcome unknown：不得重新发送同一副作用；独立任务仍可推进。</li>
+<li>QA fail/reject 或必要证据不足：不得发布；允许做其它合法工作，不把候选丢掉或自动重生。</li>
+<li>目标文件来自未知外部内容、事务出现无关写入：不能强制回滚/覆盖；局部隔离并显示安全恢复选择。</li>
+<li>总预算/明确权限不足：停止新付费，保留已有消费与结果；不能换订单/缓存键绕过。</li>
+<li>真正要求全部额外图库的订单：额外项没完成不能标为 order-complete；也不能偷偷降低目标数。</li>
+</ul>
+<h3 id="_5">工程与真实验证</h3>
+<ul>
+<li>默认测试仍 ≤100 例、≤60 秒；不得通过跳过现行用例、放宽上限来宣称通过。</li>
+<li>同合同的重复测试合并，增加正反成对的连通场景与故障断点；不只验证新命令可调用。</li>
+<li>本期新生产模块 &lt;800 行、新测试模块 &lt;600 行；原 &gt;2,000 行生产文件不得净增长。替换实现时同时删除旧路径，不留双控制器。</li>
+<li>实施时各轮保留工作树基线、RED→GREEN、隔离回退反例和最终默认准入。此方案阶段不修改生产代码。</li>
+<li>真图小样应覆盖四类的实际资料差异、正常完成与至少一类临时故障；必须另行给出新任务范围及费用预算。不能用合成 pass 证明图像质量或永久无人值守。</li>
+</ul>
+<p>不承诺“所有失败都能自动成功”。可验收的目标是：<strong>每个真实阻塞都有明确的最小影响范围和合法出口；每个不依赖它的、已授权且资源可用的任务确实能够继续；完整交付的声明仍然真实。</strong></p>
+<h2 id="8-33">8. 原 33 项审计逐项处置</h2>
+<p>完整映射见下表及 <code>AUDIT_REASSESSMENT.json</code>。它是对整改建议的纠偏，不覆盖或抹去原审计证据。</p>
+<div class="table-scroll"><table>
+<thead>
+<tr>
+<th>审计项</th>
+<th>原问题</th>
+<th>本次处理</th>
+<th>整改包</th>
+<th>具体调整</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DA01</td>
+<td>声明式箭头：生成合同允许，QA 指令却要求判失败</td>
+<td>直接修正</td>
+<td>B1</td>
+<td>统一生成与QA的annotation_mode解释；删除矛盾指令，不增加一轮审查。</td>
+</tr>
+<tr>
+<td>DA02</td>
+<td>控制台按品牌猜 GTIN 豁免，并覆盖用户明确的“否”</td>
+<td>直接修正</td>
+<td>B1</td>
+<td>后端沿用已核证业务档案，明确false优先；未知GTIN只等在正式模板，不拖住不依赖它的图像。</td>
+</tr>
+<tr>
+<td>DA03</td>
+<td>重投影中断后输入变化，会进入没有安全退出入口的僵局</td>
+<td>打通流程</td>
+<td>B3</td>
+<td>本地事务正常中断自动幂等续做；真实输入漂移提供安全结束/重新准备，不无限加新SHA门。</td>
+</tr>
+<tr>
+<td>DA04</td>
+<td>控制台有动作幂等键，却缺少 pending 动作的恢复协议</td>
+<td>打通流程</td>
+<td>B3</td>
+<td>同一决定查询领域结果并补结算，客户端不另造ID；成功的本地动作不重复。</td>
+</tr>
+<tr>
+<td>DA05</td>
+<td>新增本地决定没有完整接入批处理唤醒机制</td>
+<td>打通流程</td>
+<td>B3</td>
+<td>收窄“仅人工决定可唤醒”的旧建议；验真结果到达/资源恢复也能推进既有授权工作，唤醒不等于新预算。</td>
+</tr>
+<tr>
+<td>DA06</td>
+<td>来源观察四次耗尽后，“明确重观察”没有可授权的续做预算</td>
+<td>打通流程</td>
+<td>B3</td>
+<td>把观察纠正预算纳入原订单的一次性运行授权；不让每张图都再申请一次，不换缓存键送额度。</td>
+</tr>
+<tr>
+<td>DA07</td>
+<td>批量准入边校验边入队，失败响应可能掩盖已生效的订单</td>
+<td>直接修正</td>
+<td>B1</td>
+<td>默认允许逐项接收并返回完整逐项回执；只有明确要求atomic时才全批预校验/全有全无。</td>
+</tr>
+<tr>
+<td>DA08</td>
+<td>公网 URL 检查中的代理例外未证明实际代理路径</td>
+<td>收窄建议</td>
+<td>B6</td>
+<td>保留真实危险地址/跨域授权保护；不能把socket诊断不可读当成全项目停机理由，代理/CDN按受支持传输策略运行。</td>
+</tr>
+<tr>
+<td>DA09</td>
+<td>允许生成新版本，却没有批准后的正式导出替换事务</td>
+<td>打通流程</td>
+<td>B5</td>
+<td>由一次候选版本选择驱动受控CAS导出；不为每张图再索取一遍哈希，不静默覆盖未知内容。</td>
+</tr>
+<tr>
+<td>DA10</td>
+<td>试验任务到正式任务缺少原订单内的显式升级路径</td>
+<td>打通流程</td>
+<td>B2</td>
+<td>试验到正式目标可在原订单明确升级，保留预算、工件与未知；不是重建作业绕约束。</td>
+</tr>
+<tr>
+<td>DA11</td>
+<td>“按子体读取”在筛选前验证整个家族，隔离范围过大</td>
+<td>打通流程</td>
+<td>B2</td>
+<td>结构完整性与对象当前性分开，执行依赖闭包内验证；不通过删字段或假装共享事实未变求通过。</td>
+</tr>
+<tr>
+<td>DA12</td>
+<td>来源图库数量直接变成交付数量，槽位约束来得太晚</td>
+<td>收窄建议</td>
+<td>B2</td>
+<td>图库不等于浪费，默认保留用户原产物目标；模板容量只是选用/告知约束，不能据此任意减图或拒单。</td>
+</tr>
+<tr>
+<td>DA13</td>
+<td>任务状态与批处理状态词汇不一致，重试决策过粗</td>
+<td>打通流程</td>
+<td>B2</td>
+<td>统一状态语义并计算仍可推进的任务集合，只有集合为空才整单等人；不重试未知的同一请求。</td>
+</tr>
+<tr>
+<td>DA14</td>
+<td>配置在运行时才冻结，未完整绑定到准入决定</td>
+<td>收窄建议</td>
+<td>B4</td>
+<td>一次批准有效执行策略；密钥健康、资源建议、模型/成本语义分型，不每个微小配置变化都重新授权。</td>
+</tr>
+<tr>
+<td>DA15</td>
+<td>全仓版本锁过粗，又没有覆盖真正的模板输入</td>
+<td>收窄建议</td>
+<td>B4</td>
+<td>先去掉纯UI等非执行变化对付费工作区的连坐；保留真实执行变更保护，不先建庞大发布平台。</td>
+</tr>
+<tr>
+<td>DA16</td>
+<td>提取缓存依赖人工版本常量，计算逻辑不在语义身份内</td>
+<td>收窄建议</td>
+<td>B4</td>
+<td>只绑定有行为影响的提取规则；原字节可本地重核，不要求所有代码/环境字节完全相同。</td>
+</tr>
+<tr>
+<td>DA17</td>
+<td>本地处理能力没有在可能付费前完成预检</td>
+<td>收窄建议</td>
+<td>B1</td>
+<td>只检查当前必需能力；已达发布尺寸无需GPU，已有native先保全并排队，不以缺任一工具否决全单。</td>
+</tr>
+<tr>
+<td>DA18</td>
+<td>预算准入、网络发送和远端结果被压成一个布尔边界</td>
+<td>打通流程</td>
+<td>B3</td>
+<td>明确未发送/明确已拒绝与真实unknown分型；原消费不凭错误文案退款，合法未发送重试不逐次找人。</td>
+</tr>
+<tr>
+<td>DA19</td>
+<td>“是否当前”的查询仍能修复文件和结算回执</td>
+<td>打通流程</td>
+<td>B4</td>
+<td>查询保持纯；需要补marker/提交已收数据的正常续做自动交原owner，不把“显式命令”变成必须人工每次执行。</td>
+</tr>
+<tr>
+<td>DA20</td>
+<td>当前写端为 V9，读端仍保留 V8 执行兼容路径</td>
+<td>后置优化</td>
+<td>B6</td>
+<td>新任务统一当前schema；删除退休路径随相关修改一起做，不用历史清理/全量迁移挡住新任务。</td>
+</tr>
+<tr>
+<td>DA21</td>
+<td>配置校验分散：有的入口拒绝，有的入口静默接受</td>
+<td>直接修正</td>
+<td>B1</td>
+<td>语义/收费/权限错误不得猜；资源建议可有界归一化并告警；坏备用路由只隔离自身，正常主路由继续。</td>
+</tr>
+<tr>
+<td>DA22</td>
+<td>测试隔离会复制允许含明文凭据的生产注册表</td>
+<td>直接修正</td>
+<td>B6</td>
+<td>脱敏测试配置与阻外网，不新增生产运行门；保留合法loopback、NUL等测试基础能力。</td>
+</tr>
+<tr>
+<td>DA23</td>
+<td>交付归档先全量读入内存，1 GiB 上限却在写完后才检查</td>
+<td>收窄建议</td>
+<td>B5</td>
+<td>流式归档/实际容量检查，不按理论最大体积在起点拒全单；包失败不抹掉已有图片和工作簿。</td>
+</tr>
+<tr>
+<td>DA24</td>
+<td>默认准入证明程序契约，不足以证明跨环节语义和真实质量</td>
+<td>收窄建议</td>
+<td>B6</td>
+<td>同时测拒绝与继续路径，不靠更细schema或第二模型提高“安全感”；真实质量另做经授权的小样校准。</td>
+</tr>
+<tr>
+<td>DA25</td>
+<td>单控制器不等于单向依赖：核心责任形成大型循环耦合区</td>
+<td>后置优化</td>
+<td>B6</td>
+<td>只有实测影响阻塞的依赖先动；不以57模块连通组或函数行数为停产理由，不全仓重写。</td>
+</tr>
+<tr>
+<td>DA26</td>
+<td>并发参数的意义不一致，观察阶段实际上串行</td>
+<td>后置优化</td>
+<td>B6</td>
+<td>先澄清参数并沿用现有队列/主备/GPU槽；吞吐优化后置，不要求一开始就并发完美。</td>
+</tr>
+<tr>
+<td>DA27</td>
+<td>读事务也占写锁，轮询又反复全量扫描证据</td>
+<td>后置优化</td>
+<td>B6</td>
+<td>读写锁与增量监控逐步优化；不以没有WAL/增量索引为新准入门。</td>
+</tr>
+<tr>
+<td>DA28</td>
+<td>主文档、命令入口和实际协议已经分叉</td>
+<td>直接修正</td>
+<td>B6</td>
+<td>发布少量真实可执行的操作路径，文档同步可并行，不等所有文档自动生成后才运行。</td>
+</tr>
+<tr>
+<td>DA29</td>
+<td>环境重现依赖宽版本范围，缺少可验证的安装基线</td>
+<td>收窄建议</td>
+<td>B6</td>
+<td>提供已验证安装基线；当前健康环境不因缺锁文件或非关键版本差异被临时停用。</td>
+</tr>
+<tr>
+<td>DA30</td>
+<td>人审 UI 没有按本任务完整呈现证据和下一合法动作</td>
+<td>打通流程</td>
+<td>B3</td>
+<td>面向业务显示缺项、影响范围、可继续任务与一键处置；工件ID/SHA由程序带入，留专家入口即可。</td>
+</tr>
+<tr>
+<td>DA31</td>
+<td>新安装/新任务的初始化流程绑在一个带日期的前账清单上</td>
+<td>打通流程</td>
+<td>B6</td>
+<td>一次性确定合法工作区入口；不复查旧作业也不假装已有消费不存在，无前账入口只用于确实全新安装。</td>
+</tr>
+<tr>
+<td>DA32</td>
+<td>费用控制有预占上限，但缺少产能估算与长期维护预算解释</td>
+<td>收窄建议</td>
+<td>B1</td>
+<td>明示计次试验可合法运行；未知实扣不是读取/本地处理门槛，估算提示不能变成最坏成本必须全覆盖。</td>
+</tr>
+<tr>
+<td>DA33</td>
+<td>新增原始 HTTP 归档不经过结构化脱敏分支</td>
+<td>直接修正</td>
+<td>B5</td>
+<td>分发投影脱敏，私有原证据保留；不因私有trace含敏感字段而丢掉有效图片或拦全部本地工作。</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="9">9. 证据与交付边界</h2>
+<ul>
+<li><code>PROBES_VERIFIED.json</code>：15 个本轮场景，其中包含正面对照，记录实际结果和模拟边界。</li>
+<li><code>PROBES_MORE_FINAL.json</code>：有效主路由被全注册表验证连坐、初始化中断的两个补充场景。</li>
+<li><code>targeted_run.json / targeted.log</code>：8 个既有容错/安全用例，全部通过。</li>
+<li><code>NEW_SIMILAR_ISSUES.json</code>：11 类新增同源问题与源码定位；不是 11 个新闸门。</li>
+<li><code>AUDIT_REASSESSMENT.json</code>：33 项如何保留、改写、收窄或后置。</li>
+<li><code>SOURCE_MAP.json / CHECKS.json</code>：源码锚点、指纹、覆盖和一致性检查。</li>
+</ul>
+<p>初次 C05 合成输入少了 schema 必填的 source 字段，记录为测试准备错误并保留原日志；随后改为从实际 fetch/download/Scope 构建包含失败来源的新任务，得到有效的前后对照。没有把准备错误算成项目缺陷。</p>
+<p>本轮生产代码修改 0、原作业/图片/回执/额度修改 0、真实供应商调用 0。整改方案需要批准后实施，当前项目还没有因这份文档自动变得更可用。</p><footer>本 HTML 自包含，可离线阅读。完整 Markdown、33 项映射、11 类新增问题和场景证据均在同目录。源码快照：<code>4af6909c5bb172e817b9de9c43cc6ef3b5482b8656eee09c5caba394663ea425</code>。本方案没有授予新的费用、范围变更或原数据应用权限。</footer></main></div><script>window.planErrors=[];window.addEventListener('error',e=>planErrors.push(e.message));document.getElementById('print').addEventListener('click',()=>window.print());window.planReady=true;</script></body></html>

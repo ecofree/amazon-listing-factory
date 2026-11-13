@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -9,6 +10,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
+from pathlib import Path
 
 
 AMAZON_HOSTS = {
@@ -33,6 +35,8 @@ class ApifyClient:
     poll_seconds: int = 5
     timeout_seconds: int = 300
     deadline_monotonic: float | None = None
+    receipt_root: Path | None = None
+    refresh_received: bool = False
     _token_index: int = field(default=0, init=False, repr=False)
     _token_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _token_cooldowns: dict[str, float] = field(default_factory=dict, init=False, repr=False)
@@ -71,14 +75,21 @@ class ApifyClient:
         time.sleep(seconds)
 
     def product_url(self, asin: str) -> str:
-        host = AMAZON_HOSTS.get((self.marketplace or "US").upper(), "www.amazon.com")
+        site = str(self.marketplace).strip().upper()
+        if site not in AMAZON_HOSTS:
+            raise ValueError(f'Unsupported source marketplace: {site}')
+        host = AMAZON_HOSTS[site]
         return f"https://{host}/dp/{asin}?th=1&psc=1"
 
     def fetch_product(self, asin: str) -> dict[str, Any]:
+        asin = str(asin).strip().upper()
+        if not re.fullmatch('[A-Z0-9]{10}', asin):
+            raise RuntimeError('Requested ASIN must be ten alphanumeric characters')
         items = self.fetch_items(asin)
-        if not items:
-            raise RuntimeError(f"Apify returned no items for {asin}")
-        return items[0]
+        matched = [item for item in items if returned_asin(item) == asin]
+        if len(matched) != 1:
+            raise RuntimeError(f'Apify needs exactly one returned product matching {asin}; found {len(matched)}')
+        return matched[0]
 
     def fetch_items(self, asin: str) -> list[dict[str, Any]]:
         payload = {
@@ -146,6 +157,8 @@ class ApifyClient:
             if retry_attempts is not None
             else _retry_attempts("AMAZON_FACTORY_APIFY_REQUEST_RETRY_ATTEMPTS", 3)
         )
+        if method.upper() != 'GET':
+            attempts = 1  # Side-effect admission belongs to the durable request owner, never this GET retry loop.
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             headers = self._headers(token)
@@ -153,7 +166,14 @@ class ApifyClient:
                 headers["Content-Type"] = "application/json"
             request = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
-                with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
+                from ..service_response import prepare_request,start_submission
+                with prepare_request():
+                    timeout=self._request_timeout()
+                    if method.upper() == 'POST':
+                        from ..batch_ledger import admit_paid_request
+                        admit_paid_request('fetch')
+                start_submission()
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     body = response.read().decode("utf-8", errors="replace")
                 return json.loads(body) if body else {}
             except urllib.error.HTTPError as exc:
@@ -174,36 +194,23 @@ class ApifyClient:
         return {}
 
     def _post_run(self, endpoint: str, payload: dict[str, Any], *, token: str) -> tuple[int, Any]:
-        last_status = 0
-        last_body: Any = ""
-        for attempt in range(5):
-            try:
-                # Endpoint retry owns run-start retry budget; do not nest the
-                # request-level 3-attempt loop inside it.
-                return 200, self._json_request(
-                    endpoint, method="POST", payload=payload, token=token, retry_attempts=1
-                )
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                last_status = exc.code
-                last_body = body
-                if exc.code == 429:
-                    self._mark_token_cooldown(token, seconds=_retry_after_seconds(exc.headers.get("Retry-After")))
-                    return exc.code, body
-                if exc.code in {500, 502, 503, 504} and attempt < 4:
-                    self._sleep(min(2.0, 0.25 * (attempt + 1)))
-                    continue
-                if exc.code != 402 or "actor-memory-limit-exceeded" not in body:
-                    return exc.code, body
-                self._sleep(min(20 * (attempt + 1), 90))
-            except urllib.error.URLError as exc:
-                last_status = 599
-                last_body = str(exc.reason)
-                if attempt < 4:
-                    self._sleep(min(2.0, 0.25 * (attempt + 1)))
-                    continue
-                return last_status, last_body
-        return last_status, last_body
+        from ..service_response import perform_request, known_unsent
+        self._request_timeout()
+        if self.receipt_root is None or not payload.get('asins'):
+            raise RuntimeError('Apify POST requires durable request context and explicit ASIN owners')
+        owners = [f'fetch:{asin}' for asin in payload['asins']]
+        identity = {'operation': 'apify_create_run', 'endpoint': endpoint, 'marketplace': self.marketplace, 'payload': payload}
+        def send():
+            return json.dumps(self._json_request(endpoint, method='POST', payload=payload, token=token, retry_attempts=1), ensure_ascii=False).encode()
+        def rejected(exc):
+            return known_unsent(exc) or (isinstance(exc, urllib.error.HTTPError) and exc.code in {400, 401, 402, 403, 404, 422, 429})
+        try:
+            raw = perform_request(self.receipt_root, owners, identity, send, known_not_executed=rejected, retry_received=self.refresh_received)
+            return 200, json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode('utf-8', errors='replace')
+        except urllib.error.URLError as exc:
+            return 599, str(exc.reason)
 
     def _wait_for_run(self, run_id: str, *, token: str) -> dict[str, Any]:
         deadline = time.time() + self.timeout_seconds
@@ -222,6 +229,20 @@ class ApifyClient:
             if time.time() >= deadline:
                 raise RuntimeError(f"Timed out waiting for Apify run {run_id}")
             self._sleep(self.poll_seconds)
+
+
+def returned_asin(item: Any) -> str:
+    """Only response identity, never request/input fields or a sibling's ASIN."""
+    if not isinstance(item, dict):
+        return ''
+    values = {str(item[k]).strip().upper() for k in ('asin', 'ASIN') if item.get(k)}
+    for key in ('productUrl', 'productURL', 'url'):
+        url = urllib.parse.urlparse(str(item.get(key) or ''))
+        if url.hostname in AMAZON_HOSTS.values():
+            match = re.search(r'/(?:dp|gp/product)/([A-Za-z0-9]{10})(?:[/?]|$)', url.path)
+            if match:
+                values.add(match[1].upper())
+    return next(iter(values)) if len(values) == 1 and re.fullmatch('[A-Z0-9]{10}', next(iter(values))) else ''
 
 
 def _retry_after_seconds(value: str | None) -> float:

@@ -7,6 +7,8 @@ import subprocess
 import sys
 import unittest
 import hashlib
+import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,12 +53,15 @@ class _Plugin:
 
 class ProviderRuntimeV1Tests(unittest.TestCase):
     def setUp(self):
+        paid=patch('core.batch_ledger.admit_paid_request',return_value='mock-network-admission')
+        paid.start();self.addCleanup(paid.stop)
         memory = patch("core.image_provider_common._system_memory_bytes", return_value=(32 * 1024**3, 20 * 1024**3))
         memory.start()
         self.addCleanup(memory.stop)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        for replacement in (patch('core.image_resources._LEDGER', Path(directory.name) / 'leases.json'),
+        for replacement in (patch('core.model_call_health.model_call_health_ledger_path',return_value=Path(directory.name)/'health.json'),
+                            patch('core.image_resources._LEDGER', Path(directory.name) / 'leases.json'),
                             patch('core.image_resources._system_memory_bytes', return_value=(32 * 1024**3, 20 * 1024**3))):
             replacement.start()
             self.addCleanup(replacement.stop)
@@ -74,7 +79,6 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 SimpleNamespace(name=name, api_key="", bearer_token="", raw={"allowed_roles": ["scene"]})
                 for name in ("krill_gpt_image_2", "aicost_gpt_image_2", "apimart")]),
             patch.object(routing, "_global_provider_cooldown_active", return_value=False),
-            patch.object(routing, "_persistently_unhealthy_providers", return_value=set()),
         ):
             task = routing.apply_role_provider_policy({"role": "scene_01", "role_family": "scene", "job_dir": "job"}, _Plugin())
         self.assertEqual(3, len(task["providers"]))
@@ -151,6 +155,58 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(resources, '_LEDGER', Path(tmp) / 'leases.json'), patch.object(resources, "_system_memory_bytes", return_value=(8 * 1024**3, 4 * 1024**3)):
             with self.assertRaises(ProviderQueueUnavailable):
                 resources.reserve_image({'job_dir': tmp, 'generation_references': []})
+        from concurrent.futures import ThreadPoolExecutor
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(resources, '_LEDGER', Path(tmp) / 'leases.json'),
+            patch.object(resources, '_system_memory_bytes', return_value=(32 * 1024**3, int(6.9 * 1024**3))),
+            patch.object(resources, '_rss', return_value=0),
+        ):
+            tasks = [{'job_dir': tmp, 'logical_task_id': f'generate:memory:B{i}', 'generation_references': []}
+                     for i in range(2)]
+            self.assertEqual(1, resources.image_memory_capacity(tasks))
+            barrier = threading.Barrier(2)
+
+            def admit(task):
+                barrier.wait(timeout=5)
+                try:
+                    return task, resources.reserve_image(task)
+                except ProviderQueueUnavailable:
+                    return task, ''
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(admit, tasks))
+            admitted = [(task, lease) for task, lease in results if lease]
+            self.assertEqual(1, len(admitted), 'simultaneous requests must share one available memory lane')
+            active, lease = admitted[0]
+            other = next(task for task, token in results if not token)
+            try:
+                self.assertEqual(0, resources.image_memory_capacity([other]))
+                with self.assertRaises(ProviderQueueUnavailable):
+                    resources.reserve_image(other, local=True)
+                code = '\n'.join([
+                    'import sys; from pathlib import Path; from core import image_resources as r',
+                    'from core.image_provider_common import ProviderQueueUnavailable',
+                    'r._LEDGER=Path(sys.argv[1])/"leases.json"; r._system_memory_bytes=lambda:(32*1024**3,int(6.9*1024**3)); r._rss=lambda p:0',
+                    'task={"job_dir":sys.argv[1],"logical_task_id":"generate:memory:child","generation_references":[]}',
+                    'for local in (False,True):',
+                    ' try: r.reserve_image(task,local=local)',
+                    ' except ProviderQueueUnavailable: continue',
+                    ' raise AssertionError("cross-process memory overcommit")',
+                ])
+                child = subprocess.run([sys.executable, '-c', code, tmp], capture_output=True, text=True, timeout=10)
+                self.assertEqual(0, child.returncode, child.stderr[-500:])
+            finally:
+                resources.release_image(active, lease)
+            with self.assertRaises(ProviderQueueUnavailable):resources.reserve_image(active, local=True)
+            with patch.object(resources, '_system_memory_bytes', return_value=(32*1024**3, 8*1024**3)):
+                local_lease = resources.reserve_image(active, local=True)
+                try:
+                    with self.assertRaises(ProviderQueueUnavailable):
+                        resources.reserve_image(other)
+                finally:
+                    resources.release_image(active, local_lease)
+            self.assertEqual(1, resources.image_memory_capacity(tasks))
         with (
             tempfile.TemporaryDirectory() as tmp,
             patch.object(common, "_system_memory_bytes", return_value=(8 * 1024**3, 6 * 1024**3)),
@@ -269,7 +325,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             source = Path(tmp) / "source.png"
             source.write_bytes(b"source")
             receipt = Path(tmp) / 'response.json'
-            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
+            from tests.image_boundary_fixture import native_bytes
+            receipt.with_suffix('.bin').write_bytes(native_bytes())
             task = {
                 "job_dir": tmp, "output_path": str(output), "prompt": "prompt",
                 "providers": ["a", "b"], "child_provider_reserve": ["c", "d"],
@@ -301,16 +358,20 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual("b", generate.call_args_list[1].kwargs["provider_name"])
         self.assertEqual("b", result["provider"])
 
-    def test_protected_reference_mask_is_passed_to_mask_capable_provider(self) -> None:
+    def test_region_map_is_an_ordered_opaque_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
             source = job / "source.png"
             mask = job / "mask.png"
-            output = job / "candidate.png"
+            output = job / "fixture-task.candidate0.png"
             Image.new("RGB", (32, 32), "white").save(source)
             receipt = job / 'response.json'
-            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
-            Image.new("RGBA", (32, 32), (255, 255, 255, 128)).save(mask)
+            from tests.image_boundary_fixture import native_bytes
+            receipt.with_suffix('.bin').write_bytes(native_bytes())
+            from PIL import ImageDraw
+            region = Image.new('RGBA', (32, 32), (87, 10, 240, 0))
+            ImageDraw.Draw(region).rectangle((0, 0, 15, 31), fill=(3, 200, 10, 255))
+            region.save(mask)
             support = job / "support.png"
             Image.new("RGB", (32, 32), "blue").save(support)
             source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -334,13 +395,22 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 patch("core.image_generation_executor.provider_run_circuit_open", return_value=False),
                 patch("core.image_generation_executor.provider_runtime_circuit_key", return_value="provider:a"),
                 patch("core.image_generation_executor.assert_provider_allowed"),
-                patch("core.image_generation_executor.image_provider_supports_mask", side_effect=lambda name: name == "a"),
-                patch("core.image_generation_executor.image_provider_supports_multiple_references", side_effect=lambda name, count: name == "a" and count == 2),
+                patch("core.image_generation_executor.image_provider_supports_multiple_references", side_effect=lambda name, count: name == "a" and count == 3),
                 patch("core.image_generation_executor.generate_with_provider_retries", return_value=receipt) as generate,
                 patch("core.image_generation_executor._record_generation_progress"),
                 patch("core.image_generation_executor._record_provider_event_audit_only"),
             ):
                 generate_one(task, plugin=_Plugin())
+            from core.image_reference_context import reference_prompt
+            text = reference_prompt(task['generation_references'], design_transfer=[])
+            self.assertIn('Attachment 2: product_evidence', text)
+            self.assertIn('Attachment 3 is an opaque', text)
+            mapped = generate.call_args.kwargs['region_map_bytes']
+            with Image.open(io.BytesIO(mapped)) as visible:
+                self.assertEqual('RGB', visible.mode)
+                self.assertEqual((255, 255, 255), visible.getpixel((2, 2)))
+                self.assertEqual((0, 0, 0), visible.getpixel((30, 2)))
+            self.assertEqual(mask_sha, generate.call_args.kwargs['request_audit']['references'][-1]['source_mask_sha256'])
             from core import image_provider_transport as transport
             audit = {}
             spec = transport.ImageProviderSpec(name="a", display="a", url="https://invalid.example", api_type="openai_images_edit",
@@ -349,30 +419,56 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                 transport.api_registry, "image_provider_supports_multiple_references", return_value=True,
             ), patch.object(transport, "_generate_with_openai_images_edit", return_value=b"candidate") as send:
                 transport.generate_with_registry_image_provider(provider_name="a", image_inputs=[source.read_bytes(), support.read_bytes()],
-                    prompt="fixture", mask_bytes=mask.read_bytes(), request_id="fixture-request", request_audit=audit)
+                    prompt="fixture", region_map_bytes=mapped, request_id="fixture-request", request_audit=audit)
             sent = send.call_args.kwargs["image_inputs"]
-            self.assertEqual(2, len(sent))
+            self.assertEqual(3, len(sent))
             self.assertEqual([hashlib.sha256(data).hexdigest() for data in sent], [row["sent_sha256"] for row in audit["inputs"]])
-            self.assertEqual([source_sha, hashlib.sha256(support.read_bytes()).hexdigest()], [row["original_sha256"] for row in audit["inputs"]])
-            self.assertEqual(hashlib.sha256(send.call_args.kwargs["mask_bytes"]).hexdigest(), audit["mask_sha256"])
+            self.assertEqual([source_sha, hashlib.sha256(support.read_bytes()).hexdigest(), hashlib.sha256(mapped).hexdigest()], [row["original_sha256"] for row in audit["inputs"]])
+            self.assertEqual(mapped, sent[-1])
+            self.assertEqual(3, audit['region_map_attachment'])
+            self.assertNotIn('mask_bytes', send.call_args.kwargs)
+            # The extra physical attachment must survive commit/recovery, not only upload.
+            from core.candidate_state import commit_candidate_output, current_candidate, CandidateStateError
+            from core.io import read_json, write_json
+            from tests.publication_resize_fixture import fixture_processing
+            prompt_path = job / 'prompt.txt'; prompt_path.write_text('fixture', encoding='utf-8')
+            runtime = {**task, 'provider': 'a', 'source_path': 'source.png', 'source_sha256': source_sha,
+                'output_dir': '.', 'input_revision_id': 'fixture-input', 'request_audit': audit,
+                'prompt_path': str(prompt_path), 'task_prompt_fingerprint': 'fixture-prompt',
+                'request_prompt_fingerprint': hashlib.sha256(b'fixture').hexdigest()}
+            native = native_bytes((1600, 1600))
+            with patch('core.candidate_state.upscale_for_publication', return_value=(native, fixture_processing(native))):
+                committed = commit_candidate_output(job, runtime, native)
+            self.assertEqual(committed['candidate_sha256'], current_candidate(job, runtime)['candidate_sha256'])
+            manifest_path = job / 'reports/candidate_manifests/B1/func/fixture-task/candidate0.json'
+            manifest = read_json(manifest_path)
+            from copy import deepcopy
+            for error in ('missing_map', 'wrong_order', 'wrong_number'):
+                altered = deepcopy(manifest)
+                if error == 'missing_map': altered['request_audit']['inputs'].pop()
+                elif error == 'wrong_order': altered['request_audit']['inputs'].reverse()
+                else: altered['request_audit']['region_map_attachment'] = 1
+                write_json(manifest_path, altered)
+                with self.assertRaises(CandidateStateError): current_candidate(job, runtime)
+            write_json(manifest_path, manifest)
             with patch.object(transport, "_image_provider_spec", return_value=spec), patch.object(
                 transport.api_registry, "image_provider_supports_multiple_references", return_value=False,
             ), patch.object(transport, "_generate_with_openai_images_edit") as unsupported:
                 with self.assertRaises(ProviderConfigurationError):
                     transport.generate_with_registry_image_provider(provider_name="a", image_inputs=[source.read_bytes(), support.read_bytes()], prompt="fixture")
                 unsupported.assert_not_called()
-        self.assertIsNotNone(generate.call_args.kwargs["mask_bytes"])
+        self.assertIsNotNone(generate.call_args.kwargs["region_map_bytes"])
         self.assertEqual("a", generate.call_args.kwargs["provider_name"])
         self.assertEqual(1, generate.call_count)
-        self.assertEqual(mask_sha, hashlib.sha256(generate.call_args.kwargs["mask_bytes"]).hexdigest())
 
     def test_failed_primary_uses_fallback_and_unknown_resends_are_durable(self) -> None:
-        from core.image_response import begin_response, submit_response, save_response, response_directory
+        from core.image_response import begin_response, submit_response, save_response, response_directory, response_submission_metrics, resolve_response
         from core.io import read_json
-        for unknown, failures in ((False, 1), (True, 1), (True, 3), (True, 4)):
+        for unknown, failures in ((False, 1), (True, 1)):
             with self.subTest(unknown=unknown, failures=failures), tempfile.TemporaryDirectory() as tmp:
                 source = Path(tmp) / "source.png"
-                Image.new('RGB', (32, 32), 'white').save(source)
+                from tests.image_boundary_fixture import native_bytes
+                source.write_bytes(native_bytes())
                 task = {"job_dir": tmp, "output_path": str(Path(tmp)/'candidate.png'), "prompt": "prompt",
                     "providers": ["primary", "fallback-a"], "child_provider_reserve": ["other-primary", "fallback-b"],
                     "execution_profile": "reference_edit_soft_lock", "child": "B1", "role": "func",
@@ -393,6 +489,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                     save_response(receipt, source.read_bytes(), audit)
                     return receipt
                 with (
+                    patch('core.image_response.load_provider_policy', return_value={'image_generation': {'unknown_result_policy':
+                        {'max_replacements':3}}}),
                     patch('core.image_generation_executor.image_provider_fallback_only', side_effect=lambda name: name.startswith('fallback')),
                     patch('core.image_generation_executor.reserve_image'),
                     patch('core.image_generation_executor.release_image'),
@@ -406,24 +504,28 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
                     patch('core.image_generation_executor._record_generation_progress'),
                     patch('core.image_generation_executor._record_provider_event_audit_only'),
                 ):
-                    if failures == 4:
-                        with self.assertRaises(ProviderTransportError):
-                            generate_one(task, plugin=_Plugin())
-                        # A new executor invocation cannot reset the persisted allowance.
-                        with self.assertRaises(ProviderTransportError):
-                            generate_one({**task, 'request_outcome': ''}, plugin=_Plugin())
-                        self.assertEqual(4, len(calls))
-                    else:
-                        result = generate_one(task, plugin=_Plugin())
-                        self.assertTrue(result['provider'].startswith('fallback'))
-                        self.assertNotIn('request_outcome', result)
-                        count = len(calls)
-                        generate_one(task, plugin=_Plugin())  # Saved paid response: no resend.
-                        self.assertEqual(count, len(calls))
+                    if unknown:
+                        with self.assertRaises(ProviderTransportError):generate_one(task, plugin=_Plugin())
+                        with self.assertRaises(ProviderTransportError):generate_one({**task, 'request_outcome': ''}, plugin=_Plugin())
+                        self.assertEqual(1, len(calls))
+                        receipt=next(response_directory(task).glob('*.json'))
+                        resolve_response(Path(tmp),str(receipt),action='approve_one_resend',reason='One explicit fixture replacement')
+                    result = generate_one(task, plugin=_Plugin())
+                    self.assertTrue(result['provider'].startswith('fallback'))
+                    self.assertEqual(task['logical_task_id'], result['logical_task_id'])
+                    self.assertNotIn('request_outcome', result)
+                    count = len(calls)
+                    self.assertEqual(count, response_submission_metrics(Path(tmp))['image_provider_submission_count'])
+                    generate_one(task, plugin=_Plugin())  # Saved paid response: no resend.
+                    self.assertEqual(count, len(calls))
+                    self.assertEqual(count, response_submission_metrics(Path(tmp))['image_provider_submission_count'])
                 self.assertEqual('primary', calls[0])
                 self.assertTrue(all(name.startswith('fallback') for name in calls[1:]))
                 receipts = [read_json(p) for p in response_directory(task).glob('*.json')]
-                self.assertEqual(min(failures, 3) if unknown else 0,
+                self.assertEqual(len(calls), response_submission_metrics(Path(tmp))['image_provider_submission_count'])
+                self.assertEqual(1, len({r['request_audit']['logical_task_id'] for r in receipts}))
+                self.assertEqual(1, sum(r['status'] == 'received' for r in receipts))
+                self.assertEqual(1 if unknown else 0,
                     sum(r.get('resolution', {}).get('action') == 'approve_one_resend' for r in receipts))
 
     def test_moderation_rejection_does_not_poison_physical_provider_circuit(self) -> None:
@@ -510,7 +612,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertTrue(str(captured["output_path"]).endswith(".candidate1.png"))
         self.assertTrue(captured["revision_prompt_exists"])
         self.assertIn("human revision", captured["revision_prompt_text"])
-        self.assertIn("within the current child design", captured["revision_prompt_text"])
+        self.assertIn("Re-execute the current edit contract from attachment 1", captured["revision_prompt_text"])
+        self.assertIn("keep the selected source product instances unchanged", captured["revision_prompt_text"])
         self.assertIn("existing brand brief and brief stage", captured["revision_prompt_text"])
         self.assertEqual(captured["request_prompt_fingerprint"], captured["revision_prompt_sha"])
         self.assertEqual(1, captured["transport_attempt"])
@@ -577,6 +680,29 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             self.assertIn("Preserve:", prompt)
             if role == "func":
                 self.assertIn("Adjustable Shelf", prompt)
+        from core.image_task_inputs import role_art_direction
+        photography = {'lighting': 'soft_daylight', 'exposure': 'balanced'}
+        for role, environment, policy, canvas in (
+            ('main', 'designed_environment', 'white_background', True),
+            ('func', 'graphic_canvas', '', True),
+            ('main', 'designed_environment', 'product_first_lifestyle', False),
+            ('scene', 'designed_environment', '', False),
+        ):
+            target = current_image_task(role)
+            target['category_image_policy']['main_image_policy'] = policy
+            target['image_direction']['environment_mode'] = environment
+            target['family_art_direction']['photography_direction'] = photography
+            required = role_art_direction(target['family_art_direction'], target['image_direction'], role,
+                main_policy=policy)['photography_direction']
+            prompt = compile_task_prompt(task=target)
+            self.assertTrue(all(f'{key} = {value}' in prompt for key, value in required.items()))
+            if canvas:
+                self.assertEqual({'lighting': 'source', 'exposure': 'source'}, required)
+                self.assertIn("edit-base light direction, exposure, clarity", prompt)
+                self.assertIn('source-visible material detail', prompt)
+            else:
+                self.assertEqual(photography, required)
+                self.assertIn('lighting = soft_daylight', prompt)
 
     def test_configuration_failure_opens_run_circuit(self) -> None:
         error = ProviderConfigurationError("bad", "401")
@@ -616,16 +742,15 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             with (
                 patch.object(routing, "image_provider_entries", return_value=[first]),
                 patch.object(routing, "image_provider_physical_identity", return_value={"url": "https://example.test", "model": "image"}),
-                patch.object(routing, "record_model_call_event"),
             ):
                 first_revision = routing._provider_configuration_revision("p")
                 first_circuit = routing.provider_runtime_circuit_key("p")
-                routing.record_provider_generation_event(
-                    output_path=output, provider="p", task=task,
-                    status="configuration_failure", failure_class="configuration",
-                )
-                self.assertIn("p", routing._persistently_unhealthy_providers({"job_dir": str(job)}))
-            ledger_path = routing.project_provider_success_ledger_path(job)
+                routing.record_provider_transport_attempt_event(
+                    output_path=output,provider='p',task=task,attempt=1,
+                    status='configuration_failure',failure_class='configuration')
+                self.assertTrue(routing._global_provider_cooldown_active('p'))
+            from core.model_call_health import model_call_health_ledger_path
+            ledger_path=model_call_health_ledger_path()
             self.assertNotIn("secret-a", ledger_path.read_text(encoding="utf-8"))
             with (
                 patch.object(routing, "image_provider_entries", return_value=[second]),
@@ -633,28 +758,7 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             ):
                 self.assertNotEqual(first_revision, routing._provider_configuration_revision("p"))
                 self.assertNotEqual(first_circuit, routing.provider_runtime_circuit_key("p"))
-                self.assertNotIn("p", routing._persistently_unhealthy_providers({"job_dir": str(job)}))
-
-    def test_recent_visual_timeout_temporarily_demotes_provider(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "health.json"
-            updated = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            write_json(path, {"entries": {
-                "visual_planning|p|m": {
-                    "last_status": "timeout_failure", "last_updated": updated,
-                    "recent_events": [
-                        {"status": "timeout_failure"},
-                        {"status": "timeout_failure"},
-                    ],
-                },
-                "image_generation|p|image": {"last_status": "configuration_failure", "last_updated": updated},
-            }})
-            with (
-                patch("core.model_call_health.model_call_health_ledger_path", return_value=path),
-                patch.object(routing, "image_provider_physical_identity", return_value={"model": "image"}),
-            ):
-                self.assertTrue(model_provider_cooldown_active(scope="visual_planning", provider="p", model="m"))
-                self.assertTrue(routing._global_provider_cooldown_active("p"))
+                self.assertFalse(routing._global_provider_cooldown_active('p'))
 
     def test_single_transient_failure_does_not_collapse_global_provider_pool(self) -> None:
         from core import model_call_health as health
@@ -692,8 +796,8 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             patch.object(routing, "provider_concurrency_slot") as slot,
             patch.object(routing, "_generate_with_provider_deadline", return_value=b"image") as transport,
         ):
-            routing.generate_with_provider_retries(provider_name="budget-test", image_input_paths=[], prompt="x", total_timeout_seconds=5)
-            self.assertLessEqual(transport.call_args.kwargs["timeout_seconds"], 5)
+            routing.generate_with_provider_retries(provider_name="budget-test", image_input_paths=[], prompt="x", total_timeout_seconds=60)
+            self.assertLessEqual(transport.call_args.kwargs["timeout_seconds"], 60)
             self.assertLessEqual(slot.call_args.kwargs["deadline"], 105)
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp) / "job"
@@ -729,17 +833,50 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
             self.assertEqual(["started", "timeout_failure", "started", "timeout_failure"], statuses)
             self.assertEqual(2, call.call_count)
             self.assertTrue(provider_run_circuit_open(routing.provider_runtime_circuit_key("p")))
-            ledger = routing._read_ledger(routing.project_provider_success_ledger_path(job))
-            entry = next(iter(ledger["entries"].values()))
-            self.assertEqual(2, entry["transport_attempts"])
-            self.assertEqual({}, entry["active_transport_attempts"])
-            self.assertEqual("timeout_failure", entry["last_transport_terminal_status"])
+            from core.model_call_health import model_call_health_ledger_path
+            from core.io import read_json
+            entry=next(iter(read_json(model_call_health_ledger_path())['entries'].values()))
+            self.assertEqual(2,entry['attempts'])
+            self.assertEqual({},entry['active_attempts'])
+            self.assertEqual('timeout_failure',entry['last_status'])
+            self.assertTrue(routing._global_provider_cooldown_active('p'))
             routing.record_provider_transport_attempt_event(
                 output_path=output, provider="p", task=task, attempt=2, status="started",
             )
-            entry = next(iter(routing._read_ledger(routing.project_provider_success_ledger_path(job))["entries"].values()))
-            self.assertEqual("timeout_failure", entry["last_transport_terminal_status"])
-            self.assertTrue(entry["active_transport_attempts"])
+            entry=next(iter(read_json(model_call_health_ledger_path())['entries'].values()))
+            self.assertEqual('timeout_failure',entry['last_status'])
+            self.assertTrue(entry['active_attempts'])
+
+        from core import vision_gemini_client as vision
+        clients = [{"name": name, "model": "gemini", "protocol": "openai", "api_key": name,
+                    "base_url": f"https://{name}.example/v1", "key_env": name.upper()}
+                   for name in ("timeout-primary", "timeout-reserve")]
+        good = json.dumps({"choices": [{"message": {"content": "good"}}]})
+        for arguments, total, expected in (({"timeout_seconds": 60}, 90, [60, 30]), ({}, 300, [180, 120])):
+            reset_provider_run_circuits()
+            clock, timeouts, events = [100.0], [], []
+
+            def respond(_url, _payload, **kwargs):
+                timeouts.append(kwargs["timeout_seconds"])
+                if len(timeouts) == 1:
+                    clock[0] += kwargs["timeout_seconds"]
+                    raise TimeoutError("primary timed out")
+                return good
+
+            with (
+                patch.object(vision, "gemini_clients", return_value=clients),
+                patch.object(vision, "ordered_gemini_clients", return_value=clients),
+                patch.object(vision, "model_provider_cooldown_active", return_value=False),
+                patch.object(vision, "_record_vision_model_event"),
+                patch.object(vision.time, "monotonic", side_effect=lambda: clock[0]),
+                patch.object(vision, "provider_concurrency_slot"),
+                patch.object(vision, "_post_json_preserve_redirects", side_effect=respond),
+                patch.dict("os.environ", {"AMAZON_FACTORY_VISUAL_PLANNER_TIMEOUT_SECONDS": "180"}),
+            ):
+                self.assertEqual("good", vision.gemini_stream_generate("fixture", [], client_scope="visual_planning",
+                    total_timeout_seconds=total, max_physical_requests=2, attempt_observer=events.append, **arguments))
+            self.assertEqual(expected, timeouts)
+            self.assertEqual([0, 1, 2], [event["physical_request_count"] for event in events if event.get("event") == "request_budget"])
 
     def test_revision_with_no_eligible_provider_is_retryable_without_execution(self) -> None:
         task = current_image_task("main", category_id="bed_frame")
@@ -835,26 +972,39 @@ class ProviderRuntimeV1Tests(unittest.TestCase):
         self.assertEqual({"scene", "size"}, {row["role"] for row in completed})
         self.assertEqual([], failures)
 
-    def test_quality_ledger_accepts_human_role_score(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            job = Path(tmp) / "job"
-            image = job / "images" / "generated" / "x.png"
-            image.parent.mkdir(parents=True)
-            image.write_bytes(b"x")
-            write_json(Path(str(image) + ".source.json"), {"provider": "stale-marker-provider"})
-            task = {"child": "B1", "role": "scene_01"}
-            candidate = {"output_path": image, "provider_name": "apimart"}
-            with (
-                patch("core.image_tasks.read_image_tasks", return_value={"tasks": [task]}),
-                patch("core.candidate_state.current_candidate", return_value=candidate),
-            ):
-                routing.record_provider_quality_score(job, category_id="bed_frame", child="B1", role="scene_01", candidate_path=str(image), score=4, reason_tags=["good-lighting"])
-            ledger = routing._read_ledger(routing.project_provider_success_ledger_path(job))
-            entry = next(iter(ledger["entries"].values()))
-            self.assertEqual(1, entry["human_quality_count"])
-            self.assertEqual("apimart", entry["provider"])
-            self.assertGreater(routing._health_score(entry), 0)
+        from core import vision_gemini_client as vision
+        from contextlib import contextmanager
+        primary = {"name": "queue-primary", "model": "gemini-3.8", "protocol": "openai", "api_key": "account-a",
+                   "base_url": "https://queue.example/v1", "key_env": "QUEUE_A"}
+        clients = [primary, {**primary, "name": "queue-alias", "model": "gemini-3.7"},
+                   {**primary, "name": "queue-reserve", "api_key": "account-b", "key_env": "QUEUE_B"}]
+        events, resources = [], []
+        busy = vision._vision_resource(primary)[1]
 
+        @contextmanager
+        def slot(_provider, **kwargs):
+            resources.append(kwargs["resource_key"])
+            if kwargs["resource_key"] == busy:
+                raise ProviderQueueUnavailable("queue-primary", "busy")
+            yield
+
+        with (
+            patch.object(vision, "gemini_clients", return_value=clients),
+            patch.object(vision, "ordered_gemini_clients", return_value=clients),
+            patch.object(vision, "model_provider_cooldown_active", return_value=False),
+            patch.object(vision, "_record_vision_model_event"),
+            patch.object(vision, "provider_concurrency_slot", side_effect=slot),
+            patch.object(vision, "_post_json_preserve_redirects", return_value=json.dumps({"choices": [{"message": {"content": "good"}}]})) as post,
+        ):
+            self.assertEqual("good", vision.gemini_stream_generate("fixture", [], client_scope="visual_planning",
+                total_timeout_seconds=90, max_physical_requests=1, attempt_observer=events.append))
+        self.assertEqual([busy, vision._vision_resource(clients[2])[1]], resources)
+        self.assertEqual(1, post.call_count)
+        self.assertEqual(["queue_unavailable", "success"], [event["status"] for event in events if event.get("event") != "request_budget"])
+        self.assertEqual([0, 0, 1], [event["physical_request_count"] for event in events if event.get("event") == "request_budget"])
+        from tests.christmas_recovery_fixture import verify_unsent_budget_and_account, verify_gateway_wait
+        verify_unsent_budget_and_account(self)
+        verify_gateway_wait(self)
 
 if __name__ == "__main__":
     unittest.main()

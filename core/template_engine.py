@@ -19,30 +19,31 @@ from .io import file_sha256, read_json, write_json
 from .job import load_job
 from .paths import FACTORY_ROOT
 from .plugin import ProductPlugin
-from .product_family import read_product_family, effective_product_facts
-from .run_scope import read_run_scope, scoped_family_children
+from .product_family import read_product_family, effective_product_facts, fact_key, identity_values_equal
+from products.generic_extractors import theme_from_dimensions
+from .run_scope import read_run_scope, scoped_family_children, target_children
 from .required_role_policy import required_role_policy
 from .template_contract import template_input_fingerprint
 from .template_field_plan import (
+    _known_enum_value,
     compile_field_coverage,
     compile_field_plan,
     compile_field_requirements,
+    bound_conditional_dispositions,
     country_of_origin_value,
     fit_template_image_slots as _fit_template_image_slots,
     field_expects_number,
+    fields_for_alias,
     item_highlights_text,
     looks_numeric,
-    primary_material_label,
     resolve_field,
     role_sort as _role_sort,
     split_weight_recommendation,
     template_allowed_values,
 )
-from .template_field_values import color_map_value, light_color_value, template_dimensions_from_facts
+from .template_field_values import color_map_value, light_color_value, repeated_attribute_values, sourced_template_attributes, template_dimensions_from_facts
 from .template_package import TemplatePackageError, write_plan_package
 from .template_runtime import (
-    DEFAULT_TEMPLATE_INVENTORY_AVAILABLE,
-    DEFAULT_TEMPLATE_PRODUCT_ID_TYPE,
     child_sku,
     load_template_env,
     parent_sku,
@@ -51,19 +52,13 @@ from .template_runtime import (
     template_job_with_defaults,
     template_mode as resolve_template_mode,
 )
-from .template_submit_ready import TemplateSubmitReadyError, assert_submit_ready_price_current
-from .price import normalize_price_value
+from .template_submit_ready import TemplateSubmitReadyError, assert_submit_ready_price_current, listing_prices
 from .title_quality import listing_title_quality_issues
 from .value_utils import truthy
 
-DEFAULT_MARKETPLACE_ID = "ATVPDKIKX0DER"
-MARKETPLACE_ID = os.environ.get("AMAZON_MARKETPLACE_ID", DEFAULT_MARKETPLACE_ID).strip() or DEFAULT_MARKETPLACE_ID
 TEMPLATE_REFERENCE_MAX_ROWS = 12
 TEMPLATE_REFERENCE_VALUE_LIMIT = 600
 TEMPLATE_REFERENCE_EXAMPLE_LIMIT = 5
-def _marketplace_field(value: str) -> str:
-    return str(value).replace(f"marketplace_id={DEFAULT_MARKETPLACE_ID}", f"marketplace_id={MARKETPLACE_ID}")
-
 IMAGE_FIELDS = {
     "main": "main_product_image_locator[marketplace_id=ATVPDKIKX0DER]#1.media_location",
     "other1": "other_product_image_locator_1[marketplace_id=ATVPDKIKX0DER]#1.media_location",
@@ -94,6 +89,8 @@ FIELD_ALIASES = {
     "item_type_keyword": ["item_type_keyword[marketplace_id=ATVPDKIKX0DER]#1.value"],
     "model_number": ["model_number[marketplace_id=ATVPDKIKX0DER]#1.value"],
     "model_name": ["model_name[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
+    "occasion_type": ["occasion_type[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
+    "required_product_compliance_certificate": ["required_product_compliance_certificate[marketplace_id=ATVPDKIKX0DER]#1.value"],
     "manufacturer": ["manufacturer[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
     "description": ["product_description[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
     "bullet1": ["bullet_point[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
@@ -148,14 +145,15 @@ FIELD_ALIASES = {
     "contains_battery": ["contains_battery_or_cell[marketplace_id=ATVPDKIKX0DER]#1.value"],
     "is_fragile": ["is_fragile[marketplace_id=ATVPDKIKX0DER]#1.value"],
     "list_price": ["list_price[marketplace_id=ATVPDKIKX0DER]#1.value"],
+    "selling_price": ["purchasable_offer[marketplace_id=ATVPDKIKX0DER][audience=ALL]#1.our_price#1.schedule#1.value_with_tax"],
     "quantity": ["fulfillment_availability#1.quantity"],
     "fulfillment": ["fulfillment_availability#1.fulfillment_channel_code"],
     "inventory_available": ["fulfillment_availability#1.is_inventory_available"],
     "shipping_template": ["merchant_shipping_group[marketplace_id=ATVPDKIKX0DER]#1.value"],
-    "item_depth": ["item_depth[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
-    "item_depth_unit": ["item_depth[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.unit"],
-    "length": ["item_length_width_height[marketplace_id=ATVPDKIKX0DER]#1.length.value", "item_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.normalized_value.value", "item_display_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.value", "item_depth_width_height[marketplace_id=ATVPDKIKX0DER]#1.depth.value", "item_length[marketplace_id=ATVPDKIKX0DER]#1.value"],
-    "length_unit": ["item_length_width_height[marketplace_id=ATVPDKIKX0DER]#1.length.unit", "item_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.normalized_value.unit", "item_display_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.unit", "item_depth_width_height[marketplace_id=ATVPDKIKX0DER]#1.depth.unit", "item_length[marketplace_id=ATVPDKIKX0DER]#1.unit"],
+    "item_depth": ["item_depth[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value", "item_depth_width_height[marketplace_id=ATVPDKIKX0DER]#1.depth.value"],
+    "item_depth_unit": ["item_depth[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.unit", "item_depth_width_height[marketplace_id=ATVPDKIKX0DER]#1.depth.unit"],
+    "length": ["item_length_width_height[marketplace_id=ATVPDKIKX0DER]#1.length.value", "item_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.normalized_value.value", "item_display_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.value", "item_length[marketplace_id=ATVPDKIKX0DER]#1.value"],
+    "length_unit": ["item_length_width_height[marketplace_id=ATVPDKIKX0DER]#1.length.unit", "item_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.normalized_value.unit", "item_display_dimensions[marketplace_id=ATVPDKIKX0DER]#1.length.unit", "item_length[marketplace_id=ATVPDKIKX0DER]#1.unit"],
     "width": ["item_length_width_height[marketplace_id=ATVPDKIKX0DER]#1.width.value", "item_dimensions[marketplace_id=ATVPDKIKX0DER]#1.width.normalized_value.value", "item_display_dimensions[marketplace_id=ATVPDKIKX0DER]#1.width.value", "item_depth_width_height[marketplace_id=ATVPDKIKX0DER]#1.width.value"],
     "width_unit": ["item_length_width_height[marketplace_id=ATVPDKIKX0DER]#1.width.unit", "item_dimensions[marketplace_id=ATVPDKIKX0DER]#1.width.normalized_value.unit", "item_display_dimensions[marketplace_id=ATVPDKIKX0DER]#1.width.unit", "item_depth_width_height[marketplace_id=ATVPDKIKX0DER]#1.width.unit"],
     "height": [
@@ -203,14 +201,16 @@ FIELD_ALIASES = {
     "room_type5": ["room_type[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#5.value"],
     "indoor_outdoor": ["recommended_uses_for_product[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
     "base_type": ["base_type[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
-    "pot_material": ["container[marketplace_id=ATVPDKIKX0DER]#1.type[language_tag=en_US]#1.value"],
+    "pot_material": ["pot_material[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value",
+                     "container[marketplace_id=ATVPDKIKX0DER]#1.material[language_tag=en_US]#1.value"],
+    "leaf_material": ["leaf_material[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
+    "trunk_material": ["trunk_material[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
+    "top_material": ["top_material_type[marketplace_id=ATVPDKIKX0DER][language_tag=en_US]#1.value"],
     "has_lights": ["has_builtin_light[marketplace_id=ATVPDKIKX0DER]#1.value"],
     "has_led": ["has_builtin_light[marketplace_id=ATVPDKIKX0DER]#1.value"],
     "main_image_url": [IMAGE_FIELDS["main"]],
 }
 
-IMAGE_FIELDS = {key: _marketplace_field(value) for key, value in IMAGE_FIELDS.items()}
-FIELD_ALIASES = {key: [_marketplace_field(value) for value in values] for key, values in FIELD_ALIASES.items()}
 
 @dataclass(frozen=True)
 class TemplateInfo:
@@ -225,22 +225,33 @@ class TemplateInfo:
     allowed_values: dict[str, list[str]] | None = None
     template_product_type: str = ""
     data_start_row: int = 7
+    row_conditions: tuple | None = None
 
 class TemplateEngineError(RuntimeError):
     pass
 
-def _assert_submit_ready_job_contract(job: dict[str, Any], *, mode: str, child_count: int | None = None) -> None:
+class TemplateAuditError(TemplateEngineError):
+    """The completed field audit is reproducible from its bound inputs."""
+
+def _assert_submit_ready_job_contract(job: dict[str, Any], *, mode: str, child_count: int | None = None, child_skus=None) -> None:
     if mode != "submit_ready":
         return
     if not isinstance(job.get("gtin_exempt"), bool):
         raise TemplateEngineError("submit_ready job requires gtin_exempt to resolve to a boolean")
-    if job["gtin_exempt"] is False and (
-        not str(job.get("product_id_type") or "").strip()
-        or not str(job.get("product_id") or "").strip()
-    ):
-        raise TemplateEngineError("non-exempt submit_ready job requires product_id_type and product_id")
-    if job['gtin_exempt'] is False and child_count is not None and child_count > 1:
-        raise TemplateEngineError('Non-exempt multi-child submit_ready cannot reuse one job product_id; this input supports only a single child')
+    if job['gtin_exempt'] is False:
+        values = (job.get('business_input') or {}).get('sku_values', {})
+        identifiers = {sku: row for sku, row in values.items() if row.get('product_id_type') and row.get('product_id')}
+        if identifiers:
+            from .job import _validate_business_input
+            _validate_business_input(job['business_input'], job)
+            if child_skus is not None and set(child_skus) - set(identifiers):
+                raise TemplateEngineError('Non-exempt SKU identifiers missing: ' + ', '.join(sorted(set(child_skus) - set(identifiers))))
+            if child_count is not None and len(identifiers) < child_count:
+                raise TemplateEngineError('Non-exempt family needs a distinct product identifier for every SKU')
+        elif child_count is not None and child_count > 1:
+            raise TemplateEngineError('Non-exempt multi-child submit_ready cannot reuse one job product_id; provide per-SKU identifiers')
+        elif not str(job.get('product_id_type') or '').strip() or not str(job.get('product_id') or '').strip():
+            raise TemplateEngineError('non-exempt submit_ready job requires product_id_type and product_id')
 
 def _template_scope_children(job_path: Path, family: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
     scope = read_run_scope(job_path)
@@ -270,8 +281,8 @@ def build_template_plan(
     env = load_template_env(
         str(FACTORY_ROOT / "config.env"),
         str(FACTORY_ROOT / "config.local.env"),
-        config_path,
         job.get("config_path", ""),
+        config_path,
     )
     try:
         mode = resolve_template_mode(env, template_mode)
@@ -281,8 +292,13 @@ def build_template_plan(
     if family.get("category_id") != plugin.category_id:
         raise TemplateEngineError("ProductFamilyV3 category does not match active template plugin")
     job = template_job_with_defaults(job, env=env)
-    _assert_submit_ready_job_contract(job, mode=mode, child_count=len(family["family"]["children"]))
+    _assert_submit_ready_job_contract(job, mode=mode, child_count=len(family['family']['children']),
+        child_skus=[child_sku(job,c,i) for i,c in enumerate(family['family']['children'],1)])
     if mode == "submit_ready":
+        from .product_family import family_variation_issues
+        relation_issues = family_variation_issues(family['family'])
+        if relation_issues:
+            raise TemplateEngineError('; '.join(relation_issues))
         child_fetch_errors = list((family.get("source") or {}).get("child_fetch_errors") or [])
         if child_fetch_errors:
             raise TemplateEngineError(
@@ -315,12 +331,26 @@ def build_template_plan(
         )
     except (ValueError, FileNotFoundError) as exc:
         raise TemplateEngineError(str(exc)) from exc
-    template = analyze_template(template_file)
-    template_reference = _template_reference_report(template)
-    published_images, image_audit = _published_image_plan(job_path, plugin=plugin)
-    parent_asin = str(family["family"]["parent_asin"])
     output_path = Path(output) if output else artifact_dir / f"filled_{plugin.product_type}_{job['seed_asin']}.xlsm"
-    theme = _theme_for_template(family["family"].get("variation_theme") or "", family["family"].get("variation_dimensions", []))
+    published_images, image_audit = _published_image_plan(job_path, plugin=plugin)
+    fingerprint=template_input_fingerprint(job_path=job_path,template_path=template_file,output_path=output_path,
+        mode=mode,write_excel=write_excel,job=job,plugin_config=plugin.merged_config(),image_bindings=published_images)
+    previous_path=artifact_dir/'plan.json'
+    if mode=='submit_ready' and not preflight and previous_path.is_file():
+        from .status import load_status
+        recorded=(load_status(job_path).get('artifacts') or {}).get('template_plan') or {}
+        if recorded.get('sha256')==file_sha256(previous_path):
+            previous=read_json(previous_path)
+            if previous.get('artifact_state')=='submit_ready_blocked' and previous.get('template_input_fingerprint')==fingerprint:
+                _raise_on_template_audit_errors(previous)
+    template = analyze_template(template_file)
+    if mode == 'submit_ready':
+        contract_issues = _template_input_contract_issues(template, plugin, family['family'])
+        if contract_issues:
+            raise TemplateEngineError('; '.join(contract_issues))
+    template_reference = _template_reference_report(template)
+    parent_asin = str(family["family"]["parent_asin"])
+    theme = theme_from_dimensions(family["family"]["variation_dimensions"], template.allowed_values.get(FIELD_ALIASES['variation_theme'][0], []))
     rows: list[dict[str, Any]] = []
     listing_rows_by_sku: dict[str, dict[str, Any]] = {}
     children = source_children
@@ -335,7 +365,8 @@ def build_template_plan(
         plugin=plugin,
         job=job,
     )
-    parent_specific = _parent_family_values(children, plugin)
+    specifics = _template_family_attributes(job_path, family, children, plugin)
+    parent_specific = _common_family_values(list(specifics.values()))
     parent_child = {"asin": parent_asin, "variation_values": {}, "final_images": []}
     parent_listing = _build_listing_row_data(
         plugin=plugin,
@@ -355,6 +386,7 @@ def build_template_plan(
     )
     parent_field_plan = compile_template_field_plan(
         template=template, plugin=plugin, row_data=parent_listing, template_mode=mode,
+        conditional_dispositions=job.get('conditional_dispositions'), facts_revision=file_sha256(job_path/'source/product_family_v3.json'),
     )
     listing_rows_by_sku[parent_sku_value] = parent_listing
     rows.append({"row_type": "Parent", "sku": parent_sku_value, "source_asin": parent_asin, **parent_field_plan})
@@ -362,7 +394,7 @@ def build_template_plan(
     for index, child in enumerate(children, start=1):
         asin = str(child.get("asin") or f"child-{index}")
         sku = child_sku(job, child, index)
-        specific = _family_specific(child, plugin)
+        specific = specifics[asin]
         child_listing = _build_listing_row_data(
             plugin=plugin,
             job=job,
@@ -381,6 +413,7 @@ def build_template_plan(
         )
         child_field_plan = compile_template_field_plan(
             template=template, plugin=plugin, row_data=child_listing, template_mode=mode,
+            conditional_dispositions=job.get('conditional_dispositions'), facts_revision=file_sha256(job_path/'source/product_family_v3.json'),
         )
         listing_rows_by_sku[sku] = child_listing
         rows.append(
@@ -403,11 +436,7 @@ def build_template_plan(
         "category_id": plugin.category_id,
         "product_type": plugin.product_type,
         "variation_theme": theme,
-        "template_input_fingerprint": template_input_fingerprint(
-            job_path=job_path, template_path=template_file, output_path=output_path,
-            mode=mode, write_excel=write_excel, job=job,
-            plugin_config=plugin.merged_config(),
-        ),
+        "template_input_fingerprint": fingerprint,
         "template": {
             "sheet": template.sheet,
             "max_col": template.max_col,
@@ -433,7 +462,10 @@ def build_template_plan(
             and mode == "submit_ready"
         ),
     )
-    _assert_submit_ready_price_current(listing_package.get("children", []), source_children, mode=mode)
+    try:
+        assert_submit_ready_price_current(listing_package.get("children", []), source_children, mode=mode, job=job)
+    except TemplateSubmitReadyError as exc:
+        raise TemplateEngineError(str(exc)) from exc
     listing_data_path = artifact_dir / "listing_data.json"
     template_reference_path = artifact_dir / "template_reference.json"
     template_coverage_path = artifact_dir / "template_field_coverage.json"
@@ -461,7 +493,8 @@ def build_template_plan(
     plan["template_mode"] = mode
     plan["copy_v1_path"] = str(copy_v1["_artifact_path"])
     plan["audit"].extend(listing_package.get("audit", []))
-    plan["audit"].extend(_template_coverage_audit(template_coverage))
+    plan["audit"].extend(_template_coverage_audit(template_coverage, mode=mode))
+    plan["audit"].extend(_variation_cell_audit(template, rows, source_children, theme, job))
     plan["audit"].extend(_audit_plan(template, plan["rows"], job, plugin, mode=mode, source_children=source_children))
     blocking_audit = [
         item for item in plan["audit"]
@@ -485,14 +518,115 @@ def build_template_plan(
     if write_excel:
         written = write_plan_workbook(plan, output_path)
         plan["workbook_sha256"] = file_sha256(written)
-        if mode == "submit_ready":
-            plan["final_template_path"] = str(_export_final_template(written, parent_asin, job_path.name))
-            plan["final_template_sha256"] = file_sha256(Path(plan["final_template_path"]))
-        else:
+        if mode=='submit_ready':
+            from .publish import export_final_template
+            plan['final_export_path']=export_final_template(job_path,plan)
+        if mode != 'submit_ready':
             plan["draft_template_path"] = str(written)
     write_json(plan_path, plan)
     _write_markdown_audit(plan, audit_path)
     return plan
+
+def _template_input_contract_issues(template, plugin, family=None):
+    from .product_family import family_variation_issues
+    expected=str((plugin.merged_config().get('template') or {}).get('product_type') or plugin.product_type)
+    issues=[]
+    if template.template_product_type != expected:
+        issues.append(f'Template product type {template.template_product_type!r} differs from configured {expected!r}')
+    if family is not None:
+        allowed=(template.allowed_values or {}).get(FIELD_ALIASES['variation_theme'][0],[])
+        issues.extend(family_variation_issues(family,allowed_themes=allowed))
+    return issues
+
+
+def preflight_template_inputs(*, job_dir: str | Path, plugin: ProductPlugin, config_path: str = '',
+                              phase: str = 'source', job_input: dict | None = None) -> dict[str, Any]:
+    """Read-only preview of the SAME field plan, never a workbook or release gate."""
+    if phase not in {'business','source'}:
+        raise ValueError('Template preflight phase must be business or source')
+    path=Path(job_dir).resolve();metadata=load_job(path) if job_input is None else dict(job_input)
+    env=load_template_env(FACTORY_ROOT/'config.env',FACTORY_ROOT/'config.local.env',metadata.get('config_path',''),config_path)
+    job=template_job_with_defaults(metadata,env=env)
+    template=analyze_template(resolve_template_path(plugin,job,factory_root=FACTORY_ROOT))
+    audit=[];rows=[];family=None
+    _assert_submit_ready_job_contract(job,mode='submit_ready')
+    if phase == 'source':
+        family=read_product_family(path)
+        children=family['family']['children']
+        theme=theme_from_dimensions(family['family']['variation_dimensions'], template.allowed_values.get(FIELD_ALIASES['variation_theme'][0], []))
+        from .product_family import fact_resolutions
+        for index, child in enumerate(children,1):
+            if (fact_resolutions(child).get('sold_unit_count') or {}).get('status') != 'confirmed':
+                audit.append({'severity':'error','sku':child_sku(job,child,index),'field':'sold_unit_count',
+                    'message':'Sale quantity is unconfirmed; factual image production must wait for evidence'})
+        if family['source'].get('child_fetch_errors'):
+            audit.append({'severity':'error','sku':'*','field':'family','message':'Source family is incomplete'})
+        child_skus=[child_sku(job,c,i) for i,c in enumerate(children,1)]
+        _assert_submit_ready_job_contract(job,mode='submit_ready',child_count=len(children),child_skus=child_skus)
+        declared=set((job.get('business_input') or {}).get('sku_values',{}))
+        family_skus = {child_sku(job, {'asin':asin}, i) for i,asin in enumerate(target_children(family),1)}
+        for sku in sorted(declared-family_skus):
+            audit.append({'severity':'error','sku':sku,'field':'business_scope','message':'SKU business evidence is outside this frozen family'})
+        for sku in sorted((declared & family_skus)-set(child_skus)):
+            audit.append({'severity':'info','sku':sku,'field':'business_scope','message':'Confirmed family member; child details have not arrived'})
+        parent=parent_sku(job,family['family']['parent_asin'],child_skus)
+        specifics = _template_family_attributes(path, family, children, plugin)
+        inputs=[('Parent',{},parent,'',_common_family_values(list(specifics.values())))]
+        inputs += [('Child',c,child_sku(job,c,i),parent,specifics[c['asin']]) for i,c in enumerate(children,1)]
+    else:
+        # These are explicit business declarations, not fabricated discovered children.
+        theme='';inputs=[('Child',{},sku,'',{}) for sku in (job.get('business_input') or {}).get('sku_values',{})] or [('Child',{},'','',{})]
+    audit.extend({'severity':'error','sku':'*','field':'template_contract','message':issue}
+        for issue in _template_input_contract_issues(template,plugin,family['family'] if family else None))
+    business_aliases=('brand','manufacturer','country','condition','quantity','fulfillment','inventory_available',
+        'shipping_template','dg','batteries_required','batteries_included','contains_battery','is_fragile','product_id','product_id_type')
+    business_fields={f for alias in business_aliases for f in fields_for_alias(template.fields,template.labels,FIELD_ALIASES,alias)}
+    for row_type,child,sku,parent,specific in inputs:
+        data=_build_listing_row_data(plugin=plugin,job=job,child=child,specific=specific,row_type=row_type,sku=sku,
+            parent_sku=parent,asin=child.get('asin',''),theme=theme,env=env,copy_v1=None,template_mode='submit_ready')
+        plan=compile_template_field_plan(template=template,plugin=plugin,row_data=data,template_mode='submit_ready',preflight=True,
+            conditional_dispositions=job.get('conditional_dispositions') if phase=='source' else None,
+            facts_revision=file_sha256(path/'source/product_family_v3.json') if family else '')
+        if phase=='business':
+            plan['field_decisions']=[d for d in plan['field_decisions'] if d['field'] in business_fields]
+            plan['field_values']={k:v for k,v in plan['field_values'].items() if k in business_fields}
+            plan['field_sources']={k:v for k,v in plan['field_sources'].items() if k in business_fields}
+        rows.append({'row_type':row_type,'sku':sku,**plan})
+    coverage=compile_field_coverage(fields=template.fields,labels=template.labels,rows=rows,reference={})
+    if family:
+        audit.extend(_variation_cell_audit(template,rows,children,theme,job))
+    audit.extend(_template_coverage_audit(coverage,mode='submit_ready'))
+    from .template_field_plan import group_field_blockers
+    groups=group_field_blockers(rows)
+    needed={a['field'] for group in groups if group['owner']=='template_rule' for a in group['affected']}
+    rule_evidence=[r for r in template.required if r.get('field') in needed]
+    return {'schema':'template-preflight-v1','phase':phase,'status':'blocked' if any(r['severity']=='error' for r in audit) else 'ready',
+        'not_a_delivery':True,'job_sha256':file_sha256(path/'job.json'),'template_sha256':file_sha256(template.path),
+        'family_sha256':file_sha256(path/'source/product_family_v3.json') if family else None,
+        'rows':rows,'coverage':coverage,'audit':audit,'blocker_groups':groups,'template_rule_evidence':rule_evidence,
+        'proposal':job_input is not None}
+
+
+def update_template_dispositions(job_dir,plugin, *, records,expected_job_sha256,decision_id,reason):
+    """Explicit scoped rule evidence through the existing field plan, with no model calls."""
+    from .status import job_run_lock,input_revision_id
+    if not decision_id or not str(reason).strip():raise ValueError('Explicit decision ID and reason required')
+    job=Path(job_dir).resolve()
+    with job_run_lock(job):
+        metadata=load_job(job);request=input_revision_id({'records':records,'before':expected_job_sha256,'reason':reason})
+        old=next((r for r in metadata.get('template_decisions',[]) if r['id']==decision_id),None)
+        if old:
+            if old['request']!=request:raise ValueError('Template decision ID conflicts with its original input')
+            return {'status':'already_applied','requests_sent':0}
+        if file_sha256(job/'job.json')!=expected_job_sha256:raise ValueError('Job changed; refresh template evidence')
+        proposed={**metadata,'conditional_dispositions':records}
+        checked=preflight_template_inputs(job_dir=job,plugin=plugin,phase='source',job_input=proposed)
+        skus={row['sku'] for row in checked['rows']}
+        if not isinstance(records,list) or any(r.get('sku') not in skus for r in records):raise ValueError('Template evidence names an unknown SKU')
+        proposed['template_decisions']=[*metadata.get('template_decisions',[]),{'id':decision_id,'request':request,'reason':reason}]
+        write_json(job/'job.json',proposed)
+    return {'status':'applied','requests_sent':0,'remaining_blocker_groups':checked['blocker_groups']}
+
 
 def analyze_template(path: str | Path) -> TemplateInfo:
     try:
@@ -540,6 +674,7 @@ def analyze_template(path: str | Path) -> TemplateInfo:
                         "values": values,
                     }
                 )
+        from .template_conditions import workbook_conditions
         return TemplateInfo(
             template_path,
             "Template",
@@ -552,6 +687,7 @@ def analyze_template(path: str | Path) -> TemplateInfo:
             template_allowed_values(wb, ws, fields, data_start_row, template_product_type),
             template_product_type,
             data_start_row,
+            workbook_conditions(wb, ws, fields, template_product_type, required, data_start_row),
         )
     finally:
         _close_workbook(wb)
@@ -642,29 +778,6 @@ def _close_workbook(workbook: Any) -> None:
     if callable(close):
         close()
 
-def _export_final_template(path: Path, parent_asin: str, job_id: str = "") -> Path:
-    target_dir = FACTORY_ROOT / "Final_templates" / safe_component(parent_asin)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"_{safe_component(job_id)}" if job_id else ""
-    target = target_dir / f"{path.stem}{suffix}{path.suffix}"
-    tmp = target_dir / f".{target.name}.{os.getpid()}.tmp"
-    try:
-        shutil.copy2(path, tmp)
-        os.replace(tmp, target)
-    except PermissionError:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        target = target_dir / f"{path.stem}{suffix}_{timestamp}{path.suffix}"
-        tmp = target_dir / f".{target.name}.{os.getpid()}.tmp"
-        shutil.copy2(path, tmp)
-        os.replace(tmp, target)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-    return target
-
 def _workbook_cell_value(field: str, value: Any) -> Any:
     if value in (None, ""):
         return value
@@ -700,27 +813,31 @@ def _build_listing_row_data(
     theme: str,
     env: dict[str, str],
     copy_audit: list[dict[str, str]] | None = None,
-    copy_v1: dict[str, Any],
+    copy_v1: dict[str, Any] | None,
     template_mode: str = "draft",
     published_images: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from .job import business_for_sku
+    job=business_for_sku(job,sku,submit_ready=template_mode=='submit_ready')
     raw_variation = child.get("variation_values", {}) if isinstance(child, dict) else {}
     variation = _normalized_variation_values_for_template(child, specific, raw_variation)
-    title, item_highlights, bullets, description = _copy_v1_for_row(
-        copy_v1,
-        row_type=row_type,
-        sku=sku,
-        asin=asin,
-    )
+    if copy_v1 is None:
+        # Static preflight has no authored copy yet. Empty is an explicit
+        # dependency, never synthetic copy or permission for final delivery.
+        title, item_highlights, bullets, description = '', [], [], ''
+    else:
+        title, item_highlights, bullets, description = _copy_v1_for_row(
+            copy_v1, row_type=row_type, sku=sku, asin=asin,
+        )
     if copy_audit is not None:
-        copy_audit.append({"severity": "info", "sku": sku, "field": "copy", "message": "Using current CopyV1 listing copy"})
-    material = _first(specific, "material", "frame_material", default="")
+        copy_audit.append({"severity": "info", "sku": sku, "field": "copy", "message":
+            "Copy awaits its owner" if copy_v1 is None else "Using current CopyV1 listing copy"})
+    material = _first(specific, "material", default="")
     country = str(job.get("country") or env.get("DEFAULT_COUNTRY_OF_ORIGIN") or env.get("AMAZON_FACTORY_COUNTRY_OF_ORIGIN") or "")
-    list_price = _child_list_price(child, job, allow_job_override=template_mode != "submit_ready")
     color = str(variation.get("color") or variation.get("color_name") or specific.get("color") or "")
-    size = str(variation.get("size") or variation.get("size_name") or _template_safe_variation_size(_first(specific, "size", "size_name", "size_class")) or "")
+    size = str(variation.get("size") or variation.get("size_name") or _first(specific, "size", "size_name", "size_class") or "")
     style = str(variation.get("style") or variation.get("style_name") or specific.get("style") or "")
-    model = str(specific.get("model_number") or "")
+    model = str(job.get("model_number") or specific.get("model_number") or "")
     item_count = specific.get("sold_unit_count") if row_type == "Child" else ""
     package_quantity = specific.get("package_quantity") if row_type == "Child" else ""
     attributes = dict(specific)
@@ -731,16 +848,27 @@ def _build_listing_row_data(
             "size": size,
             "style": style,
             "model_number": model,
+            "model_name": job.get("model_name") or specific.get("model_name", ""),
+            "required_product_compliance_certificate": (job.get("required_product_compliance_certificate")
+                                                       or specific.get("required_product_compliance_certificate", "")),
             "item_count": item_count,
             "package_quantity": package_quantity,
             "item_type_keyword": _item_type_keyword(plugin),
+            "package_level": job.get('package_level') or specific.get('package_level',''),
         }
     )
     parent_row = str(row_type).casefold() == "parent"
+    conflicts = {} if parent_row else specific.get('_source_field_conflicts', {})
+    for field in conflicts:
+        attributes.pop(field, None)
+    declared_battery = _known_enum_value('batteries_required', job.get('batteries_required'), ['Yes', 'No'])
+    source_battery = _known_enum_value('batteries_required', specific.get('batteries_required'), ['Yes', 'No'])
+    battery_conflict = bool('batteries_required' in conflicts or
+                            not parent_row and declared_battery and source_battery and declared_battery != source_battery)
     return listing_data.row(
         row_type=row_type,
         sku=sku,
-        asin=str(asin or (child.get("asin") if isinstance(child, dict) else "") or job.get("seed_asin") or sku),
+        asin=asin if parent_row else str(asin or child.get("asin") or job.get("seed_asin") or sku),
         parent_sku=parent_sku if row_type == "Child" else "",
             variation=variation,
         copy={
@@ -758,10 +886,10 @@ def _build_listing_row_data(
         # A parent is a relationship row, never a sellable offer. Keeping
         # offer fields on it creates invalid parent inventory/price records.
         offer={
-            "list_price": "" if parent_row else list_price,
+            **({'list_price':'','selling_price':''} if parent_row else listing_prices(child,job,submit_ready=template_mode=='submit_ready')),
             "quantity": "" if parent_row else job.get("quantity", ""),
             "fulfillment": "" if parent_row else job.get("fulfillment", ""),
-            "inventory_available": "" if parent_row else job.get("inventory_available", DEFAULT_TEMPLATE_INVENTORY_AVAILABLE),
+            "inventory_available": "" if parent_row else job.get("inventory_available", ""),
             "shipping_template": "" if parent_row else job.get("shipping_template", ""),
         },
         compliance={
@@ -770,13 +898,14 @@ def _build_listing_row_data(
             "country": country,
             "condition": "" if parent_row else job.get("condition", ""),
             "dangerous_goods": job.get("dangerous_goods", ""),
-            "batteries_required": "" if parent_row else job.get("batteries_required", ""),
+            "batteries_required": "" if battery_conflict else declared_battery or source_battery,
+            "battery_requirement_conflict": battery_conflict,
             "batteries_included": "" if parent_row else job.get("batteries_included", ""),
             "contains_battery": "" if parent_row else job.get("contains_battery", ""),
             "is_fragile": "" if parent_row else job.get("is_fragile", ""),
-            "gtin_exempt": bool(job.get("gtin_exempt", True)),
-            "product_id_type": str(job.get("product_id_type") or DEFAULT_TEMPLATE_PRODUCT_ID_TYPE),
-            "product_id": "" if job.get("gtin_exempt", True) or row_type != "Child" else str(job.get("product_id") or ""),
+            "gtin_exempt": job.get("gtin_exempt"),
+            "product_id_type": str(job.get("product_id_type") or ('GTIN Exempt' if job.get('gtin_exempt') is True else '')),
+            "product_id": "" if job.get("gtin_exempt") is True or row_type != "Child" else str(job.get("product_id") or ""),
             "product_type": plugin.product_type,
             "variation_theme": theme,
             "parentage": row_type,
@@ -791,40 +920,14 @@ def _normalized_variation_values_for_template(
     normalized = child.get("normalized_facts") if isinstance(child, dict) and isinstance(child.get("normalized_facts"), dict) else {}
     normalized_variation = normalized.get("variation") if isinstance(normalized.get("variation"), dict) else {}
     variation = {str(key): str(value).strip() for key, value in {**(raw_variation or {}), **normalized_variation}.items() if str(value or "").strip()}
-    specs = child.get("specs") if isinstance(child, dict) and isinstance(child.get("specs"), dict) else {}
-    color = (
-        str(normalized.get("color") or "")
-        or _first(variation, "color", "color_name", "colour")
-        or _first(specific, "color", "color_name", "colour")
-        or _first(specs, "color", "color_name", "colour")
-    )
-    size_candidates = (
-        _first(variation, "size", "size_name"),
-        _first(specific, "size", "size_name", "size_class"),
-        _first(specs, "size", "size_name", "size_class"),
-        str(normalized.get("size") or ""),
-    )
-    size = next((_template_safe_variation_size(value) for value in size_candidates if _template_safe_variation_size(value)), "")
-    style = str(normalized.get("style") or "") or _first(variation, "style", "style_name") or _first(specific, "style", "style_name") or _first(specs, "style", "style_name")
-    if color:
-        variation.setdefault("color", color)
-        variation.setdefault("color_name", color)
-    if size:
-        variation.setdefault("size", size)
-        variation.setdefault("size_name", size)
-    if style:
-        variation.setdefault("style", style)
-        variation.setdefault("style_name", style)
+    from .product_family import fact_key
+    variation = {key: value for key, value in variation.items() if fact_key(key) not in {'color', 'size', 'style'}}
+    # ``specific`` is the effective fact projection, including unresolved exclusions.
+    for key in ('color', 'size', 'style'):
+        value = str(specific.get(key) or '')
+        if value:
+            variation[key] = variation[key + '_name'] = value
     return variation
-
-def _template_safe_variation_size(value: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if re.search(r"\d", text) and re.search(r"(?:\"|in|inch|cm|mm|ft|feet|[x×])", text, flags=re.I):
-        return ""
-    return text
-
 
 def _plant_species_candidate(attributes: dict[str, Any]) -> str:
     evidence_values = [
@@ -839,14 +942,11 @@ def _plant_species_candidate(attributes: dict[str, Any]) -> str:
     return ""
 
 
-def _field_hints(value: Any) -> list[str]:
-    text = str(value or "")
-    return [part for part in re.split(r"[^A-Za-z0-9]+", text) if len(part) > 2]
-
-
 def compile_template_field_plan(
     *, template: TemplateInfo, plugin: ProductPlugin, row_data: dict[str, Any],
     template_mode: str = "draft",
+    conditional_dispositions: list[dict[str, Any]] | None = None, facts_revision: str = '',
+    preflight: bool = False,
 ) -> dict[str, Any]:
     copy = row_data.get("copy") if isinstance(row_data.get("copy"), dict) else {}
     attributes = row_data.get("attributes") if isinstance(row_data.get("attributes"), dict) else {}
@@ -866,12 +966,9 @@ def compile_template_field_plan(
         "record_action": ["Create or Replace", "Update", "Create"],
         "brand": [str(compliance.get("brand") or "")],
         "item_type_keyword": _item_type_allowed_hints(plugin.category_id),
-        "material": [str(material_value or ""), *_field_hints(material_value)],
-        "color_map": [color_map_value(color_value, category_id=plugin.category_id), str(color_value or "")],
         "style": [str(attributes.get(key) or "") for key in ("source_title", "title", "style")],
         "country": ["China", "CN"],
         "inventory_available": ["Enabled", "Yes", "True", "Available", "Disabled", "No", "False", "Unavailable"],
-        "recommended_uses": [str(attributes.get("recommended_uses") or attributes.get("recommended_use") or ""), "Indoor", "Outdoor", "Home", "Decor"],
         "plant_or_animal_product_type": [
             str(attributes.get(key) or "")
             for key in ("plant_or_animal_product_type", "tree_type", "plant_type", "source_title", "title", "model_name")
@@ -890,6 +987,8 @@ def compile_template_field_plan(
         "item_type_keyword": item_type_candidate,
         "model_number": attributes.get("model_number") or "",
         "model_name": attributes.get("model_name") or "",
+        "occasion_type": attributes.get("occasion_type") or "",
+        "required_product_compliance_certificate": attributes.get("required_product_compliance_certificate") or "",
         "manufacturer": compliance.get("manufacturer") or "",
         "description": description,
         "keywords": generate_backend_keywords(
@@ -898,22 +997,21 @@ def compile_template_field_plan(
             bullets=bullets,
             description=description,
             product_specific=attributes,
-            competitor_keywords=list(plugin.merged_config().get("competitor_keywords", [])),
             extra_terms=list(plugin.merged_config().get("backend_search_terms", [])),
             brand=str(compliance.get("brand") or ""),
         ),
         # Never coerce an unknown material into a convenient dropdown value.
         # A wrong material is worse than a missing one and must be audited.
         "material": material_value,
-        "fabric_type": attributes.get("fabric_type") or primary_material_label(material_value),
+        "fabric_type": attributes.get("fabric_type") or "",
         "color": color_value,
-        "color_map": color_map_value(color_value, category_id=plugin.category_id),
+        "color_map": color_map_value(color_value, allowed=(template.allowed_values or {}).get(FIELD_ALIASES['color_map'][0], [])),
         "size": attributes.get("size", ""),
         "style": attributes.get("style", ""),
         "part_number": attributes.get("part_number") or "",
         "finish_type": attributes.get("finish_type", ""),
         "hardware_color": attributes.get("hardware_color") or "",
-        "light_color": attributes.get("light_color") or light_color_value(plugin.category_id, attributes),
+        "light_color": light_color_value(plugin.category_id, attributes),
         "mounting_type": attributes.get("mounting_type", ""),
         "plant_or_animal_product_type": tree_type,
         "number_of_items": attributes["item_count"],
@@ -923,11 +1021,12 @@ def compile_template_field_plan(
         "condition": compliance.get("condition") or "",
         "country": country_of_origin_value(compliance.get("country")),
         "dg": compliance.get("dangerous_goods") or "",
-        "batteries_required": compliance.get("batteries_required") or "",
+        "batteries_required": {False:"No",True:"Yes"}.get(compliance.get("batteries_required"), compliance.get("batteries_required") or ""),
         "batteries_included": compliance.get("batteries_included") or "",
         "contains_battery": compliance.get("contains_battery") or "",
         "is_fragile": compliance.get("is_fragile") or "",
         "list_price": offer.get("list_price", ""),
+        "selling_price": offer.get("selling_price", ""),
         "quantity": offer.get("quantity", ""),
         "fulfillment": offer.get("fulfillment", ""),
         "inventory_available": _inventory_available_candidate(offer.get("inventory_available", "")),
@@ -941,20 +1040,38 @@ def compile_template_field_plan(
         "special_feature5": attributes.get("special_feature5") or "",
         "included_component": attributes.get("included_component") or attributes.get("included_components") or "",
         "target_audience": attributes.get("target_audience") or "",
-        "number_of_doors": attributes.get("number_of_doors") or "",
-        "number_of_drawers": attributes.get("number_of_drawers") or "",
-        "number_of_shelves": attributes.get("number_of_shelves") or attributes.get("shelves") or "",
+        "number_of_doors": attributes.get("number_of_doors", ""),
+        "number_of_drawers": attributes.get("number_of_drawers", ""),
+        "number_of_shelves": (attributes.get("number_of_shelves") if attributes.get("number_of_shelves") not in (None, "")
+                              else attributes.get("shelves", "")),
         "room_type": attributes.get("room_type") or "",
         "shape": attributes.get("shape") or "",
         "door_orientation": attributes.get("door_orientation") or "",
         "base_type": attributes.get("base_type") or "",
         "pot_material": attributes.get("pot_material") or "",
+        "leaf_material": attributes.get("leaf_material") or "",
+        "trunk_material": attributes.get("trunk_material") or "",
+        "top_material": attributes.get("top_material") or "",
         "has_lights": attributes.get("has_lights") or attributes.get("has_led") or "",
         "parent_sku": parent_sku if row_type == "Child" else "",
-        "frame_material": attributes.get("frame_material") or attributes.get("material", ""),
+        "frame_material": attributes.get("frame_material") or "",
         "item_depth": attributes.get("item_depth") or attributes.get("depth") or "",
     }
     semantic_values = dict(pairs)
+    for alias in ('material','recommended_uses','included_component'):
+        field = resolve_template_field(template, alias)
+        if not field:
+            continue
+        raw = semantic_values.pop(alias)
+        slots = [k for k in template.fields if re.sub(r'#\d+(?=\.value$)', '#1', k) == field]
+        for slot, part in zip(slots, repeated_attribute_values(raw, (template.allowed_values or {}).get(field), alias)):
+            semantic_values[slot] = part
+    if row_type == 'Child':
+        for axis in str(compliance.get('variation_theme') or '').split('/'):
+            field = _variation_axis_field(template, axis)
+            value = (row_data.get('variation') or {}).get(fact_key(axis))
+            if field and value not in (None,''):
+                semantic_values[field] = value
     semantic_values["item_highlight"] = item_highlights_text(copy)
     for index, bullet in enumerate(bullets[:5], start=1):
         semantic_values[f"bullet{index}"] = bullet
@@ -971,6 +1088,11 @@ def compile_template_field_plan(
         base = alias.replace("_unit", "")
         if attributes.get(base):
             semantic_values[alias] = attributes.get(alias) or ""
+    pending = {}
+    if preflight:
+        for alias in ('item_name','item_highlight','description',*[f'bullet{i}' for i in range(1,6)]):
+            pending.update({field:'copy' for field in fields_for_alias(template.fields,template.labels,FIELD_ALIASES,alias)})
+        pending.update({field:'publish' for field in IMAGE_FIELDS.values() if field in template.fields})
     return compile_field_plan(
         fields=template.fields,
         labels=template.labels,
@@ -980,6 +1102,7 @@ def compile_template_field_plan(
         semantic_values=semantic_values,
         images=(row_data.get("images") if isinstance(row_data.get("images"), dict) else {}) if row_type == "Child" else {},
         image_fields=IMAGE_FIELDS,
+        pending_fields=pending,
         requirements=compile_field_requirements(
             fields=template.fields,
             labels=template.labels,
@@ -988,18 +1111,28 @@ def compile_template_field_plan(
             template_mode=template_mode,
         ),
         row_context={
+            "workbook_conditions": getattr(template, 'row_conditions', None),
+            "use_default_shipping": (row_type == "Child" and str(offer.get("fulfillment") or "").casefold() in
+                                     {"fbm", "default", "fulfillment by merchant (default)"}
+                                     and not str(offer.get("shipping_template") or "").strip()),
             "row_type": row_type,
             "variation_theme": compliance.get("variation_theme") or "",
-            "gtin_exempt": bool(compliance.get("gtin_exempt", True)),
+            "gtin_exempt": compliance.get("gtin_exempt"),
             "contains_battery": compliance.get("contains_battery"),
             "batteries_required": compliance.get("batteries_required"),
+            "battery_requirement_conflict": compliance.get("battery_requirement_conflict", False),
+            "source_field_conflicts": {f for k in attributes.get('_source_field_conflicts', {}) for f in FIELD_ALIASES.get(k, ())}
+                                      if row_type == 'Child' else set(),
             "dangerous_goods": compliance.get("dangerous_goods") or "",
             "package_level": attributes.get("package_level") or attributes.get("package_contains_sku") or "",
+            "conditional_dispositions": bound_conditional_dispositions(conditional_dispositions,
+                template_sha256=file_sha256(template.path) if conditional_dispositions else '',
+                sku=sku, product_type=plugin.product_type, facts_revision=facts_revision, fields=template.fields),
         },
     )
 
 def _inventory_available_candidate(value: Any) -> str:
-    text = str(value or "").strip().casefold()
+    text = str(value if value is not None else "").strip().casefold()
     if not text:
         return ""
     if text in {"1", "true", "yes", "y", "available", "enabled"}:
@@ -1078,13 +1211,14 @@ def _build_listing_data_package(
         require_main_image=require_main_image,
     )
 
-def _published_image_plan(job_path: Path, *, plugin: ProductPlugin) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+def _published_image_plan(job_path: Path, *, plugin: ProductPlugin, current_rows=None) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
     from .publish import current_published_release_rows
     from .release_manifest import approved_release_rows, build_release_manifest
 
     audit: list[dict[str, str]] = []
-    release = build_release_manifest(job_dir=job_path, plugin=plugin)
-    current_rows = current_published_release_rows(job_path, approved_release_rows(release))
+    if current_rows is None:
+        release = build_release_manifest(job_dir=job_path, plugin=plugin)
+        current_rows = current_published_release_rows(job_path, approved_release_rows(release))
     if not current_rows:
         return {}, [{"severity": "warning", "sku": "*", "field": "images", "message": "No current published release images found"}]
     rows_by_child: dict[str, list[dict[str, str]]] = {}
@@ -1166,7 +1300,7 @@ def _template_reference_field_policy(field: str) -> str:
         return "brand_model_reference_only"
     return "attribute_reference_only"
 
-def _template_coverage_audit(coverage: dict[str, Any]) -> list[dict[str, str]]:
+def _template_coverage_audit(coverage: dict[str, Any], *, mode: str = 'draft') -> list[dict[str, str]]:
     audit: list[dict[str, str]] = []
     unfilled_required = int(coverage.get("unfilled_required_field_count") or 0)
     if unfilled_required:
@@ -1193,7 +1327,7 @@ def _template_coverage_audit(coverage: dict[str, Any]) -> list[dict[str, str]]:
     conditional_risks = int(coverage.get("conditional_risk_count") or 0)
     if conditional_risks:
         audit.append({
-            "severity": "warning", "sku": "*", "field": "conditional_allowed_values",
+            "severity": "error" if mode == 'submit_ready' else "warning", "sku": "*", "field": "conditional_allowed_values",
             "message": f"{conditional_risks} conditional or allowed-value selection(s) require review.",
         })
     unfilled_reference = int(coverage.get("unfilled_reference_field_count") or 0)
@@ -1215,17 +1349,6 @@ def _template_coverage_audit(coverage: dict[str, Any]) -> list[dict[str, str]]:
             "message": f"{optional_invalid_values} optional template value(s) were omitted because no legal dropdown value matched.",
         })
     return audit
-
-def _assert_submit_ready_price_current(
-    listing_rows: list[dict[str, Any]],
-    source_children: list[dict[str, Any]],
-    *,
-    mode: str,
-) -> None:
-    try:
-        assert_submit_ready_price_current(listing_rows, source_children, mode=mode)
-    except TemplateSubmitReadyError as exc:
-        raise TemplateEngineError(str(exc)) from exc
 
 def _audit_plan(
     template: TemplateInfo,
@@ -1278,7 +1401,7 @@ def _raise_on_template_audit_errors(plan: dict[str, Any]) -> None:
         f"{item.get('sku') or '*'} {item.get('field') or ''}: {item.get('message') or ''}".strip()
         for item in errors[:5]
     )
-    raise TemplateEngineError(f"Template audit has {len(errors)} blocking error(s); see template/audit.md. {preview}")
+    raise TemplateAuditError(f"Template audit has {len(errors)} blocking error(s); see template/audit.md. {preview}")
 
 def _write_markdown_audit(plan: dict[str, Any], path: Path) -> None:
     lines = [
@@ -1410,14 +1533,17 @@ def _copy_v1_for_row(
         not title or len(title) > TITLE_MAX_CHARS
         or title_issues
         or ((row_type != "Parent" or item_highlights) and not item_highlights_text({"item_highlights": item_highlights}))
-        or len(bullets) != 5 or any(not item or len(item) > BULLET_AUDIT_MAX_CHARS for item in bullets)
+        or (len(bullets) > 5 if row_type == 'Parent' else len(bullets) != 5) or any(not item or len(item) > BULLET_AUDIT_MAX_CHARS for item in bullets)
         or not description or len(description) > DESCRIPTION_MAX_CHARS or description_issues
     ):
         raise TemplateEngineError(f"Template found incomplete CopyV1 row for {sku}")
     return title, item_highlights, bullets, description
 
-def _common_family_values(children: list[dict[str, Any]], plugin: ProductPlugin) -> dict[str, Any]:
-    rows = [_family_specific(child, plugin) for child in children]
+def _template_family_attributes(job, family, children, plugin):
+    return {c['asin']: {**sourced_template_attributes(job, family, c), **_family_specific(c, plugin)} for c in children}
+
+
+def _common_family_values(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         return {}
     common: dict[str, Any] = {}
@@ -1435,21 +1561,25 @@ def _template_values_equal(left: Any, right: Any) -> bool:
         return normalize(left) == normalize(right)
     return left == right
 
-def _parent_family_values(children: list[dict[str, Any]], plugin: ProductPlugin) -> dict[str, Any]:
-    values = _common_family_values(children, plugin)
-    if not values.get("fabric_type"):
-        materials = [str(_family_specific(child, plugin).get("material") or "") for child in children]
-        labels = [primary_material_label(value) for value in materials if value]
-        if labels and all(label == labels[0] for label in labels):
-            values["fabric_type"] = labels[0]
-    return values
-
 def _family_specific(child: dict[str, Any], plugin: ProductPlugin) -> dict[str, Any]:
     facts = effective_product_facts(child, plugin.category_id)
     facts = _normalized_template_fact_keys(facts)
     facts.update(template_dimensions_from_facts(facts, category_id=plugin.category_id))
-    if not facts.get("frame_material") and facts.get("material"):
-        facts["frame_material"] = facts["material"]
+    if plugin.category_id == 'artificial_tree':
+        statements = ' '.join(str(s) for s in [child.get('title', ''), *(child.get('bullets') or [])])
+        variation = ' '.join(str(v) for v in (child.get('variation_values') or {}).values())
+        lighting_text = variation if re.search(r'\b(?:unlit|pre[- ]?lit)\b', variation, re.I) else statements
+        flag = str(facts.get('has_lights', facts.get('has_builtin_light', ''))).strip().casefold()
+        unlit = bool(re.search(r'\bunlit\b', lighting_text, re.I)) and not re.search(
+            r'\b(?:not (?:an? )?unlit|pre[- ]?lit)\b', lighting_text, re.I)
+        if flag in {'false', 'no', '0'} or unlit:
+            for name in ('light_color', 'lighting_color', 'light_colour', 'light_type'):
+                facts.pop(name, None)
+            if flag not in {'true', 'yes', '1'} and str(facts.get('light_count') or '0').strip() == '0':
+                facts['has_lights'] = 'No'
+            else:
+                for name in ('has_lights', 'has_builtin_light', 'has_led'):
+                    facts.pop(name, None)
     return {str(key): value for key, value in facts.items() if value not in (None, "", [], {})}
 
 def _normalized_template_fact_keys(facts: dict[str, Any]) -> dict[str, Any]:
@@ -1461,51 +1591,44 @@ def _normalized_template_fact_keys(facts: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 def _item_type_keyword(plugin: ProductPlugin) -> str:
-    keywords = plugin.merged_config().get("competitor_keywords")
-    if isinstance(keywords, list) and keywords:
-        return str(keywords[0])
-    return plugin.display_name.lower().replace("_", " ")
+    return str(plugin.merged_config().get('item_type_keyword') or plugin.display_name).lower().replace('_',' ')
 
 
 def _item_type_allowed_hints(category_id: str) -> list[str]:
-    return {
-        "artificial_tree": ["Artificial Trees (artificial-trees)"],
-        "bed_frame": ["> Bed Frames (bed-frames)"],
-        "bathroom_cabinet": ["Storage Cabinets (cabinets)"],
-        "medicine_cabinet": ["Medical Cabinets (medicine-cabinets)"],
-    }.get(str(category_id or ""), [])
+    from .plugin import load_plugin
+    return list(load_plugin(category_id).merged_config().get('template',{}).get('allowed_item_type_hints',[]))
 
-def _child_list_price(child: dict[str, Any], job: dict[str, Any], *, allow_job_override: bool = True) -> str:
-    # Price authority is the Apify source evidence (normalized facts, then the
-    # child offer). job.list_price is a draft-only convenience and can never
-    # fill submit-ready output.
-    normalized = child.get("normalized_facts") if isinstance(child.get("normalized_facts"), dict) else {}
-    normalized_price = normalize_price_value(normalized.get("list_price"))
-    if normalized_price:
-        return normalized_price
-    offer = child.get("offer") if isinstance(child.get("offer"), dict) else {}
-    offer_price = normalize_price_value(offer.get("list_price"))
-    if offer_price:
-        return offer_price
-    if not allow_job_override:
-        return ""
-    return normalize_price_value(job.get("list_price"))
+def _variation_axis_field(template, axis):
+    name = fact_key(axis)
+    if not name:
+        return None
+    for field in template.fields:
+        if field.partition('[')[0] == name and field.endswith('#1.value'):
+            return field
+    return next((field for field, label in template.labels.items()
+                 if fact_key(label) == name and field.endswith('#1.value') and '#2.' not in field), None)
 
-def _theme_for_template(theme: str, dimensions: list[str]) -> str:
-    if theme:
-        return theme
-    parts: list[str] = []
-    for dim in dimensions:
-        normalized = _norm(dim)
-        if "color" in normalized:
-            parts.append("COLOR")
-        elif "size" in normalized or "height" in normalized:
-            parts.append("SIZE")
-        elif "style" in normalized:
-            parts.append("STYLE_NAME")
-    # Do not invent a variation theme when ProductFamily has none. The
-    # template's ontology must be supplied by Fetch, not guessed from fields.
-    return "/".join(dict.fromkeys(parts)) if parts else ""
+
+def _variation_cell_audit(template, rows, children, theme, job):
+    if not theme:
+        return []
+    fields = {axis:_variation_axis_field(template,axis) for axis in theme.split('/')}
+    by_sku = {r['sku']:r['field_values'] for r in rows if r['row_type']=='Child'}
+    issues, tuples = [], []
+    for index, child in enumerate(children, 1):
+        sku = child_sku(job, child, index)
+        cells = by_sku.get(sku,{})
+        source = {fact_key(k):str(v) for k,v in child['variation_values'].items()}
+        values = [str(cells.get(field) or '') for field in fields.values()]
+        for (axis,field), actual in zip(fields.items(),values):
+            expected = source.get(fact_key(axis),'')
+            if not actual or not identity_values_equal(actual, expected):
+                issues.append({'severity':'error','sku':sku,'field':field or axis,
+                               'message':f'{axis} workbook value {actual!r} does not match child variation {expected!r}'})
+        if all(values) and any(all(identity_values_equal(a,b) for a,b in zip(values,previous)) for previous in tuples):
+            issues.append({'severity':'error','sku':sku,'field':'variation_theme','message':'Duplicate written child variation tuple'})
+        tuples.append(values)
+    return issues
 
 def _first(data: dict[str, Any], *keys: str, default: str = "") -> str:
     for key in keys:

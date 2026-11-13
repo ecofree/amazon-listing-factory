@@ -1,0 +1,4 @@
+{
+  "schema": "listing-workspace-v1",
+  "ledger": "runtime/production.sqlite"
+}

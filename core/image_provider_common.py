@@ -24,6 +24,14 @@ class CandidateCommitError(ImageGenerationError):
     """Local atomic-commit failure; retry the role without spending another provider."""
 
 
+class ReceiptDispositionRequired(CandidateCommitError):
+    """A durable receipt needs explicit disposition, not an automatic local or remote retry."""
+
+
+class ImageOutputRejected(ReceiptDispositionRequired):
+    """Bounded native/transport rejection; saved receipt requires explicit disposition."""
+
+
 class ProviderFailure(ImageGenerationError):
     failure_code = "provider_content_failure"
     status = "content_failure"
@@ -159,6 +167,9 @@ def is_transient_imagegen_error(exc: Exception) -> bool:
 
 
 def provider_failure_code(exc: Exception) -> str:
+    from .batch_ledger import AdmissionDenied
+    if isinstance(exc, AdmissionDenied):
+        return 'budget_denied'
     if isinstance(exc, PromptCompileError):
         return "prompt_compile_failed"
     if isinstance(exc, CandidateCommitError):
@@ -175,6 +186,9 @@ def provider_failure_code(exc: Exception) -> str:
 
 
 def provider_failure_status(exc: Exception) -> str:
+    from .batch_ledger import AdmissionDenied
+    if isinstance(exc, AdmissionDenied):
+        return 'budget_denied'
     if isinstance(exc, CandidateCommitError):
         return "candidate_commit_failure"
     if isinstance(exc, ProviderFailure):
@@ -196,6 +210,9 @@ def provider_failure_class(exc: Exception) -> str:
     providers and may move to another provider inside the role budget. Only a
     locally compiled prompt/contract failure belongs to the immutable task.
     """
+    from .batch_ledger import AdmissionDenied
+    if isinstance(exc, AdmissionDenied):
+        return 'budget'
     if isinstance(exc, PromptCompileError):
         return "contract"
     if isinstance(exc, CandidateCommitError):

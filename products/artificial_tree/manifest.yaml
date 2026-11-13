@@ -6,7 +6,21 @@ lifecycle: production_ready
 amazon_category: Home & Kitchen > Home Decor > Artificial Plants & Flowers > Artificial Trees
 browse_node_id: ""
 
+search_terms:
+  categories: [tree, plants]
+  backend_synonyms: [faux plant, fake tree, imitation plant, decorative tree]
+  excluded_tokens: [cat, tea, storage, saddle, oil, planter]
+  unsupported_tokens: [christmas, lights, light, led]
+  identity_tokens: []
+  preserve_tokens: []
+  excluded_all_tokens: [pot, artificial, tree]
+
+recovery_fact_policy:
+  unconsumed_additions: [tree_type, plant_or_animal_product_type, tip_count, light_count, light_color, light_included, indoor_outdoor]
+  preserved_value_fields: [tree_type, plant_or_animal_product_type]
+
 template:
+  allowed_item_type_hints: ["Artificial Trees (artificial-trees)"]
   engine: template_field_plan
   path_env: AMAZON_ARTIFICIAL_TREE_TEMPLATE
   default_path: templates/ARTIFICIAL_TREE.xlsm
@@ -16,6 +30,7 @@ variation_themes:
   - SIZE
   - COLOR/SIZE
   - STYLE_NAME
+  - NUMBER_OF_ITEMS
 
 variation_dimensions:
   - color
@@ -24,14 +39,38 @@ variation_dimensions:
 
 extractors:
   product_specific_fields:
-    tree_type:
+    plant_or_animal_product_type:
       - Plant or Animal Product Type
-      - Plant Type
+    tree_type:
       - Tree Type
+    plant_type:
+      - Plant Type
+    style:
       - Style
+      - Style Name
+    tip_count:
+      - Tip Count
+      - Number of Tips
+      - Branch Tip Count
+      - Number of Branch Tips
+    light_count:
+      - Number of Lights
+      - Light Count
+    light_type:
+      - Light Type
+    light_color:
+      - Light Color
+    surface_finish:
+      - Surface Finish
+    flocking:
+      - Flocking
     material:
       - Material
+      - Material Type
+    leaf_material:
       - Leaf Material
+      - Leaves Material
+    trunk_material:
       - Trunk Material
     color:
       - Color
@@ -56,18 +95,13 @@ extractors:
       - Product Weight
     indoor_outdoor:
       - Indoor/Outdoor Usage
-      - Recommended Uses For Product
-competitor_keywords:
-  - artificial tree
-  - faux tree
-  - fake plant
-  - artificial olive tree
-  - artificial ficus tree
 
 category_match:
   require_positive_match: true
   positive_keywords:
     - artificial tree
+    - christmas tree
+    - xmas tree
     - artificial plant
     - faux tree
     - faux plant
@@ -105,6 +139,25 @@ required_role_policy:
     func: 1
 
 image_generation:
+  statement_measurements:
+    height:
+      subject: product
+      axis: height
+      label: Declared tree height
+      source_fields: [Height, Item Height, Tree Height]
+      tuple_fields: [Item Dimensions D x W x H, Item Dimensions L x W x H, Product Dimensions, Item Dimensions]
+    width:
+      subject: product
+      axis: width
+      label: Declared tree width
+      source_fields: [Width, Item Width, Tree Width]
+      tuple_fields: [Item Dimensions D x W x H, Item Dimensions L x W x H, Product Dimensions, Item Dimensions]
+  planning_guidance:
+    - Choose seasonal or everyday use from the actual child facts. Christmas trees may use residential holiday settings; generic room examples are not mandatory. Preserve evidenced lit/unlit state and flocking.
+    - Preserve the child-specific lit or unlit state. For an unlit tree, omit applied lights when removing the person or separate string would imply built-in lights. Independent room lighting and evidenced pre-lit variants remain valid.
+    - Distinguish sold tree quantity from branch tips, lights and assembly sections; repeated detail or installation views are not extra sold trees.
+    - Retain visible tree-to-support attachment and accessory proportions; a ground spike is not a floor-standing foot.
+    - Lighting, branch density, flocking and assembly claims require their own evidence. Absent optional attributes do not block unrelated images; use no bed-frame structure or bedding rules for trees.
   main_image_policy: white_background
   template_image_role_order: [main, scene, func, size]
   structure_invariants:
@@ -114,7 +167,31 @@ image_generation:
     - trunk-to-support connection and source-visible support geometry
   allowed_internal_props: []
   replaceable_staging:
-    - room or landscape background, furniture, wall decor, and loose decorative props not attached to the tree
+    - target_id: room.wall
+      physical_scope: Non-sold room wall surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: room.floor
+      physical_scope: Non-sold room floor or rug surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: landscape.ground
+      physical_scope: Non-sold ground or landscape background; excludes the sold support or stake
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: decor.furniture
+      physical_scope: Independent non-sold furniture
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: decor.loose_props
+      physical_scope: Independent non-sold decorative props and wall decor
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
   forbidden_additions:
     - Do not replace or invent the sold base, stand, stake, spike, or its attachment to the trunk
   visual_context:

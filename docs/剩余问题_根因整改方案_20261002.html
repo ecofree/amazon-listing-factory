@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>剩余问题：根因与最小整改方案 · 2026-10-02</title>
+<style>
+:root{color-scheme:light;--ink:#192a38;--muted:#546878;--line:#dce5ea;--accent:#155d78}*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:var(--ink);font:16px/1.8 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1180px;margin:28px auto;padding:40px;background:white;border:1px solid var(--line);border-radius:12px}h1{font-size:29px;line-height:1.5;margin:0 0 12px}h2{font-size:23px;border-top:1px solid var(--line);padding-top:26px;margin-top:34px}h3{font-size:19px;margin:25px 0 10px}p{margin:12px 0}a{color:var(--accent)}.meta{color:var(--muted);font-size:14px}.note{background:#eef5f8;border-left:4px solid var(--accent);padding:15px 20px;margin:18px 0}.correction{background:#fff7e9;border-left-color:#b47717}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px;margin:16px 0}th,td{border:1px solid var(--line);padding:11px;vertical-align:top;text-align:left}th{background:#f0f5f7}code{font-size:13px;overflow-wrap:anywhere;background:#f3f5f7;padding:2px 4px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f5f7;padding:16px;font-size:13px}li{margin:7px 0}.small{font-size:14px;color:var(--muted)}.flow{padding:15px;background:#f2f6f8;border:1px solid var(--line)}@media(max-width:700px){main{margin:0;padding:22px;border-radius:0}h1{font-size:24px}}@media print{body{background:white}main{border:0;padding:0;margin:0}a{color:inherit}h2,h3{break-after:avoid}tr{break-inside:avoid}}
+</style>
+</head>
+<body><main>
+<h1>剩余问题：根因与最小整改方案</h1>
+<p class="meta">2026-10-02 · 根据当前工作区、现有调用链及真实图像复核制定 · 本文件为待执行方案</p>
+<div class="note"><strong>整改范围：</strong>修正审查确认合同、目标状态表达和请求统计；用已有 SAM 候选纠正具体误归属；通过一组固定输入实验定位剩余重绘。生产阶段顺序保持原样，实际测试仍只到生图。</div>
+<p>本次只进行分析及方案整理：生产代码修改 0，付费请求 0，测试执行 0。现有未提交修改属于此前工作，不能把当前 Git HEAD 当作完整运行版本。</p>
+<p>主要依据：<a href="../test_runs/remaining_issues_audit_20261002/audit.html">剩余问题审计</a>、<a href="../test_runs/product_preservation_validation_20261001/completion.json">限定实图测试记录</a>、<a href="审计改善实施记录_20261001.md">此前改善实施记录</a>。方案指纹见 <a href="剩余问题_根因整改方案_20261002_evidence.json">配套证据索引</a>。</p>
+
+<h2>一、先确定哪些原因已查明</h2>
+<div class="table"><table>
+<thead><tr><th>问题</th><th>直接证据</th><th>根因及确定程度</th><th>负责环节</th></tr></thead><tbody>
+<tr><td>原木床未进入生图</td><td>B0DSSKTXXW / scene_02：4 次审查用尽。supported 回复删掉侧护栏候选；保护像素从 393,858 变为 373,716。</td><td>确认和改选共用可编辑响应，模型把修改当成确认。真实变化 20,142 像素，程序拒绝正确。尚未证明这些像素全部是真实木材。</td><td>Gemini 现有区域审查响应合同；保留程序内容绑定及像素/归属校验。</td></tr>
+<tr><td>秋海棠蒙版误保护生活插图</td><td>实际 API mask 左下区域混入 3,456 个插图花叶像素；最终选中候选 aead98ae32ade21947f7。初审看见污染，却误把该候选判成干净。</td><td>候选选择及语义审查出错。SAM 已提供更合适的两株主图候选，说明这处问题无需归因于模型检测失败。</td><td>现有区域选择及补审；不重新推理、不自动裁切。</td></tr>
+<tr><td>不同树体被整理成近似同姿态</td><td>玫瑰和秋海棠均出现位置、尺度、姿态归一化。秋海棠最终提示已经要求逐实例原位保留，且没有 identical。</td><td>最终执行不遵守合同已证实；提示目标混合、网关转发与模型遵守程度尚未区分。蒙版污染不足以解释两株主图全部变化。</td><td>先用隔离实验定位，之后才决定提示编译或现有渠道参数修改。</td></tr>
+<tr><td>目标状态存在矛盾</td><td>玫瑰旧冻结草案包含 Two identical…full upright posture，与原图各株不同姿态冲突，当前审查仍批准。</td><td>源状态、目标表达和允许编辑范围混在一个自由文本字段。已有保留规则没有阻止矛盾投射；需要改字段责任及审查输入表达。</td><td>当前视觉规划、局部修复及 product_depiction 审查。</td></tr>
+<tr><td>SAM 漏选及误覆盖</td><td>白床烟囱漏选但 GPT 保留；凹槽摆件误覆盖；部分候选混入床品。较完整的树体蒙版仍未保真。</td><td>区域近似误差与最终重绘不是简单因果。INT8 对全部残余漏选的影响仍未知，不能据此更换整套权重或重写分割。</td><td>优先利用已有候选与既有一次局部纠错；验收 SAM 与最终 GPT 输出的组合结果。</td></tr>
+<tr><td>统计将尝试数当成请求数</td><td>started 在本地预算和配置校验之前发生；零远端探针 outbound=0，仍记录 started。</td><td>确定的统计代码缺陷。它不能证明发生多扣费。</td><td>现有提交回执与 production 摘要。</td></tr>
+<tr><td>524 / 不完整返回及长尾</td><td>最近 10 次实际提交：5 次完整返回，5 次原请求结果未知；这 5 次均已有同 binding 的成功替代链。</td><td>外部接口可靠性问题及远端证据缺口。不是 5 个逻辑图位还未恢复，也未证明恢复控制器损坏。</td><td>沿用当前回执恢复、候补及已授权最多 3 次未知结果重发。</td></tr>
+</tbody></table></div>
+<div class="note correction"><strong>本次更正：</strong>此前“秋海棠生活插图已正确排除”的表述不准确。实际提交蒙版仍有插图污染。同时，原木床并非“相同蒙版确认被误拦截”；它确实改动了保护范围。两项更正均已纳入本方案。</div>
+
+<h2>二、修改放在现有责任环节</h2>
+<p class="flow">观察与事实 → 子体整套视觉规划 → SAM 候选与已有纠错 → 现有审查/局部修复 → 提示词编译 → 生图与本地收尾</p>
+<ul>
+<li><strong>程序：</strong>拥有所售数量、事实优先关系、输入绑定、预算、回执及流程状态。</li>
+<li><strong>Gemini：</strong>在现有规划里确定可编辑内容和必要关系；在现有审查里判断候选归属与目标是否可执行。</li>
+<li><strong>SAM：</strong>提供区域候选与已有局部增删结果。候选分数、点命中或合并面积不能替代语义判断。</li>
+<li><strong>GPT：</strong>执行源图编辑；蒙版是区域引导，最终可见产品保真仍以实际输出检查为依据。</li>
+</ul>
+<p>既有套装可以保持一个 set 的 object_id，成员用 parts 的 crop/anchors 区分。秋海棠一个 target 对应两株是当前允许的表达；不能在区域阶段凭空增加两个观察中不存在的 ID。</p>
+
+<h2>三、本轮可直接实施的精确修改</h2>
+<h3>1. 审查响应：确认与修改互斥</h3>
+<p><strong>修改：</strong><code>core/product_region.py</code>、<code>core/visual_semantics.py</code>。继续使用既有 product_region 审查及现有 4 次预算，不增控制器。</p>
+<ul>
+<li><strong>supported：</strong>绑定本次请求的当前 content_key；region_selection 只确认 input_key、全部 object_id 及需要确认的 component_ids，不返回 candidate_ids 或修复指令。程序使用当前 selection 和当前蒙版，而不是重新构建一份选择。</li>
+<li>component_ids 只能确认当前对应实例保护范围已包含的部件支持；确认元数据不允许增加保护像素、移动归属或改变当前内容。</li>
+<li>确认仍进入现有必需部件分组点覆盖、实例归属及已确认支持检查。缺少 selection 或只回一个 supported 不能成为绕过检查的入口。</li>
+<li><strong>inconclusive / retry_review：</strong>才允许完整 candidate_ids + component_ids 选择和既有一批局部修复。实际改变蒙版后，使用下一次已有预算复核新内容。</li>
+<li><strong>最后一次 region_edit_allowed=false：</strong>只确认当前版本或返回具体失败；移除可选候选目录、候选缩略图及修复操作示例，保留原图、当前 overlay、归属和必要覆盖信息。</li>
+<li>若上一轮发生真实删除，保留红色删除 overlay、前后差异和 delta 证据，供审查判断是否删了产品。不能为了缩短请求把这项证据删掉。</li>
+</ul>
+<p><strong>删除旧行为：</strong>supported 也必须重新选择 candidate_ids 的响应约定、提示及测试期望。旧“支持时替换同等候选”测试改成在现有待审路径提出修改；不保留兼容双分支。更新当前 CLAIM_REVIEW_POLICY，不迁移历史 jobs。</p>
+<p><strong>验收：</strong>旧原木床条件下，回复不得同时确认并修改。正确当前蒙版可以确认；有实质缺陷则在既有预算内修改后确认，或者有具体原因地 pending。减少协议误用不等于保证模型永不误判语义。</p>
+
+<h3>2. 目标状态：源产品状态和允许编辑范围各司其职</h3>
+<p><strong>修改：</strong><code>core/visual_design_kit.py</code> 内现有规划/局部修复合同，以及 <code>core/visual_semantics.py</code> 中 product_depiction 的对应投射。使用当前字段，不增加新的产品事实或语义控制器。</p>
+<ul>
+<li>有固定保护区时，<code>presentation.state</code> 表达底图中已证实的产品状态及该图要说明的关系。main/scene 的同型号多实例分别保留现有姿态；重新竖直、配对、统一轮廓或替换主件不能作为设计目标。</li>
+<li>房间、床品、摆件、外部背景和图形空间的目标放到现有相应设计字段；不把“美化产品”写进产品状态字段。func/size 的关系仍由选定证据支持，不把说明箭头或替代位置变成实体构件。</li>
+<li>审查请求明确显示“当前底图产品状态”“允许编辑内容”与“要表达的必要关系”。替换现有含混表达，删除重复或冲突的旧规则，不在末尾再叠一段保护禁令。</li>
+<li>矛盾应由现有 product_depiction 以具体 relation 和 target_path 返回 revise_plan，在原局部修复中改源字段；编译器不擅自用正则删词、猜测语义或静默重写规划。</li>
+</ul>
+<p><strong>验收：</strong>玫瑰旧矛盾状态必须得到局部修订；秋海棠没有 identical 的条件仍保留为执行对照，防止将一个词的替换当作通用修复。最近未重跑首次规划，这项合同效果须由新的整套规划验证。</p>
+
+<h3>3. 请求统计：以现有回执记录提交边界</h3>
+<p><strong>修改：</strong><code>core/image_response.py</code>、<code>core/production.py</code>。</p>
+<ul>
+<li>在现有 submit_response 的回执中保存一次性的 submitted_at 或等价提交边界标记；后续失败、收到结果、finalized、superseded 都保留它。</li>
+<li>started 只统计 <code>image_provider_attempt_count</code>。删除 started → <code>image_provider_request_count</code> 的错误映射。</li>
+<li><code>image_provider_submission_count</code> 从当前 job 的既有回执按唯一 receipt 计算；日志可作进度镜像，不再建立一套持久计数账本。</li>
+<li>明确区分内部尝试、提交边界记录、完整返回、原请求未知、替代提交和逻辑图位完成。provider_attempts 继续表示内部尝试。</li>
+<li>旧回执缺新标记时显示未记录/未知，不由终态或 started 反推，不扫描或迁移历史 jobs。</li>
+</ul>
+<p><strong>验收：</strong>配置失败：attempt=1、submission=0；提交后失败：submission=1；本地恢复不增加 submission；原请求加成功替代：submission=2、逻辑完成图位=1。</p>
+<p class="small">提交回执写在 POST 前，程序可能写完回执后尚未发包就退出。因此这个数是“提交边界记录数”，不是服务器受理数或计费数。当前八条启用图像路线都是原生 edits；不扩展本轮去改禁用协议。</p>
+
+<h2>四、SAM 误选先用现有证据处理</h2>
+<p>秋海棠当前污染候选 <code>aead98ae32ade21947f7</code> 属于主目标，不能把污染归因于另设了插图 target。现有候选 <code>be6f650c1c64447a551c</code> 与 <code>c27208fa243854116990</code> 分别覆盖左右主图树，两者 OR 为 730,742 个保护像素，左下插图区域为 0，并覆盖现有 4 个 whole 锚点及 4 个 part 锚点。</p>
+<ul>
+<li>先把两个已有候选组合送入同一个现有区域审查，由其确认最终合并范围；不新增 SAM 推理或独立 Gemini 轮次。</li>
+<li>单个候选只覆盖套装一个成员，导致 anchor_compatible=false，不能据此直接淘汰可组合候选。判断对象是最终 OR 及成员归属。</li>
+<li>现有 parts/正负点提供几何证据；editable_objects 只有文本，不能据此计算空间交集或自动删除像素。</li>
+<li>part crop 不等于完整产品边界。当前候选在 crop 外仍有 5,796 像素，包含主图边缘；不能自动裁掉、把区域外像素当误选，或建立新的面积阻断门槛。</li>
+<li>需要局部纠错时，复用当前一批 add_product / remove_nonproduct；错误点、crop、成员归属在原 brief 修复中处理，不能用局部成功掩盖错误目标。</li>
+</ul>
+<p><strong>通用品类验收口径：</strong>主体主要可见结构、颜色、材质、连接和成员身份保留，目标可编辑内容确实完成。普通边缘误差不单独判失败；主要漏选最终被 GPT 正确保留可记录为组合有效；重大结构被重绘则无论覆盖面积多大都没有通过。</p>
+<p>本轮不增加 INT8 完整权重下载、模型更换或第三方分割服务。只有固定输入数值/候选证据将问题明确指向量化或执行实现，才修相应位置。</p>
+
+<h2>五、剩余重绘：一组有明确判定的隔离实验</h2>
+<p><strong>目的：</strong>区分目标指令混合、候选污染与实际生图执行；不是继续逐词试提示或扫描模型。固定秋海棠同一原图、模型路线、size、quality、附件顺序及参数，保留请求体/source/mask/prompt SHA、回执和 raw。</p>
+<div class="table"><table>
+<thead><tr><th>条件</th><th>蒙版</th><th>提示</th><th>比较意义</th></tr></thead><tbody>
+<tr><td>A</td><td>当前绑定蒙版</td><td>当前完整提示</td><td>在相同渠道参数下确认现象是否复现；旧结果作辅助证据，不当新测试。</td></tr>
+<tr><td>B</td><td>与 A 相同</td><td>将目标收敛为删除生活插图、处理外部白色背景；产品状态保持只读，不要求重新呈现/美化一套产品。</td><td>A → B 只改变指令职责，判断目标表达是否是主要影响因素。</td></tr>
+<tr><td>C</td><td>两个已有主图候选 OR，经现有审查确认</td><td>与 B 完全相同</td><td>B → C 只改变保护范围，判断插图污染是否明显影响执行。</td></tr>
+</tbody></table></div>
+<ul>
+<li>前三个条件各一张。有明显优势后，复测该条件一张，再以白床一张做迁移；<strong>总上限 5 次实际图像提交，包括未知结果和替代请求</strong>，不是 5 张成功图外加无限重发。</li>
+<li>隔离比较不混入模型切换。未知结果不参加视觉判断；按现有授权与回执处理，替代消耗本次总提交预算。生产默认最多 3 次未知重发策略不因此改变。</li>
+<li>接口正常时预计约 20–40 分钟；费用按现有模型实际计价，不能在未查账单时虚报金额。预算用尽只结束本组实验，不新增生产闸门。</li>
+<li>不在生产目录改实验提示；实验代码和生成任务放在新的 test_runs 专用目录，记录修改、当前源代码指纹和参数，既有已付费结果保持原绑定。</li>
+</ul>
+<div class="table"><table>
+<thead><tr><th>结果</th><th>下一步精确处理</th><th>不能据此宣称</th></tr></thead><tbody>
+<tr><td>A 重绘，B 保真，复测及迁移一致</td><td>替换当前 image_prompt_compiler 的目标投射，把产品状态变成保留上下文，设计目标限于已批准编辑范围；删除被替代的重复/冲突指令。</td><td>所有品类永不重绘；单个成功结果也不足以改通用规则。</td></tr>
+<tr><td>B 重绘，C 保真，复测一致</td><td>优先修当前候选选择及污染审查输入，复用现有合并与补审，不增加分割次数。</td><td>必须追求 100% 精细蒙版，或 INT8 不适合。</td></tr>
+<tr><td>B、C 都重绘</td><td>停止扩大蒙版/提示改造。依据现有请求体、远端 request ID 及响应资料核对网关字段、图像/alpha处理与模型身份；只有发现具体转换错误才修改对应 transport/现有注册参数。</td><td>仅凭客户端上传正确就认定网关已正确转发；也不能直接认定模型本身没有能力。</td></tr>
+<tr><td>结果不一致、都成功或样本不完整</td><td>保持随机性/外部执行原因未定；不以一个偶然样本作生产普改。记录本组结论并停止扩样。</td><td>问题已解决，或接口失败就是画质失败。</td></tr>
+</tbody></table></div>
+<p>客户端现已核对正确的 multipart 与 mask SHA；两套凭据共用 SubRouter，不是独立后端对照。现有左右 alpha 测试已经出现越界，再原样重复不能新增定位价值。服务端转发和真实后端身份缺证据时保持未知，不要求新服务或新密钥作为生产前置。</p>
+
+<h2>六、下一次完整冻结测试怎么验收</h2>
+<p>限定实验解决的是定位问题。下一次完整冻结测试必须重跑当前首次观察和整套视觉规划，并按实际冻结 inventory 的所有图位执行；“四个 ASIN、每个两个变体”指八个变体的整套输出，不是每个 ASIN 只生成两张 main/scene。</p>
+<div class="table"><table>
+<thead><tr><th>验收方向</th><th>检查内容</th><th>责任归属</th></tr></thead><tbody>
+<tr><td>产品主体</td><td>床架构件比例、入口、连接及纹理；柜门覆盖、五金、层板；树体各成员姿态与支撑。源图、保护区与最终 raw 并列检查。</td><td>先分候选归属、目标合同与最终执行，再决定局部修改。</td></tr>
+<tr><td>func</td><td>层板替代位置不能实体化；磁吸扣和防倾倒件安装面/连接关系；引线明确指向对应部件；局部数量不等于整件数量。</td><td>观察证据错误修原观察；目标缺关系修原 brief；已正确合同仍画错归生成执行。</td></tr>
+<tr><td>size</td><td>尺寸及文案有事实来源；箭头端点对应真实表面；床垫厚度是上下表面跨度；推荐范围不能变成实物测量。</td><td>沿用现有 measurement authority，不新增推断尺寸或本地图形合成。</td></tr>
+<tr><td>整套设计</td><td>各图卖点分工、标题与标签重复、文字密度、role 正确性、布局价值及摆件归属；核查完整第一次规划，而非复用旧草案声称新规划通过。</td><td>现有子体规划与 sibling 上下文；错误状态在原局部修复中替换。</td></tr>
+<tr><td>调用效率</td><td>相同 child/role inventory 下分别统计 Gemini 观察、规划、审查、局部修复、传输重试；统计提交边界/完整返回/未知/替代/逻辑图位。</td><td>复用当前进度和回执。旧 99 次全链调用与本轮 16 次六角色审查不能直接比较。</td></tr>
+<tr><td>耗时与容量</td><td>远端排队、执行、本地收尾分开记录；确认当前池没有已证明的重复提交、饥饿或失控等待。</td><td>远端与本地 finalize 已分离、RAM 准入与 lease 已有；8 路线不等于 8 倍容量，不另建调度器。</td></tr>
+</tbody></table></div>
+<p>当前 GPT-image-2.5 系列承担普通池，size/func 优先 Sunburst，GPT-image-2 保留失败候补；候补空闲不是效率缺陷。接口未知请求保持未知与替代关系，不按成功候选数量掩盖重复收费风险。</p>
+<p>旧 74 图位的 48 ready + 26 pending 是旧版本状态，不是当前通过率。新的冻结清单必须逐图记录；本轮仍只到生图，不擅自增加生产 QA、发布或模板验收。</p>
+
+<h2>七、后置与条件性事项：什么时候处理</h2>
+<div class="table"><table>
+<thead><tr><th>事项</th><th>本轮安排与开始条件</th><th>最小处理位置</th></tr></thead><tbody>
+<tr><td>A03 家庭发现</td><td>有可核实的同父体成员被首容器遗漏时修；目前不盲目并集扩大家庭。</td><td>当前 generic_extractors 提取器。</td></tr>
+<tr><td><strong>A06 设计上限</strong></td><td><strong>完整改造不立即执行。</strong>只有事实、分类和证据正确，而锚点限制确实阻止必要功能表达，或持续重复无法在当前 brief 消除时，才改最小限制。现有重绘、污染和确认冲突未证明由 A06 导致。</td><td>当前锚点资格或 brief 约束；保持现有整套规划权威。</td></tr>
+<tr><td>A12 模板条件必填</td><td>实际模板条件被证实激活或平台返回具体必填错误时处理，不把所有 warning 前移为生图阻塞。</td><td>现有 template_field_plan。</td></tr>
+<tr><td>A14 公网批准字节</td><td>实际发布阶段核对批准 SHA 与公网完整内容；目前本地 SHA/对象键已绑定，HEAD/范围 GET 不足以证明完整字节。未发现真实错图。</td><td>当前 publish 核对；不在每张图生成前全量下载。</td></tr>
+<tr><td>A15 时间/资源预算</td><td>独立复现某调用丢 deadline、等待失控或估算错误后定点修。保留已付费结果恢复，不盲目删除 RAM 准入。</td><td>对应调用及现有资源估算。</td></tr>
+<tr><td>A16 超分</td><td>同一 raw 正确而 final 的字、纹理或构件改变时修。当前树体错误已存在 raw，不从超分先改。</td><td>现有超分后端或降级参数。</td></tr>
+<tr><td>QA 与交付</td><td>用户当前范围只到生图。后续进入 QA/交付时，用本次坏树与较好柜样例校准误放/误杀；发布、模板与 Amazon 接收分别验收。</td><td>现有 QA 与发布合同，不新增判断控制器。</td></tr>
+<tr><td>子体事实/矛盾标题</td><td>当前 confirmed 及颜色优先已实施。本轮未见新误拒；复现具体错误引用时修，不恢复矛盾标题单独否决。</td><td>现有子体事实解析与引用。</td></tr>
+<tr><td>文案事实覆盖</td><td>现有权威及绑定已在；遇到具体无依据的新表述，在原验证处修，不全量重写文案链。</td><td>现有 copy/事实验证。</td></tr>
+<tr><td>A21/A22</td><td>URL 逐跳校验及新运行指纹已实施。peer 不可获取属于部署信任边界；旧缺失证据不能补造。下一次运行记录当前源代码、配置和依赖，避免仅用 HEAD。</td><td>现有 URL 安全及运行诊断。</td></tr>
+</tbody></table></div>
+
+<h2>八、实施清单、删除清单与验证预算</h2>
+<p><strong>立即修改的生产文件：</strong>product_region.py、visual_semantics.py、visual_design_kit.py、image_response.py、production.py。不新增生产模块。image_prompt_compiler.py 仅在上述执行实验有稳定证据后定点替换；transport/注册参数仅在查明具体转发或参数错误后修改。</p>
+<p><strong>必须删除：</strong>确认回复可改选候选的旧约定、最终只读审查仍提供可执行候选/修复入口的投射、矛盾的状态表达规则、started→请求数映射及对应旧测试期望。保留正确的内容绑定、局部签名增删、已确认支持、预算和回执恢复。</p>
+<p><strong>复用当前测试：</strong>修改已有 case 内 fixture/subTest，不新增第 101 个默认用例、不新增重复测试模块；product_region_fixture.py 当前 444 行，修改后保持低于 600 行。</p>
+<pre>&amp; D:\anaconda\python.exe -X utf8 -m unittest tests.test_visual_design_remediation.VisualDesignRemediationTests.test_original_references_preserve_product_pixels tests.test_status_revision_contract.StatusRevisionContractTests.test_production_summary_reports_current_task_failures tests.test_freeze_recovery.FreezeRecoveryTests.test_submitted_worker_timeout_preserves_audit_and_unknown_receipt tests.test_provider_runtime_v1.ProviderRuntimeV1Tests.test_failed_primary_uses_fallback_and_unknown_resends_are_durable
+
+# 完成修改后执行一次默认生产套件
+&amp; D:\anaconda\python.exe -X utf8 scripts/run_production_tests.py</pre>
+<ul>
+<li>审查测试：确认不改像素/归属；需要修改时只能待审；错误 content_key、遗漏主要部件、删除已确认支持仍拒绝；最后一次不能创建未审查新版本。</li>
+<li>统计测试：本地失败没有提交、提交标记保存、恢复不重复计数、替代与逻辑图位分开、旧缺失标记保持未知。</li>
+<li>默认生产套件保持 ≤100 例、≤60 秒；不跑历史 full discovery。此前最新一次为 99/100 后定向修复通过，不能借用旧版本的 100/100，实施结束须有新的整套结果。</li>
+<li>完成报告列生产文件新增/删除/修改、实际行增减、已删除旧路径/测试、精确测试与时长、实图仍未验证内容。离线绿灯不等于产品保真通过。</li>
+</ul>
+
+<h2>九、执行顺序与收口标准</h2>
+<ol>
+<li><strong>本轮修改：</strong>完成确认合同、状态责任和统计替换；用当前回归用例验证，最后一次生产套件收口。</li>
+<li><strong>本轮限定实图：</strong>原木床确认收敛、秋海棠已有候选补审；按上限 5 次图像提交完成 A/B/C 和必要复测/迁移。不得把“仍未知”写成已修。</li>
+<li><strong>下一次完整冻结：</strong>新观察与整套规划、所有冻结图位、逐图检查，实际仍只到生图；对曝光的新缺陷在现有责任环节定点修。</li>
+<li><strong>进入对应业务阶段：</strong>按第七节触发 A03/A06/A12/A14/A15/A16 及 QA/交付处理，避免把未激活事项提前变成生成依赖。</li>
+</ol>
+<div class="note"><strong>最终标准：</strong>计划及事实正确、区域可用、生成结果保留实际产品，同时完成获准的设计修改。即使蒙版近似，也可因最终主体正确通过；即使蒙版覆盖充分，也不能把已经重绘的产品算通过。尚缺服务端证据的执行问题保持明确未知，通过有边界的实验找责任，不承诺一个未经实图证明的“完美修复”。</div>
+</main></body></html>

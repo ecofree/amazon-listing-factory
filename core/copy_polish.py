@@ -20,7 +20,6 @@ from .copy_writer import (
     _normalize_item_highlights,
     copy_request_identity,
     listing_copy_request_fingerprint,
-    configured as copy_provider_configured,
     load_copy_writer_config,
     rewrite_listing_copy,
 )
@@ -36,7 +35,7 @@ from .template_runtime import child_sku, load_template_env, normalize_template_m
 COPY_SCHEMA_VERSION = "copy-v1"
 COPY_ARTIFACT = "copy_v1.json"
 COPY_GROUP_POLICY_VERSION = "copy-group-v6-effective-facts"
-COPY_VALIDATION_POLICY_VERSION = "copy-validation-v11-effective-facts"
+COPY_VALIDATION_POLICY_VERSION = "copy-validation-v16-child-bound-parent"
 PARENT_COPY_KEY = "__parent__"
 COPY_IGNORED_FACT_KEYS = {"fabric_type"}
 
@@ -53,22 +52,19 @@ def run_copy_polish(
     limit: int = 0,
     mode: str = "",
     retry_blocked: bool = False,
+    work_children: tuple[str, ...] = (),
     deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     job_path = Path(job_dir)
     job = load_job(job_path)
-    env = load_template_env(
-        str(FACTORY_ROOT / "config.env"),
-        str(FACTORY_ROOT / "config.local.env"),
-        config_path,
-        str(job.get("config_path") or ""),
-    )
+    env = load_template_env(FACTORY_ROOT/'config.env',FACTORY_ROOT/'config.local.env',job.get('config_path',''),config_path)
     resolved_mode = normalize_template_mode(mode or env.get("AMAZON_FACTORY_TEMPLATE_MODE") or "draft")
     family_path = job_path / "source" / "product_family_v3.json"
     family = read_product_family(family_path)
     children = _children(family, limit=limit, job_dir=job_path)
-    if not copy_provider_configured(env):
-        raise CopyPolishError("CopyV1 requires a configured AI copy provider")
+    from .run_scope import execution_children, target_children
+    parent_ready = not family['family'].get('unconfirmed_variant_asins') and {c['asin'] for c in children} == set(target_children(family))
+    selected=execution_children(job_path,work_children) if work_children else {str(row['asin']) for row in children}
     request_fingerprint = copy_request_fingerprint(
         env,
         mode=resolved_mode,
@@ -82,12 +78,13 @@ def run_copy_polish(
         children=children,
         job=job,
     )
-    if current is not None:
+    if parent_ready and current is not None:
         return current
     # Terminal copy failures are not retried implicitly.  An operator must
     # explicitly request a retry so a resume cannot burn tokens on the same
     # deterministic input revision.
     previous_failures = {} if retry_blocked else _previous_blocked_failures(job_path)
+    from .service_response import retry_authorized
 
     groups = _copy_groups(children)
     rows: dict[str, dict[str, Any]] = {}
@@ -129,14 +126,19 @@ def run_copy_polish(
             previous_failures.get(_task_success(str(member.get("asin") or ""), group_fingerprint)["input_revision_id"])
             for member in members
         ]
-        if prior and all(prior):
+        if prior and all(prior) and not retry_authorized(job_path/'reports/copy_requests', ['copy:' + str(member['asin']) for member in members], include_known_unsent=True):
             failures.extend(dict(row) for row in prior if row)
             continue
         fragment = _load_fragment(job_path, group_fingerprint)
+        if fragment is None and work_children and not selected.intersection(str(member['asin']) for member in members):
+            failures.extend({**_task_failure(str(member['asin']),group_fingerprint,'Copy group deferred to its work unit'),
+                             'task_status':'not_run'} for member in members)
+            continue
         if fragment is None:
             try:
                 fragment = _rewrite_group(
                     trace_dir=job_path / 'reports' / 'copy_traces' / model_request_fingerprint,
+                    receipt_root=job_path / 'reports/copy_requests', request_owners=tuple('copy:' + str(member['asin']) for member in members), retry_received=retry_blocked,
                     env=env,
                     plugin=plugin,
                     job=job,
@@ -175,9 +177,10 @@ def run_copy_polish(
             tasks.append(_task_success(asin, group_fingerprint))
 
     parent_fingerprint = ""
-    if rows:
-        parent_source = _parent_source(children, plugin=plugin, job=job)
+    if len(child_map) == len(children) and parent_ready:
+        parent_source = _parent_source(rows, plugin=plugin)
         parent_facts = _family_common_specific(children)
+        parent_facts['_child_facts'] = [_copy_facts(child) for child in children]
         parent_model_fingerprint = _model_request_fingerprint(
             env=env, plugin=plugin, job=job, source=parent_source,
             facts=parent_facts, row_type="Parent",
@@ -190,6 +193,8 @@ def run_copy_polish(
         )
         parent_revision = _task_success(PARENT_COPY_KEY, parent_fingerprint)["input_revision_id"]
         prior_parent_failure = previous_failures.get(parent_revision)
+        if prior_parent_failure and retry_authorized(job_path/'reports/copy_requests', ['copy:__parent__'], include_known_unsent=True):
+            prior_parent_failure = None
         parent_fragment = None if prior_parent_failure else _load_fragment(job_path, parent_fingerprint, row_type="Parent")
         if prior_parent_failure:
             failures.append(dict(prior_parent_failure))
@@ -199,6 +204,7 @@ def run_copy_polish(
                     raise CopyPolishError("terminal copy failure already recorded for this input revision")
                 parent_fragment = _rewrite_group(
                     trace_dir=job_path / 'reports' / 'copy_traces' / parent_model_fingerprint,
+                    receipt_root=job_path / 'reports/copy_requests', request_owners=('copy:__parent__',), retry_received=retry_blocked,
                     env=env, plugin=plugin, job=job, source=parent_source,
                     facts=parent_facts, fingerprint=parent_fingerprint,
                     row_type="Parent",
@@ -252,6 +258,7 @@ def run_copy_polish(
         "child_map": child_map,
         "parent_request_fingerprint": parent_fingerprint,
         "parent_model_request_fingerprint": parent_model_fingerprint,
+        "parent_child_copy_fingerprint": _fingerprint(_child_copy_payload(rows)),
         "rows": rows,
         "failures": failures,
     }
@@ -261,8 +268,8 @@ def run_copy_polish(
         "output_path": str(path),
         "row_count": len(rows),
         "group_count": len(group_rows),
-        "tasks": tasks,
-        "failures": failures,
+        "tasks": [row for row in tasks if not work_children or row.get('child') in selected or row.get('child')==PARENT_COPY_KEY],
+        "failures": [row for row in failures if not work_children or row.get('task',{}).get('child') in selected or row.get('task',{}).get('child')==PARENT_COPY_KEY],
     }
 
 
@@ -298,17 +305,7 @@ def copy_request_fingerprint(
             }
             for key, members in _copy_groups([row for row in children if isinstance(row, dict)]).items()
         ],
-        "parent": {
-            "request": _group_request_fingerprint(
-                env=env,
-                plugin=plugin,
-                job=job,
-                group_key=PARENT_COPY_KEY,
-                source=_parent_source(children, plugin=plugin, job=job),
-                facts=_family_common_specific([row for row in children if isinstance(row, dict)]),
-                row_type="Parent",
-            ),
-        },
+        "parent": "validated-child-copy-with-original-fact-constraints",
     }
     return _fingerprint(payload)
 
@@ -326,14 +323,12 @@ def copy_artifact_current(
     if not family_path.is_file():
         return False
     job = load_job(job_path)
-    env = load_template_env(
-        str(FACTORY_ROOT / "config.env"),
-        str(FACTORY_ROOT / "config.local.env"),
-        config_path,
-        str(job.get("config_path") or ""),
-    )
+    env = load_template_env(FACTORY_ROOT/'config.env',FACTORY_ROOT/'config.local.env',job.get('config_path',''),config_path)
     family = read_product_family(family_path)
     children = _children(family, limit=limit, job_dir=job_path)
+    from .run_scope import target_children
+    if family['family'].get('unconfirmed_variant_asins') or {c['asin'] for c in children} != set(target_children(family)):
+        return False
     fingerprint = copy_request_fingerprint(
         env,
         mode=normalize_template_mode(mode or "draft"),
@@ -356,14 +351,16 @@ def read_copy_artifact(job_dir: str | Path, *, require_complete: bool = True) ->
     data = read_json(path)
     if not isinstance(data, dict) or data.get("schema_version") != COPY_SCHEMA_VERSION:
         raise CopyPolishError("Unsupported CopyV1 artifact")
-    if require_complete and data.get("failures"):
-        raise CopyPolishError("CopyV1 contains failed copy groups")
+    if require_complete and (data.get("failures") or PARENT_COPY_KEY not in (data.get('rows') or {})):
+        raise CopyPolishError("CopyV1 has unresolved child or family copy")
     _validate_artifact_provenance(data)
     return data
 
 
 def _validate_artifact_provenance(data: dict[str, Any]) -> None:
     rows = data.get("rows") if isinstance(data.get("rows"), dict) else {}
+    if PARENT_COPY_KEY in rows and data.get('parent_child_copy_fingerprint') != _fingerprint(_child_copy_payload(rows)):
+        raise CopyPolishError('Parent copy does not bind the current child copy')
     group_requests = {
         str(group.get("group_key") or ""): str(group.get("model_request_fingerprint") or "")
         for group in data.get("groups") or [] if isinstance(group, dict)
@@ -417,7 +414,7 @@ def _source_copy(child: dict[str, Any]) -> dict[str, Any]:
     def authorized(value: str) -> str:
         # Raw records remain in ProductFamily; only supported clauses reach the writer.
         return ' '.join(part for part in re.split(r'(?<=[.;])\s+|\n', value)
-                        if not fact_statement_issues(part, resolutions))
+                        if not fact_statement_issues(part, resolutions, product_title=str(child.get('title') or '')))
     item_highlights = child.get("item_highlights") or child.get("bullets") or child.get("features") or []
     return {
         "title": authorized(_normalize_text(child.get("title"))),
@@ -456,19 +453,22 @@ def _group_source(members: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _parent_source(children: list[Any], *, plugin: ProductPlugin, job: dict[str, Any]) -> dict[str, Any]:
-    rows = [row for row in children if isinstance(row, dict)]
-    highlight_sets = [set(_source_copy(row)["item_highlights"]) for row in rows]
-    common_highlights = [
-        value for value in (_source_copy(rows[0])["item_highlights"] if rows else [])
-        if all(value in values for values in highlight_sets[1:])
-    ]
-    descriptions = [_source_copy(row)["description"] for row in rows]
-    common_description = descriptions[0] if descriptions and all(value == descriptions[0] for value in descriptions[1:]) else ""
+def _child_copy_payload(rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {sku: {key: row.get(key) for key in ('title', 'item_highlights', 'bullets', 'description')}
+            for sku, row in sorted(rows.items()) if sku != PARENT_COPY_KEY}
+
+
+def _parent_source(rows: dict[str, dict[str, Any]], *, plugin: ProductPlugin) -> dict[str, Any]:
+    children = _child_copy_payload(rows)
+    if not children:
+        raise CopyPolishError('Parent copy needs validated child copy')
+    for key, row in rows.items():
+        if key != PARENT_COPY_KEY:
+            _validate_copy_row(row, row_type='child')
     return {
         "title": plugin.display_name,
-        "item_highlights": common_highlights,
-        "description": common_description,
+        "item_highlights": [],
+        "description": json.dumps(children, ensure_ascii=False, sort_keys=True),
         "specs": {},
         "product_specific": {},
     }
@@ -480,16 +480,34 @@ def _family_common_specific(children: list[dict[str, Any]], *_: Any) -> dict[str
         return {}
     common: dict[str, Any] = {}
     for key, value in mappings[0].items():
-        if all(key in row and _stable(row[key]) == _stable(value) for row in mappings[1:]):
+        if key != '_fact_resolutions' and all(key in row and _stable(row[key]).casefold() == _stable(value).casefold() for row in mappings[1:]):
             common[key] = value
+    resolutions = {}
+    keys = dict.fromkeys(key for row in mappings for key in row.get('_fact_resolutions', {}))
+    for key in keys:
+        records = [row.get('_fact_resolutions', {}).get(key) for row in mappings]
+        first = records[0] or {}
+        if not all(isinstance(row, dict) and row.get('status') == first.get('status')
+                   and _stable(row.get('value')).casefold() == _stable(first.get('value')).casefold() for row in records):
+            if key in {'sold_unit_count', 'tip_count'}:
+                # Counts that vary by child cannot be advertised as family-wide.
+                common.pop(key, None)
+                resolutions[key] = {'status': 'unconfirmed', 'value': None}
+            continue
+        shared = dict(first)
+        for field in ('candidates', 'evidence'):
+            values = [value for row in records for value in row.get(field, [])]
+            if values:
+                shared[field] = list({_stable(value): value for value in values}.values())
+        resolutions[key] = shared
+    if resolutions:
+        common['_fact_resolutions'] = resolutions
     return common
 
 
 def _copy_facts(child: dict[str, Any]) -> dict[str, Any]:
     facts = {key: value for key, value in effective_product_facts(child).items() if key not in COPY_IGNORED_FACT_KEYS}
     resolutions = fact_resolutions(child)
-    if 'sold_unit_count' not in resolutions and child.get('sold_unit_count_source') in {'amazon_single_unit_listing_policy', 'apify_invalid_pack_count_default'}:
-        facts.pop('sold_unit_count', None)
     if resolutions:
         facts['_fact_resolutions'] = resolutions
     return facts
@@ -507,6 +525,7 @@ def _rewrite_group(
     expected_request_fingerprint: str,
     deadline_monotonic: float | None = None,
     trace_dir: Path | None = None,
+    receipt_root: Path | None = None, request_owners: tuple[str, ...] = (), retry_received: bool = False,
 ) -> dict[str, Any]:
     source_copy = _source_copy(source)
     result = rewrite_listing_copy(
@@ -519,7 +538,7 @@ def _rewrite_group(
         source_description=source_copy["description"],
         product_specific=facts,
         deadline_monotonic=deadline_monotonic,
-        trace_dir=trace_dir,
+        trace_dir=trace_dir, receipt_root=receipt_root, request_owners=request_owners, retry_received=retry_received,
     )
     config = load_copy_writer_config(env)
     if str(result.get("_request_fingerprint") or "") != expected_request_fingerprint:
@@ -534,6 +553,12 @@ def _rewrite_group(
         "model": str(result.get("_model") or config.model or ""),
         "request_fingerprint": str(result.get("_request_fingerprint") or fingerprint),
     }
+    from .copy_measurements import bind_copy_quantity_claims
+    texts={**{key:row[key] for key in ('title','description')},
+           **{f'{key}.{i}':text for key in ('bullets','item_highlights') for i,text in enumerate(row[key])}}
+    claims=bind_copy_quantity_claims(texts,facts,category=plugin.display_name)
+    if claims['issues']:raise CopyPolishError('; '.join(claims['issues']))
+    row['evidence']['quantity_claims']={**claims,'scope_members':list(request_owners)}
     _validate_copy_row(row, row_type=row_type)
     return row
 
@@ -558,14 +583,25 @@ def _validate_copy_row(row: dict[str, Any], *, row_type: str = "child") -> None:
         raise CopyPolishError(f"Copy item_highlights joined text must be under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters")
     if not optional_parent_highlights and len({_normalize_text(value).casefold() for value in item_highlights}) != len(item_highlights):
         raise CopyPolishError("Copy item_highlights must be distinct")
-    if len(bullets) != 5 or any(not value or len(value) > BULLET_AUDIT_MAX_CHARS for value in bullets):
-        raise CopyPolishError(f"Copy requires five bullets of at most {BULLET_AUDIT_MAX_CHARS} characters")
-    if len({_normalize_text(value).casefold() for value in bullets}) != 5:
+    count_valid = len(bullets) <= 5 if str(row_type).casefold() == 'parent' else len(bullets) == 5
+    if not count_valid or any(not value or len(value) > BULLET_AUDIT_MAX_CHARS for value in bullets):
+        raise CopyPolishError(f"Copy bullet count/length is invalid for {row_type}")
+    if len({_normalize_text(value).casefold() for value in bullets}) != len(bullets):
         raise CopyPolishError("Copy bullets must be distinct")
     if not description or len(description) > DESCRIPTION_MAX_CHARS:
         raise CopyPolishError(f"Copy description must be 1..{DESCRIPTION_MAX_CHARS} characters")
     if not str(row.get("provider") or "") or not str(row.get("model") or "") or not str(row.get("request_fingerprint") or ""):
         raise CopyPolishError("Copy provider provenance is incomplete")
+    claims=(row.get('evidence') or {}).get('quantity_claims')
+    if claims:
+        texts={**{key:row[key] for key in ('title','description')},
+               **{f'{key}.{i}':text for key in ('bullets','item_highlights') for i,text in enumerate(row[key])}}
+        if claims.get('schema')!='copy-quantity-bindings-v1' or claims.get('issues'):
+            raise CopyPolishError('Invalid quantity bindings')
+        for claim in claims['bindings']:
+            left,right=claim['span']
+            if texts.get(claim['field'],'')[left:right]!=claim['text'] or not claim.get('fact_id') or not claim.get('facts_sha256'):
+                raise CopyPolishError('Quantity binding no longer matches its output span/evidence')
 
 
 def _copy_evidence_catalog(source: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
@@ -600,6 +636,7 @@ def _group_request_fingerprint(
         "category": plugin.category_id,
         "brand": str(job.get("brand") or ""),
         "group_key": group_key,
+        "validation_policy": COPY_VALIDATION_POLICY_VERSION,
         "model_request": model_request_fingerprint or _model_request_fingerprint(
             env=env, plugin=plugin, job=job, source=source,
             facts=facts, row_type=row_type,

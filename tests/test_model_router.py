@@ -16,14 +16,40 @@ from core.image_provider_common import ProviderQueueUnavailable
 
 
 class ModelRouterTests(unittest.TestCase):
+    def setUp(self):
+        # These tests mock the network; real spending/lease admission is covered
+        # separately by batch_fixture with a real SQLite ledger.
+        paid=patch('core.batch_ledger.admit_paid_request',return_value='mock-network-admission')
+        paid.start();self.addCleanup(paid.stop)
+        import tempfile
+        from pathlib import Path
+        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        self.receipts=Path(directory.name)
+
     def test_visual_planning_keeps_registry_priority_for_primary_director(self) -> None:
-        clients = [{"name": "ccsub"}, {"name": "zivv"}, {"name": "yunwu"}]
+        from pathlib import Path
+        registry_path = Path(__file__).resolve().parents[1] / "configs/api_registry.json"
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        planners = [row for row in registry["providers"] if row.get("scope") == "visual_planning"]
+        with patch.dict("os.environ", {
+            "AMAZON_FACTORY_API_REGISTRY": "", "AMAZON_FACTORY_API_REGISTRY_FILE": str(registry_path),
+            **{row["key_env"]: "synthetic-routing-key" for row in planners},
+        }, clear=False):
+            clients = model_router.clients_for_scope("visual_planning")
+            active = sorted((row for row in planners if row.get("enabled")), key=lambda row: row["priority"], reverse=True)
+            self.assertEqual([row["name"] for row in active], [row["name"] for row in clients])
+        self.assertEqual('zivv_gemini_38_flash_tiered_visual_planning',clients[0]['name'])
+        self.assertEqual('gemini-3.8-flash-tiered',clients[0]['model'])
         ordered = ordered_gemini_clients(
             clients, "prompt", [], client_scope="visual_planning", request_id="would-rotate",
         )
-        self.assertEqual(["ccsub", "zivv", "yunwu"], [row["name"] for row in ordered])
+        self.assertEqual(clients, ordered)
 
     def test_registry_requires_explicit_scope(self) -> None:
+        from tests.continuity_contract_fixture import verify_routes
+        verify_routes(self)
+        from tests.audit_recovery_fixture import verify_registry_contract
+        verify_registry_contract(self)
         registry = {
             "providers": [
                 {
@@ -59,6 +85,7 @@ class ModelRouterTests(unittest.TestCase):
                     "key_env": key_env, "model": "gpt-image-2",
                     "protocol_profile": {"request_size": "1024x1024", "output_contract": "square"},
                     "capabilities": ["image_edit", "reference_image", "square_output"],
+                    'allowed_roles': ['main','scene','func','size'], 'prompt_max_chars': 12000,
                     "enabled": True,
                 }
                 for name, key_env in (("first", "FIRST_KEY"), ("second", "SECOND_KEY"))
@@ -73,10 +100,6 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual("gpt-image-2.5-sunburst", sunburst["model"])
         self.assertTrue(sunburst["enabled"])
         self.assertEqual(rows["cxk_fixed"]["key_env"], sunburst["key_env"])
-        self.assertTrue(rows["qc_yc_fixed"]["enabled"])
-        self.assertNotIn("qc_yc_fixed_gpt_image_25", rows)
-        self.assertEqual({"gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"},
-                         {row['model'] for name, row in rows.items() if name.startswith('qc_yc_fixed') and row['enabled']})
         self.assertFalse(rows["lz_token_gpt_image_2"]["enabled"])
         import io
         from email import policy
@@ -94,21 +117,27 @@ class ModelRouterTests(unittest.TestCase):
                 image.save(buffer, format="PNG")
             images.append(buffer.getvalue())
         buffer = io.BytesIO()
-        with Image.new("RGBA", (32, 32), (255, 255, 255, 128)) as image:
+        with Image.new("RGB", (32, 32), "white") as image:
             image.save(buffer, format="PNG")
         mask = buffer.getvalue()
         for response_model in (None, sunburst["model"]):
-            audit = {}
+            from core.image_response import begin_response,submit_response,response_directory,response_binding
+            task={'job_dir':str(self.receipts),'logical_task_id':'wire:'+str(response_model),
+                'task_fingerprint':'fixture','prompt':'Exact fixture task'}
+            audit={'response_binding':response_binding(task),'logical_task_id':task['logical_task_id']}
+            receipt=begin_response(response_directory(task),provider=spec.name,audit=audit)
+            audit.update(attempt_id=receipt.stem,receipt_path=str(receipt))
             response = MagicMock()
             response.__enter__.return_value = response
             response.headers = {"x-request-id": "gateway-fixture"}
-            response.read.return_value = json.dumps({"model": response_model, "created": 123, "data": []}).encode()
+            response.read.side_effect = io.BytesIO(json.dumps({"model": response_model, "created": 123, "data": []}).encode()).read
             with patch.object(transport, "_image_provider_spec", return_value=spec), patch.object(
                     transport.api_registry, "image_provider_supports_multiple_references", return_value=True), patch.object(
                     transport.urllib.request, "urlopen", return_value=response) as send, patch.object(
                     transport, "_decode_image_response", return_value=b"candidate"):
                 transport.generate_with_registry_image_provider(provider_name=spec.name, image_inputs=images,
-                    prompt="Exact fixture task", mask_bytes=mask, request_audit=audit)
+                    prompt="Exact fixture task", region_map_bytes=mask, request_audit=audit,
+                    request_observer=lambda snapshot:submit_response(receipt,snapshot))
             request = send.call_args.args[0]
             message = BytesParser(policy=policy.default).parsebytes(
                 ("Content-Type: " + request.get_header("Content-type") + "\r\n\r\n").encode() + request.data)
@@ -121,6 +150,7 @@ class ModelRouterTests(unittest.TestCase):
             files = [part.get_payload(decode=True) for part in parts if part.get_filename()]
             self.assertEqual(images, files[:2])
             self.assertEqual(3, len(files))
+            self.assertTrue(all(part.get_param("name", header="content-disposition") == "image[]" for part in parts if part.get_filename()))
             from PIL import ImageChops
             with Image.open(io.BytesIO(mask)) as original, Image.open(io.BytesIO(files[2])) as sent_mask:
                 self.assertIsNone(ImageChops.difference(original, sent_mask).getbbox())
@@ -152,7 +182,7 @@ class ModelRouterTests(unittest.TestCase):
         ]
         with (
             patch("core.vision_gemini_client.gemini_clients", return_value=[client]),
-            patch("core.vision_gemini_client._post_vision_request", side_effect=bodies) as request,
+            patch("core.vision_gemini_client._post_json_preserve_redirects", side_effect=bodies) as request,
             patch.dict("os.environ", {"AMAZON_FACTORY_VISUAL_PLANNER_ATTEMPTS": "1"}, clear=False),
         ):
             result = gemini_stream_generate(
@@ -179,7 +209,7 @@ class ModelRouterTests(unittest.TestCase):
         with (
             patch("core.vision_gemini_client.gemini_clients", return_value=clients),
             patch(
-                "core.vision_gemini_client._post_vision_request",
+                "core.vision_gemini_client._post_json_preserve_redirects",
                 side_effect=[invalid, invalid],
             ) as request,
         ):
@@ -203,33 +233,40 @@ class ModelRouterTests(unittest.TestCase):
         good = json.dumps({"choices": [{"message": {"content": "good"}}]})
         events = []
         with patch("core.vision_gemini_client.gemini_clients", return_value=[client, fallback]), patch(
-            "core.vision_gemini_client._post_vision_request", side_effect=[IncompleteRead(b'{"choices": [', 100), good],
+            "core.vision_gemini_client._post_json_preserve_redirects", side_effect=[IncompleteRead(b'{"choices": [', 100), good],
         ) as truncated, patch("core.vision_gemini_client._deadline_sleep"):
             self.assertEqual("good", gemini_stream_generate("prompt", [], client_scope="visual_planning",
                 total_timeout_seconds=10, max_physical_requests=2, request_id="truncated-response-test", attempt_observer=events.append))
         self.assertEqual(2, truncated.call_count)
         self.assertEqual(["transport_failure", "success"], [event['status'] for event in events if event.get('event') != 'request_budget'])
-        self.assertEqual([1, 2], [event['physical_request_count'] for event in events if event.get('event') == 'request_budget'])
+        self.assertEqual([0, 1, 2], [event['physical_request_count'] for event in events if event.get('event') == 'request_budget'])
         self.assertEqual('{"choices": [', next(event['response_body'] for event in events if event.get('status') == 'transport_failure'))
         events.clear()
+        from contextlib import nullcontext
         with (
+            patch.dict('os.environ',{'AMAZON_FACTORY_VISUAL_PLANNER_TIMEOUT_SECONDS':'17'}),
             patch("core.vision_gemini_client.gemini_clients", return_value=[client, fallback]),
             patch(
-                "core.vision_gemini_client._post_vision_request",
-                side_effect=[ProviderQueueUnavailable("planner", "busy"), good],
+                "core.vision_gemini_client.provider_concurrency_slot",
+                side_effect=[ProviderQueueUnavailable("planner", "busy"), nullcontext()],
+            ) as admission,
+            patch(
+                "core.vision_gemini_client._post_json_preserve_redirects", return_value=good,
             ) as request,
             patch("core.vision_gemini_client._deadline_sleep"),
         ):
             result = gemini_stream_generate(
                 "prompt", [], client_scope="visual_planning",
-                total_timeout_seconds=10, max_physical_requests=1,
+                total_timeout_seconds=30, max_physical_requests=1,
                 response_validator=lambda text: text == "good",
                 request_id="queue-budget-test",
                 attempt_observer=events.append,
             )
         self.assertEqual("good", result)
-        self.assertEqual(2, request.call_count)
-        self.assertEqual([1, 0, 1], [event['physical_request_count'] for event in events if event.get('event') == 'request_budget'])
+        self.assertEqual(2, admission.call_count)
+        self.assertEqual(1, request.call_count)
+        self.assertEqual(17,request.call_args.kwargs['timeout_seconds'])
+        self.assertEqual([0, 0, 1], [event['physical_request_count'] for event in events if event.get('event') == 'request_budget'])
 
 
 if __name__ == "__main__":

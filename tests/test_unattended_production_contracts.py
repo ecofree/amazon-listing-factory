@@ -9,7 +9,6 @@ from unittest.mock import patch
 from PIL import Image
 
 from core.image_provider_routing import generate_with_provider_retries
-from core.image_upscale import ImageUpscaleError, upscale_for_publication
 from core.io import file_sha256
 from core.price import normalize_price_value
 from core.publish import PublishError, _publish_candidate_row
@@ -17,20 +16,6 @@ from core.vision_gemini_client import gemini_stream_generate
 
 
 class UnattendedProductionContractTests(unittest.TestCase):
-    def test_publication_sizing_is_exactly_1600_square(self) -> None:
-        source = io.BytesIO()
-        Image.new("RGB", (1024, 1024), "white").save(source, format="PNG")
-        with patch.dict(os.environ, {"AMAZON_FACTORY_UPSCALE_BACKEND": "pillow"}):
-            output = upscale_for_publication(source.getvalue())
-        with Image.open(io.BytesIO(output)) as image:
-            self.assertEqual((1600, 1600), image.size)
-
-    def test_publication_sizing_rejects_non_square_provider_output(self) -> None:
-        source = io.BytesIO()
-        Image.new("RGB", (1024, 1200), "white").save(source, format="PNG")
-        with self.assertRaises(ImageUpscaleError):
-            upscale_for_publication(source.getvalue())
-
     def test_publish_rejects_unprocessed_1024_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "candidate.png"
@@ -92,7 +77,7 @@ class UnattendedProductionContractTests(unittest.TestCase):
         with (
             patch("core.vision_gemini_client.gemini_clients", return_value=[client]),
             patch("core.vision_gemini_client._openai_chat_payload", return_value={}),
-            patch("core.vision_gemini_client._post_vision_request", return_value=response),
+            patch("core.vision_gemini_client._post_json_preserve_redirects", return_value=response),
             patch("core.vision_gemini_client._image_part", side_effect=AssertionError("native parts were eager")),
         ):
             result = gemini_stream_generate(

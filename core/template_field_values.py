@@ -3,12 +3,60 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .text_evidence import normalize_text, extract_measurements, us_measurement_text
+from .text_evidence import normalize_text, extract_measurements, us_measurement_text, dimension_axes
 
 
-_DIMENSION_NUMBER = r"\d+(?:\.\d+)?"
-_LABELED_DIMENSION_RE = re.compile(rf"\b({_DIMENSION_NUMBER})\s*(?:\"|in(?:ches?)?)?\s*([LWHDT])\b", re.I)
-_DIMENSION_CHAIN_RE = re.compile(rf"\b({_DIMENSION_NUMBER}(?:\s*(?:x|\*)\s*{_DIMENSION_NUMBER}){{2,4}})\b", re.I)
+def sourced_template_attributes(job, family, child):
+    """Read listing-only fields from the child's original, hash-bound product specifications."""
+    from .io import file_sha256, read_json
+    from .source_fetch.apify import raw_source_directory
+    from .source_fetch.apify_client import returned_asin
+    from products.generic_extractors import detail_rows, norm_key
+    from .template_field_plan import _known_enum_value
+
+    asin = child['asin']
+    expected = family.get('source', {}).get('raw_sha256', {}).get(asin)
+    if not expected:
+        return {}
+    path = raw_source_directory(job, family['family']['marketplace']) / (asin + '.json')
+    if not path.is_file() or file_sha256(path) != expected:
+        return {}
+    raw = read_json(path)
+    if returned_asin(raw) != asin:
+        return {}
+    fields = {
+        'model_name': ['Model Name'], 'model_number': ['Model Number', 'Item Model Number'],
+        'occasion_type': ['Occasion', 'Occasion Type'], 'recommended_uses': ['Recommended Uses For Product'],
+        'included_components': ['Included Components', 'Included Accessories'],
+        'batteries_required': ['Batteries Required', 'Batteries Required?'],
+        'required_product_compliance_certificate': ['Product Compliance Certificate'],
+    }
+    labels = {norm_key(label): key for key, names in fields.items() for label in names}
+    found = {}
+    for _, label, value in detail_rows(raw):
+        key = labels.get(norm_key(label))
+        if key and value:
+            if key == 'batteries_required':
+                value = _known_enum_value(key, value, ['Yes','No']) or value
+            found.setdefault(key, {})[value.casefold()] = value
+    result = {key: next(iter(values.values())) for key, values in found.items() if len(values) == 1}
+    if family.get('category_id') == 'artificial_tree':
+        from .product_family import effective_product_facts
+        from products.generic_extractors import usage_environment
+        facts = effective_product_facts(child)
+        result.pop('recommended_uses', None)
+        environment = usage_environment(facts.get('indoor_outdoor', ''))
+        if environment:
+            result['recommended_uses'] = environment
+        # This template column asks about CARB, not general electrical certification.
+        materials = [part.strip() for part in re.split(r'[,;/&]|\band\b', str(facts.get('material', '')).casefold()) if part.strip()]
+        if (materials and set(materials) <= {'pvc','polyvinyl chloride','pe','polyethylene','metal','iron','steel','plastic'}
+                and not result.get('required_product_compliance_certificate')):
+            result['required_product_compliance_certificate'] = 'Not Applicable'
+    conflicts = {key:list(values.values()) for key,values in found.items() if len(values) > 1}
+    if conflicts:
+        result['_source_field_conflicts'] = conflicts
+    return result
 
 
 def template_dimensions_from_facts(facts: dict[str, Any], *, category_id: str = "") -> dict[str, str]:
@@ -20,14 +68,17 @@ def template_dimensions_from_facts(facts: dict[str, Any], *, category_id: str = 
         "item_depth": ("item_depth", "depth"),
         "item_weight": ("item_weight", "weight"),
     }
-    if category_id in {"bathroom_cabinet", "medicine_cabinet"}:
-        keys_by_alias.pop("length")
-        keys_by_alias["item_depth"] = ("item_depth", "depth", "length", "item_length")
+    # Length is never silently renamed depth because the product is a cabinet.
+    axes=dimension_axes(_first(facts,'dimensions','product_dimensions','item_dimensions','overall_dimensions'))
     for alias, keys in keys_by_alias.items():
-        value = _first(facts, *keys)
+        value = _first(facts, *keys) or axes.get(alias,'')
         if value:
             unit = _first(facts, *(f"{key}_unit" for key in keys))
             parsed = extract_measurements(value)
+            if not parsed and not unit and alias in axes:
+                measured=extract_measurements(axes[alias])
+                if len(measured)==1 and _clean_dimension_number(value)==_clean_dimension_number(measured[0]['number']):
+                    value=axes[alias];parsed=measured
             separate = extract_measurements('1 ' + unit) if unit else []
             if parsed and separate and parsed[0]['unit'] != separate[0]['unit']:
                 raise ValueError(f'Conflicting explicit units for {alias}: {parsed[0]["unit"]} and {separate[0]["unit"]}')
@@ -44,21 +95,17 @@ def template_dimensions_from_facts(facts: dict[str, Any], *, category_id: str = 
                 dimensions[f"{alias}_unit"] = {'in': 'Inches', 'lb': 'Pounds', 'oz': 'Ounces'}.get(label, label)
             else:
                 dimensions[alias] = str(value)
-    text = _first(facts, "dimensions", "product_dimensions", "item_dimensions", "overall_dimensions")
-    text = us_measurement_text(text, length_unit='in')
-    if text:
-        dimensions.update({key: value for key, value in _parse_template_dimensions(text, category_id=category_id).items() if key not in dimensions})
-    dimension_unit = _infer_dimension_unit(text)
-    for alias in ("length", "width", "height", "item_depth"):
-        if dimensions.get(alias) and dimension_unit:
-            dimensions.setdefault(f"{alias}_unit", dimension_unit)
     return dimensions
 
 
-def color_map_value(color: Any, *, category_id: str = "") -> str:
+def color_map_value(color: Any, *, category_id: str = "", allowed=()) -> str:
     text = normalize_text(color).casefold()
     if not text:
         return ""
+    for value in allowed:
+        if value.casefold() == text or text == 'gray' and value.casefold() == 'grey':
+            return value
+    colors=[]
     for token, value in (
         ("black", "Black"),
         ("white", "White"),
@@ -76,15 +123,44 @@ def color_map_value(color: Any, *, category_id: str = "") -> str:
         ("silver", "Silver"),
         ("clear", "Clear"),
     ):
-        if token in text:
-            return value
-    if any(mark in text for mark in ("/", "&", " and ")):
-        return "Multicolor"
-    # Artificial-plant variation labels often name the species (Begonia,
-    # Cedar, Cypress) instead of a standard Amazon color.  Preserve that
-    # label in the free-text color field, while using the truthful standard
-    # map for the foliage-plus-trunk/flower product.
-    return "Multicolor" if category_id == "artificial_tree" else ""
+        if re.search(r'\b'+re.escape(token)+r'\b',text) and value not in colors:
+            colors.append(value)
+    return 'Multicolor' if len(colors)>1 else colors[0] if colors else ''
+
+
+def repeated_attribute_values(value, allowed, alias):
+    """Tile each complete positive phrase with the current column's vocabulary."""
+    if not value or not allowed:
+        return [value] if value else []
+    text = ', '.join(map(str, value)) if isinstance(value, (list,tuple)) else str(value)
+    if re.search(r"\b(?:no|not|without|excluding|except|pending|free|or)\b", text, re.I):
+        return [text]
+    names = {s.casefold():s for s in allowed}
+    equivalents = {
+        'included_component': {'gloves':'Protective Glove','protective gloves':'Protective Glove',
+                               'user guide':'Instruction Manual','user manual':'Instruction Manual'},
+        'material': {'pvc':'Polyvinyl Chloride','pe':'Polyethylene'},
+        'recommended_uses': {'indoor use':'Indoor','outdoor use':'Outdoor'},
+    }
+    names.update({key:val for key,val in equivalents.get(alias,{}).items() if val in allowed})
+    pattern = re.compile('(?:'+'|'.join(re.escape(key) for key in sorted(names,key=len,reverse=True))+r')(?=\s|$)')
+    accepted, unmatched = [], []
+    for chunk in re.split(r'\s*(?:[,;/&]|\band\b)\s*', text, flags=re.I):
+        part = chunk.strip().casefold()
+        if alias == 'included_component':
+            part = re.sub(r'^\d+\s*(?:x\s+|pairs? of\s+)?', '', part)
+        matches = []
+        while part:
+            match = pattern.match(part)
+            if not match:
+                break
+            matches.append(names[match.group()])
+            part = part[match.end():].strip()
+        if part:
+            unmatched.append(chunk)
+        else:
+            accepted.extend(matches)
+    return list(dict.fromkeys([*accepted,*unmatched]))
 
 
 def light_color_value(category_id: str, attributes: dict[str, Any]) -> str:
@@ -92,44 +168,7 @@ def light_color_value(category_id: str, attributes: dict[str, Any]) -> str:
         value = attributes.get(key)
         if value:
             return str(value)
-    return "Not Applicable" if category_id == "artificial_tree" else ""
-
-
-def _parse_template_dimensions(value: Any, *, category_id: str = "") -> dict[str, str]:
-    text = normalize_text(value)
-    parsed: dict[str, str] = {}
-    label_map = {"l": "length", "w": "width", "h": "height", "d": "item_depth", "t": "item_depth"}
-    for number, label in _LABELED_DIMENSION_RE.findall(text):
-        parsed.setdefault(label_map[label.casefold()], _clean_dimension_number(number))
-    if parsed:
-        return parsed
-    match = _DIMENSION_CHAIN_RE.search(text)
-    if not match:
-        return parsed
-    numbers = [_clean_dimension_number(item) for item in re.findall(_DIMENSION_NUMBER, match.group(1))]
-    if len(numbers) < 3:
-        return parsed
-    if category_id == "artificial_tree":
-        height = max(numbers, key=lambda item: float(item))
-        remaining = list(numbers)
-        remaining.remove(height)
-        parsed.update({"height": height, "width": remaining[0], "item_depth": remaining[1] if len(remaining) > 1 else remaining[0]})
-        return {key: value for key, value in parsed.items() if value}
-    order = _unlabeled_dimension_order(category_id)
-    for alias, number in zip(order, numbers[:3]):
-        parsed[alias] = number
-    return {key: value for key, value in parsed.items() if value}
-
-
-def _unlabeled_dimension_order(category_id: str) -> tuple[str, str, str]:
-    category = str(category_id or "").strip()
-    if category == "bed_frame":
-        return ("length", "width", "height")
-    if category == "artificial_tree":
-        return ("height", "width", "item_depth")
-    if category in {"bathroom_cabinet", "medicine_cabinet"}:
-        return ("item_depth", "width", "height")
-    return ("width", "item_depth", "height")
+    return ""  # Missing lighting evidence is not proof of non-applicability.
 
 
 def _first(values: dict[str, Any], *keys: str) -> str:
@@ -143,16 +182,3 @@ def _first(values: dict[str, Any], *keys: str) -> str:
 def _clean_dimension_number(value: Any) -> str:
     text = str(value or "").strip()
     return text[:-2] if text.endswith(".0") else text
-
-
-def _infer_dimension_unit(value: Any) -> str:
-    text = normalize_text(value).casefold()
-    if re.search(r'\b(?:in|inch|inches)\b|["″”＂]', text):
-        return "Inches"
-    if re.search(r"\b(?:cm|centimeter|centimeters)\b", text):
-        return "Centimeters"
-    if re.search(r"\b(?:mm|millimeter|millimeters)\b", text):
-        return "Millimeters"
-    if re.search(r"\b(?:ft|feet|foot)\b", text):
-        return "Feet"
-    return ""

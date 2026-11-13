@@ -6,7 +6,17 @@ lifecycle: production_ready
 amazon_category: Furniture > Bedroom Furniture > Beds, Frames & Bases
 browse_node_id: "3734891"
 
+search_terms:
+  categories: [bed]
+  backend_synonyms: [bed base, bed foundation, mattress frame, bedroom furniture, bed support]
+  excluded_tokens: [dog, cat, pet, sofa, air, flower]
+  unsupported_tokens: []
+  identity_tokens: [twin, full, queen, king, california]
+  preserve_tokens: [bunk, loft]
+  excluded_all_tokens: []
+
 template:
+  allowed_item_type_hints: ["> Bed Frames (bed-frames)"]
   engine: template_field_plan
   path_env: AMAZON_BED_FRAME_TEMPLATE
   default_path: templates/BED_FRAME.xlsm
@@ -22,6 +32,7 @@ variation_dimensions:
 
 extractors:
   product_specific_fields:
+    height: [Height, Item Height, Product Height]
     style:
       - Style
       - Style Name
@@ -64,12 +75,6 @@ extractors:
   aliases:
     weight_capacity: max_weight
     weight_capacity_unit: max_weight_unit
-competitor_keywords:
-  - bed frame
-  - platform bed
-  - bed with headboard
-  - bunk bed
-  - loft bed
 
 category_match:
   require_positive_match: true
@@ -113,6 +118,17 @@ required_role_policy:
     func: 1
 
 image_generation:
+  statement_measurements:
+    height:
+      subject: product
+      axis: height
+      label: Declared frame height
+      source_fields: [Height, Item Height, Product Height]
+      tuple_fields: [Item Dimensions D x W x H, Item Dimensions L x W x H, Product Dimensions, Item Dimensions]
+  planning_guidance:
+    - "Use source-supported bed subtype and audience. A fixed side opening is not a hinged gate or permission to add a foot-end entrance; do not infer a child's age or Montessori use from color."
+    - "When visible, retain the whole bed's roof, chimney, caps and supports even when a function view discusses slats. Keep partial slat views partial; a whole-bed count does not fill cropped views."
+    - "Bind pine frame, plywood slats and material samples to their own source facts/views. Mattress size, recommended thickness, frame dimensions and per-bunk load are different properties."
   main_image_policy: product_first_lifestyle
   template_image_role_order: [main, scene, func, size]
   structure_invariants:
@@ -123,7 +139,31 @@ image_generation:
     - trundle, drawers, or shelves when present
   allowed_internal_props: []
   replaceable_staging:
-    - mattress, bedding, pillows, rugs, wall decor, toys, and loose room props not sold with the frame
+    - target_id: room.wall
+      physical_scope: Non-sold room wall surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: room.floor
+      physical_scope: Non-sold room floor or rug surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: bedding.mattress
+      physical_scope: A separate mattress not sold with the bed frame
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: bedding.textiles
+      physical_scope: Non-sold sheets, blankets, pillows and cushions
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: decor.loose_props
+      physical_scope: Independent non-sold wall decor, toys and loose room props
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
   forbidden_additions: []
   visual_context:
     primary_setting: contemporary US bedroom suited to the actual bed type

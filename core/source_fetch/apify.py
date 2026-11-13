@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import cache
 from pathlib import Path
 from typing import Any
 
-from ..io import load_env, read_json, safe_path_component, utc_now, write_json
+from ..io import file_sha256, load_env, read_json, safe_path_component, utc_now, write_json
 from ..price import normalize_price_value
 from ..job import load_job
-from ..paths import FACTORY_ROOT
+from ..paths import FACTORY_ROOT, resolve_job_owned_path
 from ..plugin import ProductPlugin
-from ..product_family import PRODUCT_FAMILY_POLICY_VERSION, whole_part_counts
+from ..product_family import PRODUCT_FAMILY_POLICY_VERSION, fact_key, whole_part_counts, read_product_family, identity_values_equal
 from ..schema import validate_data
 from ..text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding
-from .apify_client import ApifyClient
-from products.generic_extractors import explicit_item_counts, explicit_package_quantity, parse_pack_count
+from .apify_client import ApifyClient, returned_asin
+from products.generic_extractors import explicit_item_counts, explicit_package_quantity, theme_from_dimensions
 
 
 def env_any(values: dict[str, str], *names: str, required: bool = False, default: str = "") -> str:
@@ -40,53 +42,215 @@ def _apify_tokens_from_env(values: dict[str, str], *, required: bool = False) ->
     return []
 
 
+@cache
+def _interpretation_files():
+    return {name:file_sha256(FACTORY_ROOT/name) for name in (
+        'products/generic_extractors.py', 'core/plugin.py', 'core/product_family.py',
+        'core/text_evidence.py', 'core/price.py', 'core/source_fetch/apify.py')}
+
+
+def fetch_identity(job: dict[str, Any], plugin: ProductPlugin) -> dict[str, str]:
+    from ..status import input_revision_id
+    return {'seed_asin': str(job['seed_asin']).upper(), 'marketplace': str(job.get('marketplace') or 'US').upper(),
+            'category_id': plugin.category_id, 'extractor_sha256': input_revision_id(
+                {'mapping': plugin.load_extractors().contract, 'rules': _interpretation_files()})}
+
+
+def raw_source_directory(job_path: Path, marketplace: str) -> Path:
+    """Canonical source location; raw_dir metadata is not an executable path selector."""
+    market=str(marketplace or 'US').upper()
+    if not re.fullmatch('[A-Z]{2}',market):raise ValueError('Invalid raw-source marketplace')
+    return resolve_job_owned_path(job_path,Path('source/apify_raw')/market)
+
+
+class FamilySelectionExceeded(ValueError):
+    """Terminal selection result for this candidate; its seed response remains reusable."""
+
+
+def check_family_size(job: dict, member_count: int) -> None:
+    limit = job.get('max_family_members')
+    if limit is not None and member_count > limit:
+        raise FamilySelectionExceeded(f"{job['seed_asin']}: {member_count} confirmed family members exceed selection limit {limit}")
+
+
+def family_current(job_path: Path, plugin: ProductPlugin, *, include_metadata: bool = True, require_complete: bool = True) -> bool:
+    """One source-currentness contract for controller and fetch reuse; missing is not corrupt."""
+    if not (job_path / 'source/product_family_v3.json').is_file():
+        return False
+    family = read_product_family(job_path, allow_metadata_stale=True)
+    job = load_job(job_path)
+    identity = fetch_identity(job, plugin)
+    stored = family['source']['request_identity']
+    if any(stored[key] != identity[key] for key in ('seed_asin', 'marketplace', 'category_id')):
+        raise RuntimeError('Fetch source identity changed; explicit source reconciliation is required')
+    if stored['extractor_sha256'] != identity['extractor_sha256']:
+        return False
+    if family['category_id'] != plugin.category_id or require_complete and family['source']['child_fetch_errors']:
+        return False
+    raw_dir = raw_source_directory(job_path, identity['marketplace'])
+    expected = {family['source']['seed_asin'], *(c['asin'] for c in family['family']['children'])}
+    if set(family['source']['raw_sha256']) != expected:
+        return False
+    for asin, sha in family['source']['raw_sha256'].items():
+        path = raw_dir / f'{asin}.json'
+        if not path.is_file() or file_sha256(path) != sha or returned_asin(read_json(path)) != asin:
+            return False
+    check_family_size(job, family['source']['expected_child_count'])
+    return not include_metadata or all(family['family'][key] == job[key] for key in ('brand', 'sku_prefix'))
+
+
 def fetch_family(
     *,
     job_dir: str | Path,
     plugin: ProductPlugin,
     config_path: str = "",
     limit_children: int = 0,
+    work_children: tuple[str, ...] = (),
     refresh: bool = False,
+    revalidate: bool = False,
     deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     job_path = Path(job_dir)
     job = load_job(job_path)
+    if revalidate and refresh:
+        raise ValueError('Local source revalidation and remote refresh are different operations')
+    path = job_path / 'source/product_family_v3.json'
+    prior = read_json(path) if path.is_file() and not refresh else None
+    identity = fetch_identity(job, plugin)
+    saved = prior if prior and (revalidate or prior['source']['request_identity']['extractor_sha256'] != identity['extractor_sha256']) else None
+    if len(work_children)!=len(set(work_children)):raise ValueError('Source work selection must be unique')
+    if work_children and (limit_children or refresh or revalidate):
+        raise ValueError('A work selection cannot also refresh/revalidate or truncate source execution')
+    base=None
+    if (work_children or limit_children) and prior and saved is None:
+        if not family_current(job_path,plugin,include_metadata=False,require_complete=False):
+            raise ValueError('Existing source facts/provenance changed; revalidate before continuing a work unit')
+        base=read_product_family(job_path,allow_metadata_stale=True)
+        if work_children and set(work_children)<={row['asin'] for row in base['family']['children']}:
+            base['family'].update({key:job[key] for key in ('brand','sku_prefix')})
+            write_json(path,base);return base
+    raw_dir = raw_source_directory(job_path, identity['marketplace'])
+    if saved is not None:
+        # The saved family supplies provenance/inventory only; facts are rebuilt from original bytes.
+        if not isinstance(saved, dict):
+            raise ValueError('Saved source revalidation envelope is invalid; preserve the original family')
+        source = saved.get('source')
+        family = saved.get('family') if isinstance(saved, dict) else None
+        children = family.get('children') if isinstance(family, dict) else None
+        raw_hashes = source.get('raw_sha256') if isinstance(source, dict) else None
+        if (saved.get('protocol_version') != '3.0' or saved.get('category_id') != plugin.category_id
+                or not isinstance(source, dict) or source.get('type') != 'apify'
+                or not isinstance(family, dict) or not isinstance(children, list) or not children
+                or not isinstance(raw_hashes, dict)):
+            raise ValueError('Saved source revalidation envelope is incomplete; preserve the original family')
+        child_asins = [str(child.get('asin') or '').strip().upper()
+                       for child in children if isinstance(child, dict)]
+        errors=source.get('child_fetch_errors',[])
+        failed_asins=[str(row.get('asin') or '') for row in errors if isinstance(row,dict)] if isinstance(errors,list) else []
+        if (len(child_asins) != len(children) or len(set(child_asins)) != len(child_asins)
+                or not isinstance(errors,list) or len(failed_asins)!=len(errors) or len(set(failed_asins))!=len(failed_asins)
+                or set(failed_asins)&set(child_asins)
+                or any(not re.fullmatch(r'[A-Z0-9]{10}', asin) for asin in child_asins+failed_asins)
+                or source.get('expected_child_count') != len(children)+len(failed_asins)
+                or not isinstance(source.get('request_identity'), dict)):
+            raise ValueError('Saved source revalidation inventory is invalid; preserve the original family')
+        expected = {job['seed_asin'], *(c['asin'] for c in saved['family']['children'])}
+        # Explicit local revalidation applies the current extractor to the same
+        # verified source bytes; a mapping revision is its purpose, not a refetch.
+        if (any(saved['source']['request_identity'].get(key) != identity[key]
+                for key in ('seed_asin', 'marketplace', 'category_id'))
+                or saved['source']['seed_asin'] != job['seed_asin'] or saved['category_id'] != plugin.category_id
+                or saved['family']['marketplace'] != str(job.get('marketplace') or 'US').upper()
+                or set(raw_hashes) != expected
+                or any(not re.fullmatch(r'[0-9a-f]{64}', str(sha)) for sha in raw_hashes.values())):
+            raise ValueError('Saved source identity/inventory differs from the requested revalidation')
+        for asin, sha in raw_hashes.items():
+            if not (raw_dir / f'{asin}.json').is_file() or file_sha256(raw_dir / f'{asin}.json') != sha:
+                raise ValueError(f'Saved raw source bytes changed or are missing: {asin}')
+    elif not refresh and family_current(job_path, plugin, include_metadata=False):
+        family = read_product_family(job_path, allow_metadata_stale=True)
+        if any(family['family'][key] != job[key] for key in ('brand', 'sku_prefix')):
+            family['family'].update({key: job[key] for key in ('brand', 'sku_prefix')})
+            write_json(job_path / 'source/product_family_v3.json', family)
+        return family
     config = config_path or job.get("config_path") or _default_config_path()
     # Process-level secrets/config override file defaults; this matches the
     # production controller and prevents a stale local env from replacing a
     # deliberately injected runtime credential.
-    env = {**load_env(config), **os.environ}
-    client = ApifyClient(
+    env = {} if saved is not None else {**load_env(config), **os.environ}
+    client = None if saved is not None else ApifyClient(
         tokens=_apify_tokens_from_env(env, required=True),
         actor_id=env_any(env, "APIFY_ACTOR_ID", required=True),
         marketplace=job.get("marketplace") or env_any(env, "AMAZON_MARKETPLACE", default="US"),
         deadline_monotonic=deadline_monotonic,
+        receipt_root=job_path / 'source/apify_requests', refresh_received=refresh,
     )
     extractors = plugin.load_extractors()
-    seed_asin = job["seed_asin"]
-    raw_dir = job_path / "source" / "apify_raw"
+    seed_asin = str(job["seed_asin"]).strip().upper()
     raw_dir.mkdir(parents=True, exist_ok=True)
     seed_raw = _fetch_validated_raw(
         client, raw_dir, seed_asin, refresh, extractors=extractors, require_variations=True
     )
     variation = extractors.extract_variations(seed_raw, seed_asin)
+    # A lone secondary ID cannot enroll an unrelated listing. A child's own
+    # cached response can corroborate membership without another fetch.
+    unresolved = []
+    for asin in variation.get('unconfirmed_variant_asins', []):
+        if not re.fullmatch(r'[A-Z0-9]{10}', asin):
+            continue
+        path_to_raw = raw_dir / f'{safe_path_component(asin)}.json'
+        try:
+            child_raw = read_json(path_to_raw) if path_to_raw.is_file() else {}
+        except (OSError, ValueError):
+            unresolved.append(asin)
+            continue
+        if returned_asin(child_raw) != asin:
+            unresolved.append(asin)
+            continue
+        child_family = extractors.extract_variations(child_raw, asin)
+        if variation['parent_asin'] and child_family['parent_asin']:
+            if child_family['parent_asin'] != variation['parent_asin']:
+                continue
+        elif seed_asin not in {row['asin'] for row in child_family['variants']}:
+            unresolved.append(asin)
+            continue
+        variation['variants'].append(next((r for r in child_family['variants'] if r['asin'] == asin), {'asin':asin}))
+    variation['unconfirmed_variant_asins'] = unresolved
     variants = _dedupe_variants(
         variation.get("variants", []),
         seed_asin,
-        parent_asin=str(
-            seed_raw.get("parentAsin")
-            or seed_raw.get("parent_asin")
-            or seed_raw.get("parentASIN")
-            or ""
-        ),
+        parent_asin=variation['parent_asin'],
     )
-    if limit_children:
-        variants = variants[:limit_children]
+    check_family_size(job, len(variants))
+    if saved is not None:
+        frozen_child_order = [c['asin'] for c in saved['family']['children']]
+        frozen_children = set(frozen_child_order)
+        variants_by_asin = {str(v.get('asin') or ''): v for v in variants}
+        if not frozen_children.issubset(variants_by_asin):
+            raise ValueError('Saved raw data must revalidate the complete original child inventory')
+        variants = [variants_by_asin[a] for a in frozen_child_order] + [v for v in variants if v['asin'] not in frozen_children]
+    if len(work_children)!=len(set(work_children)) or set(work_children)-{v['asin'] for v in variants}:
+        raise ValueError('Source work selection must name unique confirmed target members')
+    preferred=sorted(variants,key=lambda row:row['asin']!=seed_asin) if limit_children else variants
+    selected=set(work_children) if work_children else {v['asin'] for v in (preferred[:limit_children] if limit_children else variants)}
+    if saved is not None:
+        # Existing failed/unknown requests retain their original receipts; newly proven members
+        # can use a locally available source, or remain deferred to their own work unit.
+        selected = frozen_children | {v['asin'] for v in variants if v['asin'] not in failed_asins
+                                      and (raw_dir / f"{v['asin']}.json").is_file()}
 
     v3_by_index: dict[int, dict[str, Any]] = {}
-    errors: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = list(saved['source']['child_fetch_errors']) if saved is not None else []
+    carried={row['asin']:row for row in (base or {}).get('family',{}).get('children',[])}
+    previous_errors={row['asin']:row for row in (base or {}).get('source',{}).get('child_fetch_errors',[])}
+    for index,variant in enumerate(variants):
+        asin=variant['asin']
+        if asin in selected or saved is not None and asin in failed_asins:continue
+        if asin in carried:v3_by_index[index]=carried[asin]
+        else:errors.append(previous_errors.get(asin,{'asin':asin,'status':'deferred','error':'Work-unit execution deferred; no child fetch requested'}))
 
-    def fetch_variant(index: int, variant: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    observed_parents = {variation['parent_asin']} if variation['parent_asin'] else set()
+    def fetch_variant(index: int, variant: dict[str, Any]) -> tuple[int, dict[str, Any], str]:
         asin = variant["asin"]
         if asin == seed_asin:
             raw = seed_raw
@@ -94,45 +258,33 @@ def fetch_family(
             raw = _fetch_validated_raw(
                 client, raw_dir, asin, refresh, extractors=extractors, require_variations=False
             )
+        child_variations = extractors.extract_variations(raw, asin)
+        if variation['parent_asin'] and child_variations['parent_asin'] and variation['parent_asin'] != child_variations['parent_asin']:
+            raise ValueError('Child source identifies a different variation parent')
         specs = extractors.extract_specs(raw)
         images = extractors.image_urls(raw)
         specific = extractors.product_specific(raw) if hasattr(extractors, "product_specific") else specs
         sold_unit_count, sold_unit_count_source, sold_unit_conflict = _source_sold_unit_count(raw, specs, specific)
         explicit_package_count = explicit_package_quantity(raw)
-        package_quantity = explicit_package_count or 1
+        package_quantity = explicit_package_count
         package_quantity_source = (
             "apify_explicit_package_quantity"
             if explicit_package_count is not None
-            else "amazon_single_package_policy"
+            else "apify_missing_package_quantity"
         )
         for facts in (specs, specific):
             facts.pop("number_of_items", None)
             facts.pop("item_package_quantity", None)
         variation_values = _variation_values(variant)
-        if not variation_values:
-            child_variations = extractors.extract_variations(raw, asin)
-            own = next(
-                (
-                    row for row in child_variations.get("variants") or []
-                    if isinstance(row, dict) and str(row.get("asin") or "") == asin
-                ),
-                {},
-            )
-            variation_values = _variation_values(own)
-        if not variation_values:
-            variation_values = {
-                str(dimension): _clean_variation_value(str(dimension), specs[str(dimension)])
-                for dimension in variation.get("dimensions") or []
-                if str(dimension) in specs and _clean_variation_value(str(dimension), specs[str(dimension)])
-            }
-        if not variation_values:
-            variation_values = _fallback_variation_values(specs, title=_source_title(raw))
+        own = next((row for row in child_variations.get("variants") or []
+                    if isinstance(row, dict) and str(row.get("asin") or "") == asin), {})
+        variation_values.update(_variation_values(own))
         variation_missing = not variation_values
         description = _source_description(raw)
         title = _source_title(raw)
         bullets = _source_bullets(raw)
         review_summary = _source_review_summary(raw)
-        offer = _source_offer(raw)
+        offer = _source_offer(raw, marketplace=str(job.get('marketplace') or 'US'))
         normalized_facts = _normalized_child_facts(
             variation_values=variation_values,
             specs=specs,
@@ -147,6 +299,8 @@ def fetch_family(
         if sold_unit_conflict:
             normalized_facts["sold_unit_count_status"] = "conflicted"
             normalized_facts["sold_unit_count_candidates"] = sold_unit_conflict
+        elif sold_unit_count_source in {'apify_invalid_pack_count','apify_missing_pack_count'}:
+            normalized_facts['sold_unit_count_status'] = 'unconfirmed'
         v3_child = (
             {
                 "asin": asin,
@@ -169,9 +323,9 @@ def fetch_family(
                 "status": "ok",
             }
         )
-        return index, v3_child
+        return index, v3_child, child_variations['parent_asin']
 
-    indexed_variants = list(enumerate(variants))
+    indexed_variants = [(index,variant) for index,variant in enumerate(variants) if variant['asin'] in selected]
     child_workers = _apify_child_workers(env, len(indexed_variants))
     if child_workers > 1:
         with ThreadPoolExecutor(max_workers=child_workers) as executor:
@@ -179,22 +333,46 @@ def fetch_family(
             for future in as_completed(futures):
                 variant = futures[future]
                 try:
-                    index, v3_child = future.result()
+                    index, v3_child, parent = future.result()
                     v3_by_index[index] = v3_child
+                    if parent: observed_parents.add(parent)
                 except Exception as exc:
                     errors.append({"asin": str(variant.get("asin") or ""), "error": f"{type(exc).__name__}: {exc}"})
     else:
         for index, variant in indexed_variants:
             try:
-                item_index, v3_child = fetch_variant(index, variant)
+                item_index, v3_child, parent = fetch_variant(index, variant)
                 v3_by_index[item_index] = v3_child
+                if parent: observed_parents.add(parent)
             except Exception as exc:
                 errors.append({"asin": str(variant.get("asin") or ""), "error": f"{type(exc).__name__}: {exc}"})
 
     v3_children = [v3_by_index[index] for index in sorted(v3_by_index)]
+    if saved is not None and not frozen_children.issubset(c['asin'] for c in v3_children):
+        raise ValueError('Original source revalidation did not rebuild every child; preserve the saved family')
     _reconcile_child_template_facts(v3_children)
+    if base and base['family']['parent_asin']:
+        observed_parents.add(base['family']['parent_asin'])
+    parent_asin = next(iter(observed_parents)) if len(observed_parents) == 1 else ''
+    if parent_asin in {v['asin'] for v in variants}:
+        parent_asin = ''
+    # A source package axis may use Amazon's NUMBER_OF_ITEMS only when every
+    # child independently confirms that exact sold-unit count. Keep original
+    # source values alongside the projection; package count alone proves nothing.
+    variation_mapping = {}
+    if 'item_package_quantity' in variation['dimensions'] and len(v3_children) == len(variants) and v3_children and all(
+        c.get('sold_unit_count_source') == 'apify_explicit_pack_count'
+        and not c.get('sold_unit_count_status')
+        and str(c['variation_values'].get('item_package_quantity')) == str(c['sold_unit_count'])
+        for c in v3_children
+    ):
+        for child in v3_children:
+            child['variation_values']['number_of_items'] = str(child['sold_unit_count'])
+        variation['dimensions'] = ['number_of_items' if k == 'item_package_quantity' else k for k in variation['dimensions']]
+        variation_mapping = {'item_package_quantity':'number_of_items'}
+    variation['variation_theme'] = theme_from_dimensions(variation['dimensions'])
 
-    fetched_at = utc_now()
+    fetched_at = saved['source']['fetched_at'] if saved is not None else utc_now()
     v3_family = {
         "protocol_version": "3.0",
         "product_type": plugin.product_type,
@@ -204,16 +382,20 @@ def fetch_family(
             "seed_asin": seed_asin,
             "fetched_at": fetched_at,
             "policy_version": PRODUCT_FAMILY_POLICY_VERSION,
-            "raw_dir": str(raw_dir),
-            "raw_dirs": {"apify": str(raw_dir)},
+            "request_identity": identity,
+            "variation_mapping": variation_mapping,
+            "raw_sha256": {asin: file_sha256(raw_dir / f'{asin}.json') for asin in {seed_asin, *(c['asin'] for c in v3_children)}},
+            "raw_dir": raw_dir.relative_to(job_path.resolve()).as_posix(),
+            "raw_dirs": {"apify": raw_dir.relative_to(job_path.resolve()).as_posix()},
             "child_fetch_errors": errors,
-            "expected_child_count": len(variants),
+            "expected_child_count": len({v['asin'] for v in variants} | set(failed_asins if saved is not None else [])),
         },
         "family": {
-            "parent_asin": variation["parent_asin"],
+            "parent_asin": parent_asin,
+            **({'unconfirmed_variant_asins':variation['unconfirmed_variant_asins']} if variation.get('unconfirmed_variant_asins') else {}),
             "brand": job["brand"],
             "sku_prefix": job["sku_prefix"],
-            "marketplace": job.get("marketplace", "US"),
+            "marketplace": str(job.get("marketplace") or "US").upper(),
             "variation_theme": variation["variation_theme"],
             "variation_dimensions": variation["dimensions"],
             "children": v3_children,
@@ -224,6 +406,9 @@ def fetch_family(
         raise RuntimeError("No child ASINs were fetched successfully; refusing to write an empty product family")
     validate_data(v3_family, "product_family.schema.json", label="product_family_v3")
     v3_path = job_path / "source" / "product_family_v3.json"
+    if saved is not None or base is not None:
+        from ..run_scope import reconcile_verified_inventory
+        reconcile_verified_inventory(job_path, saved or base, v3_family)
     write_json(v3_path, v3_family)
     _write_audit(job_path / "source" / "apify_audit.md", v3_family, errors)
     return v3_family
@@ -231,9 +416,12 @@ def fetch_family(
 
 def _source_sold_unit_count(
     raw: dict[str, Any], specs: dict[str, Any], specific: dict[str, Any]
-) -> tuple[int, str, list[int]]:
-    explicit = explicit_item_counts(raw)
-    invalid_explicit = False
+) -> tuple[int | None, str, list[int]]:
+    try:
+        explicit = explicit_item_counts(raw)
+        invalid_explicit = False
+    except ValueError:
+        explicit, invalid_explicit = set(), True
     for facts in (specs, specific):
         for field in ("number_of_items",):
             value = facts.get(field)
@@ -245,12 +433,12 @@ def _source_sold_unit_count(
                 continue
             explicit.add(int(text))
     if len(explicit) > 1:
-        return 1, "apify_conflicted_pack_count", sorted(explicit)
+        return None, "apify_conflicted_pack_count", sorted(explicit)
+    if invalid_explicit:
+        return None, "apify_invalid_pack_count", []
     if explicit:
         return explicit.pop(), "apify_explicit_pack_count", []
-    if invalid_explicit:
-        return 1, "apify_invalid_pack_count_default", []
-    return 1, "amazon_single_unit_listing_policy", []
+    return None, "apify_missing_pack_count", []
 
 
 def _reconcile_child_template_facts(children: list[dict[str, Any]]) -> None:
@@ -258,7 +446,6 @@ def _reconcile_child_template_facts(children: list[dict[str, Any]]) -> None:
     for child in children:
         if not isinstance(child, dict):
             continue
-        variation = child.setdefault("variation_values", {})
         normalized = child.setdefault("normalized_facts", {})
         normalized_variation = normalized.setdefault("variation", {})
         if not str(normalized.get("color") or "").strip():
@@ -266,7 +453,6 @@ def _reconcile_child_template_facts(children: list[dict[str, Any]]) -> None:
             if color:
                 normalized["color"] = color
                 normalized_variation.setdefault("color", color)
-                variation.setdefault("color", color)
 
 
 def _infer_color_from_child_source(child: dict[str, Any]) -> str:
@@ -284,7 +470,7 @@ def _explicit_fact_value(value: Any, keys: set[str]) -> Any:
     if not isinstance(value, dict):
         return ""
     for key, item in value.items():
-        normalized = _normal_variation_key(str(key))
+        normalized = fact_key(str(key))
         if normalized in keys and item not in (None, "", [], {}):
             return item
     for item in value.values():
@@ -320,7 +506,7 @@ def _dedupe_variants(
 
 
 def _fetch_validated_raw(
-    client: ApifyClient,
+    client: ApifyClient | None,
     raw_dir: Path,
     asin: str,
     refresh: bool,
@@ -335,6 +521,8 @@ def _fetch_validated_raw(
             cached, extractors=extractors, seed_asin=asin, require_variations=require_variations
         ):
             return cached
+    if client is None:
+        raise ValueError(f'Saved raw source is missing or incomplete for local revalidation: {asin}')
     raw = client.fetch_product(asin)
     issues = _raw_quality_issues(
         raw, extractors=extractors, seed_asin=asin, require_variations=require_variations
@@ -351,6 +539,8 @@ def _raw_quality_issues(
     issues: list[str] = []
     if not isinstance(raw, dict) or not raw:
         return ["empty raw data"]
+    if returned_asin(raw) != str(seed_asin).upper():
+        issues.append('returned ASIN is missing, ambiguous or differs from the requested product')
     if not _source_title(raw):
         issues.append("missing title")
     try:
@@ -394,45 +584,18 @@ def _variation_values(variant: dict[str, Any]) -> dict[str, Any]:
     for key, value in variant.items():
         if key == "asin" or value in (None, ""):
             continue
-        normalized = _normal_variation_key(str(key).replace("_name", ""))
+        normalized = fact_key(str(key))
         cleaned = _clean_variation_value(normalized, value)
         if cleaned:
             out[normalized] = cleaned
     return out
 
 
-def _fallback_variation_values(specs: dict[str, Any], *, title: str) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key in ("color", "colour", "size", "height", "dimensions", "style", "material"):
-        value = _spec_lookup(specs, key)
-        cleaned = _clean_variation_value(key, value)
-        if cleaned:
-            out[_normal_variation_key(key)] = cleaned
-    pack = parse_pack_count(title)
-    if pack:
-        out.setdefault("pack", pack)
-    return out
-
-
-def _spec_lookup(specs: dict[str, Any], wanted: str) -> Any:
-    target = _normal_variation_key(wanted)
-    for key, value in specs.items():
-        if _normal_variation_key(str(key)) == target and value not in (None, ""):
-            return value
-    return ""
-
-
-def _normal_variation_key(value: str) -> str:
-    key = re.sub(r"[^a-z0-9]+", "_", str(value).strip().casefold()).strip("_")
-    aliases = {"colour": "color", "colour_name": "color", "color_name": "color"}
-    return aliases.get(key, key)
-
-
 def _clean_variation_value(key: str, value: Any) -> str:
     text = _clean_source_text(value)
     if not text or _has_bad_encoding(text):
         return ""
-    normalized_key = _normal_variation_key(key)
+    normalized_key = fact_key(key)
     if normalized_key == "color" and (_looks_like_measurement_or_pack(text) or not _looks_like_color_value(text)):
         return ""
     return text[:80]
@@ -468,8 +631,8 @@ def _normalized_child_facts(
     specs: dict[str, Any],
     specific: dict[str, Any],
     offer: dict[str, str],
-    sold_unit_count: int,
-    package_quantity: int,
+    sold_unit_count: int | None,
+    package_quantity: int | None,
     title: str = "",
     bullets: list[Any] | None = None,
     description: str = "",
@@ -521,8 +684,8 @@ def _normalized_child_facts(
         "package": f"{package_quantity} count" if package_quantity else "",
         "list_price": str(offer.get("list_price") or ""),
         "currency": str(offer.get("currency") or ""),
-        "sold_unit_count": int(sold_unit_count),
-        "package_quantity": int(package_quantity),
+        "sold_unit_count": sold_unit_count,
+        "package_quantity": package_quantity,
         "spec_measurements": spec_measurements[:12],
         "spec_measurement_records": spec_measurement_records[:12],
         "resolved_facts": _resolve_structured_facts(
@@ -534,7 +697,7 @@ def _normalized_child_facts(
             variation=variation,
         ),
         "evidence": {
-            "variation": "apify_variation_or_specs",
+            "variation": "apify_variation_with_explicit_count_projection",
             "price": "apify_offer" if offer.get("list_price") else "",
             "measurements": "apify_specs",
         },
@@ -552,61 +715,60 @@ def _resolve_structured_facts(
         "number_of_doors": r"doors?",
         "number_of_shelves": r"shel(?:f|ves)",
     }
-    resolved: dict[str, Any] = {}
-    colors = [{'value': value, 'source': origin, 'field': 'color'}
-              for origin, container in (('variation', variation), ('spec', specs), ('specific', specific))
-              if (value := _first_clean(container, keys=('color', 'colour', 'color_name')))
-              and _looks_like_color_value(value) and not _looks_like_measurement_or_pack(value)]
-    if colors:
-        choices = {row['value'].casefold() for row in colors}
-        resolved['color'] = {'status': 'confirmed' if len(choices) == 1 else 'conflicted',
-                             'value': colors[0]['value'] if len(choices) == 1 else '',
-                             'candidates': list(dict.fromkeys(row['value'] for row in colors)), 'evidence': colors}
-    for fact_name, pattern in fact_patterns.items():
-        candidates: list[dict[str, Any]] = []
-        for container_name, container in (("variation", variation), ("spec", specs), ("specific", specific)):
-            if not isinstance(container, dict):
+    from products.generic_extractors import MATERIAL_OWNERS
+    from core.product_family import fact_key
+    observations: dict[str, list[dict[str, Any]]] = {}
+    for origin, container in (('variation', variation), ('spec', specs), ('specific', specific)):
+        rows = [dict(row) for row in container.get('source_fact_evidence', []) if isinstance(row, dict)]
+        covered = {row['key'] for row in rows}
+        for key, value in container.items():
+            key = fact_key(key)
+            if key in covered or value in (None, '', [], {}) or key.startswith('source_'):
                 continue
-            for key, value in container.items():
-                normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
-                if fact_name not in normalized_key and not (
-                    fact_name == "number_of_shelves" and "shelf" in normalized_key
-                ):
-                    continue
-                match = re.search(r"(?<!\d)(\d{1,2})(?!\d)", str(value or ""))
-                if match:
-                    candidates.append({"value": int(match.group(1)), "source": container_name, "field": str(key)})
-        text_values = sorted({int(value) for value in whole_part_counts(text, pattern)})
-        if text_values:
-            for value in text_values:
-                candidates.append({"value": value, "source": "listing_text", "field": "title_bullets_description"})
-        if not candidates:
-            continue
-        # Structured fields (variation/spec/specific) outweigh listing prose, and
-        # repeated prose mentions of the same value still count as one vote.
-        weights = {"variation": 2, "spec": 2, "specific": 2, "listing_text": 1}
-        counts: dict[int, int] = {}
-        for candidate in candidates:
-            source = str(candidate["source"])
-            counts[int(candidate["value"])] = counts.get(int(candidate["value"]), 0) + weights.get(source, 1)
-        best_count = max(counts.values())
-        leaders = sorted(value for value, count in counts.items() if count == best_count)
-        status = "confirmed" if len(leaders) == 1 and (best_count >= 2 or len(counts) == 1) else "conflicted"
-        best_value = leaders[0] if status == "confirmed" else ""
-        resolved[fact_name] = {
-            "value": best_value,
-            "status": status,
-            "candidates": sorted(counts),
-            "evidence": [item for item in candidates if best_value != "" and int(item["value"]) == best_value],
-        }
+            if key in MATERIAL_OWNERS or key in {'color', 'size', *fact_patterns}:
+                rows.append({'key': key, 'owner': MATERIAL_OWNERS.get(key, 'product'),
+                             'field': key, 'source': origin, 'value': clean_evidence_text(value)})
+        for row in rows:
+            key = row['key']
+            if key in fact_patterns:
+                match = re.fullmatch(r'([0-9]+)(?:\.0+)?', str(row['value']).strip())
+                if not match:
+                    raise ValueError(f'Invalid whole-product count in {row["field"]}')
+                row['value'] = int(match[1])
+            observations.setdefault(key, []).append(row)
+    for key, pattern in fact_patterns.items():
+        for value in sorted(set(whole_part_counts(text, pattern))):
+            observations.setdefault(key, []).append({'key': key, 'owner': 'product', 'value': int(value),
+                'source': 'listing_text', 'field': 'title_bullets_description'})
+    resolved = {}
+    for key, rows in observations.items():
+        rows = list({json.dumps(row, sort_keys=True): row for row in rows}.values())
+        choices = []
+        for row in rows:
+            value = row['value']
+            equal = identity_values_equal if key == 'size' else lambda a, b: str(a).casefold() == str(b).casefold()
+            if not any(equal(value, previous) for previous in choices):
+                choices.append(value)
+        scoped_conflict = any(row.get('scope_conflict') for row in rows)
+        confirmed = len(choices) == 1 and not scoped_conflict
+        value = choices[0] if confirmed else ''
+        nominal = [row['value'] for row in rows if key == 'size' and row.get('source') == 'title_nominal_size']
+        if nominal and len(set(nominal)) == 1:
+            confirmed, value = True, nominal[0]
+        resolved[key] = {'status': 'confirmed' if confirmed else 'conflicted', 'value': value,
+                         'candidates': choices, 'evidence': rows, 'owner': rows[0].get('owner', MATERIAL_OWNERS.get(key,'product'))}
+        if nominal:
+            resolved[key]['selection_basis'] = 'same_child_title_nominal_size; physical dimensions remain separate'
+    if any(key in MATERIAL_OWNERS for key in resolved) and 'material' not in resolved:
+        resolved['material'] = {'status': 'unconfirmed', 'value': '', 'candidates': [], 'evidence': [], 'owner': 'product'}
     return resolved
 
 
 def _first_clean(*sources: dict[str, Any], keys: tuple[str, ...]) -> str:
-    wanted = {_normal_variation_key(key) for key in keys}
+    wanted = {fact_key(key) for key in keys}
     for source in sources:
         for key, value in source.items():
-            if _normal_variation_key(str(key)) not in wanted:
+            if fact_key(str(key)) not in wanted:
                 continue
             text = clean_evidence_text(value)
             if text and not has_bad_encoding(text):
@@ -616,10 +778,10 @@ def _first_clean(*sources: dict[str, Any], keys: tuple[str, ...]) -> str:
 
 def _first_clean_by_key_priority(*sources: dict[str, Any], keys: tuple[str, ...]) -> str:
     for wanted in keys:
-        normalized_wanted = _normal_variation_key(wanted)
+        normalized_wanted = fact_key(wanted)
         for source in sources:
             for key, value in source.items():
-                if _normal_variation_key(str(key)) != normalized_wanted:
+                if fact_key(str(key)) != normalized_wanted:
                     continue
                 text = clean_evidence_text(value)
                 if text and not has_bad_encoding(text):
@@ -692,50 +854,32 @@ def _source_review_summary(raw: dict[str, Any]) -> str:
     return " ".join(snippets)
 
 
-def _source_offer(raw: dict[str, Any]) -> dict[str, str]:
-    price = _source_price(raw)
-    if not price:
+def _source_offer(raw: dict[str, Any], *, marketplace: str = '') -> dict[str, str]:
+    owner = returned_asin(raw)
+    if not owner:
         return {}
-    currency = _clean_source_text(
-        raw.get("currency")
-        or raw.get("priceCurrency")
-        or raw.get("currencyCode")
-        or _deep_first(raw, ("currency", "priceCurrency", "currencyCode"))
-    )
-    return {"list_price": price, "currency": currency or "USD", "source": "apify"}
-
-
-def _source_price(raw: dict[str, Any]) -> str:
-    for key in (
-        "salePrice",
-        "currentPrice",
-        "buyBoxPrice",
-        "price",
-        "priceValue",
-        "amount",
-        "listPrice",
-    ):
-        price = normalize_price_value(raw.get(key))
-        if price:
-            return price
-    return normalize_price_value(_deep_first(raw, ("salePrice", "currentPrice", "buyBoxPrice", "price", "priceValue", "amount", "listPrice")))
-
-
-def _deep_first(value: Any, keys: tuple[str, ...]) -> Any:
-    if isinstance(value, dict):
-        for key in keys:
-            if value.get(key) not in (None, "", [], {}):
-                return value.get(key)
-        for item in value.values():
-            found = _deep_first(item, keys)
-            if found not in (None, "", [], {}):
-                return found
-    if isinstance(value, list):
-        for item in value:
-            found = _deep_first(item, keys)
-            if found not in (None, "", [], {}):
-                return found
-    return None
+    offer = {}
+    for field in ('listPrice', 'salePrice', 'currentPrice', 'buyBoxPrice', 'price', 'priceValue', 'amount'):
+        kind = 'list_price' if field == 'listPrice' else 'current_price'
+        if kind in offer:
+            continue
+        value = raw.get(field)
+        if isinstance(value, dict) and value.get('asin') and returned_asin(value) != owner:
+            continue
+        price = normalize_price_value(value)
+        if not price:
+            continue
+        container = {**raw, **value} if isinstance(value, dict) else raw
+        currency_field = next((key for key in ('currency', 'priceCurrency', 'currencyCode') if container.get(key)), '')
+        currency = _clean_source_text(container.get(currency_field) or '').upper()
+        if not currency:
+            currency = {'US': 'USD', 'CA': 'CAD', 'MX': 'MXN', 'UK': 'GBP', 'DE': 'EUR', 'FR': 'EUR',
+                        'IT': 'EUR', 'ES': 'EUR', 'JP': 'JPY', 'AU': 'AUD'}.get(marketplace.upper(), '')
+            currency_field = 'request.marketplace' if currency else ''
+        prefix = '' if kind == 'list_price' else 'current_'
+        offer.update({kind:price, prefix+'price_field':field, prefix+'currency':currency,
+                      prefix+'currency_field':currency_field})
+    return {**offer, 'source':'apify', 'owner_asin':owner} if offer else {}
 
 
 def _clean_source_text(value: Any) -> str:

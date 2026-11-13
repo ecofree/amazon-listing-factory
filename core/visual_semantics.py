@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -10,14 +11,12 @@ from .io import file_sha256, parse_json_object_response, read_json, write_json
 from .status import input_revision_id
 from .product_family import effective_product_facts, fact_resolutions, fact_statement_issues
 from .vision_gemini_client import gemini_stream_generate, VisionRequestError
+from .service_response import perform_request, known_unsent, ServiceOutcomeUnknown
 from .text_evidence import extract_measurements, measurement_qualifiers
-from .image_task_inputs import shared_design_values
-from .image_reference_context import product_features, source_box, source_point, measurement_attachment, resolve_edit_references, reference_semantics
+from .image_reference_context import product_features, appearance_eligible, source_usability, source_box
 
 
-OBSERVATION_POLICY = "child-joint-observation-v36-identity-and-surfaces"
-CLAIM_REVIEW_POLICY = "planning-binding-review-v33-scoped-relations"
-CANDIDATE_OBSERVATION_POLICY = "blind-candidate-observation-v20-direct-edit"
+OBSERVATION_POLICY = "child-joint-observation-v44-physical-graphic-separation"
 TEXT_KINDS = {"product_label", "marketing", "measurement", "prop", "unknown"}
 MEMBERSHIPS = {"product", "included_accessory", "unknown"}
 
@@ -34,7 +33,7 @@ def _attempt_trace(path: Path, *, observer: Any = None) -> tuple[list[dict[str, 
         summary = {key: event.get(key) for key in (
             "request_id", "provider", "model", "protocol", "attempt", "status", "elapsed_ms",
             "finish_reasons", "usage", "max_output_tokens", "output_token_cap", "response_body_sha256", "physical_request_count",
-            "semantic_valid_rows", "semantic_failed_rows", "semantic_errors",
+            "semantic_valid_rows", "semantic_failed_rows", "semantic_errors", "transport",
         )}
         summary["error"] = str(event.get("error") or "")[:1200]
         summary["validation_errors"] = [str(row["validation_error"])[:1200]
@@ -42,10 +41,10 @@ def _attempt_trace(path: Path, *, observer: Any = None) -> tuple[list[dict[str, 
         response = str(event.get("response_text") or "")
         summary["response_char_count"] = len(response)
         for kind, content in (('request', event.get('request_text')), ('response', response), ('raw_response', event.get('response_body'))):
-            if content:
+            if content or kind == 'raw_response' and (event.get('transport') or {}).get('response_complete') is True:
                 target = path.with_name(f'{path.stem}.{trace_id}.{len(events) + 1}.{kind}.txt')
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(str(content), encoding='utf-8')
+                target.write_text(str(content or ''), encoding='utf-8', newline='')
                 summary[kind + '_path'] = target.name
         events.append(summary)
         write_json(path, events)
@@ -77,53 +76,265 @@ def source_fact_records(child: dict[str, Any]) -> dict[str, str]:
         facts.pop('sold_unit_count', None)
     visit(facts, 'product.specs')
     resolutions = fact_resolutions(child)
-    records = {key: value for key, value in records.items() if key.startswith('product.specs.') or not fact_statement_issues(value, resolutions)}
+    records = {key: value for key, value in records.items() if key.startswith('product.specs.') or not fact_statement_issues(value, resolutions, product_title=str(child.get('title') or ''))}
     for key, row in resolutions.items():
         records[f'product.fact_resolutions.{key}'] = json.dumps({"field": key, **row}, ensure_ascii=False, sort_keys=True)
     return records
 
 
+def fact_identity(records: dict[str, str]) -> dict:
+    """Compare factual meaning, retaining raw statements and provenance elsewhere.
+
+    A size alias is redundant only when it is a bare length already stated as
+    the product height AND in the title. Conflicts and non-length sizes remain.
+    """
+    def value(text, field):
+        text = ' '.join(str(text).split())
+        text = re.sub(r'^' + re.escape(field.replace('_', ' ')) + r'\s*:\s*', '', text, flags=re.I)
+        try:measures = extract_measurements(text)
+        except ValueError:return text  # malformed evidence keeps its exact identity
+        if len(measures) == 1 and text.casefold() == measures[0]['raw_text'].casefold():
+            return measures[0]['canonical_pair']
+        return text
+    from .product_family import physical_fact_field
+    result = {}
+    for path, text in records.items():
+        if path.startswith(('product.specs.', 'product.product_specific.')) and not physical_fact_field(path):
+            continue
+        field = path.rsplit('.', 1)[-1]
+        if path.startswith('product.fact_resolutions.'):
+            row = json.loads(text)
+            result[path] = {k: value(row[k], field) for k in ('status', 'value') if k in row}
+            if row.get('status') != 'confirmed':
+                result[path]['candidates'] = sorted(value(v, field) for v in row.get('candidates', []))
+        else:
+            result[path] = value(text, field)
+    size = result.get('product.specs.size')
+    decision = result.get('product.fact_resolutions.size', {})
+    heights = {result.get('product.specs.height')}
+    for path,text in records.items():
+        if path in {'product.specs.dimensions','product.specs.physical_dimensions','product.specs.product_dimensions'}:
+            for match in re.finditer(r'(\d+(?:\.\d+)?\s*(?:["\u2033]|in(?:ches)?|cm|ft))\s*H\b',text,re.I):
+                heights.add(value(match[1],'height'))
+    try:title_lengths = {m['canonical_pair'] for m in extract_measurements(records.get('product.title', ''))}
+    except ValueError:title_lengths=set()
+    if (isinstance(size, str) and size.startswith('length_mm:') and size in heights and size in title_lengths
+            and (not decision or decision.get('status') == 'confirmed' and decision.get('value') == size)):
+        result.pop('product.specs.size', None); result.pop('product.fact_resolutions.size', None)
+    return result
+
+
+def same_fact_meaning(left: dict[str, str], right: dict[str, str]) -> bool:
+    """Compare evidence meaning without changing any persisted fact/cache identity."""
+    def meaning(records):
+        result = fact_identity(records)
+        for path, decision in list(result.items()):
+            if not path.startswith('product.fact_resolutions.') or decision.get('status') != 'confirmed':
+                continue
+            field = path.removeprefix('product.fact_resolutions.')
+            value = result.get('product.specs.' + field)
+            if value is not None and str(value).casefold() == str(decision.get('value')).casefold():
+                del result[path]
+        return result
+    return meaning(left) == meaning(right)
+
+
+def recovery_facts_match(left, right, *, category_id='', referenced_fields=()):
+    """Check sealed evidence reuse, retaining changes to every consumed fact.
+
+    A category may declare additional unconsumed descriptors or lossless typed
+    field relocation. This is not cache identity or a rewritten authorization.
+    """
+    if same_fact_meaning(left, right):
+        return True
+    from .plugin import load_plugin
+    declaration=load_plugin(category_id).merged_config().get('recovery_fact_policy',{}) if category_id else {}
+    if not declaration:return False
+    a, b = fact_identity(left), fact_identity(right)
+    if any(a.get(key) != b.get(key) for key in referenced_fields):
+        return False
+    a, b = dict(left), dict(right)
+    descriptors=declaration.get('unconsumed_additions',[]);relocations=declaration.get('preserved_value_fields',[])
+    if (set(declaration)!={'unconsumed_additions','preserved_value_fields'} or not isinstance(descriptors,list)
+            or not isinstance(relocations,list) or set(relocations)-set(descriptors)
+            or any(not isinstance(k,str) or not re.fullmatch('[a-z][a-z0-9_]*',k) for k in descriptors)):
+        raise ValueError('Invalid category recovery fact declaration')
+    old, new = fact_identity(a), fact_identity(b)
+    type_values = {new.get('product.specs.' + field) for field in relocations}
+    for field in descriptors:
+        path = 'product.specs.' + field
+        resolution = 'product.fact_resolutions.' + field
+        decision = new.get(resolution, {})
+        if decision and decision.get('status') != 'confirmed':
+            return False
+        if path in referenced_fields or resolution in referenced_fields:
+            continue
+        # Existing counts/light colors cannot change. A type value may move to
+        # its other typed field only if the exact original value is preserved.
+        if path not in old or field in relocations and old[path] in type_values:
+            for records in (a, b):
+                records.pop(path, None)
+                records.pop(resolution, None)
+    return same_fact_meaning(a, b)
+
+
+def _observation_scope_material(job,request):
+    from .paths import resolve_job_owned_path
+    from .final_source_intents import read_final_source_intents
+    from .product_family import read_product_family
+    from .run_scope import read_run_scope
+    if (not isinstance(request,dict) or set(request)!={'child','cache','requests'}
+            or request['child'] not in read_run_scope(job)['selected_children']
+            or not isinstance(request['requests'],list) or not request['requests']):
+        raise ValueError('Explicit observation child/cache/request references required')
+    root=(job/'reports/source_observations').resolve()
+    def verified(ref):
+        if not isinstance(ref,dict) or set(ref)!={'path','sha256'}:raise ValueError('Observation evidence needs path/SHA')
+        path=resolve_job_owned_path(job,ref['path'])
+        if path.parent!=root or not path.is_file() or path.stat().st_size>16*1024*1024 or file_sha256(path)!=ref['sha256']:
+            raise ValueError('Observation scope evidence missing, outside owner or changed')
+        return path
+    cache=verified(request['cache']);prior=read_json(cache)
+    if (not re.fullmatch('[0-9a-f]{64}',cache.stem) or cache.suffix!='.json'
+            or prior.get('input_revision_id')!=cache.stem or prior.get('child') or prior.get('request_receipts')
+            or type(prior.get('request_attempts')) is not int or prior['request_attempts']<1
+            or not any(r.get('status')=='failed' for r in prior.get('sources',[]))):
+        raise ValueError('Select one original unbound observation with protected attempts')
+    paths=[verified(r) for r in request['requests']]
+    recorded={p.resolve() for p in root.glob(cache.stem+'.*.request.txt') if '.attempts.' not in p.name}
+    if len(paths)!=len(set(paths)) or set(paths)!=recorded or len(paths)!=prior['request_attempts']:
+        raise ValueError('Supply every original application request exactly once; preserve all attempts')
+    sources=read_final_source_intents(job,require_current=False);catalog={};locations={}
+    for row in sources:
+        source_id=f"source_{int(row['source_index']):02d}"
+        locations[(row['child'],source_id)]=resolve_job_owned_path(job,row['source_path'])
+        catalog.setdefault(row['child'],{})[source_id]=row['source_sha256']
+    children={c['asin']:source_fact_records(c) for c in read_product_family(job)['family']['children']}
+    matches=set(children);packets=[]
+    for path in paths:
+        text=path.read_text(encoding='utf-8-sig');marker='Input evidence, not response fields:\n'
+        if text.count(marker)!=1:raise ValueError('Original observation request has no unique input envelope')
+        data=json.loads(text.split(marker,1)[1]);attachments=data.get('attachments');facts=data.get('facts')
+        if (not isinstance(attachments,list) or not attachments or not isinstance(facts,dict)
+                or len({a['source_id'] for a in attachments})!=len(attachments)):
+            raise ValueError('Observation request attachment scope is ambiguous')
+        owners={child for child,refs in catalog.items() if all(refs.get(a['source_id'])==a['sha256'] for a in attachments)
+                and facts.get('product.title')==children.get(child,{}).get('product.title')}
+        matches &= owners
+        packets.append({'path':path.relative_to(job).as_posix(),'sha256':file_sha256(path),
+            'attachments':[{k:a[k] for k in ('source_id','sha256')} for a in attachments]})
+    if matches!={request['child']}:raise ValueError('Original requests do not identify exactly the selected child')
+    required={a['source_id']:a['sha256'] for packet in packets for a in packet['attachments']}
+    if any(file_sha256(locations[(request['child'],key)])!=sha for key,sha in required.items()):raise ValueError('Observation scope source bytes changed')
+    return {'child':request['child'],'cache_sha256':file_sha256(cache),'requests':packets,'historical_attempts':prior['request_attempts']}
+
+
+def _observation_scope_events(job):
+    path=job/'job.json';rows=read_json(path).get('observation_scope_decisions',[]) if path.is_file() else []
+    if not isinstance(rows,list) or len({r['decision_id'] for r in rows})!=len(rows):raise ValueError('Invalid observation scope decisions')
+    for row in rows:
+        if (row.get('schema')!='observation-scope-decision-v1'
+                or input_revision_id({'request':row['request'],'data':row['data'],'before_job_sha256':row['before_job_sha256']})!=row['proposal_sha256']
+                or input_revision_id({'request':row['request'],'proposal_sha256':row['proposal_sha256'],'reason':row['reason']})!=row['request_fingerprint']):
+            raise ValueError('Observation scope decision identity changed')
+    return rows
+
+
+def _bound_observation_owner(job,path):
+    from .paths import resolve_job_owned_path
+    events=[e for e in _observation_scope_events(job) if resolve_job_owned_path(job,e['request']['cache']['path'])==path.resolve()]
+    if not events:return None
+    event=events[-1];data=_observation_scope_material(job,event['request'])
+    if data!=event['data']:raise ValueError('Observation scope evidence changed; original protection remains')
+    return data['child']
+
+
+def reconcile_observation_scope(job_dir,request,*,apply=False,proposal_sha256='',decision_id='',reason=''):
+    """Bind original ownership only. Unknown outcomes and historical attempts stay protected."""
+    from .job import load_job
+    from .status import job_run_lock
+    job=Path(job_dir).resolve()
+    def prepare():
+        metadata=load_job(job);data=_observation_scope_material(job,request)
+        proof={'request':request,'data':data,'before_job_sha256':file_sha256(job/'job.json')}
+        return metadata,proof,input_revision_id(proof)
+    if not apply:
+        _,proof,digest=prepare()
+        return {'status':'preview','proposal_sha256':digest,'child':proof['data']['child'],
+            'historical_attempts_preserved':proof['data']['historical_attempts'],'requests_sent':0,'outcome_resolved':False}
+    if (not isinstance(decision_id,str) or not 1<=len(decision_id.strip())<=128
+            or not isinstance(reason,str) or not 1<=len(reason.strip())<=2000
+            or not isinstance(proposal_sha256,str) or not re.fullmatch('[0-9a-f]{64}',proposal_sha256)):
+        raise ValueError('Scope application needs preview SHA, decision and reason')
+    with job_run_lock(job):
+        fingerprint=input_revision_id({'request':request,'proposal_sha256':proposal_sha256,'reason':reason})
+        events=_observation_scope_events(job);prior=next((r for r in events if r['decision_id']==decision_id),None)
+        if prior:
+            if prior['request_fingerprint']!=fingerprint:raise ValueError('Observation scope decision ID reused')
+            return {'status':'already_applied','requests_sent':0,'currentness_not_reasserted':True}
+        metadata,proof,digest=prepare()
+        if digest!=proposal_sha256:raise ValueError('Observation scope proposal changed')
+        from .io import utc_now
+        event={**proof,'schema':'observation-scope-decision-v1','proposal_sha256':digest,'decision_id':decision_id,'reason':reason,'request_fingerprint':fingerprint,'at':utc_now()}
+        metadata['observation_scope_decisions']=[*events,event];write_json(job/'job.json',metadata)
+        return {'status':'applied','child':request['child'],'requests_sent':0,'outcome_resolved':False}
+
+
 def observe_child_sources(
     job: Path, child: dict[str, Any], sources: list[dict[str, Any]],
     *, deadline_monotonic: float | None = None, corrections: dict[str, dict[str, Any]] | None = None,
+    select_appearance: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Replace individual visual recovery with one child-scoped observation."""
-    deadline = min(deadline_monotonic or float('inf'), time.monotonic() + 100)
+    # One shared budget must allow both the full-gallery request and its repair.
+    deadline = min(deadline_monotonic if deadline_monotonic is not None else float('inf'), time.monotonic() + 240)
     facts = source_fact_records(child)
     source_ids = [str(row["source_id"]) for row in sources]
-    inputs = [{key: row[key] for key in ("source_id", "sha256", "ocr")} for row in sources]
-    revision = input_revision_id({"policy": OBSERVATION_POLICY, "child": child.get("asin"), "facts": facts, "inputs": inputs})
+    inputs = [{key: row[key] for key in ("source_id", "sha256", "ocr", "ocr_integrity") if key in row} for row in sources]
+    revision = input_revision_id({"policy": OBSERVATION_POLICY, "child": child.get("asin"), "facts": fact_identity(facts), "inputs": inputs,
+                                  'select_appearance':select_appearance})
     cache = job / "reports" / "source_observations" / f"{revision}.json"
     retained = []
     attempts_used: dict[str, int] = {}
+    request_attempts, appearance_id = 0, None
+    correction_allowances = {}
+    def selection_resolved(rows):
+        return not select_appearance or bool(appearance_id) or (bool(rows) and all(r.get('status')=='success' for r in rows.values())
+            and not any(appearance_eligible(r) for r in rows.values()))
     corrections = corrections or {}
     if cache.is_file():
         value = read_json(cache)
         if value.get("input_revision_id") == revision:
-            attempts_used = value.get('attempts_used', {})
+            attempts_used = value['attempts_used']
+            correction_allowances = value.get('correction_allowances', {})
+            request_attempts = value['request_attempts']
+            appearance_id = value['appearance_source_id']
             observed = _validate_observations(value["sources"], source_ids, facts)
             for row in value['sources']:
                 correction = corrections.get(row['source_id'])
                 revision_matches = not correction or row.get('correction_revision', '') == correction['revision']
-                applied = (bool(row.get('planning_correction')) and revision_matches
-                           and (not correction or row['planning_correction'] == correction.get('planning_correction')))
-                annotation_pending = bool(correction and observed[row['source_id']].get('text_gaps') and any(
-                    item.get('operation') == 'source_text:' + row['source_id']
-                    for item in (correction.get('planning_correction') or {}).get('findings', [])))
-                if (revision_matches and (not correction or not correction.get('planning_correction') or applied)
-                        and observed[row['source_id']]['status'] == 'success' and not observed[row['source_id']].get('measurement_issues')
-                        and not annotation_pending):
+                if (revision_matches and observed[row['source_id']]['status'] == 'success'
+                        and not observed[row['source_id']].get('measurement_issues')):
                     retained.append(row)
-            if len(retained) == len(sources):
+            if len(retained) == len(sources) and selection_resolved(observed):
                 return observed
+    # Earlier observation counters do not prove that a lost reply was unsent.
+    # No silent conversion of those caches into fresh paid request allowance.
+    for path in cache.parent.glob('*.json'):
+        if not re.fullmatch(r'[0-9a-f]{64}', path.stem):
+            continue
+        prior = read_json(path)
+        if prior.get('child') and prior['child'] != str(child.get('asin') or ''):
+            continue
+        if (not prior.get('request_receipts') and prior.get('request_attempts', 0) > 0
+                and any(row.get('status') == 'failed' for row in prior.get('sources', []))):
+            owner=_bound_observation_owner(job,path) if not prior.get('child') else prior['child']
+            if owner and owner!=str(child.get('asin') or ''):continue
+            raise ServiceOutcomeUnknown(f'Unbound prior observation requests require explicit reconciliation: {path}')
     retained_ids = {row["source_id"] for row in retained}
     requested = [row for row in sources if row["source_id"] not in retained_ids]
-    # Persist consumption before the bounded correction request, including interruption.
-    correction_rows = {row['source_id']: {'source_id': row['source_id'], 'status': 'failed',
-        'error': 'Planning observation correction is unresolved', 'correction_revision': corrections[row['source_id']]['revision'],
-        'planning_correction': corrections[row['source_id']]['planning_correction']}
-        for row in requested if corrections.get(row['source_id'], {}).get('planning_correction')}
     schema = {
+        'appearance_source_id': 'one observed whole-view source_id or null if unresolved',
         "sources": [{
             "source_id": "attachment source_id",
             "role_guess": "scene|func|size|reference_only|unknown",
@@ -132,10 +343,10 @@ def observe_child_sources(
             "visible_numbers_or_units": ["34.5 inches"],
             "evidence_gaps": ["specific unavailable product evidence, empty when unnecessary"],
             "text_gaps": [{"text": "unreadable necessary product annotation", "kind": "product_fact|measurement"}],
-            "reference_purposes": ["appearance", "feature", "measurement"],
+            "reference_purposes": ["feature", "measurement"],
             "product_extent": "whole_view|detail|none",
             "product_features": [{"feature_id": "stable physical feature identity", "object_id": "observed object_id",
-                "physical_facts": ["visible part with its owning region, connected part and operating state; visible geometry, finish and count"]}],
+                "physical_facts": ["current visible part and owning region; per-view contact/separation, occlusion, cropped extent, geometry, finish and count"]}],
             "confidence": 0.0,
             "evidence": ["Visible evidence explaining the selected primary image purpose, not merely a list of product features"],
             "variant_identity": {
@@ -150,15 +361,17 @@ def observe_child_sources(
                 {"measurement_id": "load_01", "text": "120 lbs", "object": "whole cabinet",
                  "axis": "capacity", "kind": "capacity", "evidence_type": "text_spec"}],
             "objects": [{
-                "object_id": "stable child-local identity across views",
+                "object_id": "one independent physical product instance, stable across its detail views",
                 "kind": "sold product or specific disputed included part, never ordinary staging",
                 "sale_membership": "product|included_accessory|unknown",
                 "membership_evidence": [{"fact_id": "product.*", "quote": "exact source statement"}],
                 "visibility": "visible|occluded|not_observed",
-                "state": "only this object's physical count, open/closed state, visible extent and occlusion; no decorative colors, style or descriptions of other objects",
+                "state": "this instance's parts, assembly, visible extent and necessary occlusion, gap or reflection boundaries; no scene inventory",
             }],
         }],
     }
+    if not select_appearance:
+        schema.pop('appearance_source_id')
     prompt = (
         "Observe the gallery returned for ONE child together; gallery ownership does not prove variant identity. "
         "Return exactly one JSON object with a top-level sources array. Do not wrap it in schema, result, data or observations. "
@@ -166,8 +379,9 @@ def observe_child_sources(
         "Locate a sufficient set of distinct product views: appearance for reliable product form/finish, "
         "feature for distinct functional evidence, measurement for real quantities and their objects. "
         "Select appearance inputs for child-wide design: prefer a reliable complete product photograph with little unrelated setting; "
-        "a size-page photo can serve this purpose, but a line drawing cannot prove finish. Select exactly one reliable whole-product appearance "
-        "reference when available; retain other views as feature or measurement evidence, not additional appearance inputs. A background is not "
+        "a size-page photo can serve this purpose, but a line drawing cannot prove finish. If selection_required is true, return appearance_source_id "
+        "or null when unresolved. Otherwise keep the read-only choice unchanged; annotation-only requests have no selection authority. "
+        "Source reference_purposes contains feature/measurement only, never appearance. A background is not "
         "a reason to reject otherwise reliable evidence when no cleaner view exists. Feature and measurement views remain available "
         "for editing and factual review, not as additional room-style inputs to planning. "
         "Choose role_guess from the image's primary communication purpose, independently of reference_purposes: "
@@ -175,21 +389,22 @@ def observe_child_sources(
         "when the image primarily presents that room/use context. Visible shelves or an open door alone do not make it func. "
         "func primarily explains a specific feature, mechanism or installation through a focused demonstration, detail or callout; "
         "it need not contain text, and a necessary room or wall does not make an installation detail scene. "
-        "size primarily communicates measured dimensions. In evidence, explain the visible emphasis supporting the chosen role; "
+        "size primarily answers dimensions or fit through measurements; numbers used to demonstrate storage, passage, operation or installation remain func. Measurements and text eligibility do not determine the role. In evidence, explain the visible emphasis supporting the chosen role; "
         "resolve any mismatch between that explanation and role_guess before returning the observation. "
         "Use reference_only solely for material with no product-image delivery purpose, not to hide uncertain identity or unreadable facts. "
-        "Do not describe source room styling, ordinary props, their text, colors, counts, locations or relationships. "
+        "Omit source room styling and ordinary prop inventories. In the owning objects.state, retain the product's visible assembly, mounting and support relationships, plus non-sold occlusions, gaps or reflections necessary to distinguish product material from editable content. A cloth on a cabinet or bedding behind rails is not product material; record this boundary without creating another object. "
         "Classify text by meaning: product_fact for mechanisms, parts, counts and functional claims "
         "(8 plywood slats, Embedded Design, No Box Spring Needed); marketing for generic praise "
         "(High-Quality); product_label for surface markings, not functional callouts. "
         "Quote complete facts with their subjects and qualifiers; leave illegible text unknown. "
-        "product_features records directly visible product structure and operating state, without coordinates or crop instructions. "
-        "product_extent is whole_view when a complete product is visible somewhere in the original, detail for partial products, none for no visible product. "
+        "product_features gives independently bindable mechanisms and demonstrations separate feature_id values under their owning product instance. Assembly/contact/rotation, shaping with hands and wiping with a cloth are distinct operations when visible; do not merge shaping and wiping into one maintenance feature. In physical_facts record each relevant view or step's current visible parts, separation/contact, occlusion and action, without coordinates or crop instructions. "
+        "Source headings, mode tables, icons, panel layouts and decorative colors are graphic content, not physical_facts. Record their words in text_observations; record visible hardware and necessary functional contact separately. Incidental people and family activities do not establish a required product state. Keep written next-action instructions in text_observations; insert/attach text or arrows do not prove an already connected or hidden physical structure. "
+        "product_extent is whole_view when a complete product is visible somewhere in the original, detail for partial products, none for no visible product. In each feature's physical_facts distinguish the assembled product, cropped component view and material sample, with their observed owner and physical relationships. Describe visible extent and crop edges without completing them from another view. Printed whole-product or package quantities belong to text_observations; do not impose them on visible parts in a cropped view, or describe a material sample as an assembled joint. "
         "reference_purposes selects original attachments, not output panels. "
         "Describe necessary visible relations as part, owning region and connection: a bar under the left compartment is not a full-width bottom bar. "
         "Record each door's covered region and adjacent permanently open storage; a closed sliding door does not close the entire cabinet. "
         "Distinguish a fixed access opening from a moving gate: marketing words such as Open Gate do not prove a leaf, hinge or motion. "
-        "For installation record the evidenced mounting face, fixing point and support medium; distinguish exposed uninstalled hardware from in-use support. "
+        "For installation record mounting faces, fixing points, passage, contact and rotation that are actually visible. Contact or a rotation arrow cannot establish a hidden thread, lock or fastening mechanism; keep that mechanism unknown and distinguish exposed uninstalled hardware from in-use support. "
         "Do not infer that a stake stands on hard flooring because its full shape is shown on a product canvas. "
         "Record only visible structure; never infer hidden or occluded parts from category expectations. "
         "Authoritative product.fact_resolutions override raw prose and OCR: conflicted facts cannot authorize claims; confirmed values override stale source statements. "
@@ -200,14 +415,16 @@ def observe_child_sources(
         "For unselected sources, retain delivery role and relevant product text. evidence_gaps and text_gaps describe necessary "
         "unavailable product information, not unreadable decor or incomplete room parsing. "
         "visible_numbers_or_units is also a list of strings, not measurement objects. "
-        "For adjustable parts, record which positions are mutually exclusive states of the same part, not simultaneous parts. "
+        "For adjustable parts, distinguish actual visible surfaces and supports from mutually exclusive alternative positions of the same part; a ghost position is a diagram, not an additional simultaneous physical part. "
         "Arrows, emphasis rings, alternative-position ghosts and inset borders cannot prove physical parts, material or mounting. "
-        "objects contains the sold product and necessary included parts or specific disputed accessories only. "
-        "Do not name, classify, number or record ordinary non-sold bedding, furniture, decor or their relationships. "
-        "Product state and physical_facts describe the sold object only. An occluded joint is unavailable product evidence, "
-        "not a reason to identify the object covering it. Visible drawer contents do not prove they are included. "
+        "objects contains independent physical main-product instances and necessary included or disputed accessories only. "
+        "Two cabinets or two trees in one scene have separate object_id values even when identical; never aggregate a pair under one ID. "
+        "A detail panel or alternate-state view of the same product reuses its object_id through product_features; it is not another sold instance. "
+        "Each physical_fact belongs to that instance's visible part or connection. Do not inventory non-sold staging; "
+        "an occluded joint is unavailable evidence, and visible props or hardware do not prove package inclusion. "
         "Not observed never means confirmed absent. Product/accessory sales membership requires "
-        "an exact citation to facts (fact_id is its product.* key, quote is text from that value); visual resemblance alone is insufficient. "
+        "an exact citation to facts (fact_id is its product.* key, quote is a short unchanged substring of that value, preferably product identity or sold quantity). "
+        "Never join separate statements, normalize whitespace or paraphrase the citation; visual resemblance alone is insufficient. "
         "Use unknown only for a concrete sales-membership dispute, never as an inventory of unclassified room props. "
         "Compare visible finish and structure to the resolved child identity, model/spec records and other views. "
         "Confirmed structured color overrides contradictory title color; it does not override visibly mismatching product pixels. "
@@ -225,41 +442,55 @@ def observe_child_sources(
         requested_ids = {row["source_id"] for row in requested}
         if any(not isinstance(row, dict) or row.get("source_id") not in requested_ids for row in value["sources"]):
             raise ValueError("Observation response changed the requested attachment scope")
-        checked = _validate_observations([*retained, *value["sources"]], source_ids, facts)
-        usable = [row for row in checked.values() if row['status'] == 'success'
-                  and row.get('variant_identity', {}).get('status') != 'contradiction']
-        appearance = [row for row in usable if 'appearance' in row['reference_purposes']]
-        if len(appearance) > 1 or any(row['product_extent'] != 'whole_view' for row in appearance):
-            raise ValueError('Select exactly one reliable whole-product appearance reference; keep other views as feature/measurement evidence')
-        if not appearance and any(row['product_extent'] == 'whole_view' and row['product_features'] for row in usable):
-            raise ValueError('Choose the one reliable whole-product appearance reference from the observed gallery')
+        if any('appearance' in row.get('reference_purposes', []) for row in value['sources']):
+            raise ValueError('Appearance is a gallery selection, not a per-source model field')
+        _validate_observations([*retained, *value['sources']], source_ids, facts)
         return True
 
+    # A SHA-bound reobserve decision grants two bounded correction calls inside
+    # the original order cap. Its revision is consumed once, never a counter reset.
+    def source_limit(source_id):
+        return max([4,*[grant['source_ceiling'] for grant in correction_allowances.values() if grant['source_id']==source_id]])
+    request_limit=max([4,request_attempts,*[grant['request_ceiling'] for grant in correction_allowances.values()]])
+    for source_id, correction in corrections.items():
+        if correction['revision'] not in correction_allowances:
+            request_limit+=2
+            correction_allowances[correction['revision']]={'source_id':source_id,'request_ceiling':request_limit,
+                'source_ceiling':max(source_limit(source_id),attempts_used.get(source_id,0))+2}
     trace = cache.with_name(cache.stem + '.' + uuid.uuid4().hex)
     cache.parent.mkdir(parents=True, exist_ok=True)
     result = observed if cache.is_file() and value.get('input_revision_id') == revision else _validate_observations(retained, source_ids, facts)
     for row in requested:
-        if result[row['source_id']]['status'] == 'success' and (not result[row['source_id']].get('measurement_issues') or row['source_id'] in correction_rows):
-            result[row['source_id']] = correction_rows.get(row['source_id'], {
-                'source_id': row['source_id'], 'status': 'failed', 'error': 'Requested product observation revision is unresolved'})
-    # Spend the existing two-request budget on unresolved rows, never successful attachments.
+        if result[row['source_id']]['status'] == 'success' and not result[row['source_id']].get('measurement_issues'):
+            result[row['source_id']] = {'source_id': row['source_id'], 'status': 'failed',
+                'error': 'Requested product observation revision is unresolved'}
+    def persist_observation():
+        write_json(cache, {'input_revision_id':revision,'policy':OBSERVATION_POLICY,
+            'request_receipts':'service-response-v1','child':str(child.get('asin') or ''),
+            'request_attempts':request_attempts,'attempts_used':attempts_used,'appearance_source_id':appearance_id,
+            'correction_allowances':correction_allowances,
+            'appearance_status':'not_requested' if not select_appearance else 'selected' if appearance_id
+                else 'not_available' if selection_resolved(result) else 'budget_exhausted' if request_attempts>=request_limit else 'unresolved',
+            'sources':list(result.values())})
+
+    persist_observation()
+    # At most two calls per invocation, retaining every earlier consumed attempt.
     for attempt in range(2):
         for row in requested:
-            if attempts_used.get(row['source_id'], 0) >= 4 and result[row['source_id']]['status'] != 'success':
+            if attempts_used.get(row['source_id'], 0) >= source_limit(row['source_id']) and result[row['source_id']]['status'] != 'success':
                 result[row['source_id']]['error'] = 'Source observation request budget exhausted for this input revision; no request sent'
-        requested = [row for row in requested if attempts_used.get(row['source_id'], 0) < 4]
-        if not requested or time.monotonic() >= deadline:
+        requested = [row for row in requested if attempts_used.get(row['source_id'], 0) < source_limit(row['source_id'])]
+        if (not requested and selection_resolved(result)) or request_attempts >= request_limit or time.monotonic() >= deadline:
             break
         initial_counts = dict(attempts_used)
-        unresolved = [correction_rows.get(row['source_id'], result[row['source_id']]) for row in sources
-                      if row['source_id'] not in {r['source_id'] for r in retained}]
-
+        request_start = request_attempts
         def settle(event: dict[str, Any]) -> None:
+            nonlocal request_attempts
             if event.get('event') == 'request_budget':
+                request_attempts = request_start + event['physical_request_count']
                 for row in requested:
                     attempts_used[row['source_id']] = initial_counts.get(row['source_id'], 0) + event['physical_request_count']
-                write_json(cache, {'input_revision_id': revision, 'policy': OBSERVATION_POLICY,
-                    'attempts_used': attempts_used, 'sources': [*retained, *unresolved]})
+                persist_observation()
             elif event.get('status') == 'success' and event.get('response_text'):
                 checked = _validate_observations(parse_json_object_response(event['response_text'])['sources'],
                                                 [row['source_id'] for row in requested], facts)
@@ -269,39 +500,89 @@ def observe_child_sources(
 
         _events, record = _attempt_trace(trace.with_name(trace.name + '.attempts.json'), observer=settle)
         request_scope = [row['source_id'] for row in requested]
-        images = [Path(row['path']) for row in requested]
+        visual_inputs = sources if select_appearance and not appearance_id else requested
+        images = [Path(row['path']) for row in visual_inputs]
         limits = list({(item.get('provider'), item.get('model'), item.get('max_output_tokens')): item
             for row in requested for failure in [result[row['source_id']].get('request_failure', {})]
             if failure.get('request_scope') == request_scope for item in failure.get('output_limits', [])}.values())
         request = prompt + "\nInput evidence, not response fields:\n" + json.dumps({
             "facts": facts,
-            "attachments": [{k: row[k] for k in ('source_id', 'sha256', 'ocr')} for row in requested],
+            "attachments": [{k: row[k] for k in ('source_id', 'sha256', 'ocr', 'ocr_integrity') if k in row} for row in requested],
+            'ocr_instruction': 'OCR text is positive observed evidence only. Partial, unknown or summary-truncated OCR cannot establish absent text or complete dimensions; inspect the corresponding source image for unresolved annotations.',
+            'image_attachments': [{k:row[k] for k in ('source_id','sha256')} for row in visual_inputs],
+            'appearance_selection': appearance_id,
+            'selection_required': select_appearance and not appearance_id,
+            'selection_instruction': 'Return source rows only for attachments; if empty return sources:[] and select appearance from the read-only gallery.',
             "already_observed_read_only": [{key: row.get(key) for key in ('source_id', 'objects', 'reference_purposes', 'product_extent')} for row in retained],
-            "repair_findings": {row['source_id']: result[row['source_id']].get('error') or result[row['source_id']].get('measurement_issues') for row in requested},
+            "repair_findings": {row['source_id']:(result[row['source_id']].get('measurement_issues') or
+                result[row['source_id']].get('error') if (result[row['source_id']].get('request_failure',{}).get('kind') in
+                    {'validation_failure','json_syntax','output_limit'} or result[row['source_id']].get('measurement_issues')) else None)
+                for row in requested},
             'correction_requests': {row['source_id']: corrections[row['source_id']]['reason'] for row in requested if row['source_id'] in corrections},
         }, ensure_ascii=False)
         trace.with_name(trace.name + f".{attempt + 1}.request.txt").write_text(request, encoding="utf-8")
+        hold_request = False
+        output_limit=min(32768, max(8192, 2400 * len(requested),
+            max((int(row.get('max_output_tokens') or 0) * 2 for row in limits), default=0)))
+        request_identity={'operation':'source_observation','revision':revision,'prompt':request,
+            'images':[{k:row[k] for k in ('source_id','sha256')} for row in visual_inputs],
+            'output_limit':output_limit}
+        owners=[f"observation:{child.get('asin')}:{row['source_id']}" for row in visual_inputs]
+        def send():
+            event_start=len(_events)
+            try:
+                text=gemini_stream_generate(request, images, client_scope='visual_planning', attempts=1,
+                    max_physical_requests=1, deadline_monotonic=deadline, max_output_tokens=output_limit,
+                    prior_output_limits=limits, response_validator=validate,
+                    request_id='source-observation:'+uuid.uuid4().hex, attempt_observer=record)
+                packet={'text':text}
+            except VisionRequestError as exc:
+                received=_events[event_start:]
+                last=received[-1] if received else {}
+                rejected=(last.get('transport') or {}).get('response_complete') is True and (last.get('transport') or {}).get('request_outcome')=='rejected'
+                if not rejected and last.get('status') not in {'validation_failure','json_syntax','output_limit'}:
+                    raise
+                # A fully returned but invalid reply is a known result; do not buy
+                # it again if parsing or local observation persistence is interrupted.
+                packet={'error':str(exc),'kind':exc.failure_kind,'metadata':exc.metadata}
+            return json.dumps(packet,ensure_ascii=False).encode('utf-8')
+        def unsent(exc):
+            return known_unsent(exc) or getattr(exc,'metadata',{}).get('physical_request_count') == 0
         try:
-            response = gemini_stream_generate(
-                request, images, client_scope="visual_planning",
-                attempts=1, timeout_seconds=60, total_timeout_seconds=100,
-                max_physical_requests=1, deadline_monotonic=deadline,
-                max_output_tokens=min(32768, max(8192, 2400 * len(requested),
-                    max((int(row.get('max_output_tokens') or 0) * 2 for row in limits), default=0))),
-                prior_output_limits=limits,
-                response_validator=validate, request_id=f"source-observation:{revision}:{attempt + 1}", attempt_observer=record,
-            )
-            validate(response)
-            raw = [*retained, *({**{key: value for key, value in row.items() if key not in {'correction_revision', 'planning_correction'}},
-                                'correction_revision': corrections.get(row['source_id'], {}).get('revision', ''),
-                                **({'planning_correction': corrections[row['source_id']]['planning_correction']}
-                                   if corrections.get(row['source_id'], {}).get('planning_correction') else {})}
+            packet=json.loads(perform_request(cache.parent/'requests',owners,request_identity,send,
+                                              known_not_executed=unsent))
+            if 'error' in packet:
+                raise VisionRequestError('visual_planning',packet['kind'],packet['error'],metadata=packet['metadata'])
+            response=packet['text']
+            try:validate(response)
+            except ValueError as exc:
+                raise VisionRequestError('visual_planning','validation_failure',str(exc),metadata={}) from exc
+            raw = [*retained, *({**{key: value for key, value in row.items() if key != 'correction_revision'},
+                                'correction_revision': corrections.get(row['source_id'], {}).get('revision', '')}
                                for row in parse_json_object_response(response)['sources'])]
             checked = _validate_observations(raw, source_ids, facts)
             result = {key: result[key] if value['status'] == 'failed' and result[key].get('measurement_issues') else value
                       for key, value in checked.items()}
+            for key, value in result.items():
+                if key in request_scope and value['status']=='failed':
+                    value['request_failure']={'kind':'validation_failure','request_scope':request_scope,'output_limits':[]}
+            choice = parse_json_object_response(response).get('appearance_source_id')
+            candidate = result.get(choice, {}) if isinstance(choice, str) else {}
+            if appearance_id and (result.get(appearance_id, {}).get('status') != 'success'
+                    or result[appearance_id].get('product_extent') != 'whole_view'
+                    or result[appearance_id].get('variant_identity',{}).get('status') == 'contradiction'):
+                appearance_id = None
+            if select_appearance and not appearance_id and appearance_eligible(candidate):
+                appearance_id = choice
+            for identity, observation in result.items():
+                if observation.get('status') == 'success':
+                    observation['reference_purposes'] = [p for p in observation['reference_purposes'] if p != 'appearance']
+                    if identity == appearance_id:observation['reference_purposes'].insert(0,'appearance')
             retained = [row for row in result.values() if row['status'] == 'success' and not row.get('measurement_issues')]
         except Exception as exc:
+            hold_request = isinstance(exc, ServiceOutcomeUnknown) or (
+                isinstance(exc, VisionRequestError) and exc.failure_kind in
+                {'configuration_failure','auth_failure','model_not_found','request_failure'})
             failure = ({'kind': exc.failure_kind, 'request_scope': request_scope,
                         'output_limits': [*limits, *exc.metadata.get('output_limits', [])]}
                        if isinstance(exc, VisionRequestError) else {})
@@ -309,12 +590,11 @@ def observe_child_sources(
                 if not result[row['source_id']].get('measurement_issues'):
                     result[row['source_id']] = {'source_id': row['source_id'], 'status': 'failed',
                         'error': f'{type(exc).__name__}: {exc}'[:1200], 'request_failure': failure}
-        for source_id, correction_row in correction_rows.items():
-            result[source_id] = {**correction_row, **result[source_id]}
         requested = [row for row in sources if row['source_id'] not in retained_ids and (
             result[row['source_id']]['status'] != 'success' or result[row['source_id']].get('measurement_issues'))]
-        write_json(cache, {"input_revision_id": revision, "policy": OBSERVATION_POLICY, "attempts_used": attempts_used, "sources": [
-            *retained, *(result[row['source_id']] for row in requested)]})
+        persist_observation()
+        if hold_request:
+            break
     for source_id, correction in corrections.items():
         result[source_id]['correction_revision'] = correction['revision']
     return result
@@ -332,7 +612,7 @@ def _validate_observations(
     for row in rows:
         key = row["source_id"]
         if row.get('status') == 'failed' and isinstance(row.get('error'), str) and row['error']:
-            result[key] = {k: row[k] for k in ('source_id', 'status', 'error', 'correction_revision', 'planning_correction', 'request_failure') if k in row}
+            result[key] = {k: row[k] for k in ('source_id', 'status', 'error', 'correction_revision', 'request_failure') if k in row}
             continue
         try:
             result.update(_validate_observation_rows([row], [key], facts))
@@ -365,7 +645,9 @@ def _validate_observation_rows(
         if not isinstance(identity.get("observed_color"), str) or not isinstance(identity.get("reason"), str) or not identity["reason"].strip():
             raise ValueError("variant identity needs observed color and an evidence explanation")
         conflicts = identity.get("conflicts")
-        if not isinstance(conflicts, list) or bool(conflicts) != (identity["status"] == "contradiction"):
+        if not isinstance(conflicts, list):
+            raise ValueError("variant_identity.conflicts must be an explicit list; use [] for consistent or unknown")
+        if bool(conflicts) != (identity["status"] == "contradiction"):
             raise ValueError("variant identity verdict contradicts its conflict inventory")
         for conflict in conflicts:
             if not isinstance(conflict, dict) or not isinstance(conflict.get("fact_id"), str) or conflict["fact_id"] not in facts or not isinstance(conflict.get("observed"), str) or not conflict["observed"].strip():
@@ -380,7 +662,7 @@ def _validate_observation_rows(
         allowed = {'source_id', 'role_guess', 'has_dimension_lines', 'has_callouts_or_panels',
                    'visible_numbers_or_units', 'evidence_gaps', 'text_gaps', 'reference_purposes', 'product_features', 'product_extent',
                    'confidence', 'evidence', 'variant_identity', 'text_observations', 'measurements', 'objects',
-                   'status', 'policy_version', 'child_facts_revision_id', 'correction_revision', 'planning_correction', 'measurement_issues'}
+                   'status', 'policy_version', 'child_facts_revision_id', 'correction_revision', 'measurement_issues'}
         if set(row) - allowed:
             errors.append('Unknown product observation fields: ' + ', '.join(sorted(set(row) - allowed)))
         if row['role_guess'] == 'reference_only' and (row.get('text_gaps') or row.get('measurements')
@@ -432,6 +714,9 @@ def _validate_observation_rows(
                 raise ValueError("sales membership requires product evidence; otherwise use unknown")
         if any(item['object_id'] not in seen_objects for item in features):
             raise ValueError("Product evidence refers to an unobserved object")
+        usability = source_usability({**row, 'status':'success'})
+        if row['product_extent'] in {'whole_view','detail'} and usability['status'] != 'ready':
+            raise ValueError('Source evidence incomplete: ' + usability['code'] + '; register the visible product objects, not another role or invented fact')
         result[key] = {**row, 'measurements': measurements, 'measurement_issues': measurement_issues,
                        "status": "success", "policy_version": OBSERVATION_POLICY,
                        "child_facts_revision_id": input_revision_id(facts)}
@@ -480,486 +765,3 @@ def re_has_object_name(text: str) -> bool:
     for value in extract_measurements(text):
         text = text.replace(value['raw_text'], '')
     return bool(re.search(r'[A-Za-z]{2,}', text))
-
-
-def claim_key(text: str, evidence: dict[str, str]) -> str:
-    return input_revision_id({"policy": CLAIM_REVIEW_POLICY, "text": text, "evidence": evidence})
-
-
-def factual_shared_finding(request: dict, finding: dict) -> bool:
-    """Shared design may be corrected for cited product facts, never taste."""
-    if not str(finding.get('operation', '')).startswith('shared_design:') or finding.get('status') == 'supported':
-        return True
-    facts = {item['evidence_id'] for item in request.get('required_facts', {}).get('product_claims', [])}
-    facts.update('physical:' + item['source_id'] + ':' + feature['feature_id'] + ':' + str(i)
-        for item in request.get('selected_evidence', []) for feature in item['features']
-        for i, _ in enumerate(feature['physical_facts']))
-    ids = finding.get('fact_ids')
-    return isinstance(ids, list) and bool(ids) and all(isinstance(key, str) and key in facts for key in ids)
-
-
-def _planning_review_rows(rows: Any, requests: list[dict[str, Any]]) -> tuple[dict[str, dict], dict[str, str]]:
-    if not isinstance(rows, list):
-        raise ValueError('Planning review needs a top-level reviews list')
-    expected = {row['key']: row for row in requests}
-    result, errors, seen = {}, {}, set()
-    for index, row in enumerate(rows):
-        key = row.get('key') if isinstance(row, dict) else None
-        if not isinstance(key, str) or key not in expected:
-            errors[f'row:{index}'] = 'Unbound review identity'
-            continue
-        if key in seen:
-            result.pop(key, None)
-            errors[key] = 'Repeated review identity'
-            continue
-        seen.add(key)
-        request = expected[key]
-        try:
-            if row.get('status') not in ('supported', 'contradiction', 'inconclusive') or not isinstance(row.get('reason'), str) or not row['reason'].strip():
-                raise ValueError('Review needs a verdict and explanation')
-            findings = row.get('findings', [] if request['kind'] == 'product_claim' and not request.get('physical_operations') else None)
-            if not isinstance(findings, list) or (not findings and request.get('physical_operations')):
-                raise ValueError('Review needs typed findings for required operations')
-            operations, checked_findings, broken_operations = set(), {}, set()
-            for finding in findings:
-                if (not isinstance(finding, dict) or not {'operation', 'status', 'reason'} <= set(finding)
-                        or set(finding) - {'operation', 'status', 'reason', 'resolution', 'fact_ids'}
-                        or not isinstance(finding.get('operation'), str)
-                        or finding.get('status') not in ('supported', 'contradiction', 'inconclusive')
-                        or not isinstance(finding.get('reason'), str) or not finding['reason'].strip()
-                        ):
-                    errors[key] = 'Malformed typed review finding'
-                    continue
-                operation = finding['operation']
-                if operation in operations:
-                    checked_findings.pop(operation, None)
-                    broken_operations.add(operation)
-                    errors[key] = 'Repeated typed review finding'
-                    continue
-                operations.add(operation)
-                if operation.startswith('source_product:') and operation.split(':', 1)[1] not in {
-                        item['source_id'] for item in request.get('selected_evidence', [])}:
-                    errors[key] = 'Source correction must cite a selected source/view'
-                    continue
-                if operation.startswith('shared_design:') and operation.split(':', 1)[1] not in shared_design_values(request.get('shared_design', {})):
-                    errors[key] = 'Shared correction must name an existing leaf path, not a container'
-                    continue
-                if not factual_shared_finding(request, finding):
-                    continue
-                if request['kind'] == 'design_binding' and not operation.startswith(('source_product:', 'shared_design:')) and operation not in request['physical_operations']:
-                    errors[key] = 'Unknown planning operation'
-                    continue
-                if operation not in broken_operations:
-                    checked_findings[operation] = finding
-            if request['kind'] == 'design_binding':
-                missing = set(request.get('physical_operations', [])) - checked_findings.keys()
-                if missing and not any(item['status'] == 'contradiction' for item in checked_findings.values()):
-                    errors[key] = 'Review omitted required operations: ' + ', '.join(sorted(missing))
-                if key in errors:
-                    raise ValueError(errors[key])
-                statuses = {item['status'] for item in checked_findings.values()}
-                status = 'contradiction' if 'contradiction' in statuses else 'inconclusive' if 'inconclusive' in statuses else 'supported'
-                result[key] = {**row, 'status': status, 'findings': list(checked_findings.values())}
-            else:
-                if key in errors:
-                    raise ValueError(errors[key])
-                result[key] = {**row, 'findings': list(checked_findings.values())}
-        except ValueError as exc:
-            errors[key] = str(exc)
-    for key in expected.keys() - result.keys() - errors.keys():
-        errors[key] = 'Review omitted this binding'
-    return result, errors
-
-
-def review_planning_bindings(
-    claims: list[dict[str, Any]], *, trace_dir: Path,
-    source_manifest: list[dict[str, Any]] = (), source_paths: list[Path] = (),
-    job: Path, child: str, design_references: list[dict[str, Any]] = (),
-    deadline_monotonic: float | None = None,
-    attempt_observer: Any = None,
-    prior_output_limits: list[dict[str, Any]] | None = None,
-    protocol_errors: dict[str, str] | None = None,
-) -> dict[str, dict[str, Any]]:
-    """One existing planning review request for facts and explicit design bindings, not aesthetics."""
-    if not claims:
-        return {}
-    needed_sources = {key for row in claims for key in [row.get('source_id'), *row.get('evidence_sources', [])]}
-    needed_sources.update(item['source_id'] for row in claims for item in row.get('selected_evidence', []))
-    needed_sources.update(key.split(':')[1] for row in claims for key in row.get('evidence', {}) if key.startswith('physical:'))
-    images: list[Path] = []
-    attachment_numbers: dict[str, int] = {}
-    from .paths import resolve_job_owned_path
-    source_views, execution_inputs, execution_catalog = [], [], {}
-    for request in claims:
-        if request['kind'] != 'design_binding':
-            continue
-        direction = request['role_design']
-        refs = resolve_edit_references({'role': direction['role'], 'image_direction': direction},
-                                      list(source_manifest), job=job, child=child, design_references=design_references)
-        inputs = []
-        for index, ref in enumerate(refs, 1):
-            path = resolve_job_owned_path(job, ref['path'])
-            if ref['sha256'] not in attachment_numbers:
-                images.append(path)
-                attachment_numbers[ref['sha256']] = len(images)
-            semantics = {**reference_semantics(ref), 'review_attachment': attachment_numbers[ref['sha256']]}
-            reference_id = input_revision_id(semantics)[:20]
-            execution_catalog[reference_id] = semantics
-            inputs.append({'reference_id': reference_id, 'generation_attachment': index})
-        execution_inputs.append({'key': request['key'], 'role': direction['role'], 'attachments': inputs})
-    for source, path in zip(source_manifest, source_paths):
-        if source['source_id'] not in needed_sources:
-            continue
-        if source['source_sha256'] not in attachment_numbers:
-            images.append(path)
-            attachment_numbers[source['source_sha256']] = len(images)
-        source_views.append({'attachment_number': attachment_numbers[source['source_sha256']],
-                             'source_id': source['source_id'], 'extent': source['observation']['product_extent']})
-    # Serialize shared facts and design once; binding keys still cover each role's consumed values.
-    fact_catalog, fact_sets, shared_design, evidence_catalog, bindings = {}, {}, {}, {}, []
-    for request in claims:
-        binding = {key: value for key, value in request.items() if key != 'shared_design'}
-        if request['kind'] == 'design_binding':
-            binding['selected_evidence_ids'] = []
-            for item in binding.pop('selected_evidence'):
-                key = item['source_id']
-                evidence_catalog[key] = item
-                binding['selected_evidence_ids'].append(key)
-            required = request['required_facts']
-            fact_catalog.update({row['evidence_id']: row for row in required['product_claims']})
-            fact_ids = [row['evidence_id'] for row in required['product_claims']]
-            fact_set = input_revision_id(fact_ids)[:20]
-            fact_sets[fact_set] = fact_ids
-            binding['required_facts'] = {**{key: value for key, value in required.items() if key != 'product_claims'},
-                                        'product_fact_set': fact_set}
-            binding['shared_design_paths'] = sorted(shared_design_values(request['shared_design']))
-            for key, value in request['shared_design'].items():
-                if key == 'palette_direction':
-                    for group, parts in value.items():
-                        shared_design.setdefault(key, {}).setdefault(group, {}).update(parts)
-                else:
-                    shared_design[key] = value
-        bindings.append(binding)
-    def validate(text: str) -> bool:
-        _planning_review_rows(parse_json_object_response(text).get('reviews'), claims)
-        return True
-
-    prompt = (
-        "Verify the supplied planning bindings, not aesthetic quality. For product_claim entries, "
-        "verify proposed text against its supplied typed evidence and corresponding source pixels. "
-        "Child fact_resolutions are authoritative constraints, not claim evidence: conflicted facts cannot be asserted, "
-        "and confirmed values override contradictory raw prose, OCR and observations. "
-        "physical: IDs prove only the observed geometry, local parts or state, never material specifications, load or performance. "
-        "measurement: IDs support truthful group headings without asserting new measurements. Other IDs are quoted source statements. "
-        "Return JSON {reviews:[{key,status,reason,resolution,findings:[{operation,status,reason,resolution}]}]}; "
-        "Status is supported, contradiction or inconclusive. The supplied operation ID owns its review category. "
-        "For inconclusive results, resolution is retry_review for incomplete evaluation, correct_evidence for a cited source_product defect, "
-        "or revise_plan for an unsupported proposed depiction or claim requiring a local change. Other results may omit resolution. "
-        "For design entries, evaluate supplied operations by exact ID; child product facts are verification context, not features every image must display. "
-        "product_depiction checks this output's sold-unit presentation, depicted parts, mounting faces, connections, mutually exclusive states and measured subjects "
-        "against the first edit-base pixels in execution_inputs; other attachments verify facts, not an alternative camera or assembly to merge. "
-        "For main/scene, verify that presentation.state is feasible in that first view without changing visible product geometry to emphasize visual_goal. "
-        "If the goal needs another view, revise the brief using an available source or a feasible goal; never silently swap attachments. "
-        "No auxiliary view, mask or unrelated hidden-joint evidence is required for a supported edit. Observed physical_facts are claims to check, not independent proof. "
-        "If an observation turns graphic notation into parts or mislocates a connection, report source_product:<source_id> with the faulty fact "
-        "and pixel evidence; use correct_evidence when inconclusive. If evidence is sound but the proposed depiction needs a different "
-        "mounting face, extra parts or an unsupported view, report product_depiction with revise_plan when inconclusive. "
-        "Review role_design as the target; selected_evidence describes input photographs, not instructions to copy their state or quantity. "
-        "For product_depiction, explain the actual target state and its evidence: door coverage and permanently open compartments, "
-        "fixed openings versus evidenced movable parts, and the distinct visible surfaces owning selected dimension endpoints. "
-        "A proposed inset must remain the same local assembly; totals do not authorize redistributing parts. Leaders need evidenced target parts, "
-        "not invented attachment points on a closed or occluded view. In-use support must fit the planned surface and fixing medium. "
-        "A thickness diagram spans the depicted object's lower and upper surfaces; a recommendation range is not an actual supplied object's measured height. "
-        "State the specific supported relation or missing evidence in reason. Revise only ambiguous relations necessary to this depiction. "
-        "func/size execution uses presentation.state and selected measurements, not full observation prose: "
-        "check necessary demonstration relations there against the pixels; auxiliary views must supply needed missing facts. "
-        "Unchanged source-supported views need no redundant prose or unrelated hidden-joint evidence. "
-        "Check one part's alternative positions as alternatives, not extra physical parts. Do not require unseen unrelated joints, "
-        "a whole-product count in a close-up, or particular layouts, room styles, typography or graphics. "
-        "Compare the current role_design.presentation target, not the edit-base photograph, with confirmed sold_unit_count for ordinary main/scene whole views. "
-        "A corrected single-unit target with same-child product evidence is valid even if the edit base shows two; a one-unit ordinary scene for a sold pair is not. "
-        "Reject only the conflicting target as product_depiction, revise_plan; do not reject the source arrangement or a superseded draft. "
-        "role_design.display_copy is the complete proposed image text: a synonymous title and label for the same feature are redundant despite different evidence IDs. "
-        "Assess the proposed set together; repeated feature lists need a distinct evidenced demonstration, not merely a new layout. "
-        "Detail-only output depicts selected parts, not a new whole hero; alternative states of one item are not multiple sold units. "
-        "A bright studio reflection is not proof that a mirror became an opaque panel; a recognizable room reflection is not required. "
-        "Original source_views verify provenance only: a feature visible only on an original page does not prove it is in the generation attachments. "
-        "Check explicit contradictory instructions, not aesthetic quality or pixel-level color equality; uncertainty about taste is not inconclusive. "
-        "selected_evidence_ids resolves in selected_evidence; product_fact_set resolves through fact_sets to child_product_facts. "
-        "execution_inputs preserves attachment order using reference_id entries in execution_catalog. shared_design_paths names the only applicable leaf paths "
-        "in the shared_design catalog; ignore all other paths, including those supplied for other bindings. "
-        "Product finish and specifications are facts; palette components are non-sold target staging only. "
-        "Measurements own numeric labels, display_copy owns authored text, palette owns component appearance, typography owns font treatment, "
-        "and graphic_direction owns graphic colors. Only a shared instruction contradicting identified product facts may be reported as "
-        "shared_design:<exact leaf path>, with fact_ids naming those supplied product or physical facts, "
-        "for example shared_design:palette_direction.bedding.duvet or shared_design:graphic_direction.text_color; never name a whole container. "
-        "Otherwise use the relevant supplied operation, without redesigning the palette. "
-        "Selected measurements specify only the quantities this output communicates; other source annotations are not required labels. "
-        "Compare measured subject, property, operating state and qualifiers before treating readings as conflicting. "
-        "sold_membership resolves only specifically disputed sold parts against product records. "
-        "For a product observation that misidentifies or invents the sold product, use source_product:<source_id> and cite the actual source. "
-        "Missing ordinary props, proportional framing, room style, open/closed presentation shown by the selected edit base, or replaced bedding "
-        "are not observation defects. Unknown geometry is inconclusive only when the proposed product depiction depends on it. "
-        "Compare subject, action, property, quantity, unit, conditions, negation and scope. A modifier stays with its source subject: "
-        "drawers placeable on either bed side do not imply wheels mountable on either side. IDs and matching "
-        "numbers alone do not imply support. Two doors do not support two drawers. Pine wood does "
-        "not imply waterproof. Preserve per-shelf versus whole-product and static-load qualifiers. "
-        "A plausible but unsupported benefit is inconclusive, not supported. Do not rewrite claims "
-        "or use the designer's confidence as evidence. Adding, removing or replacing non-sold "
-        "mattresses, textiles and decor is allowed, provided necessary product feature demonstrations remain truthful. "
-        "The first selected photograph fixes the depicted product viewpoint and assembly; redesign crops, proportional placement, furnishings and graphics without reconstructing visible product geometry. "
-        "Removing a sold drawer, changing its mechanism or duplicating the sold product is a contradiction; "
-        "showing a bare frame with designed bedding is not, unless it conceals the feature this role must demonstrate. "
-        "Do not judge beauty, enforce trends, require identical colors for different graphic roles, or add "
-        "product requirements. Missing/ambiguous information is inconclusive, not contradiction.\n"
-        + json.dumps({"bindings": bindings, 'prior_protocol_errors': {row['key']: protocol_errors[row['key']] for row in claims
-                        if protocol_errors is not None and row['key'] in protocol_errors},
-                      "child_product_facts": list(fact_catalog.values()), 'fact_sets': fact_sets, 'shared_design': shared_design,
-                      "selected_evidence": evidence_catalog, "source_views": source_views, "execution_inputs": execution_inputs,
-                      'execution_catalog': execution_catalog}, ensure_ascii=False, separators=(',', ':'))
-    )
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    (trace_dir / "planning_review_request.txt").write_text(prompt, encoding="utf-8")
-    def observe(event: dict[str, Any]) -> None:
-        if event.get('status') == 'success' and event.get('response_text'):
-            valid, errors = _planning_review_rows(parse_json_object_response(event['response_text']).get('reviews'), claims)
-            complete = len(valid.keys() - errors.keys())
-            event.update(semantic_valid_rows=complete, semantic_failed_rows=len(claims)-complete, semantic_errors=errors)
-        if attempt_observer is not None:
-            attempt_observer(event)
-    _events, record = _attempt_trace(trace_dir / "planning_review_attempts.json", observer=observe)
-    response = gemini_stream_generate(
-        prompt, images, client_scope="visual_planning", attempts=1,
-        max_physical_requests=1,
-        max_output_tokens=min(32768, max([min(24576, max(8192, 600 * len(claims))),
-            *(2 * int(row.get('max_output_tokens') or 0) for row in prior_output_limits or [])])),
-        prior_output_limits=prior_output_limits,
-        deadline_monotonic=deadline_monotonic, response_validator=validate,
-        request_id=f"claim-review:{input_revision_id(claims)}", attempt_observer=record,
-    )
-    (trace_dir / "planning_review_response.txt").write_text(response, encoding="utf-8")
-    checked, errors = _planning_review_rows(parse_json_object_response(response).get('reviews'), claims)
-    if protocol_errors is not None:
-        for request in claims:
-            protocol_errors.pop(request['key'], None)
-        protocol_errors.update({key: error for key, error in errors.items() if key in {r['key'] for r in claims}})
-    provenance = {'policy': CLAIM_REVIEW_POLICY, 'response_path': str((trace_dir / 'planning_review_response.txt').resolve()),
-                  'response_sha256': file_sha256(trace_dir / 'planning_review_response.txt')}
-    return {row['key']: {**row, **provenance, 'findings': [{**finding, **provenance} for finding in row['findings']]}
-            for row in checked.values()}
-
-
-def candidate_product_targets(task: dict[str, Any]) -> list[dict[str, Any]]:
-    """QA inspects intended output and every depicted part, not every source panel."""
-    return [{'target_id': task['role'], **task['image_direction']['presentation']}]
-
-
-def observe_candidate(job: Path, task: dict[str, Any], candidate: dict[str, Any], *, deadline_monotonic: float | None = None) -> dict[str, Any]:
-    from .paths import resolve_job_owned_path
-    from .vision_gemini_client import gemini_scope_execution_revision
-
-    product_refs = [row for row in task["generation_references"] if row["kind"] != "design_reference"]
-    images = [resolve_job_owned_path(job, candidate["candidate_path"])] + [resolve_job_owned_path(job, row["path"]) for row in product_refs]
-    for ref, path in zip(product_refs, images[1:]):
-        if file_sha256(path) != ref['sha256']:
-            raise ValueError('Product reference changed before QA')
-    attachments = [{"attachment_index": index, "source_id": ref['source_id'],
-                    "purpose": ref['purpose'], "sha256": ref['sha256']} for index, ref in enumerate(product_refs, 2)]
-    required_targets = candidate_product_targets(task)
-    measurement_sources = [{**{key: row[key] for key in ('id', 'source_id', 'measured_part', 'axis', 'evidence_type')},
-                            'attachment_index': measurement_attachment(row, product_refs) + 1}
-                          for row in (task.get('measurement_authority') or {}).get('measurement_groups', [])]
-    edit_scope = {}
-    if candidate.get('revision_mode') == 'targeted_edit':
-        from .candidate_state import candidate_by_sha
-        parent = candidate_by_sha(job, task, candidate['edit_parent_candidate_sha256'])
-        parent_path = resolve_job_owned_path(job, parent['candidate_path'])
-        if file_sha256(parent_path) != candidate['edit_parent_candidate_sha256']:
-            raise ValueError('Edit parent candidate bytes changed')
-        prompt_path = resolve_job_owned_path(job, candidate['prompt_path'])
-        if file_sha256(prompt_path) != candidate['request_prompt_fingerprint']:
-            raise ValueError('Edit request bytes changed')
-        request = prompt_path.read_text(encoding='utf-8').split('# Revision request\n', 1)
-        if len(request) != 2:
-            raise ValueError('Targeted edit has no bound revision request')
-        images.append(parent_path)
-        edit_scope = {'parent_attachment_index': len(images), 'parent_sha256': candidate['edit_parent_candidate_sha256'], 'request': request[1]}
-    revision = input_revision_id({"policy": CANDIDATE_OBSERVATION_POLICY, "candidate": candidate["candidate_sha256"],
-                                 "observer_execution": gemini_scope_execution_revision("vision_qa"),
-                                 "references": product_refs, "product": task["product_facts"], "edit_scope": edit_scope,
-                                 "measurements": task.get('measurement_authority'), "required_targets": required_targets,
-                                 "presentation": task['image_direction']['presentation']})
-    path = job / "reports" / "candidate_observations" / f"{revision}.json"
-    if path.is_file():
-        cached = read_json(path)
-        _validate_candidate_bindings(cached, attachments, required_targets, measurement_sources, edit_scope)
-        return cached
-    schema = {
-        "text_coverage": "complete|partial|unreadable",
-        "texts": [{"text": "verbatim observed text", "kind": "marketing|measurement|product_label|prop|brand|unknown",
-                   "confidence": 0.0, "region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
-        "measurements": [{"measurement_id": "source measurement id, or null for unlisted evidence", "object": "measured part and axis", "source_id": "source_id from attachments", "attachment_index": 2,
-                          "source_text": "observed in attachment 2+",
-                          "candidate_text": "observed in attachment 1", "relationship": "same|different|unknown",
-                          "source_endpoints": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}], "candidate_endpoints": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
-                          "confidence": 0.0, "source_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0), "candidate_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
-        "measurement_coverage": "complete|partial|not_applicable",
-        "product_coverage": "complete|partial",
-        "product_comparisons": [{"target_id": "required target_id or extra:unique_id for an additional depicted detail", "source_id": "its source_id", "attachment_index": 2,
-                               "status": "consistent|contradiction|unknown", "part": "specific sold part",
-                               "evidence": "source/candidate geometry, count, finish and state comparison, not aesthetics",
-                               "confidence": 0.0, "source_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0), "candidate_region": dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}],
-    }
-    if edit_scope:
-        schema['edit_comparison'] = {'status': 'consistent|contradiction|unknown', 'part': 'specific unexpected change',
-                                     'evidence': 'Compare parent and candidate outside the requested change; no aesthetic rating',
-                                     'confidence': 0.0, 'source_region': dict(left=0.0, top=0.0, right=1.0, bottom=1.0), 'candidate_region': dict(left=0.0, top=0.0, right=1.0, bottom=1.0)}
-    prompt = (
-        "Attachment 1 is the generated candidate; subsequent attachments are the same child's product evidence. "
-        "Observe the actual pixels independently; no expected display copy is supplied. Return the completed observation object, not its schema or input context. "
-        "Transcribe candidate text verbatim. Regions use named {left,top,right,bottom}; endpoints use {x,y}, normalized to the specified attachment, not another crop or output. Distinguish marketing/dimensions from "
-        "product surface labels and loose props; do not guess illegible words or brand identity. "
-        "Compare full quantities including bounds, ranges and qualifiers, measured objects and endpoints; equivalent US-unit conversion with display rounding is not a product change. Transcribe both expressions exactly; bind each measurement id once. Use null endpoints for non-diagram callouts and unknown for unreadable geometry. "
-        "Return one product_comparisons row per required target_id, covering its intended product scope, "
-        "using attachment_index and source_region to cite any supplied same-child view that proves its structure, plus extra:unique_id rows "
-        "for all additional product-bearing insets/parts in the candidate, comparing against the original source attachment. "
-        "Compare depicted joints, visible faces, part count, attachment position and state, not merely function. "
-        "Alternative adjustment positions do not mean simultaneous extra parts. Compare door coverage and enclosed versus open compartments. "
-        "Dimension arrows must span the same measured part's full stated extent; matching numbers on a shorter inner panel are a contradiction. "
-        "A stopper block serving the same purpose but showing a newly invented side/joint is not the same observed detail. "
-        "Do not use a correct inset to excuse a changed main view. "
-        "Inspect the planned demonstration without prescribing layout or requiring other views from the source gallery. "
-        "Inspect the entire candidate including background and unlabeled details for extra or altered products or mechanisms. "
-        "product_coverage is complete only when every depicted product region is compared; an unregistered detail is not automatically correct. "
-        "Use presentation.scope: detail_only authorizes selected parts, not an invented assembled product. "
-        "Repeated close-ups and a representative unit in a dimension diagram are not extra sold units. "
-        "Compare the depicted product to its selected edit base and actual supplied detail views; auxiliary evidence does not excuse invented joints or fused viewpoints. "
-        "unseen geometry is unknown, not an automatic contradiction. A contradiction needs an actually incompatible product part. "
-        "Adjustment-position ghosts are not extra physical shelves. Non-sold rooms, bedding and props may be added, removed or replaced. "
-        "Occlusion is not removal: judge depicted product regions and required functional demonstrations, not every part hidden by normal staging. "
-        "When a necessary comparison is genuinely unavailable, report unknown/partial with its visible location, not absence or an empty region. "
-        "Do not score aesthetics or improve the image. Every contradiction needs a specific part and two visible regions.\n"
-        + "INPUT CONTEXT:\n" + json.dumps({"product_identity": task["product_facts"], "presentation": task['image_direction']['presentation'], "attachments": attachments,
-                      "required_targets": required_targets, "measurement_sources": measurement_sources, "edit_scope": edit_scope}, ensure_ascii=False)
-        + "\nOUTPUT OBJECT (these fields are top-level):\n" + json.dumps(schema, ensure_ascii=False)
-    )
-    def validate(text: str) -> bool:
-        observed = parse_json_object_response(text)
-        _validate_candidate_bindings(observed, attachments, required_targets, measurement_sources, edit_scope)
-        return True
-    events, record = _attempt_trace(path.with_suffix(".attempts.json"))
-    raw = gemini_stream_generate(prompt, images, client_scope="vision_qa", attempts=1,
-        max_physical_requests=1,
-                                deadline_monotonic=deadline_monotonic, response_validator=validate,
-                                request_id=f"candidate-observation:{revision}", attempt_observer=record)
-    result = parse_json_object_response(raw)
-    _validate_candidate_bindings(result, attachments, required_targets, measurement_sources, edit_scope)
-    success = next((event for event in reversed(events) if event.get("status") == "success"), {})
-    result["provider"] = {key: success.get(key) or "unavailable" for key in ("provider", "model", "protocol")}
-    write_json(path, result)
-    return result
-
-
-def _validate_candidate_bindings(observed, attachments, required_targets, measurement_sources, edit_scope):
-    _validate_candidate_observation(observed)
-    expected = {(row['source_id'], row['id']): row for row in measurement_sources}
-    seen = set()
-    for row in observed['measurements']:
-        if not any(row['attachment_index'] == a['attachment_index'] and row['source_id'] == a['source_id'] for a in attachments):
-            raise ValueError('Measurement refers to a different source attachment')
-        if row.get('measurement_id') is None:
-            continue
-        key = (row['source_id'], row['measurement_id'])
-        binding = expected.get(key)
-        if binding is None or key in seen or row['attachment_index'] != binding['attachment_index']:
-            raise ValueError('Measurement ID refers to a different view attachment or is repeated')
-        if binding['evidence_type'] == 'dimension_line' and any(
-                row.get(field) is None for field in ('source_endpoints', 'candidate_endpoints')):
-            row.update(relationship='unknown', confidence=0.0, location_error='Dimension line endpoints are missing')
-            observed['measurement_coverage'] = 'partial'
-        seen.add(key)
-    if seen != set(expected):
-        observed['measurement_coverage'] = 'partial'
-    required = {row['target_id'] for row in required_targets}
-    for row in observed['product_comparisons']:
-        extra = row['target_id'].startswith('extra:')
-        if ((not extra and row['target_id'] not in required)
-                or not any(row['attachment_index'] == a['attachment_index'] and row['source_id'] == a['source_id'] for a in attachments)):
-            raise ValueError('Product comparison needs a planned target and supplied same-child evidence attachment')
-    if edit_scope and 'edit_comparison' not in observed:
-        raise ValueError('Targeted edit comparison is missing')
-
-
-def _validate_candidate_observation(value: Any) -> None:
-    if not isinstance(value, dict) or value.get("text_coverage") not in {"complete", "partial", "unreadable"}:
-        raise ValueError("Candidate observation has no honest text coverage")
-    if value.get("measurement_coverage") not in {"complete", "partial", "not_applicable"}:
-        raise ValueError("Candidate measurement coverage is invalid")
-    if value.get('product_coverage') not in {'complete', 'partial'}:
-        raise ValueError('Candidate must report whole-image product coverage')
-    if not isinstance(value.get("texts"), list) or not isinstance(value.get("measurements"), list):
-        raise ValueError("Candidate observation lists are missing")
-    for row in value["texts"]:
-        if not isinstance(row, dict) or row.get("kind") not in TEXT_KINDS | {"brand"} or not isinstance(row.get("text"), str):
-            raise ValueError("Candidate text observation is malformed")
-        _located_finding(row, ('region',), 'kind', 'unknown')
-    for row in value["measurements"]:
-        if not isinstance(row, dict) or row.get("relationship") not in {"same", "different", "unknown"} or not row.get("object"):
-            raise ValueError("Candidate measured-object relationship is missing")
-        if not isinstance(row.get("source_text"), str) or not isinstance(row.get("candidate_text"), str):
-            raise ValueError("Observed source and candidate measurement text is required")
-        if not _located_finding(row, ('source_region', 'candidate_region'), 'relationship', 'unknown'):
-            value['measurement_coverage'] = 'partial'
-        if not row.get('source_id') or type(row.get('attachment_index')) is not int or row['attachment_index'] < 2:
-            raise ValueError('Measurement source attachment is missing')
-        for field in ('source_endpoints', 'candidate_endpoints'):
-            points = row.get(field)
-            try:
-                if points is not None:
-                    if not isinstance(points, list) or len(points) != 2 or points[0] == points[1]:
-                        raise ValueError('Invalid measurement endpoints')
-                    for point in points:
-                        source_point(point)
-            except ValueError:
-                row.update(relationship='unknown', confidence=0.0, location_error='Invalid measurement endpoints')
-                row[field] = None
-                value['measurement_coverage'] = 'partial'
-    comparisons = value.get("product_comparisons")
-    if not isinstance(comparisons, list):
-        raise ValueError("Candidate output product comparisons are missing")
-    seen = set()
-    for comparison in comparisons:
-        if (not isinstance(comparison, dict) or comparison.get('status') not in {'consistent', 'contradiction', 'unknown'}
-                or not all(comparison.get(key) for key in ('source_id', 'target_id', 'evidence', 'part'))
-                or type(comparison.get('attachment_index')) is not int or comparison['attachment_index'] < 2):
-            raise ValueError('Candidate product comparison needs a bound view and located evidence')
-        key = comparison['target_id']
-        if key in seen:
-            raise ValueError('Candidate product comparison repeats a target')
-        seen.add(key)
-        if not _located_finding(comparison, ('source_region', 'candidate_region'), 'status', 'unknown'):
-            value['product_coverage'] = 'partial'
-    if 'edit_comparison' in value:
-        edit = value['edit_comparison']
-        if not isinstance(edit, dict) or edit.get('status') not in {'consistent', 'contradiction', 'unknown'} or not edit.get('evidence'):
-            raise ValueError('Edit comparison is invalid')
-        _located_finding(edit, ('source_region', 'candidate_region'), 'status', 'unknown')
-
-
-def _located_finding(row: dict[str, Any], regions: tuple[str, ...], field: str, unknown: str) -> bool:
-    try:
-        _observation_location(row, regions)
-        return True
-    except ValueError as exc:
-        row.update({field: unknown, 'confidence': 0.0, 'location_error': str(exc)})
-        for region in regions:
-            row[region] = None
-        return False
-
-
-def _observation_location(row: dict[str, Any], regions: tuple[str, ...]) -> None:
-    confidence = row.get("confidence")
-    if not isinstance(confidence, (float, int)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
-        raise ValueError("Invalid observation confidence")
-    for field in regions:
-        source_box(row.get(field))

@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SAM 3.1 最小接入执行方案 · 2026-09-30</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f5f8;color:#182234;font:16px/1.85 "Microsoft YaHei",sans-serif}
+main{max-width:1180px;margin:30px auto;padding:34px;background:#fff;border-radius:12px}h1{font-size:30px;line-height:1.5}
+h2{font-size:23px;margin-top:38px}h3{font-size:18px;margin-top:25px}p{margin:14px 0}a{color:#1756a5}
+table{width:100%;border-collapse:collapse;font-size:14px;line-height:1.7}td,th{padding:11px;border:1px solid #dce2eb;text-align:left;vertical-align:top}th{background:#edf3fb}
+.summary{padding:18px 22px;background:#edf4fc;border-left:4px solid #2e67a4}.limit{padding:16px 20px;background:#fff6e7;border-left:4px solid #c78d27}
+.meta,small{color:#606b7b}.flow{padding:18px;background:#f5f7fa;line-height:2.1;border:1px solid #dce2eb}
+code,pre{font:13px/1.7 Consolas,monospace}code{overflow-wrap:anywhere}pre{background:#f5f7fa;padding:16px;white-space:pre-wrap}
+li{margin:8px 0}.scroll{overflow-x:auto}footer{border-top:1px solid #dce2eb;margin-top:34px;padding-top:16px}
+@media(max-width:700px){main{margin:0;padding:18px}h1{font-size:25px}}
+</style></head><body><main>
+<p class="meta">2026-09-30 · D:\Amazon_pics\amazon_listing_factory · 本文是待执行设计，未修改生产代码</p>
+<h1>SAM 3.1 最小接入执行方案</h1>
+<div class="summary">
+<p><b>推荐：接入现有 brief 内部的“实际编辑底图保护区准备”，复用现有规划审查、修复循环、ImageTask、原生 mask 传输和结果检查。</b></p>
+<p>第一版使用已经实测的本地 SAM 3.1 INT8 环境，处理可见不透明产品构件及明确售卖实例。先完成当前调用链的受控接入验证，再根据实图结果决定启用范围。当前证据支持实施接入代码，不支持立即把 SAM 设成所有商品、所有角色的强制前置门槛。</p>
+<p>业务阶段保持原样：不增加 segmentation stage，不要求逐图手工涂蒙版，不引入新服务或另一套控制器。SAM 只输出区域；商品事实、视觉设计和生成结果各沿用现有权威。</p>
+</div>
+
+<h2>1. 最近测试对接入方案的直接约束</h2>
+<table><thead><tr><th>已核实事实</th><th>接入决定</th></tr></thead><tbody>
+<tr><td>固定批次 11 张底图、床架/柜体/仿真树三类；本地 SAM 能输出独立候选、自动构件框和局部结果。</td><td>复用本地后端和固定样本，不重做免费 HF 服务探索，不要求新增访问令牌或下载另一套整模型。</td></tr>
+<tr><td>一次批次记录 17 次 SAM 推理约 5.438 秒，批次约 10.422 秒；该数字排除了解释器启动和权重哈希。31 次 Gemini 请求约 641 秒。</td><td>优化一次加载、同图特征复用与同底图区域复用；区域语义判断并入原有成套审查，不复制 31 次逐部件审查方式。冷启动、CPU 内存、模型加载时间仍须实测。</td></tr>
+<tr><td>全局集中负点会侵蚀木面；状态保留、局部定位及归属合并可改善，但非通用保证。</td><td>采用语义候选起步、实例绑定、有限局部修正；不把所有负点持续累加为整图重算。</td></tr>
+<tr><td>4 产品点＋6 非产品点全部通过，木面内部仍漏选 6,133 像素。另一种合并通过四块右栏杆见证区，却删除远侧木条已保护的 197 像素。</td><td>点命中、面积、稳定度、预测 IoU 均不能独立判 ready；必须检查实际删除区和其他已确认构件。见证区是诊断标注，不要求生产逐图人工画。</td></tr>
+<tr><td>候选包含整件、部件及背景同类物；双树、柜门、床抽屉都已有反例。</td><td>事实合同决定售卖范围，位置和父部件关系决定候选归属。禁止第一候选、最高分或全部候选并集直接成为保护区。</td></tr>
+<tr><td>原生蒙版传输的 RGBA/alpha 未变；黑柜对照保留主要结构，仍有细节与光影再解释，未建立蒙版的因果优势。</td><td>复用已有传输；正确 mask 与成图保真分别留证。配置 supports_mask 不等于已经证明供应商执行有效。</td></tr>
+</tbody></table>
+<p>详细证据：<a href="../test_runs/sam31_int8_20260929/usage_audit_07/three_questions_20260930/三个问题明确结论与实施边界.html">三个问题复核报告</a>；<a href="../test_runs/sam31_int8_20260929/usage_audit_07/最终修改方案与验证边界_20260930.html">调用、归属与合并试验</a>；<a href="../test_runs/sam31_int8_20260929/auto_06/summary.json">固定批次统计</a>。</p>
+
+<h2>2. 接入的具体位置和责任</h2>
+<div class="flow">现有商品事实与观察 → 现有成套规划选定实际编辑底图 → <b>在 brief 内准备 SAM 候选</b> → <b>同一次规划审查核对实体、构件和区域</b> → <b>原修复循环内完成有限局部修正</b> → 原 brief 编译 → ImageTask／Prompt 指纹冻结 → 原 generate → 原结果检查</div>
+<p><b>插入点：</b><code>core/visual_design_kit.py::_finish_image_briefs()</code> 的 <code>compile_reviewed()</code>，有效 draft 的底图已经选定之后、<code>design_binding_request()</code> 构建之前准备候选。当前 <code>core/image_tasks.py</code> 中 <code>resolve_edit_references()</code> 的调用与 <code>_task_fingerprint()</code> 之间只投影最终已审查的保护区，不在那里重新运行 SAM。</p>
+<table><thead><tr><th>已有环节</th><th>责任</th><th>SAM 不承担的内容</th></tr></thead><tbody>
+<tr><td>商品事实／联合观察</td><td>提供确认的售卖成员、附件、可见部件与 source/object 身份。</td><td>不由分割分数决定单件/两件套，不用树盆或床品的一般常识覆盖商品证据。</td></tr>
+<tr><td>成套规划／原规划审查</td><td>决定目标画面与编辑范围，绑定实例位置，审核漏构件、误选和修正区域。</td><td>不把 mask 作为设计模板；不通过新的单图规划器替代现有成套规划。</td></tr>
+<tr><td>新增唯一区域模块＋本地推理工作进程</td><td>执行分割、尺度映射、区域增删和文件输出；程序执行已经确定的约束。</td><td>不决定事实、审美、ready、QA、候选批准或发布。</td></tr>
+<tr><td>现有生成与结果检查</td><td>发送实际原生 mask，检查最终结构、颜色、纹理和材质。</td><td>不因 mask 合格就自动认定实图合格；不在失败时静默撤掉 mask。</td></tr>
+</tbody></table>
+
+<h2>3. 第一版适用范围</h2>
+<table><thead><tr><th>任务类型</th><th>处理方式</th></tr></thead><tbody>
+<tr><td>main / scene：同机位替换房间、床品、松散摆件</td><td>优先验证接入。保护全部可见产品构件；栏杆缝、床底环境与床品按编辑意图开放。保持原有遮挡，不凭空露出缺少证据的木面。</td></tr>
+<tr><td>柜体、床架、仿真树的清楚可见实体</td><td>共用身份和部件规则。床品不属于床架；柜内松散物不默认随售；随售盆体、抽屉和安装件按当前事实归属。黑色金属床架不纳入本轮样本。</td></tr>
+<tr><td>func / size：同底图、同透视、主体位置保持的编辑</td><td>沿用同一个区域模块，保护对应构件并开放排版区。尺寸端点、引线归属与文案仍来自原合同，SAM 不能替代这些事实。首轮接入验证包含规划与传输合同，真实成图拓展须另有该角色证据。</td></tr>
+<tr><td>func / size：需要移动主体、改变视角或暴露隐藏结构</td><td>固定坐标蒙版不适配这些目标。回到现有 planner 选择可执行底图和画面状态；不把 SAM 加成一个新的整体禁用原因，也不转换成本地拼图或新产品渲染。</td></tr>
+<tr><td>镜面、透明门、透射像素、严重遮挡或源文字覆盖关键产品面</td><td>在原计划中明确特殊表面和可见证据；二值 mask 不被宣称能解混产品与背景。第一版不承诺这些情形的完整自动保护，保留原来的参考编辑合同与审查责任。</td></tr>
+</tbody></table>
+<p class="limit">“无新增阻塞”通过不设置全量 SAM 强制门槛、不新增人工待办和资源服务实现。对已选择并冻结原生蒙版的任务，文件/归属不合格必须沿用现有 brief 失败出口；无法同时承诺“任意失败都继续”“所有产品完全保真”和“不降级”。未适用的任务不是运行失败后的无蒙版 fallback。</p>
+
+<h2>4. 区域实现：固定一种方法，替换已失败的试验规则</h2>
+<ol>
+<li><b>固定真正提交的第一张底图。</b>通过原 <code>resolve_edit_references()</code> 取得 <code>product_sources[0]</code> 的像素、SHA、尺寸；角色 <code>source_id</code> 只是证据锚点。输入、审查预览与 mask 使用同一图像解码和方向，工作进程不能单独旋转或裁切整图。最近 11 张源图均没有 EXIF 旋转标记；带 EXIF 的通用能力不据此宣称已经通过。</li>
+<li><b>语义分割建立候选。</b>使用简短产品或部件名称，保留独立 mask、候选框和分数。低分整件与高分局部都可进入归属比较，不能先按分数截掉需要的整件。</li>
+<li><b>同一次原规划审查返回选择。</b>把候选接触表、目标/部件清单及其身份送入原请求。选择结果必须绑定底图、父实例和目标构件；补漏位置可由已知构件的 SAM 查询框自动建立，不只搜索旧 mask 边缘。</li>
+<li><b>局部处理只更新区域。</b>全图统一坐标记录局部框、缩放与逆映射。产品补选与非产品删除分别计算；未被局部选中的像素不自动变成删除区。点提示仅在已绑定的同一实例/局部使用，沿用实际已测试的低分辨率状态语义。</li>
+<li><b>用差异提交，避免整体替换。</b>设已有保护区为 M，已核实归属的补选为 A，明确非产品的可删除支持为 D，已确认产品支持为 K。更新为 <code>M_new = (M ∪ A) \ D</code>，必须检查 <code>D ∩ K</code>、对其他构件的影响和范围越界。出现身份或木面删除矛盾时不提交该修正，并在原修复预算内处理原因。</li>
+<li><b>保守约束不能冒充真值。</b>K 来自既有观察/审查确认的产品支持，不能把多候选交集或“高分 mask”直接命名为真值。它能防止已经确认区域退步，无法自动证明尚未识别的构件完整。对疑似木面删除，在原审查中同时展示底图和删除区；既不能全部删掉，也不能把所有删除都判有害。</li>
+<li><b>最终区域沿原审查合同确认。</b>初始漏选与修正误删分开记录。明显构件遗漏、木面内部破洞、售卖实体误归属不能由点检查通过掩盖；粗略边缘不单独制造新的硬阻塞。</li>
+</ol>
+<p><b>不迁入生产的旧试验规则：</b>全图负点累计重算；只取 candidate 0 或预测 IoU 最大者；所有候选并集；按整矩形覆盖；按旧组件 mask 全量替换；未经核实的床品 mask 直接相减；全局填孔/膨胀/最大连通域；把 90% 包含率或本次 10% 裁切扩边写成通用品质阈值。这些目前是隔离研究脚本，不是待兼容的生产后端。</p>
+
+<h2>5. 同类多实例与跨品类的统一合同</h2>
+<p>不做床架、柜体、树的三套控制器。一次区域请求只包含：实际底图身份；事实引用；要保护的父实例及可见部件；位置锚点；允许编辑的对象；特殊表面策略。模型临时 candidate_id 不能当 ASIN 或持久 object_id。</p>
+<ul>
+<li><b>双树：</b>事实确认两件时绑定左右两个父实例；同一树的整件和叶球候选属于一个实例，不额外计数。单件场景的另一棵树不能因“看起来是同类”自动保护。</li>
+<li><b>高柜：</b>柜门归到主柜；背景洗手盆柜即使同类别也不合入。抽屉、柜门、把手和铰链属于组件关系。</li>
+<li><b>抽屉床：</b>拉出的随售抽屉仍是同一组装体的一部分；抽屉中的衣物、书和摆件按售卖事实另行处理。</li>
+<li><b>身份冲突：</b>空间重叠与模型分数只能辅助排序。没有唯一关联时，保留歧义交回原 brief 修复，不能靠并集猜测。</li>
+</ul>
+
+<h2>6. 最小数据与缓存设计</h2>
+<p><b>规划输入到区域输出保持单向：</b>在原规划响应的 brief 内补充 <code>region_intent</code>（保护对象/部件、可见位置锚点、可编辑对象与特殊表面），供区域模块消费；编译后的 brief 仅保留最终 <code>product_region</code> 引用。当前观察已有 object_id 和部件事实，没有完整构件坐标，不能假定这些坐标已经存在。位置锚点在原有规划调用中形成，不另做逐部件观察请求；其作用是匹配候选，不是像素真值。</p>
+<p><b>只增加一个 brief 区域引用。</b><code>brief.product_region</code> 引用当前底图的不可变区域 artifact。区域 artifact 保存实际底图 SHA/尺寸、事实与实例绑定、处理/模型版本、坐标映射、候选与修正轨迹、最终 mask 路径/SHA和实际调用耗时。<b>不再建立独立 ready/status 控制器：</b>最终状态由原 brief compiler 与其 design_review 决定。</p>
+<p>原审查合同新增明确操作 <code>product_region</code>；存在区域删除时才检查相应变更。选择与修正放在审查行的结构化字段中，不挤进自由文本reason：</p>
+<pre>region_selection: {input_key, targets: [{object_id, candidate_ids, component_ids}]}
+region_repairs: [{parent_id, part, operation, query, crop, positive_points, negative_points}]
+operation: add_product | remove_nonproduct
+crop: {left, top, right, bottom}，归一化到实际底图
+points: {x, y}，归一化到实际底图</pre>
+<p>parser 核对请求key、候选范围、父对象、坐标与操作类型；不得丢掉不认识的区域finding后仍判supported。同步替换当前“supported edit不要求mask”的泛化文句：没有区域请求的编辑仍不附加mask要求；已带区域合同的请求须核对实际区域。相互覆盖的旧提示删除，不不断追加新禁令。</p>
+<pre>brief.product_region → 当前不可变区域 artifact
+        ↓ 唯一投影
+generation_references[0].protected_mask = {path, sha256}
+        ↓
+原 generation_reference_mask_bytes() → 原 provider transport</pre>
+<ul>
+<li>区域内容 key 覆盖 child、实际底图像素、事实/售卖范围、保护意图、几何映射、SAM 代码/权重身份和处理版本。相同 Job 内相同底图与相同保护意图跨 role 复用；不同变体不因图片相同就盲目共用。</li>
+<li>审查请求覆盖该次候选/当前 mask 的内容 key；审查结果引用 key。内容 key 不包含 ready 或 review_key，避免自引用。区域改动后请求 key 改变，旧 supported 结果不能继续用。</li>
+<li>初始自动匹配的mask在同一次原审查中展示。选择改变、合并或局部修正产生不同mask时，沿原修复循环的下一次审查检查新的合并图；不能拿旧候选的supported替代新mask的审查。未改动且已有当前审查的区域不单独再开复审。首轮预算仍沿原review上限，不按每一根木条另起请求。</li>
+<li>更新现有设计/审查版本常量和 currentness 判断；历史缓存按现有方式失效，不新增迁移、兼容读取或历史 Job 回放。</li>
+<li>最终 mask 在 <code>_task_fingerprint()</code> 前挂载。其 SHA 通过现有 <code>reference_semantics()</code> 进入任务指纹；冻结后不补写或替换。</li>
+<li>黑白检查图和 API RGBA 图可由同一保留区域导出。内部 1=保护；API alpha 255=保护、0=可编辑。叠色接触图只供审查，不能作为普通第二参考代替原生 mask 参数。</li>
+</ul>
+
+<h2>7. 本地运行与效率</h2>
+<p>采用已经运行成功的 Comfy SAM 3.1 INT8 静态图路径，并固定实际代码、依赖、权重 SHA。旧方案中的 HF Space、多目标视频 wrapper、任意二值 mask 回灌和官方原权重重新下载，不作为本次接入依赖。不得把低分辨率 decoder 状态与外部二值 mask 回灌混为一谈。</p>
+<ul>
+<li>主项目继续用 <code>D:\anaconda\python.exe</code>。独立工作进程使用已安装的 SAM 环境；主环境不再装一套 Torch/Comfy。路径通过现有本机配置提供，不写死用户目录、实验日期，不移动当前 venv，不把模型或环境提交 Git。</li>
+<li>生产 worker 不 import/exec 隔离实验脚本，不读取历史候选 mask。现有环境与权重可作为已授权运行依赖引用；图像、mask和任务输入必须来自当前 Job。清理依赖目录须先检查配置引用。</li>
+<li>沿用现有 <code>provider_concurrency_slot('host_gpu_auto')</code>，一次本地 GPU 推理进程；按本次 brief 批次复用权重和同图特征。权重哈希在启动/固定身份时核对一次，不每张图读取 1.2 GB。</li>
+<li>导出 CPU mask 后及时释放 GPU；brief 批次结束关闭工作进程，异常、deadline 和取消时也关闭。generate 不驻留 SAM，避免挤占已有图像请求的主机内存。测量冷启动和进程树峰值 RSS，不能把 1,754 MiB Torch 显存当 CPU 内存预算。</li>
+<li>一个底图一次候选准备、一批必要局部请求、最多一轮区域修正，沿原 brief deadline 和修复预算。局部前向必须逐项计数；不另开独立 Gemini 区域轮询。若测试发现真实必要请求超出原预算，先校正责任环节与重复请求，不能删掉构件要求来凑次数。</li>
+<li>不提高 <code>core/image_resources.py</code> 的现有内存门槛，不通过永久常驻进程消耗生图容量。新增资源预约确有需要时扩展同一资源权威，不建立第二份队列/账本。</li>
+</ul>
+
+<h2>8. 修改文件及规模</h2>
+<p>以下为拟议改动上限，不是已经实现。新增生产代码目标约 650–950 行，现有文件新增约 120–220 行、删除约 40–90 行；实施时以实际 diff 核查。单个新生产模块必须小于 800 行。</p>
+<div class="scroll"><table><thead><tr><th>文件</th><th>动作</th><th>具体职责</th></tr></thead><tbody>
+<tr><td><code>core/product_region.py</code></td><td>新增，目标≤650行</td><td>唯一的区域请求、worker调用、候选/部件绑定验证、差异合并和不可变artifact生成。语义选择消费原审查结果，不自行建立另一个审查器。</td></tr>
+<tr><td><code>scripts/sam31_region_worker.py</code></td><td>新增，目标≤300行</td><td>已验证后端的加载、候选、局部/实例细化、特征复用和原始mask导出。仅推理，不拥有业务状态；参数和文件IO明确，stdout只输出少量元数据。</td></tr>
+<tr><td><code>core/visual_design_kit.py</code></td><td>修改</td><td>在原 compile_reviewed 内准备区域和消费修正结果；由原修复循环控制预算；完成后关闭worker。draft结构校验与最终区域审查分离，防止循环依赖。</td></tr>
+<tr><td><code>core/visual_design_kit_compiler.py</code></td><td>修改</td><td>design_binding_request 纳入区域内容key与检查操作；原compiler保留并验证区域引用；原failure owner处理修正责任。当前783行，不另造compiler。</td></tr>
+<tr><td><code>core/visual_semantics.py</code></td><td>修改</td><td>同一次review加入候选接触表、实例选择与区域变更；扩展严格parser。当前finding仅允许operation/status/reason/resolution/fact_ids，新字段不能未经parser支持直接塞入。</td></tr>
+<tr><td><code>core/image_reference_context.py</code></td><td>修改</td><td>把最终region唯一投影到第一edit_base；核对底图、所属Job和mask绑定。沿用RGBA/SHA/尺寸reader。</td></tr>
+<tr><td>现有测试／版本常量／本机配置说明</td><td>定向修改</td><td>补齐可达链合同与缓存失效说明；只增加实际需要的本地路径配置，不提交密钥或大模型。</td></tr>
+<tr><td><code>image_tasks.py</code>、executor、transport、candidate_state</td><td>优先复用</td><td>指纹含mask SHA、原生参数传输及候选输入校验已存在，不重复实现。测试发现具体缺口时才局部修改，不预先扩大整改范围。</td></tr>
+</tbody></table></div>
+<p><b>删除范围：</b>目前生产没有 SAM 自动生产者，因此没有旧 HF 生产分支要保留或删除。生产实现采用一条本地路径；不得引入 HF、本地、手工、语义/点提示等多套互相兜底的控制器。实验比较保留为证据，不加入生产入口。若实施发现复制或替换了现有责任，同次提交删除被替代路径及其重复测试。</p>
+
+<h2>9. 重试、恢复与候选修订的边界</h2>
+<table><thead><tr><th>情况</th><th>处理</th></tr></thead><tbody>
+<tr><td>相同底图的生图重试、供应商切换</td><td>复用冻结的mask和区域合同，不重跑SAM。维持用户既有模型分工与524未知结果重发规则；候补必须能传原生mask，不能为换路由撤mask。对照测试固定同一路由，换路由的数据不混入同臂比较。</td></tr>
+<tr><td>已经保存响应、local_finalize、status/currentness</td><td>只恢复或校验当前证据，不调用SAM、不新发生图请求。</td></tr>
+<tr><td>更改同child编辑底图或保护意图</td><td>在原brief重建区域与指纹；旧区域不迁移，新旧内容各自绑定。</td></tr>
+<tr><td>targeted_edit 用当前候选做底图</td><td>不能复用原图坐标mask。当前代码移除原mask是防止坐标误用的必要行为，不能删掉这条保护。第一版声明SAM自动生产者用于brief形成的普通编辑任务，不宣称targeted_edit已获得同等mask保护；现有候选编辑合同继续负责保真。需要候选mask时另用同一模块在原修订入口、不可变请求形成前准备，并核对授权编辑区，不能自动保护恰好要修的错误部件。</td></tr>
+<tr><td>无候选、worker失败、归属不明或审查未决</td><td>任务沿现有brief／review原因处理，无依赖的child/role继续。新蒙版任务不伪造ready、不复制原图交付、不无限修正，也不静默改走无蒙版路线。</td></tr>
+</tbody></table>
+<p>将 targeted_edit 自动蒙版明确后置可以保持第一版改动范围；若用户要求首轮覆盖所有自动候选修复，这一项必须加入同一接入提交并补实图验证，不能隐瞒为已支持。</p>
+
+<h2>10. 固定实施顺序与验收</h2>
+<h3>A. 实现区域合同和本地入口</h3>
+<p>先把推理从研究脚本整理为明确函数/worker；实现父实例、构件、区域差异和原图/局部映射。保持现有权重与已核实数值语义，不修改未知根因的INT8转换公式。准备相同固定底图的新请求，不能把历史mask复制到新Job当自动生产成功。</p>
+<h3>B. 接入现有 brief 并做合同验证</h3>
+<p>原规划审查同时得到候选与实体信息，解析器实际保存结果；局部修正后重新绑定该次内容key。校验mask进任务指纹、发给第一参考；现有恢复不触发SAM。检查不同变体、不同同类实例、矩形尺寸、局部逆映射、alpha和文件篡改行为。</p>
+<p><b>当前生产测试套件已经100例，上限100例。</b>先扩展原生mask、规划绑定与恢复已有行为用例，不新增重复传输测试。需要新增独立区域行为case时，先核实并合并真正重叠覆盖，腾出相同数量；不靠跳过、删除独立契约或掩藏大量无关子用例绕预算。目标测试跑编辑涉及模块，最后仅一次 <code>D:\anaconda\python.exe scripts/run_production_tests.py</code>，仍≤100例且≤60秒。</p>
+<h3>C. 固定11张底图回归</h3>
+<p>仍使用最近的11张床架/柜体/仿真树底图，不新增ASIN、不测试黑色金属床架。原木与白色房子床检查屋顶/烟囱、凹槽、远近栏杆、床腿；抽屉床检查窄木边、抽屉与床品；柜体检查暗背板、把手与五金；树检查全树、底盆与多个实例；透明高柜作为归属与特殊表面边界样本。</p>
+<p>人工只做冻结测试评价，不手工补mask后记为自动成功。必须记录每个原有问题是否消失，以及是否新删木面/混入背景实例。点命中和四块见证区保留为定位工具，不用于冒充整图准确率。</p>
+<h3>D. 当前链条的有界实图验证，只到生图</h3>
+<p>从上述已核实覆盖范围的底图中固定床架、黑柜、双树各1张：同源、同提示词、同辅助参考、同模型/路由/参数，两臂分别有原生mask与无mask，各最多2次，<b>总上限12张真实返回</b>。先做每臂1次的6张，发现硬结构变化则停止相应类目的后续重复，保留失败。没有匹配随机种子时不声称精确降幅或普遍因果。</p>
+<p>验证走新Job中的当前brief、ImageTask和generate入口，截止生图；不启动生产QA阶段。逐图比较原始输出与实际使用底图，同时记录现有最终化处理是否改变细节。成功条件同时包含产品结构/颜色/纹理/材质保持、要求的床品/房间/摆件确实变化、缝隙同步变化且没有保留大片旧背景。已合格mask下仍发生主体重绘时，责任转到生成执行/供应商实际mask语义，不继续盲目改SAM。</p>
+<p>当前账单价格未从注册表得到，不能给虚构金额或零计费承诺。按物理请求记录未知524，使用现有重发规则；替代请求也计入物理次数，不能因未知结果掩盖请求量。原始计划12次提交以内，触发未知结果重发时保留少于12张可比较结果，不为了凑图新增收费。</p>
+<h3>E. 一次明确决定，避免继续碎片试验</h3>
+<ul>
+<li><b>合同链通过＋区域回归无新增构件丢失＋实图达标：</b>启用已经验证的同机位普通编辑范围；按实际角色证据扩展func/size。报告列明范围，不称全品类上线。</li>
+<li><b>归属或合并仍失败：</b>修复唯一的区域模块/原审查合同，保留受影响类型未通过，其他无依赖任务保持原流程。不扩大样本、下载模型或增加服务来绕过责任。</li>
+<li><b>区域合格但实图仍改变主体：</b>当前模型路线未满足该任务保真需求；核对真实mask执行并保留结果。不用SAM反复重分割掩盖生成能力边界。</li>
+</ul>
+
+<h2>11. 明确后置的事项</h2>
+<p>官方原始共享主干权重的数值对照、未知量化破碎根因、镜面/透射的通用分解、候选修订自动mask、全品类零漏选和零重绘承诺均不作为本次代码接入已完成能力。前两项保持证据驱动，不先下载全模型；它们不妨碍实现可用的合同与有限范围，但若实际回归失败也不能因“根因后置”强行宣布通过。</p>
+<p>本方案替换早期文档中的HF后端依赖、每张/每部件独立Gemini流程、未经验证的4次前向硬预算、默认整体mask替换和一次性全角色上线建议。保留底图绑定、透明通道、不可见证据、恢复和真实成图验收原则。</p>
+
+<footer><p><b>本轮工作记录：</b>新增本执行方案文件；生产文件新增/删除/修改均为0，生产行数+0/−0，无生产路径或测试删除。只加载默认测试套件核查数量（100例），未运行测试、SAM、Gemini或生图。以上规模、字段与验收均为待执行方案；当前代码有原生mask读取与发送，没有SAM自动生产者。</p></footer>
+</main></body></html>

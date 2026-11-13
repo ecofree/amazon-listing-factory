@@ -1,15 +1,38 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "job_state.schema.json",
-  "title": "JobStateV7",
+  "title": "JobStateV8",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "job_id", "status", "stage", "stages", "tasks", "task_history", "artifacts", "errors", "invalidated_errors", "warnings", "updated_at"],
   "properties": {
-    "schema_version": {"const": 7},
+    "schema_version": {"const": 8},
     "job_id": {"type": "string", "minLength": 1},
     "status": {"enum": ["pending", "running", "awaiting_review", "partial_success", "failed", "success"]},
     "status_reason": {"type": "string"},
+    "generation_execution_scope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "tasks", "selection_sha256"],
+      "properties": {
+        "mode": {"enum": ["all", "selected"]},
+        "selection_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "tasks": {"oneOf": [
+          {"type": "null"},
+          {"type": "array", "minItems": 1, "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["child", "role", "task_fingerprint"],
+            "properties": {
+              "child": {"type": "string", "minLength": 1},
+              "role": {"type": "string", "minLength": 1},
+              "task_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          }}
+        ]}
+      },
+      "allOf": [{"if": {"properties": {"mode": {"const": "all"}}},
+        "then": {"properties": {"tasks": {"type": "null"}}},
+        "else": {"properties": {"tasks": {"type": "array", "minItems": 1}}}}]
+    },
     "stage": {"type": "string"},
     "stages": {"type": "object", "additionalProperties": {"type": "object"}},
     "tasks": {
@@ -27,6 +50,10 @@
           "attempts": {"type": "integer", "minimum": 0},
           "error": {"type": "string"},
           "failure_owner": {"type": "string"},
+          "reason_code": {"type": "string", "minLength": 1},
+          "next_action": {"type": "string", "minLength": 1},
+          "resume_condition": {"type": "string", "minLength": 1},
+          "remote_request_allowed": {"type": "boolean"},
           "transport_attempt": {"type": "integer", "minimum": 0},
           "provider_attempts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
           "candidate_revision": {"type": "integer", "minimum": 0, "maximum": 99},

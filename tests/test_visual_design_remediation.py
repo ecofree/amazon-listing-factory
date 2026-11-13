@@ -1,893 +1,388 @@
-from __future__ import annotations
-
-from core.image_task_inputs import initial_output_inventory
-
+"""Current source, transport, style and QA boundaries after planner-loop replacement."""
+from contextlib import contextmanager
+from copy import deepcopy
 import json
-import tempfile
-import unittest
 from pathlib import Path
+import tempfile
+import time
+import unittest
 from unittest.mock import patch
 
-from core.io import read_json
-from tests.current_image_contract_fixture import current_product_feature, current_measurement_rows, supported_design_reviews, supported_review_results
-from core.visual_semantics import _attempt_trace
-from core.visual_design_kit_compiler import cleaned_source_claims, _compile_display_copy
-from core.vision_gemini_client import (
-    _gemini_native_payload, _parse_sse_text_candidates, _parse_generate_content_candidates,
-    _response_finish_reasons,
-)
-
-
-def _evidence_source(role='main', *, features=None, source_id='source_00'):
-    features = [current_product_feature()] if features is None else features
-    return dict(source_id=source_id, source_index=int(source_id.split('_')[-1]), role=role,
-        source_sha256='a'*64, input_revision_id='r', claims=[], measurements=current_measurement_rows() if role == 'size' else [],
-        observation=dict(status='success', objects=[], product_features=features, product_extent='whole_view',
-            reference_purposes=['appearance', 'feature'], evidence_gaps=[], text_gaps=[]))
-
-
-def _role_brief(compiled, role):
-    return next(brief for brief in compiled['image_briefs'] if brief['role'] == role)
+from core.io import read_json,file_sha256,write_json
+from tests.current_image_contract_fixture import (current_art_direction,current_image_task,current_product_feature,
+    current_measurement_rows,current_observed_measurement,observation_wire,write_observation_images)
 
 
 class VisualDesignRemediationTests(unittest.TestCase):
-    def test_original_references_preserve_product_pixels(self):
-        from copy import deepcopy
-        from tests.remediation_recheck_fixture import verify_review_projection, verify_observation_feedback
-        verify_review_projection(self)
-        verify_observation_feedback(self)
-        from PIL import Image
-        from core.io import file_sha256
-        from core.image_reference_context import prepare_planning_references, resolve_edit_references
-        from tests.current_image_contract_fixture import current_image_direction
-        with tempfile.TemporaryDirectory() as tmp:
-            job = Path(tmp)
-            image = job / 'source.png'
-            with Image.new('RGB', (1500, 1000), 'white') as pixels:
-                pixels.save(image)
-            source = _evidence_source('func')
-            source.update(source_path='source.png', source_sha256=file_sha256(image))
-            planned = prepare_planning_references(job, [source], job / 'planning')
-            self.assertEqual([image], planned)
-            other = deepcopy(source)
-            other['source_id'] = 'source_01'
-            with self.assertRaisesRegex(ValueError, 'one reliable whole-product'):
-                prepare_planning_references(job, [source, other], job / 'ambiguous')
-            source['observation']['reference_purposes'] = ['feature']
-            self.assertEqual([image], prepare_planning_references(job, [source, other], job / 'selected'))
-            self.assertEqual('source_01', read_json(job / 'selected/manifest.json')['attachments'][0]['source_id'])
-            source['observation']['reference_purposes'] = ['appearance', 'feature']
-            refs = resolve_edit_references(dict(role='func', image_direction=current_image_direction()),
-                                           [source], job=job, child='B1')
-            self.assertEqual(source['source_sha256'], refs[0]['sha256'])
-            self.assertEqual(source['source_path'], refs[0]['path'])
-            self.assertFalse((job / 'images' / 'evidence_views').exists())
-            source['source_sha256'] = '0' * 64
-            with self.assertRaisesRegex(ValueError, '[Ss]ource changed'):
-                prepare_planning_references(job, [source], job / 'changed')
-
-    def test_local_repair_preserves_facts_without_source_panel_obligations(self):
-        from tests.remediation_recheck_fixture import verify_shared_repair, verify_partial_review_rows
-        verify_shared_repair(self)
-        verify_partial_review_rows(self)
-        import time
-        from copy import deepcopy
-        from core.visual_design_kit import _finish_image_briefs, _planner_source_view
-        from core.visual_design_kit_compiler import compile_visual_design_kit_response, design_binding_request
-        from tests.current_image_contract_fixture import current_art_direction, current_image_direction, supported_review_results
-        from core.visual_semantics import CLAIM_REVIEW_POLICY
-        features = [current_product_feature(), current_product_feature(feature='edge_joint')]
-        source = _evidence_source('func', features=features)
-        source['claims'] = [dict(evidence_id='drawer', text='Drawers on wheels')]
-        draft = dict(role='func', source_id='source_00', image_direction=current_image_direction(),
-                     display_copy=dict(title=None, labels=[dict(text='Drawers on wheels', evidence_ids=['drawer'])]))
-        raw = dict(family_art_direction=current_art_direction(), image_briefs=[
-            dict(role='main', source_id='source_00', image_direction=current_image_direction()), draft,
-            dict(role='scene', source_id='source_00', image_direction=current_image_direction())])
-        request = design_binding_request(draft, raw['family_art_direction'], source=source)
-        self.assertEqual(['product_depiction'], request['physical_operations'])
-        self.assertNotIn('unknown_product_objects', request['required_facts'])
-        self.assertEqual(['source_00'], [row['source_id'] for row in request['selected_evidence']])
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as reviewer, patch(
-                'core.visual_design_kit.gemini_stream_generate') as remote:
-            ready = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
-                source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
-            self.assertEqual('ready', _role_brief(ready, 'func')['status'])
-            reviewer.assert_called_once()
-            self.assertEqual(['main', 'func', 'scene'], [r['role_design']['role'] for r in reviewer.call_args.args[0]])
-            cached = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
-                source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=ready)
-            self.assertEqual(ready, cached)
-            reviewer.assert_called_once()
-            remote.assert_not_called()
-        unchecked = compile_visual_design_kit_response(raw, source_manifest=[source], output_inventory=initial_output_inventory([source]))
-        self.assertEqual('review', _role_brief(unchecked, 'func')['failure_owner'])
-        wrong_face = deepcopy(raw)
-        wrong_face['image_briefs'][1]['image_direction']['presentation']['state'] = 'Mount the catch on the exterior top face'
-        def check_face(requests, **kwargs):
-            reviews = supported_review_results(requests)
-            for row in requests:
-                if row.get('role_design', {}).get('presentation', {}).get('state') == 'Mount the catch on the exterior top face':
-                    reviews[row['key']]['findings'] = [dict(operation='product_depiction', status='inconclusive',
-                        resolution='revise_plan', reason='Source supports the inner door-frame underside, not the exterior top face')]
-            return reviews
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=check_face) as reviewer, patch(
-                'core.visual_design_kit.gemini_stream_generate', return_value=json.dumps(dict(image_briefs=[draft]))) as remote:
-            corrected = _finish_image_briefs(wrong_face, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
-                source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
-            self.assertEqual(ready, corrected)
-            self.assertEqual(2, reviewer.call_count)
-            remote.assert_called_once()
-        for invalid_id in (None, 'bad_source_id'):
-            broken = deepcopy(raw)
-            broken['image_briefs'][1].pop('source_id')
-            if invalid_id:
-                broken['image_briefs'][1]['source_id'] = invalid_id
-            def repair_anchor(prompt, attachments, **kwargs):
-                payload = json.loads(prompt.split('\n', 1)[1])
-                self.assertEqual('source_00', payload['pending'][0]['draft']['source_id'])
-                self.assertEqual([], payload['design_review_findings'])
-                return json.dumps(dict(image_briefs=[draft]))
-            with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as reviewer, patch(
-                    'core.visual_design_kit.gemini_stream_generate', side_effect=repair_anchor) as remote:
-                repaired = _finish_image_briefs(broken, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
-                    source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
-                self.assertEqual('ready', _role_brief(repaired, 'func')['status'])
-                self.assertEqual(_role_brief(ready, 'main'), _role_brief(repaired, 'main'))
-                self.assertEqual(1, remote.call_count)
-                self.assertEqual(2, reviewer.call_count)
-                self.assertEqual(['main', 'scene'], [r['role_design']['role'] for r in reviewer.call_args_list[0].args[0]])
-                self.assertEqual(['func'], [r['role_design']['role'] for r in reviewer.call_args_list[1].args[0]])
-        draft['display_copy']['labels'] = [dict(text='Effortless pull-out', evidence_ids=['drawer'])]
-        def review(requests, **kwargs):
-            return {**supported_review_results(requests), **{row['key']: dict(key=row['key'], policy=CLAIM_REVIEW_POLICY, response_sha256='b'*64,
-                    status='inconclusive', resolution='revise_plan', reason='Unsupported performance', findings=[]) for row in requests if row['kind'] == 'product_claim'}}
-        def repair(prompt, attachments, **kwargs):
-            self.assertIn('Effortless pull-out', prompt)
-            self.assertEqual(1, kwargs['max_physical_requests'])
-            fixed = deepcopy(draft)
-            fixed['display_copy']['labels'] = [dict(text='Drawers on wheels', evidence_ids=['drawer'])]
-            return json.dumps(dict(image_briefs=[fixed]))
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=review) as reviewer, patch(
-                'core.visual_design_kit.gemini_stream_generate', side_effect=repair) as repair_call:
-            fixed = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
-                source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
-            self.assertEqual('ready', _role_brief(fixed, 'func')['status'])
-            self.assertEqual(1, repair_call.call_count)
-            self.assertEqual(2, reviewer.call_count)
-            self.assertEqual(['Drawers on wheels'], reviewer.call_args.args[0][0]['role_design']['display_copy']['labels'])
-            self.assertEqual(raw['family_art_direction'], fixed['family_art_direction'])
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=TimeoutError('review clock')), patch(
-                'core.visual_design_kit.gemini_stream_generate') as unnecessary:
-            unavailable = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
-                source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=None)
-            self.assertEqual('review', _role_brief(unavailable, 'func')['failure_owner'])
-            with patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results):
-                recovered = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame', source_paths=[],
-                    source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+10, cached=unavailable)
-            self.assertEqual('ready', _role_brief(recovered, 'func')['status'])
-            unnecessary.assert_not_called()
+    def test_source_observation_unknown_stops_across_revisions(self):
+        from core.visual_semantics import observe_child_sources
         from core.vision_errors import VisionRequestError
-        for busy_primary, expected_calls in ((True, 2), (False, 1)):
-            failure = VisionRequestError('visual_planning', 'auth_failure', 'backup quota exhausted', metadata={
-                'physical_request_count': 1, 'response_candidate_count': 0,
-                'attempts': ([{'status': 'queue_unavailable'}] if busy_primary else []) + [{'status': 'auth_failure'}]})
-            def resume_primary(requests, **kwargs):
-                kwargs['attempt_observer']({'event': 'request_budget', 'physical_request_count': 1})
-                if reviewer.call_count == 1:
-                    raise failure
-                return supported_review_results(requests)
-            with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=resume_primary) as reviewer, patch(
-                    'core.visual_design_kit.gemini_stream_generate') as unnecessary:
-                recovered = _finish_image_briefs(raw, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1',
-                    source_manifest=[source], category_id='bed_frame', source_paths=[], source_originals=[], trace_dir=Path(tmp),
-                    deadline_monotonic=time.monotonic()+10, cached=None)
-                self.assertEqual(expected_calls, reviewer.call_count)
-                self.assertEqual('ready' if busy_primary else 'pending', _role_brief(recovered, 'func')['status'])
-                self.assertEqual(expected_calls, json.loads((Path(tmp)/'attempt_budget.json').read_text())['review'])
-                unnecessary.assert_not_called()
-        draft['display_copy']['labels'][0]['text'] = 'Drawers on wheels'
-        from core.visual_semantics import candidate_product_targets
-        self.assertEqual([{'target_id': 'func', **draft['image_direction']['presentation']}], candidate_product_targets(draft))
-        request = design_binding_request(draft, raw['family_art_direction'], source=source)
-        self.assertEqual(['product_depiction'], request['physical_operations'])
-        review = supported_review_results([request])
-        review[request['key']]['findings'].append(dict(operation='source_product:source_00',
-            status='contradiction', reason='Observation invents feet absent from original'))
-        failed = _role_brief(compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]),
-                            source_manifest=[source], claim_reviews=review), 'func')
-        self.assertEqual('observation', failed['failure_owner'])
-        from core.visual_design_kit import compact_product_claims
-        product_claims = compact_product_claims({'title': 'Frame with drawers'})
-        disputed = dict(object_id='frame', kind='frame', sale_membership='unknown',
-            membership_evidence=[dict(fact_id='product.title', quote='Frame with drawers')],
-            visibility='visible', state='visible product')
-        source['observation']['objects'] = [disputed]
-        request = design_binding_request(draft, raw['family_art_direction'], source=source, product_claims=product_claims)
-        self.assertEqual(['product_depiction', 'sold_membership:source_00'], request['physical_operations'])
-        self.assertEqual([dict(source_id='source_00', **disputed)], request['required_facts']['unknown_product_objects'])
-        self.assertEqual(product_claims, request['required_facts']['product_claims'])
-        self.assertEqual('product.title', request['required_facts']['product_claims'][0]['field_path'])
-        unchanged = deepcopy(raw)
-        source['observation']['objects'] = [{**disputed, 'sale_membership': 'product', 'state': 'Assembled frame with mattress'}]
-        unchanged['image_briefs'][1]['display_copy']['labels'] = [dict(text='Drawers on wheels', evidence_ids=['drawer'])]
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_design_kit.review_planning_bindings', side_effect=supported_review_results) as review, patch(
-                'core.visual_design_kit.gemini_stream_generate') as redesign:
-            ready = _finish_image_briefs(unchanged, output_inventory=initial_output_inventory([source]), job=Path(tmp), child='B1', source_manifest=[source], category_id='bed_frame',
-                source_paths=[], source_originals=[], trace_dir=Path(tmp), deadline_monotonic=time.monotonic()+5, cached=None)
-            self.assertTrue(all(row['status'] == 'ready' for row in ready['image_briefs'] if row['role'] in {'main', 'func'}),
-                            [(row['role'], row.get('error')) for row in ready['image_briefs']])
-            review.assert_called_once()
-            self.assertEqual(['product_depiction'], review.call_args.args[0][0]['physical_operations'])
-            redesign.assert_not_called()
-        source['observation']['objects'] = []
-        source['observation']['reference_purposes'] = ['appearance']
-        projection = _planner_source_view(source)
-        self.assertEqual('whole_view', projection['product_extent'])
-        self.assertNotIn('physical_evidence', projection)
-
-    def test_independent_canvas_uses_one_design_contract_without_source_style(self):
-        from core.visual_design_kit import visual_design_kit_prompt
-        from core.visual_design_kit_compiler import compile_visual_design_kit_response
-        from core.plugin import load_plugin
-        from tests.current_image_contract_fixture import current_art_direction, current_image_direction
-        source = _evidence_source()
-        source['shopping_intent'] = 'OLD_PURPOSE'
-        source['observation'].update(layout_summary='OLD_CAPSULE_LAYOUT', text_observations=[dict(kind='prop', text='OLD_PROP_WORDS')])
-        prompt = visual_design_kit_prompt(load_plugin("bed_frame"), {}, {}, [source], output_inventory=initial_output_inventory([source]))
-        for old in ("OLD_PURPOSE", "OLD_CAPSULE_LAYOUT", "OLD_PROP_WORDS"):
-            self.assertNotIn(old, prompt)
-        raw = {"family_art_direction": current_art_direction(), "image_briefs": [{
-            "role": "main", "source_id": "source_00", "image_direction": "obsolete unconstrained string"}]}
-        rejected = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source])
-        self.assertEqual("pending", rejected["image_briefs"][0]["status"])
-        raw["image_briefs"][0]["image_direction"] = current_image_direction()
-        self.assertEqual("ready", compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], claim_reviews=supported_design_reviews(raw, [source]))["image_briefs"][0]["status"])
-        raw["image_briefs"][0]["image_direction"]["product_sources"] = ["unobserved_source"]
-        self.assertEqual("pending", compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source])["image_briefs"][0]["status"])
-        raw["image_briefs"][0]["image_direction"] = current_image_direction()
-        raw["image_briefs"][0]["image_direction"]["measurement_ids"] = ["source_00:unobserved"]
-        self.assertEqual("pending", compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source])["image_briefs"][0]["status"])
-        source["role"] = "size"
-        source["measurements"] = current_measurement_rows()
-        raw['image_briefs'][0]['role'] = 'size'
-        source['claims'] = [{'evidence_id': 'heading', 'text': 'Product Dimensions'}]
-        raw['image_briefs'][0]['display_copy'] = {'title': {'evidence_ids': ['heading'], 'text': 'Product Dimensions'}, 'labels': []}
-        raw["image_briefs"][0]["image_direction"] = current_image_direction(environment="graphic_canvas", measurement_ids=["source_00:width"])
-        size_brief = _role_brief(compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], claim_reviews=supported_design_reviews(raw, [source])), 'size')
-        self.assertEqual("ready", size_brief["status"])
-        self.assertEqual({'visual_goal', 'presentation', 'product_sources', 'measurement_ids', 'design_transfer', 'environment_mode'}, set(size_brief['image_direction']))
-        self.assertEqual(raw['image_briefs'][0]['image_direction'], size_brief['image_direction'])
-        self.assertEqual('Product Dimensions', size_brief['display_copy_contract']['title'])
-        from core.image_task_inputs import task_specs
-        sources = [_evidence_source(role, source_id=f'source_{i:02d}') for i, role in enumerate(
-            ('size', 'scene', 'scene', 'func', 'func', 'reference_only'))]
-        sources[2]['observation'].update(product_features=[], reference_purposes=[], product_extent='none')
-        specs = task_specs({}, sources, inventory=initial_output_inventory(sources), include_optional=True)
-        self.assertEqual(['main', 'scene', 'scene_02', 'func', 'func_02', 'size'], [row['role'] for row in specs])
-        self.assertIs(specs[0]['source'], specs[-1]['source'])
-        self.assertEqual(['main', 'scene', 'func', 'size'], [row['role'] for row in task_specs({}, sources, inventory=initial_output_inventory(sources))])
-        briefs = []
-        for spec in specs:
-            brief = dict(role=spec['role'], source_id=spec['source']['source_id'], image_direction=current_image_direction(
-                measurement_ids=['source_00:width'] if spec['role'] == 'size' else []))
-            if spec['role'].split('_', 1)[0] in {'func', 'size'}:
-                brief['display_copy'] = dict(title=None, labels=[])
-            briefs.append(brief)
-        raw = dict(family_art_direction=current_art_direction(), image_briefs=briefs)
-        self.assertTrue(all(row['status'] == 'ready' for row in compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory(sources), source_manifest=sources, claim_reviews=supported_design_reviews(raw, sources))['image_briefs']))
-        sources[0]['observation']['text_gaps'] = [dict(text='Required width is unreadable', kind='measurement')]
-        sources[3]['observation']['text_gaps'] = [dict(text='Unselected source claim unreadable', kind='product_fact')]
-        affected = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory(sources), source_manifest=sources, claim_reviews=supported_design_reviews(raw, sources))
-        self.assertEqual([], [row['role'] for row in affected['image_briefs'] if row['status'] != 'ready'])
-        from core.image_generation import _compose_revision_prompt
-        measured_func = _evidence_source('func')
-        measured_func['measurements'] = current_measurement_rows()
-        frozen = initial_output_inventory([measured_func])
-        self.assertEqual('source_00', next(row['source_id'] for row in frozen if row['role'] == 'size'))
-        replacement = {**measured_func, 'source_id': 'source_07', 'source_index': 7, 'source_sha256': 'b'*64, 'input_revision_id': 'r2'}
-        resumed = initial_output_inventory([replacement], previous={'output_inventory': frozen, 'source_references': [measured_func]})
-        self.assertEqual(frozen, initial_output_inventory([measured_func], previous={'output_inventory': frozen, 'source_references': [measured_func]}))
-        self.assertEqual(['main', 'scene', 'func', 'size'], [row['role'] for row in resumed])
-        self.assertTrue(all(row['source_id'] == 'source_07' for row in resumed))
-        current = task_specs({'asin': 'B1'}, [dict(measured_func, child='B2'), dict(replacement, child='B1')], inventory=frozen)
-        self.assertTrue(all(row['source']['source_id'] == 'source_07' for row in current))
-        replacement['measurements'] = []
-        pending = task_specs({}, [replacement], inventory=resumed)
-        self.assertEqual(['size'], [row['role'] for row in pending if row['evidence_pending']])
-        base = 'x' * 7394
-        revised = _compose_revision_prompt(base_prompt=base, request_heading='full redraw', request_intro='Redraw the same task.', reason='Preserve the original joint.')
-        self.assertTrue(revised.startswith(base))
-        self.assertLessEqual(len(revised), 8000)
-        with self.assertRaisesRegex(RuntimeError, 'maximum executable length'):
-            _compose_revision_prompt(base_prompt=base, request_heading='full redraw', request_intro='Same task.', reason='x'*1000)
-
-    def test_observed_size_facts_survive_projection_without_qa_false_failure(self):
-        from core.final_source_intents import _observed_measurements, _measurement_rows
-        from core.image_task_inputs import measurement_authority
-        from core.visual_semantics import OBSERVATION_POLICY
-        from core.image_qa import _semantic_gates
-        from tests.test_qa_lite_v1 import _task, _observed
-        from tests.current_image_contract_fixture import current_observed_measurement
-        visual = {"status": "success", "policy_version": OBSERVATION_POLICY, "visible_numbers_or_units": ['57"'],
-                  'measurements': [current_observed_measurement(), current_observed_measurement('300 lbs', 'Bed capacity', 'capacity', key='load', kind='capacity')],
-                  "text_observations": [{"text": "Dimensions", "kind": "marketing"},
-                                        {"text": "300 lbs", "kind": "measurement"}]}
-        source = {"source_id": "source_00", "role": "size", "visual_evidence": visual,
-                  "ocr_evidence": {"lines": [{"text": "17'", "confidence": .93, "box": [0, 0, 1, 1]}]},
-                  "measurements": _measurement_rows(_observed_measurements(visual), {})}
-        authority = measurement_authority('size', {'measurement_ids': ['source_00:width', 'source_00:load']}, [source])
-        self.assertEqual(2, len(authority["measurement_groups"]))
-        self.assertEqual(['17 in', '300 lbs'], authority['render_text'])
-        self.assertEqual('load_capacity', authority['measurement_groups'][1]['measurement_role'])
-        self.assertNotIn('source_visible_callouts', authority)
-        values = _observed_measurements(visual)
-        self.assertEqual(2, len(values))
-        self.assertNotIn('17 ft', [r['text'] for r in values])
-        from core.visual_semantics import _validate_source_measurements, _validate_candidate_observation
-        from copy import deepcopy
-        repeated = deepcopy(visual['measurements'])
-        from core.image_prompt_compiler import _measurement_content
-        from core.image_reference_context import measurement_attachment
-        before = deepcopy(authority)
-        refs = [{'kind': 'measurement_evidence', 'source_id': 'source_00'}]
-        content = _measurement_content(authority, refs)
-        self.assertEqual(before, authority)
-        self.assertEqual(1, content.count('17 in'))
-        self.assertNotIn('coordinates', content.casefold())
-        repeated[1] = {**repeated[0], 'text': '17 ft'}
-        with self.assertRaisesRegex(ValueError, 'competing readings'):
-            _validate_source_measurements(repeated)
-        task = _task("size", "source_image")
-        task['renderable_text_contract'] = {'mode': 'exact', 'strings': ['Dimensions']}
-        task["measurement_authority"] = authority
-        repeated_source = _evidence_source('func')
-        first = current_measurement_rows()[0]
-        repeated_source['measurements'] = [dict(first, source_occurrence='upper'), dict(first, source_occurrence='lower')]
-        repeated_authority = measurement_authority('func', {'measurement_ids': ['source_00:upper', 'source_00:lower']}, [repeated_source])
-        self.assertEqual(['source_00:upper', 'source_00:lower'], [row['id'] for row in repeated_authority['measurement_groups']])
-        self.assertEqual(1, len(repeated_authority['render_text']))
-        obs = _observed(task)
-        obs.update(texts=[{"text": text, "kind": "marketing", "confidence": .99} for text in ("Dimensions", "300 lbs")],
-                   measurement_coverage="complete", measurements=[{
-                       "measurement_id": row["id"], "candidate_text": row["render_text"], "source_text": row["source_text"],
-                       "relationship": "same", "confidence": .99} for row in authority["measurement_groups"]])
-        obs["measurements"].append({"measurement_id": None, "source_text": '4.5"', "candidate_text": '4.5"', "relationship": "same", "confidence": .99})
-        self.assertEqual(["pass", "fail"], [r["status"] for r in _semantic_gates(task, obs)[:2]])
-        obs['measurements'][-1]['candidate_text'] = obs['measurements'][-1]['source_text'] = authority['measurement_groups'][0]['render_text']
-        self.assertEqual('inconclusive', _semantic_gates(task, obs)[1]['status'])
-        obs["measurements"][-1]["candidate_text"] = '6"'
-        self.assertEqual("fail", _semantic_gates(task, obs)[1]["status"])
-        obs["texts"].append({"text": "Waterproof", "kind": "marketing", "confidence": .99})
-        self.assertEqual("fail", _semantic_gates(task, obs)[0]["status"])
-        located = _observed(task)
-        located['measurement_coverage'] = 'complete'
-        located['measurements'] = [{'measurement_id': 'width', 'object': 'cabinet width', 'source_id': 'source_00',
-            'attachment_index': 2, 'source_text': '17 in', 'candidate_text': '13.5 in', 'relationship': 'different',
-            'confidence': .99, 'source_region': dict(left=.1, top=.1, right=.2, bottom=.2), 'candidate_region': dict(left=.2, top=.2, right=.3, bottom=.3)},
-            {'measurement_id': 'ghost', 'object': 'unlocatable OCR', 'source_id': 'source_00', 'attachment_index': 2,
-             'source_text': '17 ft', 'candidate_text': '17 in', 'relationship': 'different', 'confidence': .99,
-             'source_region': dict(left=0, top=0, right=0, bottom=0), 'candidate_region': dict(left=.2, top=.2, right=.3, bottom=.3)}]
-        _validate_candidate_observation(located)
-        self.assertEqual('unknown', located['measurements'][1]['relationship'])
-        self.assertEqual('fail', _semantic_gates(task, located)[1]['status'])
-        located['measurements'].pop(0)
-        self.assertEqual('inconclusive', _semantic_gates(task, located)[1]['status'])
-        for text in ('\u2264 6"', '6-8 in', '6 in to 8 in'):
-            with self.subTest(complete_measurement=text):
-                visual['measurements'] = [current_observed_measurement(text, 'Recommended mattress thickness', key='mattress')]
-                _validate_source_measurements(visual['measurements'])
-                source['measurements'] = _measurement_rows(_observed_measurements(visual), {})
-                authority = measurement_authority('func', {'measurement_ids': ['source_00:mattress']}, [source])
-                self.assertEqual(text, authority['measurement_groups'][0]['source_text'])
-                self.assertEqual(text, authority['render_text'][0])
-                self.assertIn('Recommended mattress thickness', _measurement_content(authority, refs))
-                self.assertIn(text, _measurement_content(authority, refs))
-                task['measurement_authority'] = authority
-                obs['measurements'] = [dict(measurement_id=authority['measurement_groups'][0]['id'],
-                    source_text=text, candidate_text='6 in', relationship='same', confidence=.99)]
-                self.assertEqual('fail', _semantic_gates(task, obs)[1]['status'])
-
-    def test_complete_single_word_claims_remain_bindable(self):
-        source = _evidence_source('func')
-        source['claims'] = [{"evidence_id": str(i), "text": word}
-                            for i, word in enumerate(("Pathway", "Wedding", "Q", "T o", "\ufffd"))]
-        self.assertEqual(["Pathway", "Wedding"], [row["text"] for row in cleaned_source_claims(source)])
-        result = _compile_display_copy([source], {"title": None, "labels": [
-            {"text": "Pathway", "evidence_ids": ["0"]}, {"text": "Wedding", "evidence_ids": ["1"]}]})
-        self.assertEqual(["Pathway", "Wedding"], result["labels"])
-        from core.visual_design_kit_compiler import claim_review_requests, compile_visual_design_kit_response
-        from core.visual_semantics import CLAIM_REVIEW_POLICY
-        physical_id = 'physical:source_00:frame_support:0'
-        copy = {'title': None, 'labels': [{'text': 'Visible frame support and its joints', 'evidence_ids': [physical_id]}]}
-        requests = claim_review_requests({'image_briefs': [{'role': 'func', 'source_id': 'source_00', 'display_copy': copy}]}, [source])
-        self.assertEqual(1, len(requests))  # Visual descriptions never bypass independent claim verification.
-        self.assertEqual({physical_id: copy['labels'][0]['text']}, requests[0]['evidence'])
-        with self.assertRaisesRegex(ValueError, 'independent evidence review'):
-            _compile_display_copy([source], copy)
-        reviewed = {requests[0]['key']: {'key': requests[0]['key'], 'status': 'supported',
-                                       'policy': CLAIM_REVIEW_POLICY, 'response_sha256': 'a' * 64}}
-        self.assertEqual([copy['labels'][0]['text']], _compile_display_copy([source], copy, claim_reviews=reviewed)['labels'])
-        from core.image_task_inputs import build_display_copy_contract
-        from core.visual_design_kit_compiler import validate_image_brief_draft
-        from tests.current_image_contract_fixture import current_art_direction, current_image_direction
-        from copy import deepcopy
-        other = deepcopy(source)
-        other['source_id'] = 'source_06'
-        other['claims'] = [dict(evidence_id='8347dde92d972874b0a8', text='Open Shelf'),
-                           dict(evidence_id='c87e2308a69a60c4c00d', text='2-Door Lower Cabinet'),
-                           dict(evidence_id='a8bcffa59a926b4a01bc', text='Sliding Barn Door Cabinet')]
-        cross_copy = dict(title=None, labels=[dict(evidence_ids=[row['evidence_id']], text=row['text']) for row in other['claims']])
-        draft = dict(role='func', source_id=source['source_id'], image_direction=current_image_direction(), display_copy=cross_copy)
-        sources = [source, other]
-        validate_image_brief_draft(draft, source, current_art_direction(), sources, 'bathroom_cabinet')
-        contract = _compile_display_copy(sources, cross_copy)
-        self.assertEqual(contract, build_display_copy_contract(sources, dict(source_id=source['source_id'], display_copy_contract=contract)))
-        with self.assertRaisesRegex(ValueError, 'evidence scope'):
-            _compile_display_copy([source], cross_copy)
-        with self.assertRaisesRegex(ValueError, 'independent evidence review'):
-            _compile_display_copy(sources, dict(title=None, labels=[dict(evidence_ids=[physical_id], text='Solid pine supports 440 lb')]))
-        source['measurements'] = [dict(current_measurement_rows()[0], source_label='recommended mattress thickness', text='\u2264 6"')]
-        stale = dict(title=None, labels=[dict(evidence_ids=['measurement:source_00:0'], text='Recommended mattress thickness: 6 in')])
-        with self.assertRaisesRegex(ValueError, 'headings only'):
-            _compile_display_copy(sources, stale)
-        stale_contract = dict(mode='source_claims', title='', labels=[stale['labels'][0]['text']], bindings=stale['labels'])
-        with self.assertRaisesRegex(ValueError, 'headings only'):
-            build_display_copy_contract(sources, dict(source_id='source_00', display_copy_contract=stale_contract))
-        stale['labels'][0]['text'] = 'recommended mattress thickness'
-        self.assertEqual(['recommended mattress thickness'], _compile_display_copy(sources, stale)['labels'])
-        product_claims = [dict(type='source_product_statement', evidence_id='bullet',
-                              text='Built to Last: Crafted from solid wood for long-term durability.'),
-                          dict(type='source_product_statement', evidence_id='capacity', text='Up to 400 lbs: With evenly distributed load.')]
-        for text, evidence_id in (('Dimensions', 'measurement:source_00:0'), ('Built to Last', 'bullet')):
-            title = dict(text=text, evidence_ids=[evidence_id])
-            story = dict(title=title, labels=[])
-            self.assertEqual([], claim_review_requests({'image_briefs': [dict(role='size', source_id='source_00', display_copy=story)]}, sources, product_claims))
-            self.assertEqual(text, _compile_display_copy(sources, story, product_claims=product_claims)['title'])
-            raw = dict(family_art_direction=current_art_direction(), image_briefs=[dict(
-                role='func', source_id='source_00', image_direction=current_image_direction(), display_copy=story)])
-            compiled = compile_visual_design_kit_response(raw, source_manifest=[source], output_inventory=initial_output_inventory([source]),
-                product_claims=product_claims, claim_reviews=supported_design_reviews(raw, [source], product_claims=product_claims))
-            self.assertEqual('ready', _role_brief(compiled, 'func')['status'])
-        for text, evidence_id in (('Accurate Dimensions', 'measurement:source_00:0'), ('Built to Last', physical_id),
-                                 ('Last', 'bullet'), ('400 lbs', 'capacity')):
-            story = dict(title=dict(text=text, evidence_ids=[evidence_id]), labels=[])
-            self.assertEqual(1, len(claim_review_requests({'image_briefs': [dict(role='func', source_id='source_00', display_copy=story)]}, sources, product_claims)))
-            with self.assertRaisesRegex(ValueError, 'independent evidence review'):
-                _compile_display_copy(sources, story, product_claims=product_claims)
-        with self.assertRaisesRegex(ValueError, 'independent evidence review'):
-            _compile_display_copy(sources, dict(title=None, labels=[dict(text='Dimensions', evidence_ids=['measurement:source_00:0'])]))
-        import time
-        from core.visual_semantics import review_planning_bindings
-        from tests.current_image_contract_fixture import current_art_direction
-        deadline = time.monotonic() + 80
-        response = json.dumps({'reviews': [{'key': requests[0]['key'], 'status': 'supported', 'reason': 'Visible local structure',
-            'findings': [{'operation': 'source_00', 'status': 'supported', 'reason': 'Visible frame joints'}]}]})
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', return_value=response) as remote:
-            review_planning_bindings(requests, job=Path(tmp), child='B1', trace_dir=Path(tmp), deadline_monotonic=deadline)
-        self.assertEqual(deadline, remote.call_args.kwargs['deadline_monotonic'])
-        self.assertEqual(1, remote.call_args.kwargs['max_physical_requests'])
-        self.assertNotIn('total_timeout_seconds', remote.call_args.kwargs)
-        review_payload = json.loads(remote.call_args.args[0].split('\n', 1)[1])
-        self.assertEqual({}, review_payload['shared_design'])
-        self.assertNotIn('shared_design_paths', review_payload['bindings'][0])
-        from core.visual_design_kit import _planner_evidence
-        source['claims'] = [{'evidence_id': 'source_00:wheel', 'text': 'Drawers on wheels'}]
-        product_claims = [{'evidence_id': 'product:wheel', 'text': 'Drawers on wheels'}]
-        second = {**source, 'source_id': 'source_01', 'claims': [
-            {'evidence_id': 'source_01:wheel', 'text': 'Drawers on wheels'},
-            {'evidence_id': 'source_01:placement', 'text': 'Drawers can be placed on either side of the bed'}]}
-        views, texts = _planner_evidence([source, second], product_claims)
-        self.assertTrue(all('source_supported_claims' not in view for view in views))
-        wheel = [row for row in texts if row['text'] == 'Drawers on wheels']
-        self.assertEqual(1, len(wheel))
-        self.assertEqual({'product:wheel', 'source_00:wheel', 'source_01:wheel'}, set(wheel[0]['evidence_ids']))
-        self.assertIn('source_01:placement', views[1]['source_supported_claim_ids'])
-        self.assertIn('Drawers can be placed on either side of the bed', [row['text'] for row in texts])
-
-    def test_native_json_ignores_thoughts_and_keeps_failed_response_evidence(self):
-        from tests.remediation_recheck_fixture import verify_output_capacity_and_raw_trace
-        verify_output_capacity_and_raw_trace(self)
-        payload = {"candidates": [{"content": {"parts": [
-            {"thought": True, "text": '{"draft": 1}'}, {"text": '{"sources": []}'}]}, "finishReason": "STOP"}]}
-        body = json.dumps(payload)
-        self.assertEqual(["STOP"], _response_finish_reasons(body))
-        self.assertEqual(["length"], _response_finish_reasons('data: {"choices": [{"finish_reason": "length"}]}'))
-        self.assertEqual(['{"sources": []}'], _parse_generate_content_candidates(body))
-        self.assertEqual(['{"sources": []}'], _parse_sse_text_candidates("data: " + body))
-        config = _gemini_native_payload([], {"protocol": "google_gemini", "max_output_tokens": "12000"})
-        self.assertEqual("application/json", config["generationConfig"]["responseMimeType"])
-        self.assertEqual(12000, config["generationConfig"]["maxOutputTokens"])
-        from core.vision_gemini_client import _select_response_candidate, _response_failure_kind, _response_retry_prompt, _response_usage
-        limited = json.dumps({'candidates': [{'finishReason': 'MAX_TOKENS'}], 'usageMetadata': {'candidatesTokenCount': 8192}})
-        self.assertIsNone(_select_response_candidate(['{}'], lambda text: True, response_body=limited)[1])
-        self.assertEqual('output_limit', _response_failure_kind(limited, 'JSONDecodeError'))
-        self.assertEqual('json_syntax', _response_failure_kind(body, 'JSONDecodeError: bad JSON at char 18'))
-        client = {'max_output_tokens': 8192}
-        self.assertEqual('original', _response_retry_prompt(client, 'original', 'cut', 'partial', 'output_limit'))
-        self.assertEqual(16384, client['max_output_tokens'])
-        self.assertEqual({'candidatesTokenCount': 8192}, _response_usage(limited))
+        from tests.test_image_branch_v1 import _child
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "attempts.json"
-            _, record = _attempt_trace(path)
-            record({"status": "validation_failure", "response_text": '{"sources": [',
-                    "response_candidates": [{"validation_error": "incomplete object"}]})
-            event = read_json(path)[0]
-            self.assertEqual('{"sources": [', (path.parent / event["response_path"]).read_text())
-            self.assertEqual(["incomplete object"], event["validation_errors"])
-            _, next_record = _attempt_trace(path)
-            next_record({'status': 'success', 'response_text': '{}'})
-            self.assertEqual(2, len(read_json(path)))
-            self.assertNotEqual(read_json(path)[0]['response_path'], read_json(path)[1]['response_path'])
+            job=Path(tmp);sources=[dict(source_id='source_00',sha256='a'*64,ocr=[],path=job/'source.png')]
+            write_observation_images(sources)
+            def lost(*args,**kwargs):
+                kwargs['attempt_observer']({'event':'request_budget','physical_request_count':1})
+                raise VisionRequestError('visual_planning','timeout_failure','Reply lost after submission',metadata={'physical_request_count':1})
+            with patch('core.visual_semantics.gemini_stream_generate',side_effect=lost) as model:
+                first=observe_child_sources(job,_child(),sources)
+                self.assertEqual(1,model.call_count)
+                self.assertEqual('failed',first['source_00']['status'])
+                observe_child_sources(job,_child(),sources)
+                changed=deepcopy(_child());changed['specs']['Color']='Black'
+                observe_child_sources(job,changed,sources,corrections={'source_00':{'revision':'new','reason':'New evidence'}})
+                self.assertEqual(1,model.call_count,'A revision is not permission to repeat an unknown POST')
+                receipts=list((job/'reports/source_observations/requests').glob('*.json'))
+                self.assertEqual(1,len(receipts));self.assertEqual('unknown',read_json(receipts[0])['status'])
+        with tempfile.TemporaryDirectory() as tmp:
+            job=Path(tmp);sources=[dict(source_id='source_00',sha256='a'*64,ocr=[],path=job/'source.png')]
+            write_observation_images(sources)
+            write_json(job/'reports/source_observations'/('c'*64+'.json'),{
+                'child':'different-child','request_attempts':1,'sources':[{'source_id':'source_00','status':'failed'}]})
+            def rejected(*args,**kwargs):
+                kwargs['attempt_observer']({'event':'request_budget','physical_request_count':1})
+                kwargs['attempt_observer']({'status':'configuration_failure','response_body':'{"error":"insufficient_balance"}',
+                    'transport':{'response_complete':True,'request_outcome':'rejected'}})
+                raise VisionRequestError('visual_planning','configuration_failure','Complete HTTP 402 rejection',metadata={'physical_request_count':1})
+            with patch('core.visual_semantics.gemini_stream_generate',side_effect=rejected) as model:
+                for _ in range(2):
+                    result=observe_child_sources(job,_child(),sources)
+                    self.assertEqual('configuration_failure',result['source_00']['request_failure']['kind'])
+                self.assertEqual(1,model.call_count,'A known account rejection is not a schema-repair request')
+            receipts=list((job/'reports/source_observations/requests').glob('*.json'))
+            self.assertEqual(1,len(receipts));self.assertEqual('received',read_json(receipts[0])['status'])
 
-    def test_color_tools_measure_gemini_choices_without_selecting_or_mutating(self):
-        from tests.child_palette_regression_fixture import check_child_components
-        check_child_components(self)
-        from copy import deepcopy
-        from core.palette_registry import planned_palette_diagnostics
-        from tests.current_image_contract_fixture import current_art_direction
-        direction = current_art_direction()
-        before = deepcopy(direction)
-        report = planned_palette_diagnostics(direction)
-        self.assertEqual(before, direction)
-        self.assertIn("palette_direction.room.wall", report["colors"])
-        self.assertTrue(report["pairs"])
-        self.assertEqual("diagnostics_only_no_design_or_qa_decision", report["authority"])
-        self.assertNotIn("score", report)
-        direction["graphic_direction"]["text_color"] = "#FFFFFF"
-        self.assertNotEqual(report, planned_palette_diagnostics(direction))
-        direction["graphic_direction"]["backing_color"] = "#FFFFFF80"
-        transparent = planned_palette_diagnostics(direction)
-        self.assertAlmostEqual(128 / 255, transparent["colors"]["graphic_direction.backing_color"]["alpha"])
-        pairs = [row for row in transparent["pairs"] if row["second"] == "graphic_direction.backing_color"]
-        self.assertTrue(pairs)
-        self.assertTrue(all(row["underlay"] for row in pairs))
-        self.assertTrue(all(row["first"].startswith("graphic_direction.") for row in transparent["pairs"]))
-
-    def test_incomplete_copy_shape_uses_complete_object_repair(self):
-        from core.copy_writer import _is_non_json_copy_error, _only_title_validation_errors
-        error = "Copy AI response must contain title, item_highlights, bullets, and description keys only"
-        self.assertTrue(_is_non_json_copy_error(error))
-        self.assertFalse(_only_title_validation_errors(error))
-        self.assertTrue(_only_title_validation_errors("title exceeds 70 characters"))
-
-    def test_approved_reference_import_reaches_planner_and_only_selected_role(self):
-        from copy import deepcopy
+    def test_original_references_and_execution_permissions_remain_bound(self):
+        from tests.convergence_fixture import verify_gateway_admission,verify_recovery_and_binding
+        from tests.generation_selection_fixture import verify_execution_selection
+        from tests.sam_worker_fixture import verify_sam_worker_lifecycle
+        verify_gateway_admission(self);verify_recovery_and_binding(self);verify_execution_selection(self);verify_sam_worker_lifecycle(self)
+        from tests.generation_selection_fixture import _workspace,_snapshot
+        from core import production
+        from core.visual_design_kit import VisualDesignKitError
+        with _workspace() as (job,plugin,tasks):
+            (job/'reports/visual_design_kits_v16.jsonl').write_text('{}\n',encoding='utf-8')
+            before=_snapshot(job)
+            with patch.object(production,'begin_run') as begin,patch.object(production,'_run_stage') as execute:
+                with self.assertRaisesRegex(VisualDesignKitError,'Retired visual-plan'):
+                    production.run_job(production.JobRunRequest(job_dir=job,plugin=plugin),stages=['classify','brief','generate'])
+                begin.assert_not_called();execute.assert_not_called()
+            self.assertEqual(before,_snapshot(job))
         from PIL import Image
-        from core.io import write_json, file_sha256
-        from core.job import create_job, load_job
-        from core.plugin import load_plugin
-        from core.design_reference_library import approved_design_references, brand_design_brief, design_reference_usage
-        from core.visual_design_kit import visual_design_kit_prompt
-        from core.visual_design_kit_compiler import compile_visual_design_kit_response
-        from core.image_reference_context import resolve_edit_references
-        from tests.current_image_contract_fixture import current_art_direction, current_image_direction, current_image_task
-        from core.image_prompt_compiler import compile_task_prompt
-        plugin = load_plugin("bed_frame")
+        from core.image_reference_context import prepare_planning_references
+        from tests.test_visual_flow_contract import source
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            with Image.new("RGB", (32, 32), "magenta") as image:
-                image.paste((255, 255, 255), (8, 8, 24, 24))
-                image.save(root / "owned-fixture.png")
-            approval = {"status": "approved", "approved_by": "test-fixture-only", "approved_at": "2026-09-11",
-                        "allowed_uses": ["image_generation_reference"], "license_evidence": "Test-generated pixels"}
-            visual = {**approval, "product_clarity": "Test-only clear product field", "information_hierarchy": "Test-only hierarchy",
-                      "evidence_fit": "No unseen product parts required", "series_cohesion": "Test-only shared typography",
-                      "transfer_scope": "Reviewed central blank area; excluded magenta frame stands for unrelated reference product"}
-            asset = {"asset_id": "owned-layout", "roles": ["func"], "children": ["B1"],
-                     "local_path": "owned-fixture.png", "sha256": file_sha256(root / "owned-fixture.png"),
-                     "author": "test", "source_url": "local-test-fixture", "asset_license": "test-owned",
-                     "rights_review": approval, "visual_review": visual,
-                     "reference_region": [.25, .25, .75, .75],
-                     "purpose": "Asymmetric hierarchy and generous breathing room"}
-            pack = {"schema_version": "design-pack-v4", "pack_id": "fixture", "version": "1", 'approval_scope': 'production',
-                    "status": "approved", "production_ready": True,
-                    "design_system": "Test-only light photography and editorial information hierarchy",
-                    "compatibility": {"categories": ["bed_frame"]}, "assets": [asset]}
-            write_json(root / "pack.json", pack)
-            write_json(root / "brief.json", {"positioning": "quiet modern residential"})
-            kwargs = dict(plugin=plugin, seed_asin="B1", brand="safeplus", sku_prefix="test", out_root=root / "jobs")
-            empty = create_job(**kwargs)
-            self.assertEqual([], approved_design_references(empty, "B1"))
-            job = create_job(**kwargs, design_pack_path=str(root / "pack.json"), brand_brief_path=str(root / "brief.json"))
-            self.assertEqual("safeplus", load_job(job)["brand"])
-            refs = approved_design_references(job, "B1")
-            self.assertEqual([], approved_design_references(job, "B2"))
-            self.assertEqual(asset["sha256"], refs[0]["original_sha256"])
-            self.assertNotEqual(asset["sha256"], file_sha256(job / refs[0]["path"]))
-            with Image.open(job / refs[0]["path"]) as image:
-                self.assertEqual((16, 16), image.size)
-                self.assertEqual({(255, 255, 255)}, set(image.getdata()))
-            source = _evidence_source('func')
-            source['source_path'] = 'source.png'
-            from core.image_reference_context import prepare_planning_references
-            Image.new('RGB', (100, 100), 'white').save(job / 'source.png')
-            source['source_sha256'] = file_sha256(job / 'source.png')
-            self.assertEqual([job / 'source.png'], prepare_planning_references(job, [source], job / 'trace'))
-            self.assertEqual(1, len(read_json(job / 'trace/manifest.json')['attachments']))
-            prompt = visual_design_kit_prompt(plugin, {}, {}, [source], refs, brand_design_brief(job), output_inventory=initial_output_inventory([source]))
-            self.assertIn("quiet modern residential", prompt)
-            self.assertIn('"attachment_number":1', prompt)
-            self.assertEqual(1, prompt.count('"attachment_number"'))
-            self.assertNotIn("license_evidence", prompt)
-            direction = current_image_direction()
-            direction["design_transfer"] = [{"reference_id": asset["asset_id"],
-                "inherit": "Keep the reference detail-to-product hierarchy with shared typography",
-                "adapt": "Use the available frontal view for this product instead of an unseen angle"}]
-            raw = {"family_art_direction": current_art_direction(), "image_briefs": [{
-                "role": "func", "source_id": "source_00", "image_direction": direction,
-                "display_copy": {"title": None, "labels": []}}]}
-            compiled = compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], design_references=refs, claim_reviews=supported_design_reviews(raw, [source], refs))
-            brief = _role_brief(compiled, 'func')
-            self.assertEqual("ready", brief["status"])
-            self.assertEqual('supported', brief['design_review']['status'])
-            from core.visual_design_kit_compiler import design_binding_request, validate_compiled_visual_design_kit
-            from core.visual_semantics import CLAIM_REVIEW_POLICY
-            request = design_binding_request(raw['image_briefs'][0], compiled['family_art_direction'], source=source, design_references=refs)
-            self.assertEqual(refs[0]['purpose'], request['reference_scopes'][0]['purpose'])
-            self.assertEqual(refs[0]['visual_review']['transfer_scope'], request['reference_scopes'][0]['approval_boundary'])
-            changed_refs = deepcopy(refs)
-            changed_refs[0]['roles'] = ['scene']
-            with self.assertRaisesRegex(ValueError, 'not approved'):
-                validate_compiled_visual_design_kit(compiled, source_manifest=[source], design_references=changed_refs)
-            validate_compiled_visual_design_kit(compiled, source_manifest=[source], design_references=refs)
-            generation = resolve_edit_references(brief, [source], design_references=refs, job=job, child="B1")
-            self.assertEqual(["edit_base", "design_reference"], [row["kind"] for row in generation])
-            task = current_image_task("func")
-            task["image_direction"]["design_transfer"] = deepcopy(direction["design_transfer"])
-            task["generation_references"] = generation
-            compiled_prompt = compile_task_prompt(task=task)
-            self.assertEqual(1, compiled_prompt.count(direction["design_transfer"][0]["inherit"]))
-            self.assertEqual(1, compiled_prompt.count(direction["design_transfer"][0]["adapt"]))
-            self.assertIn(asset["purpose"], compiled_prompt)
-            self.assertIn(asset['visual_review']['transfer_scope'], compiled_prompt)
-            self.assertIn(task["display_copy_contract"]["title"], compiled_prompt)
-            alternate = deepcopy(task)
-            alternate["image_direction"]["design_transfer"][0]["inherit"] = "Keep reference contrast between the intact product and quiet margin"
-            alternate_prompt = compile_task_prompt(task=alternate)
-            self.assertNotEqual(compiled_prompt, alternate_prompt)
-            self.assertEqual(task["product_facts"], alternate["product_facts"])
-            self.assertEqual(task["family_art_direction"], alternate["family_art_direction"])
-            self.assertEqual(task["renderable_text_contract"], alternate["renderable_text_contract"])
-            repaired = compile_task_prompt(task=task, targeted_edit=True)
-            self.assertIn(asset['purpose'], repaired)
-            self.assertNotIn(direction["design_transfer"][0]["adapt"], repaired)
-            self.assertIn("Style verification only", repaired)
-            task["generation_references"] = generation[:1]
-            with self.assertRaisesRegex(ValueError, "do not match"):
-                compile_task_prompt(task=task)
-            usage = design_reference_usage(job, refs, [brief])
-            self.assertEqual("external_reference_selected", usage["roles"][0]["status"])
-            self.assertEqual("not_evaluated", usage["visual_acceptance"])
-            autonomous = {**brief, "image_direction": {**brief["image_direction"], "design_transfer": []}}
-            self.assertEqual("available_not_selected", design_reference_usage(job, refs, [autonomous])["roles"][0]["status"])
-            self.assertEqual("requested_no_matching_reference", design_reference_usage(job, [], [autonomous])["roles"][0]["status"])
-            self.assertEqual("autonomous_no_external_standard", design_reference_usage(empty, [], [autonomous])["roles"][0]["status"])
-            broken = deepcopy(raw)
-            broken["image_briefs"][0]["image_direction"]["design_transfer"][0]["inherit"] = "Use #123456 for all titles"
-            self.assertEqual("pending", _role_brief(compile_visual_design_kit_response(broken, output_inventory=initial_output_inventory([source]), source_manifest=[source], design_references=refs), 'func')["status"])
-            source["role"] = "scene"
-            raw['image_briefs'][0]['role'] = 'scene'
-            raw['image_briefs'][0].pop('display_copy')
-            self.assertEqual("pending", _role_brief(compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], design_references=refs), 'scene')["status"])
-            direction["design_transfer"] = []
-            self.assertEqual("ready", _role_brief(compile_visual_design_kit_response(raw, output_inventory=initial_output_inventory([source]), source_manifest=[source], design_references=refs, claim_reviews=supported_design_reviews(raw, [source], refs)), 'scene')["status"])
-            for changed in ({"production_ready": False}, {"compatibility": {"categories": ["artificial_tree"]}}, {"schema_version": "design-pack-v2"}):
-                write_json(root / "pack.json", {**pack, **changed})
-                with self.assertRaises(ValueError):
-                    create_job(**kwargs, design_pack_path=str(root / "pack.json"))
-            write_json(root / "pack.json", {**pack, "compatibility": {"categories": ["*"]}})
-            cross = create_job(**{**kwargs, "plugin": load_plugin("bathroom_cabinet")}, design_pack_path=str(root / "pack.json"))
-            self.assertEqual(1, len(approved_design_references(cross, "B1")))
-            evaluation = {**deepcopy(pack), 'approval_scope': 'evaluation', 'production_ready': False}
-            write_json(root / 'pack.json', evaluation)
-            limited = create_job(**kwargs, design_pack_path=str(root / 'pack.json'))
-            self.assertEqual('evaluation', approved_design_references(limited, 'B1')[0]['approval_scope'])
-            self.assertFalse(load_job(limited)['design_inputs']['pack']['production_ready'])
-            from core.design_reference_library import production_reference_error
-            from core.image_tasks import _task_fingerprint
-            limited_task = current_image_task('func')
-            limited_task['image_direction']['design_transfer'] = deepcopy(task['image_direction']['design_transfer'])
-            limited_task['generation_references'] = [generation[0], *approved_design_references(limited, 'B1')]
-            self.assertIn('production usage approval', production_reference_error(limited, limited_task))
-            self.assertEqual('', production_reference_error(limited, {**limited_task, 'generation_references': []}))
-            before = _task_fingerprint(limited_task)
-            updated = load_job(limited)
-            updated['design_inputs']['pack'].update(approval_scope='production', production_ready=True)
-            for ref in updated['design_inputs']['references']:
-                ref.update(approval_scope='production', approved_at='new authorized review date')
-            write_json(limited / 'job.json', updated)
-            self.assertEqual('', production_reference_error(limited, limited_task))
-            limited_task['generation_references'] = [generation[0], *approved_design_references(limited, 'B1')]
-            self.assertEqual(before, _task_fingerprint(limited_task))
-            from core.image_tasks import image_tasks_current
-            refreshed = deepcopy(limited_task)
-            refreshed['generation_references'][1]['approved_at'] = 'latest authorized review'
-            self.assertEqual(_task_fingerprint(limited_task), _task_fingerprint(refreshed))
-            with patch('core.image_tasks.read_image_tasks', return_value=dict(tasks=[limited_task])), patch(
-                    'core.image_tasks._expected_rows', return_value=[refreshed]):
-                self.assertFalse(image_tasks_current(limited, plugin))
-            limited_task['generation_references'][1]['visual_review']['transfer_scope'] += ' Changed design scope'
-            self.assertNotEqual(before, _task_fingerprint(limited_task))
-            evaluation['assets'][0]['children'] = ['*']
-            write_json(root / 'pack.json', evaluation)
-            with self.assertRaisesRegex(ValueError, 'explicit child scope'):
-                create_job(**kwargs, design_pack_path=str(root / 'pack.json'))
-            invalid = deepcopy(pack)
-            invalid["assets"][0]["reference_region"] = [0, 0, 2, 1]
-            write_json(root / "pack.json", invalid)
-            with self.assertRaisesRegex(ValueError, "reference region"):
-                create_job(**kwargs, design_pack_path=str(root / "pack.json"))
-            invalid = deepcopy(pack)
-            del invalid["assets"][0]["visual_review"]["evidence_fit"]
-            write_json(root / "pack.json", invalid)
-            with self.assertRaisesRegex(ValueError, "Visual approval"):
-                create_job(**kwargs, design_pack_path=str(root / "pack.json"))
-            invalid = deepcopy(pack)
-            invalid["assets"][0]["rights_review"]["status"] = "pending"
-            write_json(root / "pack.json", invalid)
-            with self.assertRaises(ValueError):
-                create_job(**kwargs, design_pack_path=str(root / "pack.json"))
-            (job / refs[0]["path"]).write_bytes(b"changed")
-            with self.assertRaisesRegex(ValueError, "changed"):
-                approved_design_references(job, "B1")
+            job=Path(tmp);Image.new('RGB',(1000,1500),'white').save(job/'source.png')
+            row=source();row['source_sha256']=file_sha256(job/'source.png')
+            self.assertEqual([job/'source.png'],prepare_planning_references(job,[row],job/'trace'))
+            other=deepcopy(row);other['source_id']='source_01'
+            with self.assertRaisesRegex(ValueError,'one reliable'):
+                prepare_planning_references(job,[row,other],job/'ambiguous')
+            row['observation']['reference_purposes']=['feature']
+            self.assertEqual([job/'source.png'],prepare_planning_references(job,[row,other],job/'selected'))
+            self.assertEqual([1,1],[r['attachment_number'] for r in read_json(job/'selected/manifest.json')['attachments']])
+            row['source_sha256']='0'*64
+            with self.assertRaisesRegex(ValueError,'Source changed'):
+                prepare_planning_references(job,[row,other],job/'stale')
 
-    def test_vision_admission_precedes_encoding_and_observation_failure_is_local(self):
-        import time
-        from contextlib import contextmanager
-        from copy import deepcopy
+    def test_observed_measurements_and_post_generation_hard_gates_remain_independent(self):
+        from core.final_source_intents import _observed_measurements,_measurement_rows
+        from core.measurement_sources import measurement_authority
+        from core.visual_semantics import OBSERVATION_POLICY,_validate_source_measurements
+        from core.image_prompt_compiler import _measurement_content
+        visual=dict(status='success',policy_version=OBSERVATION_POLICY,measurements=[current_observed_measurement(),
+            current_observed_measurement('300 lbs','Bed capacity','capacity',key='load',kind='capacity')])
+        source=dict(source_id='source_00',role='size',measurements=_measurement_rows(_observed_measurements(visual),{}))
+        authority=measurement_authority('size',{'measurement_ids':['source_00:width','source_00:load']},[source])
+        self.assertEqual(['17 in','300 lbs'],authority['render_text']);self.assertEqual('load_capacity',authority['measurement_groups'][1]['measurement_role'])
+        repeated=[visual['measurements'][0],{**visual['measurements'][0],'text':'17 ft'}]
+        with self.assertRaisesRegex(ValueError,'competing readings'):_validate_source_measurements(repeated)
+        for text in ('\u2264 6"','6-8 in','6 in to 8 in'):
+            visual['measurements']=[current_observed_measurement(text,'Recommended mattress thickness',key='mattress')]
+            _validate_source_measurements(visual['measurements'])
+            source['measurements']=_measurement_rows(_observed_measurements(visual),{})
+            selected=measurement_authority('func',{'measurement_ids':['source_00:mattress']},[source])
+            self.assertEqual(text,selected['render_text'][0]);self.assertIn('Recommended mattress thickness',_measurement_content(selected,[{'kind':'measurement_evidence','source_id':'source_00'}]))
+        same=current_measurement_rows()[0]
+        source['measurements']=[dict(same,source_occurrence='upper'),dict(same,source_occurrence='lower')]
+        selected=measurement_authority('func',{'measurement_ids':['source_00:upper','source_00:lower']},[source])
+        self.assertEqual(2,len(selected['measurement_groups']));self.assertEqual(1,len(selected['render_text']))
+
+    def test_native_json_trace_and_complete_copy_repair_are_preserved(self):
+        from core.vision_gemini_client import (_gemini_native_payload,_parse_sse_text_candidates,_parse_generate_content_candidates,
+            _response_finish_reasons,_select_response_candidate,_response_failure_kind,_response_retry_prompt,_response_usage)
+        from core.visual_semantics import _attempt_trace
+        payload={'candidates':[{'content':{'parts':[{'thought':True,'text':'{"draft":1}'},{'text':'{"sources":[]}'}]},'finishReason':'STOP'}]}
+        body=json.dumps(payload)
+        self.assertEqual(['STOP'],_response_finish_reasons(body));self.assertEqual(['length'],_response_finish_reasons('data: {"choices":[{"finish_reason":"length"}]}'))
+        self.assertEqual(['{"sources":[]}'],_parse_generate_content_candidates(body));self.assertEqual(['{"sources":[]}'],_parse_sse_text_candidates('data: '+body))
+        config=_gemini_native_payload([],{'protocol':'google_gemini','max_output_tokens':'12000'})
+        self.assertEqual('application/json',config['generationConfig']['responseMimeType']);self.assertEqual(12000,config['generationConfig']['maxOutputTokens'])
+        limited=json.dumps({'candidates':[{'finishReason':'MAX_TOKENS'}],'usageMetadata':{'candidatesTokenCount':8192}})
+        self.assertIsNone(_select_response_candidate(['{}'],lambda text:True,response_body=limited)[1])
+        self.assertEqual('output_limit',_response_failure_kind(limited,'JSONDecodeError'))
+        endpoint={'max_output_tokens':8192};self.assertEqual('original',_response_retry_prompt(endpoint,'original','cut','partial','output_limit'))
+        self.assertEqual(16384,endpoint['max_output_tokens']);self.assertEqual({'candidatesTokenCount':8192},_response_usage(limited))
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'attempts.json';_,record=_attempt_trace(path)
+            record(dict(status='validation_failure',response_text='{"sources":[',response_candidates=[{'validation_error':'incomplete object'}]))
+            event=read_json(path)[0];self.assertEqual('{"sources":[',(path.parent/event['response_path']).read_text())
+            self.assertEqual(['incomplete object'],event['validation_errors'])
+            _,record=_attempt_trace(path);record(dict(status='success',response_text='{}'))
+            self.assertEqual(2,len(read_json(path)));self.assertNotEqual(read_json(path)[0]['response_path'],read_json(path)[1]['response_path'])
+        from core.planning_contract import compact_schema,obj,array,text
+        from jsonschema import Draft202012Validator
+        part=obj({'value':text(200),'fixed':{'const':{'nested':{'type':'literal data'}}},'tags':array({'enum':['one','two']},1,3)})
+        schema=obj({'a':part,'b':part,'c':part});compressed=compact_schema(schema)
+        Draft202012Validator.check_schema(compressed)
+        self.assertLess(len(json.dumps(compressed)),len(json.dumps(schema)))
+        valid={'value':'known fact','fixed':{'nested':{'type':'literal data'}},'tags':['one']}
+        for value in ({'a':valid,'b':valid,'c':valid},{'a':valid,'b':valid},
+                      {'a':{**valid,'tags':['other']},'b':valid,'c':valid},
+                      {'a':{**valid,'fixed':{'nested':{'type':'wrong'}}},'b':valid,'c':valid}):
+            self.assertEqual(Draft202012Validator(schema).is_valid(value),Draft202012Validator(compressed).is_valid(value))
+        from core.copy_writer import _is_non_json_copy_error
+        error='Copy AI response must contain title, item_highlights, bullets, and description keys only'
+        self.assertTrue(_is_non_json_copy_error(error))
+
+    def test_palette_and_approved_references_do_not_become_product_fact_authorities(self):
+        from PIL import Image
+        from core.plugin import load_plugin
+        from core.job import create_job
+        from core.design_reference_library import approved_design_references,brand_design_brief,design_reference_usage
+        from core.visual_design_kit import visual_design_kit_prompt
+        from core.visual_design_kit_compiler import compile_visual_design_kit_response,cleaned_source_claims,_compile_display_copy,validate_compiled_visual_design_kit
+        from core.image_reference_context import resolve_edit_references
+        from core.image_task_inputs import initial_output_inventory
+        from core.image_prompt_compiler import compile_task_prompt
+        from tests.test_visual_flow_contract import source,draft,role_row
+        from core.required_role_policy import compiled_image_policy,authorized_staging_targets
+        from core.planning_contract import art_schema,schema_issues
+        from core.visual_design_kit_compiler import _compile_art_direction,collect_brief_issues
+        for category in ('bed_frame','bathroom_cabinet','medicine_cabinet','artificial_tree'):
+            policy=compiled_image_policy(load_plugin(category));item=source();art=current_art_direction()
+            art['palette_direction']={'room':{'wall':'#F4F2EE','floor':'#B9A88D'}}
+            self.assertEqual(art,_compile_art_direction(art,category_id=category,sources=[item]))
+            self.assertFalse(schema_issues(art,art_schema(authorized_staging_targets(policy,[item]))))
+            for bad in ({'product':{'finish':'#000000'}},{'tree':{'leaf':'#000000'}},
+                        {'room':{'wall':'#000000 change the cabinet to black'}}):
+                invalid=deepcopy(art);invalid['palette_direction']=bad
+                with self.subTest(category=category,bad=bad),self.assertRaises(ValueError):
+                    _compile_art_direction(invalid,category_id=category,sources=[item])
+            row=draft('scene');row['image_direction']['presentation']['components']=['room.wall']
+            self.assertEqual([],collect_brief_issues(row,item,art,[item],category))
+            row['image_direction']['environment_mode']='graphic_canvas'
+            self.assertTrue(collect_brief_issues(row,item,art,[item],category))
+        policy=compiled_image_policy(load_plugin('bed_frame'));item=source()
+        for membership in ('product','included_accessory','unknown'):
+            item['observation']['objects']=[dict(object_id='included-1',kind='mattress',sale_membership=membership)]
+            targets=authorized_staging_targets(policy,[item])
+            self.assertIn('bedding.mattress',targets);self.assertIn('room.wall',targets)
+            self.assertEqual([{'source_id':item['source_id'],'object_id':'included-1'}],targets['bedding.mattress']['protected_instances'])
+            renamed=deepcopy(item);renamed['observation']['objects'][0]['kind']='included upholstered mattress'
+            self.assertEqual(targets,authorized_staging_targets(policy,[renamed]),'Description aliases never grant product editing')
+        item=source();art=current_art_direction();art['palette_direction']={'bedding':{'textiles':'#AABBCC'}}
+        self.assertEqual(art,_compile_art_direction(art,category_id='bed_frame',sources=[item]))
+        target=current_image_task('scene',category_id='bed_frame');target['category_image_policy']=policy
+        target['family_art_direction']=art;target['image_direction']['presentation']['components']=['bedding.textiles']
+        compiled=compile_task_prompt(task=target)
+        self.assertIn('Non-sold sheets, blankets, pillows and cushions = #AABBCC',compiled)
+        self.assertNotIn('Target components:',compiled)
+        target['family_art_direction']['palette_direction']={'room':{'wall':'#000000 recolor the bed frame'}}
+        with self.assertRaisesRegex(ValueError,'strict'):compile_task_prompt(task=target)
+        policy=compiled_image_policy(load_plugin('bathroom_cabinet'))
+        self.assertEqual({},authorized_staging_targets(policy,role='main',environment_mode='designed_environment'))
+        words=source();words['claims']=[dict(evidence_id=str(i),text=text) for i,text in enumerate(('Pathway','Wedding','Q','T o','\ufffd'))]
+        self.assertEqual(['Pathway','Wedding'],[r['text'] for r in cleaned_source_claims(words)])
+        self.assertEqual(['Pathway'],_compile_display_copy([words],dict(title=None,labels=[dict(text='Pathway',evidence_ids=['0'],target=None)]))['labels'])
+        plugin=load_plugin('bed_frame')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);image=Image.new('RGB',(32,32),'magenta');image.paste('white',(8,8,24,24));image.save(root/'owned.png')
+            approval=dict(status='approved',approved_by='fixture',approved_at='2026-09-11',allowed_uses=['image_generation_reference'],license_evidence='Test-generated pixels')
+            visual={**approval,'product_clarity':'Clear field','information_hierarchy':'Test hierarchy','evidence_fit':'No new product geometry',
+                'series_cohesion':'Shared typography','transfer_scope':'Only the central blank area'}
+            asset=dict(asset_id='owned-layout',roles=['func'],children=['B1'],local_path='owned.png',sha256=file_sha256(root/'owned.png'),
+                author='test',source_url='local-fixture',asset_license='test-owned',rights_review=approval,visual_review=visual,
+                reference_region=[.25,.25,.75,.75],purpose='Asymmetric hierarchy and breathing room')
+            write_json(root/'pack.json',dict(schema_version='design-pack-v4',pack_id='fixture',version='1',approval_scope='production',
+                status='approved',production_ready=True,design_system='Test visual hierarchy',compatibility={'categories':['bed_frame']},assets=[asset]))
+            write_json(root/'brief.json',{'positioning':'quiet modern residential'})
+            job=create_job(plugin=plugin,seed_asin='B000000001',brand='safeplus',sku_prefix='test',out_root=root/'jobs',
+                design_pack_path=str(root/'pack.json'),brand_brief_path=str(root/'brief.json'))
+            refs=approved_design_references(job,'B1');self.assertEqual([],approved_design_references(job,'B2'))
+            with Image.open(job/refs[0]['path']) as cropped:self.assertEqual((16,16),cropped.size);self.assertEqual({(255,255,255)},set(cropped.getdata()))
+            item=source();Image.new('RGB',(100,100),'white').save(job/'source.png');item['source_sha256']=file_sha256(job/'source.png')
+            row=draft();row['image_direction']['design_transfer']=[dict(reference_id='owned-layout',inherit='Use the approved hierarchy',adapt='Keep the existing product view')]
+            kit=compile_visual_design_kit_response(dict(family_art_direction=current_art_direction(),image_briefs=[row]),source_manifest=[item],
+                output_inventory=initial_output_inventory([item]),design_references=refs)
+            brief=role_row(kit);self.assertEqual('ready',brief['status'],brief.get('error'))
+            changed=deepcopy(refs);changed[0]['roles']=['scene']
+            with self.assertRaisesRegex(ValueError,'not approved'):validate_compiled_visual_design_kit(kit,source_manifest=[item],design_references=changed)
+            prompt=visual_design_kit_prompt(plugin,{},dict(main_image_policy='product_first_lifestyle'),[item],refs,brand_design_brief(job),output_inventory=initial_output_inventory([item]))
+            self.assertIn('quiet modern residential',prompt);self.assertNotIn('license_evidence',prompt)
+            self.assertIn('Prefer no people or human reflections',prompt)
+            self.assertIn('ONE child-wide typography and graphic ink system',prompt)
+            from core.image_tasks import _edit_contract
+            for category in ('bed_frame','bathroom_cabinet','medicine_cabinet','artificial_tree'):
+                policy=compiled_image_policy(load_plugin(category))
+                for role in ('scene','func','size'):
+                    task=current_image_task(role,category_id=category)
+                    task['edit_contract']=_edit_contract(role,task['measurement_authority'],policy)
+                    sent=compile_task_prompt(task=task)
+                    self.assertIn('visibly different person, appearance and clothing',sent)
+                    self.assertIn('remove incidental source families',sent)
+                    if role in ('func','size'):
+                        self.assertIn('text_color = #303634',sent)
+                        self.assertIn('shared child-wide graphic colors',sent)
+                white=_edit_contract('main',{},compiled_image_policy(load_plugin('artificial_tree')))
+                self.assertIn('remove people and reflected people',str(white))
+            references=resolve_edit_references(brief,[item],job=job,child='B1',design_references=refs)
+            self.assertEqual(['edit_base','design_reference'],[r['kind'] for r in references])
+            task=current_image_task('func');task['generation_references']=references;task['image_direction']['design_transfer']=row['image_direction']['design_transfer']
+            compiled=compile_task_prompt(task=task);self.assertIn(visual['transfer_scope'],compiled)
+            self.assertEqual(1,compiled.count('Use the approved hierarchy'))
+            self.assertEqual('external_reference_selected',design_reference_usage(job,refs,[brief])['roles'][0]['status'])
+
+    def test_vision_admission_and_source_failure_isolation(self):
+        from tests.audit_delivery_fixture import verify_safe_redirects
+        verify_safe_redirects(self)
+        _verify_transport_deadline(self)
         from core import vision_gemini_client as client
         from core.image_provider_common import ProviderQueueUnavailable
-        from core.visual_semantics import observe_child_sources
-        endpoint = {"name": "primary", "base_url": "https://fixture.invalid/v1", "api_key": "fixture"}
-        events = []
+        from core.visual_semantics import _validate_observations,observe_child_sources
+        from tests.test_image_branch_v1 import _evidence,_child
+        events=[]
         @contextmanager
-        def slot(*args, **kwargs):
-            events.append("admitted")
-            yield
-        def payload():
-            events.append("encoded")
-            return {"text": "fixture"}
-        with patch.object(client, "provider_concurrency_slot", side_effect=slot), patch.object(client, "_post_json_preserve_redirects", return_value="ok"):
-            self.assertEqual("ok", client._post_vision_request(endpoint, "https://fixture.invalid", payload,
-                headers={}, timeout_seconds=5, deadline=time.monotonic() + 10))
-        self.assertEqual(["admitted", "encoded"], events)
-        with patch.object(client, "provider_concurrency_slot", side_effect=ProviderQueueUnavailable("fixture", "busy")), patch.object(
-                client, "_post_json_preserve_redirects") as network:
-            with self.assertRaises(ProviderQueueUnavailable):
-                client._post_vision_request(endpoint, "https://fixture.invalid", payload, headers={}, timeout_seconds=5, deadline=time.monotonic() + 1)
+        def slot(*args,**kwargs):events.append('admitted');yield
+        def payload():events.append('encoded');return {'text':'fixture'}
+        endpoint=dict(name='primary',base_url='https://fixture.invalid/v1',api_key='fixture')
+        with patch.object(client,'provider_concurrency_slot',side_effect=slot),patch.object(client,'_post_json_preserve_redirects',return_value='ok'), \
+             patch('core.batch_ledger.admit_paid_request',return_value='mock-network-admission'):
+            self.assertEqual('ok',client._post_vision_request(endpoint,'https://fixture.invalid',payload,headers={},timeout_seconds=5,deadline=time.monotonic()+10,on_submit=lambda:events.append('submitted')))
+        self.assertEqual(['admitted','encoded','submitted'],events)
+        with patch.object(client,'provider_concurrency_slot',side_effect=ProviderQueueUnavailable('fixture','busy')),patch.object(client,'_post_json_preserve_redirects') as network:
+            with self.assertRaises(ProviderQueueUnavailable):client._post_vision_request(endpoint,'https://fixture.invalid',payload,headers={},timeout_seconds=5,deadline=time.monotonic()+1,on_submit=lambda:events.append('submitted'))
             network.assert_not_called()
-        self.assertEqual(2, len(events))
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        from threading import Thread
-        from http.client import IncompleteRead
-        class ResponseHandler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-            def do_POST(self):
-                self.rfile.read(int(self.headers.get('Content-Length', '0')))
-                if self.path == '/redirect':
-                    self.send_response(307)
-                    self.send_header('Location', '/slow')
-                    self.end_headers()
-                    return
-                self.send_response(200)
-                self.send_header('Content-Length', '2' if self.path == '/ok' else '100')
-                self.end_headers()
-                try:
-                    if self.path in {'/ok', '/truncated'}:
-                        self.wfile.write(b'{}')
-                    else:
-                        for _ in range(20):
-                            self.wfile.write(b'x')
-                            self.wfile.flush()
-                            time.sleep(.04)
-                except ConnectionError:
-                    pass
-        server = ThreadingHTTPServer(('127.0.0.1', 0), ResponseHandler)
-        thread = Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True)
-        thread.start()
-        try:
-            url = f'http://127.0.0.1:{server.server_port}'
-            self.assertEqual('{}', client._post_json_preserve_redirects(url+'/ok', {}, {}, timeout_seconds=2))
-            with self.assertRaises(IncompleteRead):
-                client._post_json_preserve_redirects(url+'/truncated', {}, {}, timeout_seconds=2)
-            started = time.monotonic()
-            with self.assertRaises(TimeoutError):
-                client._post_json_preserve_redirects(url+'/redirect', {}, {}, timeout_seconds=2, deadline=started+.15)
-            self.assertLess(time.monotonic()-started, .6)
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
-        alias = {**endpoint, "name": "alias", "model": "different-model"}
-        other = {**endpoint, "name": "other", "base_url": "https://other.invalid/v1"}
-        with patch.object(client, "gemini_clients", return_value=[endpoint, alias, other]), patch.object(client, "provider_concurrency_limit", return_value=1):
-            self.assertEqual(2, client.vision_scope_capacity("vision_qa"))
-            self.assertEqual(client._vision_resource(endpoint)[1], client._vision_resource(alias)[1])
-        valid = {"source_id": "source_00", "role_guess": "scene", "evidence_gaps": [], "text_gaps": [], "has_dimension_lines": False,
-                 "has_callouts_or_panels": False, "visible_numbers_or_units": [], "confidence": .95, "evidence": [],
-                 "measurements": [], "objects": [{'object_id': 'frame', 'kind': 'frame', 'state': 'visible frame', 'sale_membership': 'unknown', 'visibility': 'visible', 'membership_evidence': []}],
-                 "text_observations": [], "product_features": [current_product_feature()], "product_extent": "whole_view",
-                 "reference_purposes": ["appearance"],
-                 "variant_identity": {"status": "unknown", "observed_color": "", "reason": "Occluded", "conflicts": []}}
-        from core.visual_semantics import _validate_observations
-        mixed = {**deepcopy(valid), 'evidence_gaps': 'wrong list type',
-                 'visible_numbers_or_units': [{'raw_text': '34.5 inches'}]}
-        rejected = _validate_observations([mixed], ['source_00'], {})['source_00']['error']
-        self.assertIn('evidence_gaps', rejected)
-        self.assertIn('visible_numbers_or_units', rejected)
-        for fields, value in (
-            (('objects', 0, 'membership_evidence'), [{'fact_id': 'product.title', 'quote': 17}]),
-            (('objects', 0, 'membership_evidence'), [{'fact_id': [], 'quote': 'Wood frame'}]),
-            (('objects', 0, 'membership_evidence'), {}),
-            (('objects', 0, 'sale_membership'), []), (('role_guess',), []),
-            (('variant_identity', 'status'), []), (('text_observations',), 17),
-            (('product_extent',), []), (('product_features', 0, 'feature_id'), []),
-            (('reference_purposes',), [[]]),
-            (('text_gaps',), [dict(text='', kind='measurement')]),
-            (('text_gaps',), [dict(text='Unreadable width', kind=[])]),
-        ):
-            malformed = {**deepcopy(valid), 'source_id': 'source_01'}
-            target = malformed
-            for field in fields[:-1]:
-                target = target[field]
-            target[fields[-1]] = value
-            result = _validate_observations([valid, malformed], ['source_00', 'source_01'], {'product.title': 'Wood frame'})
-            self.assertEqual(['success', 'failed'], [result[key]['status'] for key in ('source_00', 'source_01')])
-        malformed = {**deepcopy(valid), 'source_id': 'source_01'}
-        malformed['objects'][0]['membership_evidence'] = [{'fact_id': 'product.title', 'quote': 17}]
-        with tempfile.TemporaryDirectory() as tmp, patch('core.visual_semantics.gemini_stream_generate', side_effect=[
-                json.dumps({'sources': [valid, malformed]}), json.dumps({'sources': [{**valid, 'source_id': 'source_01', 'reference_purposes': ['feature']}]})]) as remote:
-            sources = [dict(source_id=f'source_0{i}', sha256=str(i)*64, ocr=[], path=Path(tmp)/f'{i}.png') for i in range(2)]
-            from tests.current_image_contract_fixture import write_observation_images
-            write_observation_images(sources)
-            result = observe_child_sources(Path(tmp), {'asin': 'TYPES', 'title': 'Wood frame'}, sources)
-            self.assertTrue(all(row['status'] == 'success' for row in result.values()))
-            self.assertEqual([sources[1]['path']], remote.call_args.args[1])
-        bad = {**deepcopy(valid), "source_id": "source_01", "product_features": []}
+        self.assertEqual(['admitted','encoded','submitted'],events)
+        with patch.object(client,'MAX_VISION_REQUEST_BYTES',8,create=True), \
+             patch.object(client,'provider_concurrency_slot',side_effect=slot), \
+             patch('core.batch_ledger.admit_paid_request') as paid, \
+             patch.object(client,'_post_json_preserve_redirects') as network:
+            with self.assertRaises(client.VisionRequestError) as rejected:
+                client._post_vision_request(endpoint,'https://fixture.invalid',lambda:{'text':'x'*50},
+                    headers={},timeout_seconds=5,deadline=time.monotonic()+10,on_submit=lambda:events.append('submitted'))
+            self.assertEqual(0,rejected.exception.metadata['physical_request_count'])
+            network.assert_not_called();paid.assert_not_called()
+        with patch.object(client,'provider_concurrency_slot',side_effect=slot), \
+             patch('core.batch_ledger.admit_paid_request',return_value='bounded-large-mock'), \
+             patch.object(client,'_post_json_preserve_redirects',return_value='ok') as network:
+            self.assertEqual('ok',client._post_vision_request(endpoint,'https://fixture.invalid',
+                lambda:{'text':'x'*4_300_000},headers={},timeout_seconds=5,
+                deadline=time.monotonic()+10,on_submit=lambda:None))
+            self.assertGreater(network.call_args.args[1].__len__(),4*1024*1024)
+        valid={**_evidence('main')['visual_evidence'],'source_id':'source_00'}
+        bad=deepcopy(valid);bad.update(source_id='source_01',evidence_gaps='not a list',visible_numbers_or_units=[{}])
+        from core.visual_semantics import source_fact_records
+        checked=_validate_observations([valid,bad],['source_00','source_01'],source_fact_records(_child()))
+        self.assertEqual(['success','failed'],[checked[k]['status'] for k in ('source_00','source_01')])
+        for fields,value in ((('objects',0,'membership_evidence'),[{'fact_id':'product.title','quote':17}]),
+                (('objects',0,'sale_membership'),[]),(('role_guess',),[]),(('variant_identity','status'),[]),
+                (('text_observations',),17),(('product_extent',),[]),(('product_features',0,'feature_id'),[]),
+                (('reference_purposes',),[[]]),(('text_gaps',),[dict(text='Unreadable width',kind=[])])):
+            malformed=deepcopy(valid);malformed['source_id']='source_01';target=malformed
+            for field in fields[:-1]:target=target[field]
+            target[fields[-1]]=value
+            checked=_validate_observations([valid,malformed],['source_00','source_01'],source_fact_records(_child()))
+            self.assertEqual(['success','failed'],[checked[k]['status'] for k in ('source_00','source_01')])
+        repaired={**deepcopy(valid),'source_id':'source_01','reference_purposes':['feature']}
         with tempfile.TemporaryDirectory() as tmp:
-            job = Path(tmp)
-            sources = [{"source_id": f"source_0{i}", "sha256": str(i) * 64, "ocr": [], "path": job / f"source{i}.png"} for i in range(2)]
+            job=Path(tmp);sources=[dict(source_id=f'source_0{i}',sha256=str(i)*64,ocr=[],path=job/f'{i}.png') for i in range(2)]
             write_observation_images(sources)
-            with patch("core.visual_semantics.gemini_stream_generate", return_value=json.dumps({"schema": {"sources": [valid, bad]}})):
-                invalid = observe_child_sources(job, {"asin": "INVALID"}, sources)
-                self.assertIn('top-level sources', invalid['source_00']['error'])
-            with patch("core.visual_semantics.gemini_stream_generate", side_effect=[json.dumps({"sources": [valid, bad]}), TimeoutError('fixture timeout')]) as partial:
-                result = observe_child_sources(job, {"asin": "B1"}, sources)
-            self.assertEqual(2, partial.call_count)
-            self.assertEqual([sources[1]['path']], partial.call_args.args[1])
-            self.assertEqual(["success", "failed"], [result[row["source_id"]]["status"] for row in sources])
-            bad['product_features'] = valid['product_features']
-            bad['reference_purposes'] = ['feature']
-            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps({'sources': [bad]})) as retry:
-                result = observe_child_sources(job, {'asin': 'B1'}, sources)
-            self.assertEqual([sources[1]['path']], retry.call_args.args[1])
-            self.assertTrue(all(row['status'] == 'success' for row in result.values()))
-            correction = {'source_00': {'revision': 'operator-correction-1', 'reason': 'Source annotation is not a product finish'}}
-            corrected = deepcopy(valid)
-            corrected['product_features'][0]['physical_facts'] = ['Visible frame without a colored outline']
-            with patch('core.visual_semantics.gemini_stream_generate', return_value=json.dumps({'sources': [corrected]})) as reread:
-                result = observe_child_sources(job, {'asin': 'B1'}, sources, corrections=correction)
-                self.assertEqual([sources[0]['path']], reread.call_args.args[1])
-                self.assertEqual('operator-correction-1', result['source_00']['correction_revision'])
-                self.assertEqual('success', result['source_01']['status'])
-                observe_child_sources(job, {'asin': 'B1'}, sources, corrections=correction)
-                self.assertEqual(1, reread.call_count)
-            malformed = deepcopy(bad)
-            malformed['product_features'] = [{'feature_id': [], 'object_id': 'frame', 'physical_facts': []}]
-            bad["product_features"] = valid["product_features"]
-            bad['reference_purposes'] = ['appearance']
-            with patch("core.visual_semantics.gemini_stream_generate", side_effect=[json.dumps({"sources": [malformed]}), json.dumps({"sources": [bad]})]) as repaired:
-                result = observe_child_sources(job, {"asin": "B2"}, sources[1:])
-            self.assertEqual(2, repaired.call_count)
-            self.assertIn('"product_features"', repaired.call_args.args[0])
-            self.assertIn('"reference_purposes"', repaired.call_args.args[0])
-            self.assertNotIn('"endpoints"', repaired.call_args.args[0])
-            self.assertNotIn('complete|partial;', repaired.call_args.args[0])
-            self.assertNotIn('"region": [', repaired.call_args.args[0])
-            self.assertTrue(all(row["status"] == "success" for row in result.values()))
+            clock=[1000.0];responses=[observation_wire([valid,bad]),observation_wire([repaired])]
+            def slow_observation(*args,**kwargs):
+                self.assertGreaterEqual(kwargs['deadline_monotonic']-clock[0],120)
+                clock[0]+=84  # Real first response left only 16 seconds under the retired 100-second cap.
+                return json.dumps(responses.pop(0))
+            with patch('core.visual_semantics.time.monotonic',side_effect=lambda:clock[0]), \
+                 patch('core.visual_semantics.gemini_stream_generate',side_effect=slow_observation) as model:
+                result=observe_child_sources(job,_child(),sources)
+                self.assertTrue(all(r['status']=='success' for r in result.values()))
+                self.assertEqual([sources[1]['path']],model.call_args.args[1])
+                observe_child_sources(job,_child(),sources);self.assertEqual(2,model.call_count)
+            cache=next(path for path in (job/'reports/source_observations').glob('*.json') if len(path.stem)==64)
+            saved=read_json(cache);saved.update(request_attempts=4,attempts_used={'source_00':4,'source_01':4});write_json(cache,saved)
+            corrections={'source_00':dict(revision='operator-1',reason='Correct the source observation')}
+            def correction(*args,**kwargs):
+                kwargs['attempt_observer']({'event':'request_budget','physical_request_count':1})
+                return json.dumps(observation_wire([valid]))
+            with patch('core.visual_semantics.gemini_stream_generate',side_effect=correction) as model:
+                parent_deadline=time.monotonic()+7
+                result=observe_child_sources(job,_child(),sources,corrections=corrections,deadline_monotonic=parent_deadline)
+                self.assertEqual(parent_deadline,model.call_args.kwargs['deadline_monotonic'])
+                self.assertEqual('operator-1',result['source_00']['correction_revision'])
+                observe_child_sources(job,_child(),sources,corrections=corrections);self.assertEqual(1,model.call_count)
+                self.assertEqual(5,read_json(cache)['request_attempts'])
+                self.assertEqual(6,read_json(cache)['correction_allowances']['operator-1']['request_ceiling'])
 
 
-if __name__ == "__main__":
+def _verify_transport_deadline(test):
+    # Cold optional-backend imports can exceed this fixture's two-second wire
+    # deadline on Windows. Warm imports only; request/deadline bounds stay unchanged.
+    import anyio._backends._asyncio
+    import httpcore._backends.anyio
+    from core import vision_gemini_client as client
+    from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+    from http.client import IncompleteRead
+    from threading import Thread
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self,*args):pass
+        def do_POST(self):
+            if self.path=='/upload':time.sleep(.4);return
+            self.rfile.read(int(self.headers.get('Content-Length','0')))
+            if self.path=='/headers':time.sleep(.4)
+            body=b'{"error":{"type":"insufficient_balance"}}' if self.path=='/balance' else b'{}'
+            self.send_response(402 if self.path.startswith('/error') or self.path=='/balance' else 200)
+            self.send_header('x-request-id','fixture-gateway-id')
+            self.send_header('Content-Length',str(len(body)) if self.path in {'/ok','/error','/balance'} else '100');self.end_headers()
+            try:
+                if self.path in {'/ok','/truncated','/error','/balance'}:self.wfile.write(body)
+                else:
+                    for _ in range(20):self.wfile.write(b'x');self.wfile.flush();time.sleep(.04)
+            except ConnectionError:pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler);thread=Thread(target=lambda:server.serve_forever(poll_interval=.01),daemon=True);thread.start()
+    try:
+        url=f'http://127.0.0.1:{server.server_port}'
+        audit={}
+        test.assertEqual('{}',client._post_json_preserve_redirects(url+'/ok',{}, {},timeout_seconds=2,audit=audit))
+        test.assertEqual('fixture-gateway-id',audit['response_headers']['x-request-id'])
+        with test.assertRaises(IncompleteRead):client._post_json_preserve_redirects(url+'/truncated',{}, {},timeout_seconds=2)
+        with test.assertRaises(client.urllib.error.HTTPError) as rejected:
+            client._post_json_preserve_redirects(url+'/error',{}, {},timeout_seconds=2,audit=audit)
+        test.assertEqual(402,rejected.exception.code)
+        test.assertEqual(b'{}',rejected.exception.read())
+        for route in ('error','balance'):
+            audit={}
+            with test.assertRaises(client.urllib.error.HTTPError):
+                client._post_json_preserve_redirects(url+'/'+route,{}, {},timeout_seconds=2,audit=audit)
+            test.assertTrue(audit['response_complete'])
+            test.assertEqual('rejected' if route=='balance' else 'unknown',audit['request_outcome'])
+            event=client._emit_attempt(None,request_id='fixture',client={'_transport':audit},model='fixture',protocol='test',
+                attempt=1,status='transport_failure',started=time.monotonic())
+            test.assertTrue(event['response_body_sha256']);test.assertIn('error' if route=='balance' else '{}',event['response_body'])
+            test.assertNotIn('_response_body',event['transport'])
+        for route in ('slow','headers','error-slow','upload'):
+            started=time.monotonic()
+            payload={'padding':'x'*3_000_000} if route=='upload' else {}
+            with test.assertRaises(TimeoutError):
+                client._post_json_preserve_redirects(url+'/'+route,payload,{},timeout_seconds=2,deadline=started+.15)
+            test.assertLess(time.monotonic()-started,.6,route)
+    finally:
+        server.shutdown();server.server_close();thread.join(timeout=1)
+    endpoint=dict(name='primary',base_url='https://fixture.invalid/v1',api_key='fixture')
+    alias={**endpoint,'name':'alias','model':'different-model'};other={**endpoint,'name':'other','base_url':'https://other.invalid/v1'}
+    with patch.object(client,'gemini_clients',return_value=[endpoint,alias,other]),patch.object(client,'provider_concurrency_limit',return_value=1):
+        test.assertEqual(client._vision_resource(endpoint)[1],client._vision_resource(alias)[1]);test.assertNotEqual(client._vision_resource(endpoint)[1],client._vision_resource(other)[1])
+
+
+if __name__=='__main__':
     unittest.main()

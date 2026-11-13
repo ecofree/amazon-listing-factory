@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -37,6 +37,10 @@ class OcrResult:
     raw_text: str = ""
     avg_confidence: float = 0.0
     error: str = ""
+    completeness: str = "unavailable"
+    completeness_source: str = ""
+    completeness_reasons: list[str] = field(default_factory=list)
+    summary_truncation: list[str] = field(default_factory=list)
 
 
 EMPTY_OCR_RESULT = OcrResult(error="ocr_unavailable")
@@ -46,13 +50,13 @@ _CACHE_LOCK = threading.RLock()
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _LOW_CONFIDENCE_DEFAULT = 0.5
-_OCR_REQUEST_VERSION = "ppocr-v7-localized-dedup"
+_OCR_REQUEST_VERSION = "ppocr-v8-result-completeness"
 _RESULT_MAX_BYTES = 8 * 1024 * 1024
 _MAX_OCR_BLOCKS = 2000
 _MAX_OCR_DEPTH = 8
 
 
-def scan_image(image_path: str | Path, *, deadline_monotonic: float | None = None) -> OcrResult:
+def scan_image(image_path: str | Path, *, deadline_monotonic: float | None = None, receipt_root: Path | None = None) -> OcrResult:
     """Return OCR text evidence for an image.
 
     Disabled, unconfigured, low-confidence, and failed OCR return explicit
@@ -72,8 +76,7 @@ def scan_image(image_path: str | Path, *, deadline_monotonic: float | None = Non
             _CACHE.move_to_end(cache_key)
             return cached
     try:
-        result = _scan_image_uncached(path, deadline_monotonic=deadline_monotonic)
-        _remaining_seconds(0.0, deadline_monotonic)
+        result = _scan_image_uncached(path, deadline_monotonic=deadline_monotonic, receipt_root=receipt_root)
     except Exception as exc:
         result = OcrResult(error=f"{type(exc).__name__}: {exc}")
     if result.error:
@@ -85,25 +88,43 @@ def scan_image(image_path: str | Path, *, deadline_monotonic: float | None = Non
     return result
 
 
-def _scan_image_uncached(path: Path, *, deadline_monotonic: float | None = None) -> OcrResult:
+def _scan_image_uncached(path: Path, *, deadline_monotonic: float | None = None, receipt_root: Path | None = None) -> OcrResult:
+    from .service_response import perform_request, known_unsent
+    if receipt_root is None:
+        raise RuntimeError('OCR POST requires durable request context; no request sent')
+    data = path.read_bytes()
+    if len(data) > 32 * 1024 * 1024:
+        raise ValueError('OCR source exceeds byte limit')
+    source_sha = hashlib.sha256(data).hexdigest()
     headers = {"Authorization": f"Bearer {_api_token()}"}
     optional_payload = json.dumps(_optional_payload(), separators=(",", ":"), sort_keys=True)
-    with path.open("rb") as handle:
-        response = _request_with_retries(
-            lambda timeout: (
-                handle.seek(0)
-                or requests.post(
-                    _api_url(),
-                    headers=headers,
-                    data={"model": _model(), "optionalPayload": optional_payload},
-                    files={"file": (path.name, handle, _content_type(path))},
-                    timeout=timeout,
-                )
-            ),
-            timeout=_submit_timeout(),
-            deadline_monotonic=deadline_monotonic,
-        )
-    payload = response.json()
+    identity = {'operation': 'ocr_submit', 'source_sha256': source_sha, 'api_url': _api_url(), 'model': _model(), 'options': optional_payload}
+    def submit():
+        from .batch_ledger import admit_paid_request
+        from .service_response import prepare_request,start_submission
+        with prepare_request():
+            timeout=_remaining_seconds(_submit_timeout(),deadline_monotonic)
+            files={'file':(path.name,data,_content_type(path))}
+            admit_paid_request('ocr')
+        start_submission()
+        response = requests.post(_api_url(), headers=headers, data={'model': _model(), 'optionalPayload': optional_payload},
+            files=files, timeout=timeout, stream=True)
+        try:
+            response.raise_for_status()
+            chunks, size = [], 0
+            for chunk in response.iter_content(chunk_size=65536):
+                _remaining_seconds(0, deadline_monotonic)
+                size += len(chunk)
+                if size > _RESULT_MAX_BYTES:
+                    raise ValueError('OCR submission response exceeds byte limit')
+                chunks.append(chunk)
+            return b''.join(chunks)
+        finally:
+            response.close()
+    def rejected(exc):
+        return known_unsent(exc) or (isinstance(exc, requests.HTTPError) and getattr(exc.response, 'status_code', 0) in {400, 401, 403, 404, 422, 429})
+    body = perform_request(receipt_root, ['ocr:' + source_sha], identity, submit, known_not_executed=rejected, max_bytes=_RESULT_MAX_BYTES)
+    payload = json.loads(body)
     job_id = str((payload.get("data") or {}).get("jobId") or payload.get("jobId") or "").strip()
     if not job_id:
         return _parse_result_payload(payload, deadline_monotonic=deadline_monotonic)
@@ -149,8 +170,10 @@ def _poll_result(
 def _parse_result_payload(
     payload: dict[str, Any], *, deadline_monotonic: float | None = None,
 ) -> OcrResult:
-    blocks: list[OcrBlock] = []
-    blocks.extend(_extract_blocks(payload))
+    reasons: list[str] = []
+    inline_reasons: list[str] = []
+    blocks = _extract_blocks(payload, diagnostics=inline_reasons)
+    completeness, source, error = 'unknown', 'inline_unverified', ''
     result_url = _result_json_url(payload)
     if result_url:
         try:
@@ -167,15 +190,36 @@ def _parse_result_payload(
                 body = response.content
                 if len(body) > _RESULT_MAX_BYTES:
                     raise RuntimeError("OCR result exceeds size limit")
-                blocks.extend(_extract_blocks_from_jsonl(body.decode("utf-8", errors="replace")))
+                complete_blocks = _extract_blocks_from_jsonl(body.decode("utf-8"), diagnostics=reasons)
+                # A downloaded full result is authoritative; inline may be its summary.
+                if reasons:
+                    seen = {(block.text, _freeze_bbox(block.bbox)) for block in complete_blocks}
+                    complete_blocks.extend(block for block in blocks if (block.text, _freeze_bbox(block.bbox)) not in seen)
+                    if len(complete_blocks) > _MAX_OCR_BLOCKS:
+                        reasons.append('block_limit')
+                blocks = complete_blocks[:_MAX_OCR_BLOCKS]
+                completeness, source = 'complete', 'result_url'
             finally:
                 response.close()
-        except TimeoutError:
-            raise
         except Exception as exc:
-            if not blocks:
-                return OcrResult(error=f"{type(exc).__name__}: {exc}")
-    return _analyze_blocks(blocks)
+            error = f"{type(exc).__name__}: {exc}"
+            completeness = 'partial' if blocks else 'unavailable'
+            source = 'inline_after_result_fetch_failure'
+            reasons.extend(inline_reasons)
+            reasons.append('result_fetch_failed')
+    elif isinstance(payload.get('rec_texts'), list) and isinstance(payload.get('rec_scores'), list) and len(payload['rec_texts']) == len(payload['rec_scores']):
+        # A direct recognition output contains its full parallel text/score arrays.
+        completeness, source = 'complete', 'inline_recognition_arrays'
+        reasons.extend(inline_reasons)
+    else:
+        reasons.extend(inline_reasons)
+        reasons.append('inline_completeness_unverified')
+    if any(reason in {'block_limit', 'depth_limit', 'invalid_jsonl', 'empty_result', 'unsupported_result_shape'} for reason in reasons) and completeness != 'unavailable':
+        completeness = 'partial' if blocks else 'unknown'
+    result = _analyze_blocks(blocks)
+    return replace(result, error='; '.join(value for value in (error, result.error) if value),
+                   completeness=completeness, completeness_source=source,
+                   completeness_reasons=list(dict.fromkeys(reasons)))
 
 
 def _remaining_seconds(limit: float, deadline_monotonic: float | None) -> float:
@@ -220,26 +264,56 @@ def _retryable_http_error(exc: requests.HTTPError) -> bool:
     return status == 429 or status >= 500
 
 
-def _extract_blocks_from_jsonl(text: str) -> list[OcrBlock]:
+def _extract_blocks_from_jsonl(text: str, *, diagnostics: list[str] | None = None) -> list[OcrBlock]:
+    diagnostics = diagnostics if diagnostics is not None else []
     blocks: list[OcrBlock] = []
+    parsed = False
     for line in text.splitlines():
-        if len(blocks) >= _MAX_OCR_BLOCKS:
-            break
         stripped = line.strip()
         if not stripped:
             continue
+        if len(blocks) >= _MAX_OCR_BLOCKS:
+            diagnostics.append('block_limit')
+            break
         try:
             payload = json.loads(stripped)
         except json.JSONDecodeError:
+            diagnostics.append('invalid_jsonl')
             continue
-        blocks.extend(_extract_blocks(payload, depth=0)[: max(0, _MAX_OCR_BLOCKS - len(blocks))])
+        parsed = True
+        if not _contains_ocr_output(payload):
+            diagnostics.append('unsupported_result_shape')
+        incoming = _extract_blocks(payload, depth=0, diagnostics=diagnostics)
+        if len(blocks) + len(incoming) > _MAX_OCR_BLOCKS:
+            diagnostics.append('block_limit')
+        blocks.extend(incoming[:max(0, _MAX_OCR_BLOCKS - len(blocks))])
+    if not parsed:
+        diagnostics.append('empty_result')
     return blocks
 
 
-def _extract_blocks(payload: Any, *, depth: int = 0) -> list[OcrBlock]:
+def _contains_ocr_output(payload: Any, depth: int = 0) -> bool:
+    if not isinstance(payload, dict) or depth > _MAX_OCR_DEPTH:
+        return False
+    if any(key in payload for key in ('rec_texts', 'recTexts', 'text', 'rec_text', 'content', 'markdown')):
+        return True
+    for key in ('ocrResults', 'ocr_results', 'layoutElements', 'layoutParsingResults', 'parsing_res_list',
+                'prunedResult', 'results', 'pages', 'items', 'result'):
+        value = payload.get(key)
+        if isinstance(value, list) and (not value or any(_contains_ocr_output(item, depth+1) for item in value)):
+            return True
+        if isinstance(value, dict) and _contains_ocr_output(value, depth+1):
+            return True
+    return False
+
+
+def _extract_blocks(payload: Any, *, depth: int = 0, diagnostics: list[str] | None = None) -> list[OcrBlock]:
+    diagnostics = diagnostics if diagnostics is not None else []
     if not isinstance(payload, dict):
         return []
     if depth > _MAX_OCR_DEPTH:
+        if payload:
+            diagnostics.append('depth_limit')
         return []
     blocks: list[OcrBlock] = []
     texts = payload.get("rec_texts", payload.get("recTexts"))
@@ -248,7 +322,9 @@ def _extract_blocks(payload: Any, *, depth: int = 0) -> list[OcrBlock]:
     if isinstance(texts, list):
         score_rows = scores if isinstance(scores, list) else []
         polygon_rows = polygons if isinstance(polygons, list) else []
-        for index, text in enumerate(texts):
+        if len(texts) > _MAX_OCR_BLOCKS:
+            diagnostics.append('block_limit')
+        for index, text in enumerate(texts[:_MAX_OCR_BLOCKS]):
             if not isinstance(text, str) or not text.strip():
                 continue
             score = score_rows[index] if index < len(score_rows) else 0.0
@@ -276,10 +352,14 @@ def _extract_blocks(payload: Any, *, depth: int = 0) -> list[OcrBlock]:
         value = payload.get(key)
         if isinstance(value, list):
             for item in value:
-                blocks.extend(_extract_blocks(item, depth=depth + 1))
+                blocks.extend(_extract_blocks(item, depth=depth + 1, diagnostics=diagnostics))
+                if len(blocks) > _MAX_OCR_BLOCKS:
+                    diagnostics.append('block_limit')
+                    break
         elif isinstance(value, dict):
-            blocks.extend(_extract_blocks(value, depth=depth + 1))
-        if len(blocks) >= _MAX_OCR_BLOCKS:
+            blocks.extend(_extract_blocks(value, depth=depth + 1, diagnostics=diagnostics))
+        if len(blocks) > _MAX_OCR_BLOCKS:
+            diagnostics.append('block_limit')
             break
     return blocks[:_MAX_OCR_BLOCKS]
 
@@ -355,6 +435,8 @@ def _analyze_blocks(blocks: list[OcrBlock]) -> OcrResult:
         text_blocks=deduped,
         raw_text=raw_text[:1200],
         avg_confidence=round(avg, 3),
+        completeness='unknown',
+        summary_truncation=['raw_text_1200'] if len(raw_text) > 1200 else [],
     )
 
 

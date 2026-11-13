@@ -27,7 +27,55 @@ from .image_provider_common import (
     provider_timeout_seconds,
     assert_imagegen_prompt_contract,
 )
-from .url_safety import assert_public_http_url
+from .url_safety import request_public_url
+from .image_provider_common import CandidateCommitError, ImageOutputRejected
+from .imagegen_artifacts import (IMAGE_OUTPUT_MAX_BYTES, IMAGE_RESPONSE_MAX_BYTES,
+                                IMAGE_OUTPUT_MAX_DIMENSION, IMAGE_OUTPUT_MAX_PIXELS, _is_invalid_image_encoding)
+
+
+def _bounded_response_bytes(response, maximum=None):
+    maximum = IMAGE_RESPONSE_MAX_BYTES if maximum is None else maximum
+    declared = response.headers.get('Content-Length') if response.headers else None
+    if declared and str(declared).isdigit() and int(declared) > maximum:
+        raise ImageOutputRejected(f'Generated response declares {declared} bytes, exceeding limit {maximum}')
+    buffered = bytearray()
+    while True:
+        interrupted = None
+        try:
+            chunk = response.read(min(65536, maximum - len(buffered) + 1))
+        except IncompleteRead as exc:
+            chunk, interrupted = exc.partial, exc
+        received = len(buffered) + len(chunk)
+        if received > maximum:
+            rejection = ImageOutputRejected(f'Generated response exceeds byte limit {maximum}; stopped at {received}')
+            rejection.partial = bytes(buffered) + chunk[:maximum - len(buffered)]
+            raise rejection from interrupted
+        buffered.extend(chunk)
+        if interrupted is not None:
+            raise IncompleteRead(bytes(buffered), interrupted.expected) from interrupted
+        if not chunk:
+            return bytes(buffered)
+
+
+def _validate_output_bytes(data):
+    if not data or len(data) > IMAGE_OUTPUT_MAX_BYTES:
+        raise ImageOutputRejected(f'Generated image exceeds byte limit {IMAGE_OUTPUT_MAX_BYTES} or is empty')
+    from PIL import Image, UnidentifiedImageError
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if max(image.size) > IMAGE_OUTPUT_MAX_DIMENSION or image.width * image.height > IMAGE_OUTPUT_MAX_PIXELS:
+                raise ImageOutputRejected('Generated image exceeds the output pixel limit')
+    except UnidentifiedImageError:
+        pass  # Native validation owns decodability; bytes still have a hard bound.
+    except Image.DecompressionBombError as exc:
+        raise ImageOutputRejected(f'Generated image exceeds safe pixel limits: {exc}') from exc
+    except MemoryError as exc:
+        raise CandidateCommitError('Image header validation needs local memory recovery; paid bytes retained') from exc
+    except (OSError, SyntaxError, ValueError) as exc:
+        if isinstance(exc, OSError) and not _is_invalid_image_encoding(exc):
+            raise CandidateCommitError('Image header validation needs local system recovery; paid bytes retained') from exc
+        raise ImageOutputRejected(f'Generated image header is malformed: {type(exc).__name__}: {exc}') from exc
+    return data
 
 
 IMAGE_DATA_URL_MAX_DIMENSION = 4096
@@ -36,7 +84,6 @@ IMAGE_DATA_URL_MAX_BYTES = 20 * 1024 * 1024
 
 @dataclass(frozen=True)
 class ImageEditRequest:
-    image_url: str
     prompt: str
     size: str
     background: str
@@ -86,21 +133,21 @@ def _registry_image_provider_specs() -> dict[str, ImageProviderSpec]:
 
 def generate_with_registry_image_provider(
     *, provider_name: str, image_inputs: list[bytes], prompt: str,
-    mask_bytes: bytes | None = None, request_id: str = "", request_audit: dict[str, Any] | None = None,
+    region_map_bytes: bytes | None = None, request_id: str = "", request_audit: dict[str, Any] | None = None,
     request_observer: Any | None = None,
     transport_observer: Any | None = None,
 ) -> bytes:
     if not image_inputs:
         raise ProviderConfigurationError(provider_name, "image provider requires at least one reference image")
     spec = _image_provider_spec(provider_name)
-    if len(image_inputs) > 1 and not api_registry.image_provider_supports_multiple_references(provider_name, len(image_inputs)):
+    count = len(image_inputs) + int(region_map_bytes is not None)
+    if count > 1 and not api_registry.image_provider_supports_multiple_references(provider_name, count):
         raise ProviderConfigurationError(provider_name, "Route does not support the required reference set")
     profile = spec.protocol_profile or {} if spec else {}
-    originals = [hashlib.sha256(data).hexdigest() for data in image_inputs]
-    image_inputs = [_bounded_image_data_url_bytes(data) for data in image_inputs]
-    original_mask_sha = hashlib.sha256(mask_bytes).hexdigest() if mask_bytes else ""
-    if mask_bytes is not None:
-        mask_bytes = _validated_mask_bytes(mask_bytes, expected_image_bytes=image_inputs[0])
+    originals = image_inputs + ([region_map_bytes] if region_map_bytes is not None else [])
+    original_sizes = [_input_size(data) for data in originals]
+    originals = [hashlib.sha256(data).hexdigest() for data in originals]
+    image_inputs = _prepare_edit_inputs(image_inputs, region_map_bytes)
     if request_audit is not None:
         from urllib.parse import urlsplit
         endpoint = urlsplit(_provider_url(spec) if spec else "")
@@ -110,53 +157,27 @@ def generate_with_registry_image_provider(
             "endpoint": {"scheme": endpoint.scheme, "host": endpoint.hostname, "port": endpoint.port, "path": endpoint.path},
             "request_size": str(profile.get("request_size") or ""), "quality": str(profile.get("quality") or "low"),
             "output_contract": str(profile.get("output_contract") or ""),
-            "mask_sha256": hashlib.sha256(mask_bytes).hexdigest() if mask_bytes else "",
-            "original_mask_sha256": original_mask_sha,
+            "region_map_attachment": count if region_map_bytes is not None else None,
+            "region_guidance_mode": "opaque_reference" if region_map_bytes is not None else "none",
+            'original_sizes': original_sizes, 'sent_sizes': [_input_size(data) for data in image_inputs],
             "inputs": [{"original_sha256": original, "sent_sha256": hashlib.sha256(data).hexdigest(),
                         "sent_bytes": len(data), "transform": "unchanged" if original == hashlib.sha256(data).hexdigest() else "bounded_image_encoding"}
                        for original, data in zip(originals, image_inputs)],
         })
-    if request_observer is not None and (not spec or spec.api_type != 'openai_images_edit'):
-        request_observer(dict(request_audit or {}))
     if spec and spec.api_type == "openai_images_edit":
         return _generate_with_openai_images_edit(
             provider_name=provider_name,
             image_inputs=image_inputs,
             prompt=prompt,
-            mask_bytes=mask_bytes,
             request_audit=request_audit,
             transport_observer=transport_observer,
             request_observer=request_observer,
-        )
-    if spec and spec.api_type == "openai_chat_completions_image":
-        if mask_bytes is not None:
-            raise ProviderConfigurationError(provider_name, "chat completions image provider cannot enforce protected masks")
-        return _generate_with_openai_chat_completions_image(
-            provider_name=provider_name,
-            image_inputs=image_inputs,
-            prompt=prompt,
-        )
-    if spec and spec.api_type == "async_image_generation":
-        if mask_bytes is not None:
-            raise ProviderConfigurationError(provider_name, "async image generation provider cannot enforce protected masks")
-        return _generate_with_async_image_generation(
-            provider_name=provider_name,
-            image_inputs=image_inputs,
-            prompt=prompt,
-            request_id=request_id,
-        )
-    if spec and spec.api_type == "highwayapi":
-        return _generate_with_highwayapi(
-            provider_name=provider_name,
-            image_inputs=image_inputs,
-            prompt=prompt,
-            mask_bytes=mask_bytes,
         )
     raise ProviderConfigurationError(provider_name, f"Unsupported registry image provider: {provider_name}")
 
 
 def _generate_with_openai_images_edit(
-    *, provider_name: str, image_inputs: list[bytes], prompt: str, mask_bytes: bytes | None,
+    *, provider_name: str, image_inputs: list[bytes], prompt: str,
     request_audit: dict[str, Any] | None = None,
     transport_observer: Any | None = None,
     request_observer: Any | None = None,
@@ -168,7 +189,7 @@ def _generate_with_openai_images_edit(
     if not key:
         token_hint = f" Set {spec.key_env}." if spec.key_env else ""
         raise ProviderConfigurationError(provider_name, f"Provider '{spec.display}' API key is not configured.{token_hint}")
-    edit_request = _canonical_image_edit_request(spec=spec, image_bytes=image_inputs[0], prompt=prompt)
+    edit_request = _canonical_image_edit_request(spec=spec, prompt=prompt)
     model = spec.model
     if not model:
         raise ProviderConfigurationError(provider_name, "image provider requires an explicit registry model")
@@ -176,8 +197,12 @@ def _generate_with_openai_images_edit(
         edit_request=edit_request,
         model=model,
         image_inputs=image_inputs,
-        mask_bytes=mask_bytes,
     )
+    if request_audit is not None:
+        request_audit.update(request_body_sha256=hashlib.sha256(body).hexdigest(), request_fields={
+            "model": model, "prompt_sha256": hashlib.sha256(edit_request.prompt.encode("utf-8")).hexdigest(),
+            **{name: getattr(edit_request, name) for name in ("quality", "background", "moderation", "size")
+               if getattr(edit_request, name) and (name != "size" or edit_request.size.strip().lower() not in {"1:1", "square"})}})
     url = _provider_url(spec)
     timeout = provider_timeout_seconds(provider_name)
     request = urllib.request.Request(
@@ -191,22 +216,44 @@ def _generate_with_openai_images_edit(
             "User-Agent": "Mozilla/5.0",
         },
     )
-    if request_observer is not None:
-        request_observer(dict(request_audit or {}))
+    if not request_audit or not request_audit.get('receipt_path') or not callable(request_observer):
+        raise ProviderConfigurationError(provider_name, 'Image submission requires a durable attempt and submission observer')
+    from pathlib import Path
+    from .io import read_json
+    from .image_response import RESPONSE_SCHEMA
+    receipt=Path(request_audit['receipt_path'])
+    prepared=read_json(receipt)
+    if (prepared.get('schema')!=RESPONSE_SCHEMA or prepared.get('binding')!=receipt.parent.name
+            or prepared.get('provider')!=provider_name or prepared.get('status')!='prepared'
+            or request_audit.get('attempt_id')!=receipt.stem
+            or request_audit.get('response_binding')!=prepared.get('binding')):
+        raise ProviderConfigurationError(provider_name,'Image request is not bound to a prepared receipt')
+    from .batch_ledger import admit_paid_request
+    request_audit['admission_id'] = admit_paid_request('image',receipt.stem,receipt_path=receipt)
+    request_audit['transport_phase'] = 'submission_call_started'
+    request_observer(dict(request_audit))
+    submitted=read_json(receipt)
+    if submitted.get('status')!='submitted' or not submitted.get('submitted_at'):
+        raise ProviderConfigurationError(provider_name,'Submission observer did not persist the POST boundary')
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if request_audit is not None:
                 request_audit["remote_request_id"] = str(response.headers.get("x-request-id") or "")[:200]
+                request_audit['transport_phase'] = 'response_headers_received'
             if transport_observer:
                 transport_observer('headers', b'', request_audit or {})
             try:
-                raw = response.read()
-            except IncompleteRead as exc:
-                if transport_observer:
+                raw = _bounded_response_bytes(response)
+            except (IncompleteRead, ImageOutputRejected) as exc:
+                if request_audit is not None:
+                    request_audit.update(transport_phase='response_body_interrupted', response_bytes_received=len(getattr(exc,'partial',b'')))
+                if transport_observer and hasattr(exc, 'partial'):
                     transport_observer('partial', exc.partial, request_audit or {})
                 raise
+            if request_audit is not None:
+                request_audit.update(transport_phase='response_body_received', response_bytes_received=len(raw))
             text = raw.decode("utf-8", errors="replace")
-            payload = _raise_image_rejection(provider_name, text, 200)
+            payload = _raise_image_rejection(provider_name, text, 200, request_audit=request_audit, api_key=key)
             if transport_observer:
                 transport_observer('body', raw, request_audit or {})
     except urllib.error.HTTPError as exc:
@@ -216,12 +263,12 @@ def _generate_with_openai_images_edit(
         if transport_observer:
             transport_observer('headers', b'', request_audit or {})
         try:
-            excerpt = exc.read(800).decode("utf-8", errors="replace")
+            excerpt = exc.read(8192).decode("utf-8", errors="replace")
         except Exception as body_error:
             excerpt = f'Unreadable error body: {type(body_error).__name__}'
-        _raise_image_rejection(provider_name, excerpt, exc.code)
-        raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
-    except (ProviderConfigurationError, ProviderTransportError):
+        _raise_image_rejection(provider_name, excerpt, exc.code, request_audit=request_audit, api_key=key)
+        raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {_image_error_text(excerpt, key)}") from exc
+    except (ProviderConfigurationError, ProviderTransportError, CandidateCommitError):
         raise
     except Exception as exc:
         reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
@@ -230,6 +277,9 @@ def _generate_with_openai_images_edit(
         if isinstance(reason, (socket.gaierror, ConnectionRefusedError)):
             raise ProviderTransportError(provider_name, f'Connection failed before image submission: {reason}') from exc
         raise ProviderTransportError(provider_name, f"Remote image result unknown after {type(exc).__name__}: {exc}", ambiguous=True) from exc
+    finally:
+        if transport_observer and request_audit and request_audit.get('provider_error'):
+            transport_observer('headers', b'', request_audit)
     if request_audit is not None:
         if isinstance(payload, dict):
             request_audit["response_metadata"] = {key: value for key in ("model", "id", "created")
@@ -239,7 +289,16 @@ def _generate_with_openai_images_edit(
     return _decode_image_response(text)
 
 
-def _raise_image_rejection(provider_name: str, text: str, status: int) -> Any:
+def _image_error_text(value: Any, api_key: str = '', limit: int = 500) -> str:
+    text = str(value) if isinstance(value, (str, int, float)) else ''
+    if api_key:
+        text = text.replace(api_key, '[redacted]')
+    text = re.sub(r'(?i)(bearer\s+|(?:api[_-]?key|token|authorization)[\s\"\x27:=]+)\S+', r'\1[redacted]', text)
+    text = re.sub(r'(?:data:[^\s,]*;base64,\S+|[A-Za-z0-9+/=]{128,})', '[redacted payload]', text)
+    return text[:limit]
+
+
+def _raise_image_rejection(provider_name: str, text: str, status: int, *, request_audit: dict[str, Any] | None = None, api_key: str = '') -> Any:
     """A complete rejection is not a recoverable paid-image body, even on HTTP 200."""
     try:
         payload = json.loads(text)
@@ -248,323 +307,25 @@ def _raise_image_rejection(provider_name: str, text: str, status: int) -> Any:
             'data', 'images', 'output', 'result', 'choices', 'content', 'image', 'url', 'b64_json'))
         code = (error.get('code') or error.get('type')) if isinstance(error, dict) and not has_result else ''
     except ValueError:
-        payload, code = None, ''
+        payload, error, code = None, None, ''
     code = code if isinstance(code, str) else ''
+    if request_audit is not None and (error or status >= 400):
+        message = error.get('message') if isinstance(error, dict) else error if isinstance(error, str) else ''
+        message = message or (payload.get('message') if isinstance(payload, dict) else '') or (text if payload is None else '')
+        request_audit['provider_error'] = {
+            'http_status': status, 'code': _image_error_text(code, api_key, 100),
+            'message': _image_error_text(message, api_key),
+            'request_id': _image_error_text((error.get('request_id') if isinstance(error, dict) else '')
+                or (payload.get('request_id') if isinstance(payload, dict) else '')
+                or request_audit.get('remote_request_id'), api_key, 200),
+        }
     if code in {'model_not_found', 'invalid_api_key', 'insufficient_quota', 'permission_denied'}:
         raise ProviderConfigurationError(provider_name, f'Image request rejected: {code}')
     if status == 429 or code in {'rate_limit_exceeded', 'no_available_channel', 'image_account_selection_timeout'}:
         raise ProviderTransportError(provider_name, f'Image request rejected before generation: HTTP {status}: {code}')
     if status == 408 or status >= 500:
-        raise ProviderTransportError(provider_name, f'Remote image result unknown after HTTP {status}: {text[:800]}', ambiguous=True)
+        raise ProviderTransportError(provider_name, f'Remote image result unknown after HTTP {status}: {_image_error_text(text, api_key)}', ambiguous=True)
     return payload
-
-
-def _generate_with_openai_chat_completions_image(
-    *, provider_name: str, image_inputs: list[bytes], prompt: str
-) -> bytes:
-    spec = _image_provider_spec(provider_name)
-    if spec is None or spec.api_type != "openai_chat_completions_image":
-        raise ProviderConfigurationError(provider_name, f"Unsupported OpenAI chat image provider: {provider_name}")
-    key = _provider_api_key(spec)
-    if not key:
-        token_hint = f" Set {spec.key_env}." if spec.key_env else ""
-        raise ProviderConfigurationError(provider_name, f"Provider '{spec.display}' API key is not configured.{token_hint}")
-    body = json.dumps(
-        {
-            "model": spec.model or "gpt-image-2",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": str(prompt or "")},
-                        *[
-                            {"type": "image_url", "image_url": {"url": _image_data_url_from_bytes(image_bytes)}}
-                            for image_bytes in image_inputs
-                        ],
-                    ],
-                }
-            ],
-            "modalities": ["image", "text"],
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        _provider_url(spec),
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {key}",
-            "User-Agent": "Mozilla/5.0",
-        },
-    )
-    timeout = provider_timeout_seconds(provider_name)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            text = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        excerpt = exc.read().decode("utf-8", errors="replace")[:800]
-        raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
-    except urllib.error.URLError as exc:
-        raise ImageGenerationError(f"{provider_name} request failed: {exc}") from exc
-    return _decode_image_response(text)
-
-
-def _generate_with_async_image_generation(
-    *, provider_name: str, image_inputs: list[bytes], prompt: str, request_id: str = ""
-) -> bytes:
-    spec = _image_provider_spec(provider_name)
-    if spec is None or spec.api_type != "async_image_generation":
-        raise ProviderConfigurationError(provider_name, f"Unsupported async image provider: {provider_name}")
-    key = _provider_api_key(spec)
-    if not key:
-        token_hint = f" Set {spec.key_env}." if spec.key_env else ""
-        raise ProviderConfigurationError(provider_name, f"Provider '{spec.display}' API key is not configured.{token_hint}")
-    submit_payload = _async_image_generation_payload(spec=spec, image_inputs=image_inputs, prompt=prompt)
-    idempotency_key = _async_idempotency_key(provider_name, request_id, prompt, image_inputs)
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {key}",
-        "User-Agent": "Mozilla/5.0",
-        "Idempotency-Key": idempotency_key,
-    }
-    submit_text = _async_submit_with_retry(
-        _provider_url(spec), submit_payload, headers=headers, provider_name=provider_name,
-    )
-    submit_data = _loads_provider_json(submit_text, provider_name=provider_name)
-    task_id = _async_task_id(submit_data)
-    if not task_id:
-        raise ImageGenerationError(f"{provider_name} async image response did not contain task_id: {submit_text[:800]}")
-    task_url = _async_task_status_url(_provider_url(spec), task_id)
-    timeout = provider_timeout_seconds(provider_name)
-    deadline = time.monotonic() + timeout
-    poll_interval = 2.0
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ImageGenerationError(f"{provider_name} async image generation timed out after {timeout}s (task_id={task_id})")
-        status_text = _async_poll_with_retry(
-            task_url,
-            headers=headers,
-            timeout=min(30, max(5, int(remaining))),
-            provider_name=provider_name,
-            task_id=task_id,
-        )
-        status_data = _loads_provider_json(status_text, provider_name=provider_name)
-        task_data = status_data.get("data") if isinstance(status_data, dict) else None
-        if isinstance(task_data, list) and task_data:
-            task_data = task_data[0]
-        if not isinstance(task_data, dict):
-            task_data = status_data if isinstance(status_data, dict) else {}
-        status = str(task_data.get("status") or "").strip().lower()
-        if status in {"failed", "error", "cancelled", "canceled"}:
-            error = task_data.get("error") or status_data.get("error") if isinstance(status_data, dict) else None
-            raise ImageGenerationError(f"{provider_name} async image task failed: {error or status_text[:800]}")
-        image_url = _async_result_image_url(task_data)
-        progress = task_data.get("progress")
-        if image_url and (status in {"completed", "succeeded", "success"} or str(progress) == "100"):
-            return _download_image_bytes(image_url)
-        time.sleep(min(poll_interval, max(0.5, remaining)))
-        poll_interval = min(5.0, poll_interval + 0.5)
-
-
-def _async_idempotency_key(provider_name: str, request_id: str, prompt: str, image_inputs: list[bytes]) -> str:
-    digest = hashlib.sha256()
-    digest.update(str(provider_name).encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(str(request_id or "").encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(str(prompt or "").encode("utf-8"))
-    for image in image_inputs:
-        digest.update(b"\0")
-        digest.update(bytes(image))
-    return digest.hexdigest()
-
-
-def _is_ambiguous_transport_error(exc: Exception) -> bool:
-    text = str(exc).casefold()
-    return any(marker in text for marker in (
-        "unexpected_eof", "ssl eof", "ssl: eof", "remote end closed",
-        "remote disconnected", "incompleteread", "connection reset",
-    ))
-
-
-def _async_submit_with_retry(
-    url: str, payload: dict[str, Any], *, headers: dict[str, str],
-    provider_name: str,
-) -> str:
-    last: Exception | None = None
-    for attempt in range(1, 3):
-        try:
-            return _post_json(url, payload, headers=headers, timeout=30, provider_name=provider_name)
-        except Exception as exc:
-            last = exc
-            if not _is_ambiguous_transport_error(exc) or attempt >= 2:
-                break
-            time.sleep(0.75 * attempt)
-    assert last is not None
-    if _is_ambiguous_transport_error(last):
-        raise ProviderTransportError(
-            provider_name,
-            f"async_submit_response_ambiguous: {last}",
-            ambiguous=True,
-        ) from last
-    raise last
-
-
-def _async_poll_with_retry(
-    url: str, *, headers: dict[str, str], timeout: int,
-    provider_name: str, task_id: str,
-) -> str:
-    last: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            return _get_text(url, headers=headers, timeout=timeout, provider_name=provider_name)
-        except Exception as exc:
-            last = exc
-            if not _is_ambiguous_transport_error(exc) or attempt >= 3:
-                break
-            time.sleep(0.75 * attempt)
-    assert last is not None
-    if _is_ambiguous_transport_error(last):
-        raise ProviderTransportError(
-            provider_name,
-            f"async_poll_response_ambiguous: task_id={task_id}: {last}",
-            ambiguous=True,
-        ) from last
-    raise last
-
-
-def _async_image_generation_payload(*, spec: ImageProviderSpec, image_inputs: list[bytes], prompt: str) -> dict[str, Any]:
-    profile = spec.protocol_profile or {}
-    size = str(profile.get("async_size") or profile.get("size") or "").strip()
-    if not size:
-        size = "1:1" if (spec.request_size or "").lower() in {"1024x1024", "2048x2048"} else spec.request_size or "1:1"
-    resolution = str(profile.get("resolution") or "1k").strip().lower()
-    return {
-        "model": spec.model or "gpt-image-2",
-        "prompt": str(prompt or ""),
-        "n": 1,
-        "size": size,
-        "resolution": resolution,
-        "image_urls": [_image_data_url_from_bytes(image_bytes) for image_bytes in image_inputs],
-    }
-
-
-def _post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str], timeout: int, provider_name: str) -> str:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        method="POST",
-        headers=headers,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        excerpt = exc.read().decode("utf-8", errors="replace")[:800]
-        raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
-    except urllib.error.URLError as exc:
-        raise ImageGenerationError(f"{provider_name} request failed: {exc}") from exc
-
-
-def _get_text(url: str, *, headers: dict[str, str], timeout: int, provider_name: str) -> str:
-    request = urllib.request.Request(url, method="GET", headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        excerpt = exc.read().decode("utf-8", errors="replace")[:800]
-        raise ImageGenerationError(f"{provider_name} HTTP {exc.code}: {excerpt}") from exc
-    except urllib.error.URLError as exc:
-        raise ImageGenerationError(f"{provider_name} request failed: {exc}") from exc
-
-
-def _loads_provider_json(text: str, *, provider_name: str) -> dict[str, Any]:
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ImageGenerationError(f"{provider_name} returned non-JSON response: {text[:500]}") from exc
-    if not isinstance(data, dict):
-        raise ImageGenerationError(f"{provider_name} returned unexpected JSON response: {text[:500]}")
-    return data
-
-
-def _async_task_id(data: dict[str, Any]) -> str:
-    raw = data.get("data")
-    if isinstance(raw, list) and raw:
-        raw = raw[0]
-    if isinstance(raw, dict):
-        return str(raw.get("task_id") or raw.get("id") or "").strip()
-    return str(data.get("task_id") or data.get("id") or "").strip()
-
-
-def _async_task_status_url(submit_url: str, task_id: str) -> str:
-    base = submit_url.rstrip("/")
-    if base.lower().endswith("/images/generations"):
-        base = base.rsplit("/", 2)[0]
-    return f"{base}/tasks/{task_id}"
-
-
-def _async_result_image_url(task_data: dict[str, Any]) -> str:
-    result = task_data.get("result")
-    if not isinstance(result, dict):
-        return ""
-    images = result.get("images")
-    if not isinstance(images, list) or not images:
-        return ""
-    first = images[0]
-    if isinstance(first, str):
-        return first.strip()
-    if isinstance(first, dict):
-        url = first.get("url")
-        if isinstance(url, list):
-            return str(url[0] if url else "").strip()
-        return str(url or "").strip()
-    return ""
-
-
-def _generate_with_highwayapi(
-    *, provider_name: str, image_inputs: list[bytes], prompt: str, mask_bytes: bytes | None
-) -> bytes:
-    spec = _image_provider_spec(provider_name)
-    if spec is None or spec.api_type != "highwayapi":
-        raise ProviderConfigurationError(provider_name, f"Unsupported HighwayAPI image provider: {provider_name}")
-    key = _provider_api_key(spec)
-    if not key:
-        token_hint = f" Set {spec.key_env}." if spec.key_env else ""
-        raise ProviderConfigurationError(provider_name, f"Provider '{spec.display}' API key is not configured.{token_hint}")
-    profile = spec.protocol_profile or {}
-    if len(image_inputs) != 1:
-        raise ProviderConfigurationError(provider_name, "HighwayAPI transport supports one reference image per edit")
-    image_data_url = _image_data_url_from_bytes(image_inputs[0])
-    image_field = str(profile.get("image_field") or "image").strip().lower()
-    payload: dict[str, Any] = {
-        "prompt": str(prompt or ""),
-        "n": 1,
-        "size": str(profile.get("size") or spec.request_size or "1024x1024"),
-        "quality": str(profile.get("quality") or "low"),
-        "background": str(profile.get("background") or "auto"),
-        "output_format": str(profile.get("output_format") or "png"),
-    }
-    if image_field == "images":
-        payload["images"] = [{"image_url": image_data_url}]
-    else:
-        payload["image"] = image_data_url
-    if mask_bytes:
-        if image_field == "images":
-            raise ProviderConfigurationError(provider_name, "HighwayAPI images-array provider cannot enforce protected masks")
-        payload["mask"] = _image_data_url_from_bytes(mask_bytes)
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {key}",
-        "User-Agent": "Mozilla/5.0",
-    }
-    text = _post_json(_provider_url(spec), payload, headers=headers, timeout=provider_timeout_seconds(provider_name), provider_name=provider_name)
-    return _decode_image_response(text)
 
 
 def _openai_images_edit_multipart_body(
@@ -572,10 +333,9 @@ def _openai_images_edit_multipart_body(
     edit_request: ImageEditRequest,
     model: str,
     image_inputs: list[bytes],
-    mask_bytes: bytes | None = None,
 ) -> tuple[bytes, str]:
     boundary = f"amazonfactory-{uuid.uuid4().hex}"
-    bounded_images = [_bounded_image_data_url_bytes(image_bytes) for image_bytes in image_inputs]
+    bounded_images = image_inputs  # Prepared references, no second bounding pass.
     chunks: list[bytes] = []
 
     def add_field(name: str, value: str) -> None:
@@ -612,32 +372,32 @@ def _openai_images_edit_multipart_body(
     for index, bounded_image in enumerate(bounded_images):
         image_mime = _image_mime_from_bytes(bounded_image)
         add_file(image_field, _image_filename_from_mime(f"source-{index}", image_mime), image_mime, bounded_image)
-    if mask_bytes is not None:
-        bounded_mask = _validated_mask_bytes(mask_bytes, expected_image_bytes=bounded_images[0])
-        add_file("mask", "protected-mask.png", "image/png", bounded_mask)
     chunks.append(f"--{boundary}--\r\n".encode("ascii"))
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def _validated_mask_bytes(mask_bytes: bytes, *, expected_image_bytes: bytes) -> bytes:
+def _input_size(data):
     from PIL import Image
+    with Image.open(io.BytesIO(data)) as image:
+        return list(image.size)
 
-    with Image.open(io.BytesIO(expected_image_bytes)) as source, Image.open(io.BytesIO(mask_bytes)) as mask:
-        if mask.mode != "RGBA":
-            raise ImageGenerationError(
-                f"Protected-region mask must be RGBA, got {mask.mode}"
-            )
-        if mask.size != source.size:
-            source_ratio = source.width / max(1, source.height)
-            mask_ratio = mask.width / max(1, mask.height)
-            if abs(source_ratio - mask_ratio) > 0.001:
-                raise ImageGenerationError(
-                    f"Protected-region mask aspect ratio differs from the submitted reference: {mask.size} != {source.size}"
-                )
-            mask = mask.resize(source.size, resample=Image.Resampling.NEAREST)
-        out = io.BytesIO()
-        mask.save(out, format="PNG", optimize=True)
-        return out.getvalue()
+
+def _prepare_edit_inputs(image_inputs, region_map_bytes):
+    from PIL import Image
+    if region_map_bytes is not None:
+        with Image.open(io.BytesIO(region_map_bytes)) as region:
+            if region.mode != 'RGB' or 'transparency' in region.info or list(region.size) != _input_size(image_inputs[0]):
+                raise ImageGenerationError('Region map must be opaque RGB with exact original source dimensions')
+    bounded = [_bounded_image_data_url_bytes(data) for data in image_inputs]
+    if region_map_bytes is not None:
+        with Image.open(io.BytesIO(region_map_bytes)) as region:
+            size = tuple(_input_size(bounded[0]))
+            if region.size != size:
+                out = io.BytesIO()
+                region.resize(size, resample=Image.Resampling.NEAREST).save(out, format='PNG')
+                region_map_bytes = out.getvalue()
+        bounded.append(region_map_bytes)
+    return bounded
 
 
 def _image_filename_from_mime(stem: str, mime: str) -> str:
@@ -664,15 +424,14 @@ def _provider_url(spec: ImageProviderSpec) -> str:
 
 
 def _canonical_image_edit_request(
-    *, spec: ImageProviderSpec, image_bytes: bytes, prompt: str
+    *, spec: ImageProviderSpec, prompt: str
 ) -> ImageEditRequest:
     if spec.output_contract != "square" or not spec.request_size:
         raise ProviderConfigurationError(spec.name, "image provider requires square output_contract and request_size")
     return ImageEditRequest(
-        image_url=_image_data_url_from_bytes(image_bytes),
         prompt=str(prompt or ""),
         size=spec.request_size,
-        background="auto",
+        background=str((spec.protocol_profile or {}).get("background") or "auto"),
         moderation="",
         quality=str((spec.protocol_profile or {}).get("quality") or "low"),
     )
@@ -729,13 +488,6 @@ def assert_imagegen_prompt_preflight(prompt: str, providers: list[str]) -> None:
         )
 
 
-def _image_data_url_from_bytes(image_bytes: bytes) -> str:
-    image_bytes = _bounded_image_data_url_bytes(image_bytes)
-    image_b64 = base64.b64encode(image_bytes).decode("ascii")
-    mime = _image_mime_from_bytes(image_bytes)
-    return f"data:{mime};base64,{image_b64}"
-
-
 def _bounded_image_data_url_bytes(image_bytes: bytes) -> bytes:
     try:
         from PIL import Image
@@ -778,7 +530,9 @@ def _image_mime_from_bytes(image_bytes: bytes) -> str:
     return "image/png"
 
 
-def _decode_image_response(text: str) -> bytes:
+def _decode_image_response(text: str, *, deadline: float | None = None) -> bytes:
+    if len(text) > IMAGE_RESPONSE_MAX_BYTES or len(text.encode('utf-8')) > IMAGE_RESPONSE_MAX_BYTES:
+        raise ImageOutputRejected(f'Generated response exceeds envelope limit {IMAGE_RESPONSE_MAX_BYTES}')
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -795,88 +549,116 @@ def _decode_image_response(text: str) -> bytes:
     elif isinstance(payload, list):
         candidates.extend(payload)
     for item in candidates:
-        image = _image_bytes_from_response_item(item)
+        image = _image_bytes_from_response_item(item, deadline=deadline)
         if image:
             return image
     raise ImageGenerationError(f"Image edit provider response did not contain image data: {text[:800]}")
 
 
-def _image_bytes_from_response_item(item: Any) -> bytes | None:
+def _image_bytes_from_response_item(item: Any, *, deadline: float | None = None) -> bytes | None:
     if item in (None, ""):
         return None
     if isinstance(item, list):
         for value in item:
-            data = _image_bytes_from_response_item(value)
+            data = _image_bytes_from_response_item(value, deadline=deadline)
             if data:
                 return data
         return None
     if isinstance(item, str):
-        return _image_bytes_from_string(item)
+        return _image_bytes_from_string(item, deadline=deadline)
     if isinstance(item, dict):
         for key in ("b64_json", "base64", "image", "image_base64", "data", "content", "message"):
             value = item.get(key)
             if isinstance(value, str):
-                data = _image_bytes_from_string(value)
+                data = _image_bytes_from_string(value, deadline=deadline)
                 if data:
                     return data
             elif isinstance(value, list):
-                data = _image_bytes_from_response_item(value)
+                data = _image_bytes_from_response_item(value, deadline=deadline)
                 if data:
                     return data
             elif isinstance(value, dict):
-                data = _image_bytes_from_response_item(value)
+                data = _image_bytes_from_response_item(value, deadline=deadline)
                 if data:
                     return data
         for key in ("url", "image_url", "output_url", "images"):
             value = item.get(key)
             if isinstance(value, str):
-                data = _image_bytes_from_string(value)
+                data = _image_bytes_from_string(value, deadline=deadline)
                 if data:
                     return data
             elif isinstance(value, list):
-                data = _image_bytes_from_response_item(value)
+                data = _image_bytes_from_response_item(value, deadline=deadline)
                 if data:
                     return data
             elif isinstance(value, dict):
-                data = _image_bytes_from_response_item(value)
+                data = _image_bytes_from_response_item(value, deadline=deadline)
                 if data:
                     return data
     return None
 
 
-def _image_bytes_from_string(value: str) -> bytes | None:
+def _image_bytes_from_string(value: str, *, deadline: float | None = None) -> bytes | None:
     text = value.strip()
     if not text:
         return None
     markdown_url = re.search(r"!\[[^\]]*]\((https?://[^)\s]+)\)", text)
     if markdown_url:
-        return _download_image_bytes(markdown_url.group(1))
+        return _download_image_bytes(markdown_url.group(1), deadline=deadline)
     if text.startswith(("http://", "https://")):
-        return _download_image_bytes(text)
+        return _download_image_bytes(text, deadline=deadline)
     if text.startswith("data:") and "," in text:
         text = text.split(",", 1)[1]
+    text = re.sub(r'\s+', '', text)
+    if len(text) > 4 * ((IMAGE_OUTPUT_MAX_BYTES + 2) // 3):
+        raise ImageOutputRejected(f'Generated base64 exceeds decoded byte limit {IMAGE_OUTPUT_MAX_BYTES}')
     try:
-        data = base64.b64decode(text, validate=False)
-    except Exception:
+        data = base64.b64decode(text, validate=True)
+    except (ValueError, base64.binascii.Error):
         return None
-    return data if data else None
+    return _validate_output_bytes(data) if data else None
 
 
-def _download_image_bytes(url: str) -> bytes:
-    assert_public_http_url(url)
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "image/*,*/*"})
+def _download_image_bytes(url: str, *, deadline: float | None = None) -> bytes:
+    deadline = min(time.monotonic() + 120, deadline if deadline is not None else float('inf'))
     attempts = image_url_download_attempts()
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                data = response.read()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CandidateCommitError('Saved image download deadline exhausted; receipt retained')
+            response = request_public_url("GET", url, timeout=remaining,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "image/*,*/*"}, stream=True)
+            try:
+                if response.status_code >= 400:
+                    raise urllib.error.HTTPError(url, response.status_code,
+                        f"HTTP {response.status_code}", response.headers, None)
+                declared = response.headers.get('Content-Length')
+                if declared and str(declared).isdigit() and int(declared) > IMAGE_OUTPUT_MAX_BYTES:
+                    raise ImageOutputRejected(f'Generated URL image exceeds byte limit {IMAGE_OUTPUT_MAX_BYTES}')
+                chunks, count = [], 0
+                for chunk in response.iter_content(chunk_size=65536):
+                    if time.monotonic() >= deadline:
+                        raise CandidateCommitError('Saved image stream exceeded local deadline; receipt retained')
+                    count += len(chunk)
+                    if count > IMAGE_OUTPUT_MAX_BYTES:
+                        raise ImageOutputRejected(f'Generated URL image exceeds byte limit {IMAGE_OUTPUT_MAX_BYTES}')
+                    chunks.append(chunk)
+                data = b''.join(chunks)
+            finally:
+                response.close()
             if not data:
                 raise ImageGenerationError(f"Downloaded generated image is empty: {url}")
-            return data
+            return _validate_output_bytes(data)
+        except CandidateCommitError:
+            raise
         except Exception as exc:
             last_exc = exc
             if attempt >= attempts or not is_transient_imagegen_error(exc):
                 break
-            time.sleep(image_url_download_retry_delay(attempt))
+            delay = image_url_download_retry_delay(attempt)
+            if time.monotonic() + delay >= deadline:
+                raise CandidateCommitError('Saved image retry exceeds local deadline; receipt retained') from exc
+            time.sleep(delay)
     raise ImageGenerationError(f"Failed to download generated image after {attempts} attempt(s): {url}: {last_exc}") from last_exc

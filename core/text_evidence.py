@@ -94,7 +94,12 @@ _MOJIBAKE_MARKERS = (
 
 
 def normalize_text(value: Any) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).translate(_QUOTE_MAP)
+    text = str(value or "")
+    for char, fraction in zip('¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞',
+                              ('1/4','1/2','3/4','1/7','1/9','1/10','1/3','2/3','1/5','2/5','3/5','4/5','1/6','5/6','1/8','3/8','5/8','7/8')):
+        text = text.replace(char, ' ' + fraction)
+    text = unicodedata.normalize("NFKC", text).translate(_QUOTE_MAP).replace('⁄', '/')
+    text = re.sub(r'(?<=\d)\s*/\s*(?=\d)', '/', text)
     text = re.sub(r"(?<=\d)\s*\u00a1[\u00e5\u00b1]", '"', text)
     text = re.sub(r"(?<=\d)\s*'{2,}", '"', text)
     text = re.sub(r"(?<=\d)\s+([\"'])", r"\1", text)
@@ -208,6 +213,10 @@ def numeric_signature(value: str) -> tuple[float, ...]:
 
 def extract_measurements(value: Any) -> list[dict[str, Any]]:
     text = normalize_text(value)
+    # Slash-separated counts (LEDs, branch tips, options) are not measurements.
+    for fraction in re.findall(rf'(?<![\w/])(\d+(?:/+\d*)+)\s*(?:{_UNIT_RE})(?![A-Za-z])', text, re.I):
+        if not re.fullmatch(r'\d+/[1-9]\d*', fraction):
+            raise ValueError('Invalid measurement fraction')
     results: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     occupied: list[range] = []
@@ -241,6 +250,12 @@ def extract_measurements(value: Any) -> list[dict[str, Any]]:
     for match in _MEASURE_RE.finditer(text):
         if any(match.start() in span and match.end() - 1 in span for span in occupied):
             continue
+        # N-in-1 names combined functions, not inches. Real ranges were consumed
+        # above; a following unit still makes this a measurement, not a feature.
+        compound = re.match(r'(?:\s*-\s*|\s+)(?:1|one)\b(?![./]\d)', text[match.end():], re.I)
+        if (match[2].casefold() == 'in' and match[1].isdigit() and int(match[1]) > 1 and compound
+                and not re.match(rf'\s*-?\s*(?:{_UNIT_RE})(?![A-Za-z])', text[match.end()+compound.end():], re.I)):
+            continue
         unit = _unit(match.group(2))
         if unit is not None:
             _append_measurement(results, seen, match.group(1), unit, match.group(0), allow_duplicate=True)
@@ -252,6 +267,33 @@ def extract_measurements(value: Any) -> list[dict[str, Any]]:
         if unit is not None:
             _append_measurement(results, seen, match.group(1), unit, match.group(0))
     return results
+
+
+def dimension_axes(value: Any, *, source_field: str = '') -> dict[str, str]:
+    """Project explicit product axes only; category and magnitude never supply order."""
+    field=normalize_text(source_field)
+    if re.search(r'\b(?:package|packaging|shipping|carton)\b',field,re.I):return {}
+    labels={'l':'length','length':'length','w':'width','width':'width','h':'height','height':'height','d':'item_depth','depth':'item_depth'}
+    axis=r'(?:length|width|height|depth|[LWHD])'
+    parts=re.split(r'\s*[x*]\s*',normalize_text(value),flags=re.I)
+    if not 2<=len(parts)<=3:return {}
+    matches=[re.fullmatch(rf'({_NUMBER_RE})\s*({_UNIT_RE})?\s*({axis})?\s*({_UNIT_RE})?',part,re.I) for part in parts]
+    if not all(matches):return {}
+    declared=[labels[a.casefold()] for a in re.findall(rf'(?<![A-Za-z])({axis})(?![A-Za-z])',field,re.I)]
+    units=[m[2] or m[4] for m in matches]
+    shared=units[-1] if units[-1] and sum(bool(u) for u in units)==1 else None
+    result={}
+    for index,m in enumerate(matches):
+        label=labels.get(str(m[3]).casefold()) or (declared[index] if len(declared)==len(parts) else '')
+        if m[3] and len(declared)==len(parts) and labels[m[3].casefold()]!=declared[index]:
+            raise ValueError('Dimension value axes conflict with the source field')
+        unit=units[index] or shared
+        if not label or not unit:return {}
+        if label in result or _unit(unit)[0]!='length_mm' or _number_value(m[1])<=0:
+            raise ValueError('Invalid/repeated product dimension axis')
+        if m[2] and m[4] and _unit(m[2])!=_unit(m[4]):raise ValueError('Conflicting dimension units')
+        result[label]=f'{m[1]} {_unit(unit)[2]}'
+    return result
 
 
 def us_measurement_text(value: Any, *, upper_bound: bool = False, length_unit: str = '') -> str:
@@ -407,9 +449,9 @@ def _clean_number(value: str) -> str:
 
 def _number_value(value: str) -> float:
     text = normalize_text(value).replace(',', '')
-    if re.fullmatch(r"\d+\s+\d+/\d+", text):
+    if re.fullmatch(r"[+-]?\d+\s+\d+/\d+", text):
         whole, fraction = text.split()
-        return float(int(whole) + Fraction(fraction))
+        return float((abs(int(whole)) + Fraction(fraction)) * (-1 if whole.startswith('-') else 1))
     if "/" in text and "." not in text:
         return float(Fraction(text))
     return float(text)

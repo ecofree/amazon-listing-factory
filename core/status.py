@@ -11,7 +11,7 @@ from .io import file_sha256, read_json, utc_now, write_json
 from .schema import SchemaValidationError, validate_data
 
 
-JOB_STATE_SCHEMA_VERSION = 7
+JOB_STATE_SCHEMA_VERSION = 8
 VALID_RUN_STATES = {
     "pending",
     "running",
@@ -40,6 +40,23 @@ class JobLockError(JobStateError):
 
 def job_run_lock(job_dir: str | Path):
     return _status_file_lock(Path(job_dir) / ".production.lock")
+
+
+def runtime_presence(job_dir: str | Path, state: dict) -> dict:
+    """Observe the existing process lease without rewriting a saved running state."""
+    try:
+        with job_run_lock(job_dir):active=False
+    except JobLockError:active=True
+    from datetime import datetime,timezone
+    reports=Path(job_dir)/'reports'
+    times={name:(reports/name).stat().st_mtime for name in ('production_summary_v3.json','release_manifest_v6.json',
+        'image_tasks_v13.jsonl','visual_design_kits_v20.jsonl') if (reports/name).is_file()}
+    candidate_time=max((p.stat().st_mtime for p in (reports/'candidate_manifests').glob('*/*/*/candidate*.json')),default=0)
+    if candidate_time:times['latest_candidate_manifest']=candidate_time
+    return {'runtime_observed_at':utc_now(),'production_lock_held':active,
+            'artifact_snapshot_at':{k:datetime.fromtimestamp(v,timezone.utc).isoformat() for k,v in times.items()},
+            'summary_stale':bool(times and max(times.values())>times.get('production_summary_v3.json',0)),
+            'runtime_status':'active' if active else 'interrupted' if state.get('status')=='running' else 'idle'}
 
 
 def status_path(job_dir: str | Path) -> Path:
@@ -93,7 +110,6 @@ def mark_interrupted_running(job_dir: str | Path, *, reason: str) -> list[str]:
                     "status": "retryable",
                     "updated_at": now,
                     "error": reason,
-                    "interrupted": True,
                 }
         if interrupted or data.get("status") == "running":
             data["status"] = "failed"
@@ -104,6 +120,7 @@ def mark_interrupted_running(job_dir: str | Path, *, reason: str) -> list[str]:
                 "interrupted": sorted(set(interrupted)),
                 "created_at": now,
             })
+            validate_data(data, "job_state.schema.json", label="recovered job state")
             write_json(status_path(job_dir), data)
     return sorted(set(interrupted))
 
@@ -131,6 +148,22 @@ def logical_task_id(
 def input_revision_id(payload: Any) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def record_generation_scope(job_dir: str | Path, scope: dict[str, Any], *, allow_expansion: bool = False) -> None:
+    """Persist accepted invocation permission in the existing state authority, not output scope."""
+    if type(allow_expansion) is not bool:
+        raise ValueError('Generation scope acknowledgement must be a boolean')
+    with _status_file_lock(status_path(job_dir)):
+        data = load_status(job_dir)
+        previous = data.get('generation_execution_scope') or {}
+        if previous.get('mode') == 'selected' and scope.get('mode') == 'all' and not allow_expansion:
+            raise ValueError('Explicit --all-generation-tasks is required to expand generation scope')
+        if previous != scope:
+            data['generation_execution_scope'] = scope
+            data['updated_at'] = utc_now()
+            validate_data(data, 'job_state.schema.json', label='generation execution scope')
+            write_json(status_path(job_dir), data)
 
 
 def begin_run(job_dir: str | Path) -> None:
@@ -430,7 +463,7 @@ def _task_runtime_metadata(row: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "transport_attempt", "provider_attempts", "candidate_revision",
         "candidate_sha256", "execution_revision",
-        "request_outcome", "request_audit",
+        "request_outcome", "request_audit", "reason_code", "next_action", "resume_condition", "remote_request_allowed",
     }
     return {key: row[key] for key in allowed if key in row}
 
@@ -494,6 +527,9 @@ def _write_task(
         runtime.pop("request_outcome", None)
         runtime.pop("request_audit", None)
     runtime.update(metadata or {})
+    if status == 'success':
+        for field in ('reason_code','next_action','resume_condition','remote_request_allowed'):
+            runtime.pop(field, None)
     for key, value in runtime.items():
         if key not in row and value not in (None, "", [], {}):
             row[key] = value

@@ -71,6 +71,10 @@ def template_allowed_values(
             for col in range(int(min_col), int(max_col) + 1):
                 field = field_by_col.get(col)
                 if field:
+                    # The offer-price cell accepts numbers. Its non-enforcing list only offers a delete command.
+                    if (field.endswith('.our_price#1.schedule#1.value_with_tax') and not validation.showErrorMessage
+                            and all(str(v).casefold().startswith('delete offer') for v in values)):
+                        continue
                     allowed[field] = list(dict.fromkeys([*(allowed.get(field) or []), *values]))
     return allowed
 
@@ -87,6 +91,7 @@ def compile_field_plan(
     image_fields: dict[str, str],
     requirements: list[dict[str, Any]] | None = None,
     row_context: dict[str, Any] | None = None,
+    pending_fields: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     values: dict[str, str] = {}
     sources: dict[str, str] = {}
@@ -147,6 +152,7 @@ def compile_field_plan(
         requirements=requirements or [],
         row_context=row_context or {},
         invalid_candidates=invalid_candidates,
+        pending_fields=pending_fields,
     )
     return {"field_values": values, "field_sources": sources, "field_decisions": decisions}
 
@@ -173,9 +179,8 @@ def compile_field_requirements(
         "item_type_keyword": ("Required", ""),
         "country": ("Required", ""),
         "product_id_type": ("Required", "Child"),
-        # Price is optional when Apify has no source offer; a blank cell is
-        # preferable to inventing a value.  Existing source prices remain
-        # populated and are checked by template_submit_ready.
+        # The factory adds no universal price requirement; the actual template
+        # may require it. Missing evidence must not downgrade that requirement.
         "list_price": ("Optional", "Child"),
         "main_image_url": ("Required" if submit_ready else "Optional", "Child"),
         "quantity": ("Required", "Child"),
@@ -191,12 +196,7 @@ def compile_field_requirements(
             continue
         existing = by_field.get(field, {})
         existing_required = str(existing.get("required") or "Optional").strip()
-        # A missing Apify price is an allowed blank by product policy.  The
-        # template's raw Required label must not turn an absent fact into a
-        # fabricated-value blocker; sourced prices are still checked for drift
-        # by template_submit_ready.
-        price_optional = alias == "list_price"
-        use_factory = price_optional or strength.get(factory_required.casefold(), 0) > strength.get(existing_required.casefold(), 0)
+        use_factory = strength.get(factory_required.casefold(), 0) > strength.get(existing_required.casefold(), 0)
         by_field[field] = {
             **existing,
             "field": field,
@@ -288,6 +288,7 @@ def compile_field_decisions(
     requirements: list[dict[str, Any]],
     row_context: dict[str, Any],
     invalid_candidates: dict[str, str],
+    pending_fields: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     requirement_by_field = {
         str(item.get("field") or ""): item
@@ -295,6 +296,8 @@ def compile_field_decisions(
         if isinstance(item, dict) and str(item.get("field") or "") in fields
     }
     decisions: list[dict[str, Any]] = []
+    from .template_conditions import row_applicability
+    row_context = {**row_context, 'workbook_applies': row_applicability(row_context.get('workbook_conditions'), values)}
     candidates = set(values) | set(invalid_candidates) | set(requirement_by_field)
     for field in sorted(candidates, key=lambda name: fields.get(name, 10_000)):
         meta = requirement_by_field.get(field, {})
@@ -302,8 +305,16 @@ def compile_field_decisions(
         required_kind = requirement.casefold().replace(" ", "_")
         row_scope = str(meta.get("row_scope") or "").strip().casefold()
         scope_active = not row_scope or row_scope == str(row_context.get("row_type") or "").strip().casefold()
+        marketplace=re.search(r'marketplace_id=([^\]]+)',field)
+        if marketplace and marketplace[1]!=row_context.get('marketplace_id','ATVPDKIKX0DER'):
+            if str(values.get(field) or '').strip():raise ValueError('Foreign marketplace value in the US-only listing contract')
+            scope_active=False;row_scope='other_marketplace'
+        battery_conflict = (scope_active and field in aliases.get('batteries_required', ())
+                            and row_context.get('battery_requirement_conflict'))
         if not scope_active:
             active, activation_reason = False, f"{row_scope}_rows_only"
+        elif battery_conflict:
+            active, activation_reason = None, 'seller_and_product_battery_requirement_conflict'
         elif required_kind == "required":
             active, activation_reason = True, "template_required"
         elif required_kind == "conditionally_required":
@@ -313,11 +324,23 @@ def compile_field_decisions(
         else:
             active = field in values or field in invalid_candidates
             activation_reason = "value_supplied" if active else "optional"
+        disposition = (row_context.get('conditional_dispositions') or {}).get(field)
+        if disposition and scope_active and not battery_conflict and required_kind == 'conditionally_required':
+            if active is not None and active is not disposition['applicable']:
+                raise ValueError(f'Conditional disposition contradicts current facts: {field}')
+            active, activation_reason = disposition['applicable'], f"operational:{disposition['source']}: {disposition['reason']}"
         value = str(values.get(field) or "")
         attempted = str(invalid_candidates.get(field) or "")
         unknown_conditional = required_kind == "conditionally_required" and active is None
         inactive_conditional = required_kind == "conditionally_required" and active is False
-        if unknown_conditional:
+        dependency = (pending_fields or {}).get(field, '')
+        if dependency and scope_active and not value and not attempted:
+            validation = 'awaiting_upstream'
+            activation_reason = 'pending:' + dependency
+        elif scope_active and field in row_context.get('source_field_conflicts', ()) and (
+                battery_conflict or active is not False and required_kind in {'required','conditionally_required'}):
+            validation, activation_reason = 'conditional_risk', 'conflicting_child_source_values'
+        elif battery_conflict or unknown_conditional:
             validation = "conditional_risk"
         elif inactive_conditional:
             validation = "pass"
@@ -347,7 +370,7 @@ def compile_field_decisions(
                 "source": str(sources.get(field) or ""),
                 "requirement": requirement,
                 "requirement_source": str(meta.get("requirement_source") or "template"),
-                "active": bool(active),
+                "active": active,
                 "activation_reason": activation_reason,
                 "validation_status": validation,
                 **({"attempted_value": attempted} if attempted else {}),
@@ -417,20 +440,6 @@ def select_allowed_value(preferred: Any, allowed_values: list[str], *, hints: li
     return ""
 
 
-def primary_material_label(value: Any) -> str:
-    text = str(value or "").strip()
-    lowered = text.casefold()
-    if not lowered:
-        return ""
-    if re.search(r"\b(?:pine|wood|mdf|plywood|engineered wood|rubber wood|particleboard)\b", lowered):
-        return "Wood"
-    if re.search(r"\b(?:steel|metal|iron|aluminum|aluminium)\b", lowered):
-        return "Metal"
-    if re.search(r"\b(?:plastic|polyethylene|polypropylene|pe|pp)\b", lowered):
-        return "Plastic"
-    return text
-
-
 def _legal_template_value(
     fields: dict[str, int],
     labels: dict[str, str],
@@ -447,12 +456,18 @@ def _legal_template_value(
     equivalent = _known_enum_value(alias, value, allowed)
     if equivalent:
         return equivalent
+    if alias in {'variation_theme','required_product_compliance_certificate','condition','color_map',
+                 'material','recommended_uses','included_component'} or alias in fields:
+        return select_allowed_value(value, allowed)
     return select_allowed_value(value, allowed, hints=[*_value_hints(value), *(hints or [])])
 
 
 def _known_enum_value(alias: str, value: Any, allowed: list[str]) -> str:
-    token = _norm(value)
-    groups = {
+    token = _norm(_string_value(value))
+    if alias in {'batteries_required','batteries_included','contains_battery','is_fragile'}:
+        groups=({'yes','true','1'},{'no','false','0'})
+    else:
+        groups = {
         "inventory_available": (
             {"enabled", "yes", "true", "available", "1"},
             {"disabled", "no", "false", "unavailable", "0"},
@@ -460,7 +475,8 @@ def _known_enum_value(alias: str, value: Any, allowed: list[str]) -> str:
         "country": (
             {"china", "cn", "chn", "peoplesrepublicofchina", "prc"},
         ),
-    }.get(alias, ())
+        'fulfillment': ({'fbm','default','merchantfulfilled','sellerfulfilled','fulfillmentbymerchantdefault'},),
+        }.get(alias, ())
     for group in groups:
         if token in group:
             for candidate in allowed:
@@ -506,17 +522,32 @@ def _conditional_activation(
         return bool(theme), "variation_family" if theme else "no_variation_theme"
     product_id_fields = set(fields_for_alias(fields, labels, aliases, "product_id"))
     if field in product_id_fields:
-        active = not bool(row_context.get("gtin_exempt", True)) and row_type == "Child"
-        return active, "non_exempt_child" if active else "gtin_exempt_or_parent"
+        if row_type == 'Parent': return False, 'parent_row'
+        exempt = row_context.get('gtin_exempt')
+        if type(exempt) is not bool: return None, 'gtin_exemption_unknown'
+        return not exempt, 'gtin_exempt' if exempt else 'non_exempt_child'
     if name.endswith(".unit"):
         value_field = field[:-5] + ".value"
         active = bool(str(values.get(value_field) or "").strip())
         return active, "paired_value_present" if active else "paired_value_missing"
+    if (row_context.get('use_default_shipping') and field in aliases.get('shipping_template', ())
+            and 'marketplace_id=ATVPDKIKX0DER' in field
+            and 'create' in str(values.get('::record_action', '')).casefold()):
+        return False, 'new_sku_uses_account_shipping_default'
+    if field in row_context.get('workbook_applies', {}):
+        return row_context['workbook_applies'][field], 'template_row_condition'
     if "package_contains_sku" in name:
-        active = bool(row_context.get("package_level"))
-        return active, "package_level_present" if active else "not_a_package_hierarchy"
-    if any(token in name for token in ("battery[", "num_batteries", "lithium_battery", "lithium_ion", "lithium_metal")):
-        flags = {str(row_context.get(key)).strip().casefold() for key in ("contains_battery", "batteries_required")}
+        level = str(row_context.get('package_level') or '').strip().casefold()
+        if not level or level in {'unknown','not specified'}: return None, 'package_hierarchy_unknown'
+        active = level not in {'unit','false','no','none','not applicable'}
+        return active, 'package_level_present' if active else 'not_a_package_hierarchy'
+    if row_type=='Parent' and name.startswith('number_of_items['):return False,'parent_not_sellable'
+    if any(token in name for token in ("battery[", "num_batteries", "lithium_battery", "lithium_ion", "lithium_metal",
+        'battery_contains_','battery_installation_','is_battery_non_spillable','has_less_than_30_percent_state_of_charge',
+        'has_multiple_battery_powered_components','contains_battery_or_cell')):
+        # Required-but-not-included batteries do not prove shipped battery contents.
+        flags = {str(row_context.get(key)).strip().casefold() for key in ("contains_battery", "batteries_included")}
+        if flags & {'true','yes','1'} and flags & {'false','no','0'}:return None,'battery_evidence_conflict'
         if flags & {"true", "yes", "1"}:
             return True, "battery_present"
         if flags & {"false", "no", "0"}:
@@ -529,6 +560,9 @@ def _conditional_activation(
         active = dangerous not in {"not applicable", "not_applicable", "none", "no"}
         return active, "dangerous_goods_present" if active else "dangerous_goods_not_applicable"
     value = str(values.get(field) or "").strip()
+    inventory_fields=set(fields_for_alias(fields,labels,aliases,'inventory_available'))
+    if field in inventory_fields and not value and any(values.get(q) not in (None,'') for q in fields_for_alias(fields,labels,aliases,'quantity')):
+        return False,'finite_quantity_instead_of_always_available'
     if value:
         return True, "value_supplied"
     hardware_color_fields = set(fields_for_alias(fields, labels, aliases, "hardware_color"))
@@ -539,8 +573,6 @@ def _conditional_activation(
     size_fields = set(fields_for_alias(fields, labels, aliases, "size"))
     if row_type == "Parent" and field in color_fields | hardware_color_fields | size_fields:
         return False, "parent_row"
-    if field in hardware_color_fields:
-        return False, "hardware_color_not_supplied"
     if "COLOR" in theme and row_type == "Child" and field in color_fields:
         return True, "color_variation"
     if "SIZE" in theme and row_type == "Child" and field in size_fields:
@@ -548,18 +580,62 @@ def _conditional_activation(
     return None, "activation_unknown"
 
 
+def bound_conditional_dispositions(records, *, template_sha256, sku, product_type, facts_revision, fields):
+    """Consume explicit evidence in the existing template field authority, bound to this SKU/revision."""
+    if records is None: return {}
+    if not isinstance(records, list): raise ValueError('conditional_dispositions must be a list')
+    bound = {}
+    keys = {'template_sha256','sku','product_type','facts_revision','field','applicable','reason','source'}
+    for record in records:
+        if (not isinstance(record,dict) or set(record) != keys or type(record['applicable']) is not bool
+                or any(not isinstance(record[k],str) or not record[k].strip() for k in keys-{'applicable'})):
+            raise ValueError('Conditional disposition requires a concrete field, applicability, reason and source')
+        if record['sku'] != sku: continue
+        if (record['template_sha256'] != template_sha256 or record['product_type'] != product_type
+                or record['facts_revision'] != facts_revision or record['field'] not in fields):
+            raise ValueError(f"Conditional disposition is stale or not applicable to this template/SKU: {record['field']}")
+        if record['field'] in bound: raise ValueError(f"Duplicate conditional disposition: {record['field']}")
+        bound[record['field']] = record
+    return bound
+
+
+def group_field_blockers(rows):
+    """Read-only grouping of the existing decisions, never another applicability gate."""
+    groups={}
+    for row in rows:
+        for decision in row.get('field_decisions',[]):
+            status=decision['validation_status']
+            if status in {'pass','awaiting_upstream'} or status.startswith('optional_'):continue
+            reason=decision.get('activation_reason','')
+            field=decision['field'];root=re.split(r'[\[#]',field,1)[0]
+            owner='template_rule' if reason=='activation_unknown' else 'business_or_product_evidence'
+            key=(status,reason,root if reason=='activation_unknown' or status!='conditional_risk' else reason)
+            group=groups.setdefault(key,{'status':status,'reason_code':reason,'owner':owner,'subject':key[2],
+                'action':'provide_scoped_rule_evidence' if owner=='template_rule' else 'provide_or_correct_bound_facts','affected':[]})
+            group['affected'].append({'sku':row.get('sku',''),'row_type':row.get('row_type',''),'field':field,'label':decision.get('label','')})
+    return list(groups.values())
+
+
 def field_expects_number(field: str) -> bool:
-    name = str(field or "").casefold()
-    if any(token in name for token in ("language_tag", ".unit", ".type")):
+    name = re.sub(r'\[[^]]*\]|#\d+', '', str(field or '').casefold())
+    if set(name.split('.')) & {'unit', 'type', 'language_tag'}:
         return False
     return any(
         token in name
         for token in (
             "number_of_items",
+            "number_of_doors",
+            "number_of_drawers",
+            "number_of_shelves",
+            "item_weight",
+            "item_package_weight",
+            "weight_capacity",
+            "maximum_weight_recommendation",
             "item_package_quantity",
             "unit_count",
             "list_price",
-            "fulfillment_availability#1.quantity",
+            ".our_price.schedule.value_with_tax",
+            "fulfillment_availability.quantity",
             ".length.value",
             ".width.value",
             ".height.value",
@@ -577,8 +653,12 @@ def looks_numeric(value: Any, *, field: str = "") -> bool:
         number = float(str(value).strip())
         if not math.isfinite(number):
             return False
-        if any(token in field.casefold() for token in ('number_of_items', 'item_package_quantity', 'fulfillment_availability#1.quantity')):
-            return number >= 0 and number.is_integer()
+        name = re.sub(r'\[[^]]*\]|#\d+', '', field.casefold())
+        if any(token in name for token in ('number_of_', 'item_package_quantity', 'fulfillment_availability.quantity')):
+            minimum = 1 if any(token in name for token in ('number_of_items', 'item_package_quantity')) else 0
+            return number >= minimum and number.is_integer()
+        if '.our_price.schedule.value_with_tax' in name:
+            return number > 0
         return not field or number >= 0
     except (TypeError, ValueError):
         return False

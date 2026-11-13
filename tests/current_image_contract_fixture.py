@@ -18,19 +18,17 @@ from core.image_tasks import (
 )
 
 
-def supported_design_reviews(raw, sources, design_references=None, product_claims=()):
-    from core.visual_design_kit_compiler import design_binding_request
-    by_id = {row['source_id']: row for row in sources}
-    requests = [design_binding_request(brief, raw['family_art_direction'], source=by_id[brief['source_id']],
-                source_manifest=sources, product_claims=product_claims, design_references=design_references) for brief in raw['image_briefs']]
-    return supported_review_results([row for row in requests if row['physical_operations']])
+def planner_wire(raw):
+    """Author model fixtures without the compiler's program-owned source binding."""
+    return {**raw, 'image_briefs': [{k:v for k,v in row.items() if k not in {'source_id','source_sha256','source_intent_revision_id'}}
+                                  for row in raw['image_briefs']]}
 
 
-def supported_review_results(requests, **kwargs):
-    from core.visual_semantics import CLAIM_REVIEW_POLICY
-    return {row['key']: {'key': row['key'], 'policy': CLAIM_REVIEW_POLICY, 'response_sha256': 'a'*64,
-            'status': 'supported', 'findings': [{'operation': op, 'status': 'supported', 'reason': 'Simulated verdict for contract testing only'}
-                                               for op in row.get('physical_operations', [])]} for row in requests}
+def observation_wire(observations):
+    rows=list(observations.values()) if isinstance(observations,dict) else observations
+    selected=[r['source_id'] for r in rows if 'appearance' in r.get('reference_purposes',[])]
+    return {'sources':[{**r,'reference_purposes':[p for p in r.get('reference_purposes',[]) if p!='appearance']} for r in rows],
+            'appearance_source_id': selected[0] if selected else None}
 
 
 def current_product_feature(*, feature='frame_support', object_id='frame'):
@@ -47,8 +45,8 @@ def current_measurement_rows():
 def current_art_direction() -> dict[str, Any]:
     return {
         "audience_and_market": "US homeowners seeking calm, practical bathroom storage with a residential rather than commercial impression.",
-        "palette_direction": {"room": {"wall": "#F4F2EE matte mineral paint, solid", "floor": "#B9A88D oak, natural grain"}, "bath": {"towels": "#8A999E cotton, solid"}},
-        "photography_direction": "Bright clear exposure, neutral white balance, soft contrast and truthful painted-wood response.",
+        "palette_direction": {},
+        "photography_direction": {"lighting": "soft_daylight", "exposure": "balanced"},
         "typography_direction": {"font_family": "Inter", "title_style": "Semibold sentence case", "body_style": "Regular with readable spacing", "numeric_style": "Tabular figures with unit spacing"},
         "graphic_direction": {"text_color": "#303634", "line_color": "#637470", "icon_color": "#303634", "backing_color": "#F4F2EE", "backed_symbol_color": "#303634", "icon_style": "outline", "line_style": "fine"},
     }
@@ -64,7 +62,7 @@ def current_observed_measurement(text='17 in', object_name='Cabinet', axis='widt
 def current_image_direction(*, environment: str = "designed_environment", source_id: str = 'source_00', measurement_ids=None) -> dict[str, Any]:
     return {"visual_goal": "Explain the visible physical feature at a glance",
             "presentation": {"scope": "whole_product", "state": "Show the complete product with its functional parts visible",
-                             "components": ['room.wall', 'room.floor', 'bath.towels'] if environment == 'designed_environment' else []},
+                             "components": []},
             "product_sources": [source_id], "measurement_ids": list(measurement_ids or []),
             "design_transfer": [],
             "environment_mode": environment}
@@ -77,7 +75,6 @@ def current_image_task(
     source_sha256: str = "a" * 64,
     category_id: str = "bathroom_cabinet",
     reason_code: str = "",
-    retryable: bool = False,
 ) -> dict[str, Any]:
     family = role.split("_", 1)[0]
     base: dict[str, Any] = {
@@ -90,7 +87,7 @@ def current_image_task(
         "logical_task_id": f"generate:B1:{role}",
         "output_dir": f"images/generated/B1/{role}",
         "prompt_contract_version": PROMPT_CONTRACT_VERSION,
-        "category_image_policy": {},
+        "category_image_policy": {'main_image_policy': 'product_first_lifestyle'},
         "formation_status": "blocked" if blocked_reason else "ready",
         "formation_reason": blocked_reason,
         "source_path": "" if blocked_reason else "images/source.png",
@@ -98,7 +95,7 @@ def current_image_task(
     }
     if blocked_reason:
         base["formation_reason_code"] = reason_code or "deterministic_block"
-        base['formation_failure_owner'] = 'review' if retryable else 'brief'
+        base['formation_failure_owner'] = 'brief'
     else:
         story = (
             {
@@ -106,9 +103,9 @@ def current_image_task(
                 "title": "Flexible Shelf Storage",
                 "labels": ["Adjustable Shelf", "Open Storage Access"],
                 "bindings": [
-                    {"evidence_ids": ["title"], "text": "Flexible Shelf Storage"},
-                    {"evidence_ids": ["label-1"], "text": "Adjustable Shelf"},
-                    {"evidence_ids": ["label-2"], "text": "Open Storage Access"},
+                    {'target': None, "evidence_ids": ["title"], "text": "Flexible Shelf Storage"},
+                    {'target': None, "evidence_ids": ["label-1"], "text": "Adjustable Shelf"},
+                    {'target': None, "evidence_ids": ["label-2"], "text": "Open Storage Access"},
                 ],
             }
             if family == "func"

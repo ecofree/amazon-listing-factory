@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
-from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,307 +10,214 @@ from core import image_qa
 from core.candidate_state import CandidateStateError
 from core.image_tasks import IMAGE_TASK_POLICY_VERSION
 from tests.current_image_contract_fixture import current_image_task, current_prompt_artifact, current_image_direction
-from core.visual_semantics import candidate_product_targets
 
 
-def _task(role: str, mode: str = "none") -> dict:
-    family = role.split("_", 1)[0]
+def _task(role: str, mode: str = 'none') -> dict:
+    family = role.split('_', 1)[0]
     return {
-        "child": "B1", "role": role, "role_family": family,
-        "policy_version": IMAGE_TASK_POLICY_VERSION, "task_fingerprint": "task",
-        "category_image_policy": {"main_image_policy": "white_background"},
-        "measurement_authority": {"mode": mode, "render_text": []},
-        "renderable_text_contract": {
-            "mode": "exact" if family in {"func", "size"} else "none",
-            "strings": ["Storage That Adapts", "Adjustable Shelf"] if family == "func" else [],
-        },
-        "source_path": "source.png",
-        "generation_references": [{"source_id": "source_00"}],
-        "image_direction": current_image_direction(),
+        'child': 'B1', 'role': role, 'role_family': family,
+        'policy_version': IMAGE_TASK_POLICY_VERSION, 'task_fingerprint': 'task',
+        'category_image_policy': {'main_image_policy': 'white_background'},
+        'measurement_authority': {'mode': mode, 'render_text': []},
+        'renderable_text_contract': {'mode': 'exact' if family in {'func', 'size'} else 'none',
+                                   'strings': ['Adjustable Shelf'] if family == 'func' else []},
+        'source_path': 'source.png', 'source_sha256': 's' * 64,
+        'generation_references': [{'source_id': 'source_00'}],
+        'image_direction': current_image_direction(),
     }
 
 
-def _observed(task: dict) -> dict:
-    return {
-        "text_coverage": "complete", "measurement_coverage": "not_applicable", "measurements": [],
-        "product_coverage": "complete",
-        "texts": [{"text": text, "kind": "marketing", "confidence": 0.99, "region": dict(left=0, top=0, right=1, bottom=1)}
-                  for text in task["renderable_text_contract"]["strings"]],
-        "product_comparisons": [{"source_id": task["generation_references"][0]["source_id"], "target_id": row["target_id"], "attachment_index": index,
-                                "status": "consistent", "part": "sold structure", "confidence": 0.99,
-                                "evidence": "Fixture geometry retained", "source_region": dict(left=0, top=0, right=1, bottom=1), "candidate_region": dict(left=0, top=0, right=1, bottom=1)}
-                               for index, row in enumerate(candidate_product_targets(task), 2)],
-    }
+def _checks(required, status='pass'):
+    return [dict(check=name, status=status, candidate_observation='One same-color cabinet with matching visible structure; text Adjustable Shelf',
+                 reference_observation='source_00 shows the same structure and the contract authorizes Adjustable Shelf',
+                 source_ids=['source_00'], reason='The visible product and exact approved text agree with the bound reference') for name in required]
 
 
 class QaLiteV1Tests(unittest.TestCase):
-    def setUp(self):
-        observer = patch.object(image_qa, "observe_candidate", side_effect=lambda _job, task, _candidate, **_kw: _observed(task))
-        observer.start()
-        self.addCleanup(observer.stop)
-
-    def test_missing_ready_candidate_is_not_duplicated_by_qa(self) -> None:
-        task = current_image_task("func_01")
-        plugin = type("Plugin", (), {"category_id": "bathroom_cabinet"})()
+    def test_factual_qa_and_resume_reuse_bound_response(self):
+        from tests.continuity_contract_fixture import verify_qa_semantics, verify_qa_service_recovery
+        verify_qa_semantics(self); verify_qa_service_recovery(self)
+        from core.io import file_sha256
+        task = current_image_task('func_01')
+        plugin = type('Plugin', (), {'category_id': 'bathroom_cabinet'})()
         with tempfile.TemporaryDirectory() as tmp:
-            prompt_artifact = current_prompt_artifact(tmp, task)
-            with (
-                patch.object(image_qa, "load_job", return_value={}),
-                patch.object(image_qa, "require_current_image_branch"),
-                patch.object(image_qa, "scoped_child_set", return_value={"B1"}),
-                patch.object(image_qa, "read_image_prompts", return_value=prompt_artifact),
-                patch.object(image_qa, "read_image_tasks", return_value={"tasks": [task]}),
-                patch.object(image_qa, "current_candidate", return_value={}),
-                patch.object(image_qa, "read_qa_evidence", return_value=[]),
-                patch.object(image_qa, "write_qa_evidence"),
-            ):
+            root = Path(tmp)
+            (root / 'candidate.png').write_bytes(b'bound fixture candidate')
+            (root / 'source.png').write_bytes(b'bound source')
+            task['generation_references'] = [dict(source_id='source_00', child='B1', kind='edit_base', path='source.png',
+                sha256=file_sha256(root / 'source.png'), purpose='Product evidence')]
+            prompts = current_prompt_artifact(tmp, task)
+            candidate = {'candidate_path': 'candidate.png', 'candidate_sha256': file_sha256(root / 'candidate.png'),
+                         'provider_name':'fixture-provider','task_prompt_fingerprint': 'original-saved-prompt'}
+            candidate['reuse_evidence'] = dict(original_task_fingerprint='original-task',
+                current_task_fingerprint=task['task_fingerprint'],
+                current_prompt_sha256=prompts['prompts'][0]['prompt_sha256'],
+                candidate_sha256=candidate['candidate_sha256'],basis='same_edit_instructions_and_attachment_bytes')
+            with (patch.object(image_qa, 'load_job', return_value={}),
+                  patch.object(image_qa, 'require_current_image_branch'),
+                  patch.object(image_qa, 'scoped_child_set', return_value={'B1'}),
+                  patch.object(image_qa, 'read_image_prompts', return_value=prompts),
+                  patch.object(image_qa, 'read_image_tasks', return_value={'tasks': [task]}),
+                  patch.object(image_qa, 'current_candidate', return_value=candidate),
+                  patch.object(image_qa, '_local_gates', return_value=[dict(gate='image_integrity', status='pass', evidence='Decodable fixture')]) as local,
+                  patch('core.vision_gemini_client.gemini_stream_generate', return_value=json.dumps({'checks': _checks(['product_fidelity', 'unauthorized_text'])})) as model):
+                first = image_qa.run_image_qa(job_dir=root, plugin=plugin)
+                resumed = image_qa.run_image_qa(job_dir=root, plugin=plugin)
+                candidate['provider_name']='copy'
+                diagnostic=image_qa.run_image_qa(job_dir=root,plugin=plugin)
+                self.assertEqual([],diagnostic['qa'])
+                self.assertEqual('generation',diagnostic['failures'][0]['failure_owner'])
+                candidate['provider_name']='fixture-provider'
+                for field in ('current_task_fingerprint','current_prompt_sha256','candidate_sha256','basis'):
+                    with self.subTest(stale_reuse=field):
+                        original=candidate['reuse_evidence'][field]
+                        candidate['reuse_evidence'][field]='foreign'
+                        rejected=image_qa.run_image_qa(job_dir=root,plugin=plugin)
+                        candidate['reuse_evidence'][field]=original
+                        self.assertEqual([],rejected['qa'])
+                        self.assertEqual('generation',rejected['failures'][0]['failure_owner'])
+            self.assertEqual(1, model.call_count)
+            self.assertEqual(1, local.call_count)
+            self.assertEqual([], first['failures'])
+            self.assertEqual(first['qa'], resumed['qa'])
+            self.assertEqual('success', resumed['tasks'][0]['status'])
+            self.assertEqual('pass', resumed['qa'][0]['automatic_decision'])
+            from types import SimpleNamespace
+            from core.release_manifest import build_release_manifest
+            with (patch('core.release_manifest._product_family', return_value={'family': {'parent_asin': 'B1', 'children': [{'asin': 'B1'}]}}),
+                  patch('core.release_manifest.scoped_family_children', return_value=[{'asin': 'B1'}]),
+                  patch('core.release_manifest.required_role_policy', return_value=SimpleNamespace(counts={'func': 1}, policy_id='policy')),
+                  patch('core.release_manifest.image_branch_currentness', return_value=(True, '')),
+                  patch('core.release_manifest.read_image_prompts', return_value=prompts),
+                  patch('core.release_manifest.read_image_tasks', return_value={'tasks': [task]}),
+                  patch('core.release_manifest.validate_task_inventory'),
+                  patch('core.release_manifest._review_rows', return_value={}) as reviews,
+                  patch('core.release_manifest.current_candidate', return_value=candidate),
+                  patch('core.release_manifest.task_record_current', return_value={}),
+                  patch('core.release_manifest.production_reference_error', return_value=''),
+                  patch('core.release_manifest.source_inventory_coverage', return_value={'status': 'success', 'rows': []}),
+                  patch('core.vision_gemini_client.gemini_stream_generate', side_effect=AssertionError('Release must not call a model'))):
+                release = build_release_manifest(job_dir=root, plugin=plugin)
+                candidate['provider_name']='mock'
+                simulation=build_release_manifest(job_dir=root,plugin=plugin)
+                self.assertEqual('blocked_reference',simulation['rows'][0]['final_decision'])
+                candidate['provider_name']='fixture-provider'
+                evidence=first['qa'][0]
+                reviews.return_value={(task['child'],task['role'],candidate['candidate_sha256']):dict(
+                    child=task['child'],role=task['role'],decision='reject',candidate_sha256=candidate['candidate_sha256'],
+                    release_candidate_fingerprint=evidence['release_candidate_fingerprint'],
+                    qa_policy_id=evidence['qa_policy_id'],qa_evidence_fingerprint=evidence['evidence_fingerprint'])}
+                rejected=build_release_manifest(job_dir=root,plugin=plugin)
+                self.assertEqual('rejected_human',rejected['rows'][0]['final_decision'])
+                from core.qa_evidence import evidence_fingerprint, write_qa_evidence
+                from copy import deepcopy
+                wrong=deepcopy(evidence);wrong['automatic_decision']='fail';wrong['automatic_pass']=False
+                next(g for g in wrong['gates'] if g['gate']=='unauthorized_text')['status']='fail'
+                wrong['evidence_fingerprint']=evidence_fingerprint(wrong);write_qa_evidence(root,[wrong])
+                approval={**next(iter(reviews.return_value.values())),'decision':'approve',
+                    'qa_evidence_fingerprint':wrong['evidence_fingerprint'],'resolutions':[]}
+                reviews.return_value={(task['child'],task['role'],candidate['candidate_sha256']):approval}
+                self.assertEqual('blocked_auto',build_release_manifest(job_dir=root,plugin=plugin)['rows'][0]['final_decision'])
+                approval['resolutions']=[{'check':'unauthorized_text','candidate_sha256':candidate['candidate_sha256'],
+                    'source_sha256':task['source_sha256'],'conclusion':'confirmed','evidence':'Source banner is absent from candidate pixels.'}]
+                self.assertEqual('approved',build_release_manifest(job_dir=root,plugin=plugin)['rows'][0]['final_decision'])
+
+            self.assertEqual('approved', release['rows'][0]['final_decision'])
+
+    def test_missing_and_invalid_candidates_stay_with_generation_owner(self):
+        task = current_image_task('func_01')
+        plugin = type('Plugin', (), {'category_id': 'bathroom_cabinet'})()
+        with tempfile.TemporaryDirectory() as tmp:
+            prompts = current_prompt_artifact(tmp, task)
+            with (patch.object(image_qa, 'load_job', return_value={}), patch.object(image_qa, 'require_current_image_branch'),
+                  patch.object(image_qa, 'scoped_child_set', return_value={'B1'}),
+                  patch.object(image_qa, 'read_image_prompts', return_value=prompts),
+                  patch.object(image_qa, 'read_image_tasks', return_value={'tasks': [task]}),
+                  patch.object(image_qa, 'current_candidate', return_value={}) as current):
+                self.assertEqual([], image_qa.run_image_qa(job_dir=tmp, plugin=plugin)['failures'])
+                current.side_effect = CandidateStateError('manifest bytes changed')
                 result = image_qa.run_image_qa(job_dir=tmp, plugin=plugin)
-        self.assertEqual([], result["failures"])
-        self.assertEqual([], result["qa"])
+                self.assertEqual([], result['qa'])
+                self.assertEqual('generation', result['failures'][0]['failure_owner'])
+                self.assertEqual('blocked', result['tasks'][0]['status'])
+            from core.io import file_sha256
+            from core.qa_evidence import qa_receipt_root
+            root=Path(tmp); (root/'source.png').write_bytes(b'source'); (root/'candidate.png').write_bytes(b'candidate')
+            task['generation_references']=[dict(kind='edit_base',child='B1',source_id='source_00',purpose='Product truth',
+                path='source.png',sha256=file_sha256(root/'source.png'))]
+            candidate=dict(candidate_path='candidate.png',candidate_sha256=file_sha256(root/'candidate.png'))
+            with patch('core.vision_gemini_client.gemini_stream_generate', return_value='{"checks":[]}') as remote:
+                for _ in range(2):
+                    gates,_=image_qa._factual_gates(root,task,candidate)
+                    self.assertTrue(all(g['status']=='inconclusive' for g in gates))
+                self.assertEqual(1,remote.call_count,'Malformed known replies are retained without another POST')
+            (root/'candidate.png').write_bytes(b'new candidate')
+            candidate['candidate_sha256']=file_sha256(root/'candidate.png')
+            with patch('core.vision_gemini_client.gemini_stream_generate', side_effect=TimeoutError('Reply lost after send')) as remote:
+                for _ in range(2):
+                    gates,_=image_qa._factual_gates(root,task,candidate)
+                    self.assertTrue(all(g['status']=='inconclusive' for g in gates))
+                self.assertEqual(1,remote.call_count,'Unknown replies are never silently resubmitted')
+            required=['product_fidelity','unauthorized_text']
+            for invalid in ([],_checks(required)*2,_checks(required)+_checks(['extra'])):
+                with self.assertRaises(ValueError): image_qa._parse_factual_gates(json.dumps({'checks':invalid}),required,{'source_00'})
+            foreign=_checks(required);foreign[0]['source_ids']=['other_child']
+            with self.assertRaises(ValueError): image_qa._parse_factual_gates(json.dumps({'checks':foreign}),required,{'source_00'})
+            failed=image_qa._parse_factual_gates(json.dumps({'checks':_checks(required,'fail')}),required,{'source_00'})
+            self.assertEqual(['fail','inconclusive'], [g['status'] for g in failed])
+            from tests.four_stage_fixture import verify_qa_attribution
+            verify_qa_attribution(self)
 
-        sibling = current_image_task("main")
-        sibling_prompt = current_prompt_artifact(tmp, sibling)["prompts"][0]
-        candidate = {
-            "candidate_path": "candidate.png", "candidate_sha256": "candidate",
-            "task_prompt_fingerprint": sibling_prompt["prompt_sha256"],
-        }
-        prompt_artifact = {"schema_version": prompt_artifact["schema_version"], "prompts": [
-            prompt_artifact["prompts"][0], sibling_prompt,
-        ]}
-        with (
-            patch.object(image_qa, "load_job", return_value={}),
-            patch.object(image_qa, "require_current_image_branch"),
-            patch.object(image_qa, "scoped_child_set", return_value={"B1"}),
-            patch.object(image_qa, "read_image_prompts", return_value=prompt_artifact),
-            patch.object(image_qa, "read_image_tasks", return_value={"tasks": [task, sibling]}),
-            patch.object(image_qa, "current_candidate", side_effect=[CandidateStateError("manifest bytes changed"), candidate]),
-            patch.object(image_qa, "read_qa_evidence", return_value=[]),
-            patch.object(image_qa, "_local_gates", return_value=[{"gate": "image_integrity", "status": "pass"}]),
-            patch.object(image_qa, "write_qa_evidence"),
-        ):
-            result = image_qa.run_image_qa(job_dir=tmp, plugin=plugin)
-        self.assertEqual("candidate_manifest_invalid_before_qa", result["failures"][0]["error_code"])
-        self.assertEqual("blocked", result["failures"][0]["task_status"])
-        self.assertEqual(["main"], [row["role"] for row in result["qa"]])
-        task = current_image_task("main")
-        with tempfile.TemporaryDirectory() as tmp:
-            prompt_artifact = current_prompt_artifact(tmp, task)
-            prompt = prompt_artifact["prompts"][0]
-            candidate = {
-                "candidate_path": "candidate.png", "candidate_sha256": "candidate",
-                "task_prompt_fingerprint": prompt["prompt_sha256"],
-            }
-            def qa_patches() -> tuple[object, ...]:
-                return (
-                    patch.object(image_qa, "load_job", return_value={}),
-                    patch.object(image_qa, "require_current_image_branch"),
-                    patch.object(image_qa, "scoped_child_set", return_value={"B1"}),
-                    patch.object(image_qa, "read_image_prompts", return_value=prompt_artifact),
-                    patch.object(image_qa, "read_image_tasks", return_value={"tasks": [task]}),
-                    patch.object(image_qa, "current_candidate", return_value=candidate),
-                    patch.object(image_qa, "_local_gates", return_value=[{"gate": "image_integrity", "status": "pass"}]),
-                    patch.object(image_qa, "write_qa_evidence"),
-                )
 
-            with ExitStack() as stack:
-                for context in qa_patches():
-                    stack.enter_context(context)
-                progress = stack.enter_context(patch.object(image_qa, "record_progress"))
-                image_qa.run_image_qa(job_dir=tmp, plugin=plugin)
-            events = [call.args[1] for call in progress.call_args_list]
-            from core.image_provider_common import ProviderQueueUnavailable
-            from core.vision_errors import VisionRequestError
-            for exc in (ProviderQueueUnavailable("vision", "busy"), VisionRequestError(
-                "vision_qa", "queue_unavailable", "busy", metadata={"physical_request_count": 0})):
-                with ExitStack() as stack:
-                    for context in qa_patches():
-                        stack.enter_context(context)
-                    stack.enter_context(patch.object(image_qa, "observe_candidate", side_effect=exc))
-                    not_executed = image_qa.run_image_qa(job_dir=tmp, plugin=plugin)
-                self.assertEqual([], not_executed["qa"])
-                self.assertEqual("qa_not_executed_capacity", not_executed["failures"][0]["error_code"])
-                self.assertEqual("retryable", not_executed["tasks"][0]["status"])
-            self.assertIn("qa_evidence_cache_miss", events)
-            self.assertNotIn("qa_evidence_cache_rejected", events)
-            qa_path = Path(tmp) / "reports" / image_qa.QA_EVIDENCE_ARTIFACT
-            qa_path.write_text("{}\n", encoding="utf-8")
-            with ExitStack() as stack:
-                for context in qa_patches():
-                    stack.enter_context(context)
-                progress = stack.enter_context(patch.object(image_qa, "record_progress"))
-                image_qa.run_image_qa(job_dir=tmp, plugin=plugin)
-            self.assertIn(
-                "qa_evidence_cache_rejected",
-                [call.args[1] for call in progress.call_args_list],
-            )
-
-    def test_qa_decision_uses_hard_gates_and_leaves_quality_to_humans(self) -> None:
-        from core.release_manifest import _validate_resolutions, ReleaseManifestError
-        from core.qa_evidence import _validate_row, evidence_fingerprint, evidence_is_current, QA_EVIDENCE_SCHEMA_VERSION, QaEvidenceError
-        invalid = {"schema_version": QA_EVIDENCE_SCHEMA_VERSION, "child": "B1", "role": "main", "candidate_path": "candidate.png",
-                   "candidate_sha256": "c" * 64, "release_candidate_fingerprint": "release", "qa_policy_id": "policy",
-                   "automatic_decision": "pass", "gates": [{"gate": "product_fidelity", "status": "inconclusive", "evidence": "occluded"}]}
-        invalid["evidence_fingerprint"] = evidence_fingerprint(invalid)
-        with self.assertRaisesRegex(QaEvidenceError, "contradicts"):
+    def test_unknown_visual_facts_require_bound_human_resolution(self):
+        from core.qa_evidence import evidence_is_current, _validate_row, evidence_fingerprint, QaEvidenceError
+        from core.release_manifest import _validate_resolutions, _review_is_current, ReleaseManifestError
+        task, candidate = _task('func'), dict(candidate_path='candidate.png', candidate_sha256='c' * 64)
+        with (patch.object(image_qa, '_local_gates', side_effect=lambda *_: [dict(gate='image_integrity', status='pass', evidence='Decoded')]),
+              patch.object(image_qa, '_factual_gates', side_effect=lambda job,t,c,**kw: (
+                  [dict(gate=g,status='inconclusive',evidence='Pixels are unclear at the measured connection') for g in image_qa._factual_checks(t,c)], {}))):
+            evidence = image_qa._evaluate(Path('.'), object(), task, candidate)
+            scoped = image_qa._evaluate(Path('.'), object(), _task('size', 'source_image'), {**candidate, 'revision_mode': 'targeted_edit'})
+        self.assertEqual('inconclusive', evidence['automatic_decision'])
+        self.assertFalse(evidence['automatic_pass'])
+        self.assertEqual({'product_fidelity', 'unauthorized_text'}, {g['gate'] for g in evidence['gates'] if g['status'] == 'inconclusive'})
+        self.assertEqual({'product_fidelity', 'unauthorized_text', 'dimension_accuracy', 'edit_scope'}, {g['gate'] for g in scoped['gates'] if g['status'] == 'inconclusive'})
+        self.assertTrue(evidence_is_current(evidence, task, candidate))
+        with patch('core.vision_gemini_client.gemini_scope_execution_revision', return_value='changed-connection'):
+            self.assertTrue(evidence_is_current(evidence, task, candidate))
+        with patch('core.qa_evidence.QA_POLICY_VERSION', 'changed-hard-factual-rules'):
+            self.assertFalse(evidence_is_current(evidence, task, candidate))
+        invalid = {**evidence, 'automatic_decision': 'pass'}
+        invalid['evidence_fingerprint'] = evidence_fingerprint(invalid)
+        with self.assertRaisesRegex(QaEvidenceError, 'contradicts'):
             _validate_row(invalid)
-        task = _task("func_01")
-        candidate = {"candidate_path": "candidate.png", "candidate_sha256": "c" * 64}
-        with tempfile.TemporaryDirectory() as tmp, patch.object(
-            image_qa, "_local_gates", return_value=[{"gate": "image_integrity", "status": "pass", "evidence": "Decodable candidate"}],
-        ):
-            evidence = image_qa._evaluate(Path(tmp), object(), task, candidate)
-            self.assertEqual("pass", evidence["automatic_decision"])
-            self.assertTrue(evidence_is_current(evidence, task, candidate))
-            with patch("core.vision_gemini_client.gemini_scope_execution_revision", return_value="new-qa-credential"):
-                self.assertFalse(evidence_is_current(evidence, task, candidate))
-            with patch.object(image_qa, "observe_candidate", side_effect=TimeoutError("bounded")):
-                evidence = image_qa._evaluate(Path(tmp), object(), task, candidate)
-            self.assertEqual("inconclusive", evidence["automatic_decision"])
-            self.assertTrue(evidence_is_current(evidence, task, candidate))
-            self.assertEqual("unavailable", evidence['observation_status'])
-            self.assertEqual({'product_fidelity', 'unauthorized_text'}, {row['gate'] for row in evidence['gates'] if row['status'] == 'inconclusive'})
-            with patch.object(image_qa, 'observe_candidate', side_effect=TimeoutError('bounded')):
-                scoped = image_qa._evaluate(Path(tmp), object(), _task('size', 'source_image'), {**candidate, 'revision_mode': 'targeted_edit'})
-            self.assertEqual({'product_fidelity', 'unauthorized_text', 'dimension_accuracy', 'edit_scope'},
-                             {row['gate'] for row in scoped['gates'] if row['status'] == 'inconclusive'})
-            unknown = _observed(task)
-            unknown["product_comparisons"][0]["status"] = "unknown"
-            with patch.object(image_qa, "observe_candidate", return_value=unknown):
-                completed = image_qa._evaluate(Path(tmp), object(), task, candidate)
-            self.assertEqual("inconclusive", completed["automatic_decision"])
-            self.assertTrue(evidence_is_current(completed, task, candidate))
-        self.assertEqual("observed_hard_facts_only", evidence["decision_scope"])
-        self.assertEqual("human_review_and_provider_ledger", evidence["quality_authority"])
-        target = {"candidate_sha256": "c" * 64, "source_sha256": "s" * 64, "unresolved_checks": ["product_fidelity"]}
+        target = {'candidate_sha256': candidate['candidate_sha256'], 'source_sha256': task['source_sha256'],
+                  'unresolved_checks': [g['gate'] for g in evidence['gates'] if g['status'] == 'inconclusive']}
         with self.assertRaises(ReleaseManifestError):
             _validate_resolutions([], target)
-        resolution = {"candidate_sha256": "c" * 64, "source_sha256": "s" * 64, "check": "product_fidelity",
-                      "conclusion": "confirmed", "evidence": "Both images retain the two drawer fronts and four legs."}
-        _validate_resolutions([resolution], target)
-        with self.assertRaises(ReleaseManifestError):
-            _validate_resolutions([{**resolution, "source_sha256": "changed"}], target)
+        resolutions = [{**{k: target[k] for k in ('candidate_sha256', 'source_sha256')}, 'check': check,
+                        'conclusion': 'confirmed', 'evidence': 'Compared source and candidate; exact product and approved text confirmed.'}
+                       for check in target['unresolved_checks']]
+        _validate_resolutions(resolutions, target)
+        from core.image_task_inputs import release_candidate_fingerprint
+        review = dict(decision='approve', resolutions=resolutions, candidate_sha256=candidate['candidate_sha256'],
+                      release_candidate_fingerprint=release_candidate_fingerprint(task, candidate),
+                      qa_policy_id=evidence['qa_policy_id'], qa_evidence_fingerprint=evidence['evidence_fingerprint'])
+        self.assertTrue(_review_is_current(review, task=task, candidate=candidate, evidence=evidence))
+        self.assertFalse(_review_is_current(review, task=task, candidate={**candidate, 'candidate_sha256': 'd' * 64}, evidence=evidence))
+        from contextlib import nullcontext
+        from core.release_manifest import record_human_reviews
+        with (patch('core.release_manifest.job_run_lock', return_value=nullcontext()),
+              patch('core.release_manifest.build_release_manifest', return_value={'rows': [{'child': 'B1', 'role': 'func', 'automatic_decision': 'fail'}]})):
+            with self.assertRaisesRegex(ReleaseManifestError, 'factual failure'):
+                record_human_reviews(job_dir='unused', plugin=object(), targets=[('B1', 'func')], decision='approve', resolutions=resolutions)
 
-    def test_func_contract_text_and_unverified_prop_text_do_not_auto_fail(self) -> None:
-        task = _task("func_01")
-        task["renderable_text_contract"]["strings"] = ["Weight Capacity: 440 lbs"]
-        observation = _observed(task)
-        observation["texts"].append({"text": "Goodnight", "kind": "prop", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)})
-        self.assertEqual("pass", image_qa._semantic_gates(task, observation)[0]["status"])
-        observation['texts'][0]['confidence'] = .7
-        uncertain = image_qa._semantic_gates(task, observation)[0]
-        self.assertEqual('inconclusive', uncertain['status'])
-        self.assertIn('low-confidence reading (not proof of a brand)', uncertain['evidence'])
-        observation['texts'][0]['confidence'] = .99
-        observation["texts"][0]["text"] = "Weight Capacity: 441 lbs"
-        self.assertEqual("fail", image_qa._semantic_gates(task, observation)[0]["status"])
-        observation["texts"][0]["kind"] = "unknown"
-        self.assertEqual("inconclusive", image_qa._semantic_gates(task, observation)[0]["status"])
-        observation = _observed(task)
-        observation["texts"] = []
-        observation["text_coverage"] = "partial"
-        self.assertEqual("inconclusive", image_qa._semantic_gates(task, observation)[0]["status"])
-
-    def test_source_size_semantic_measurements_require_observed_relationships(self) -> None:
-        task = _task("size_01", "source_image")
-        task['measurement_authority']['measurement_groups'] = [dict(id='width', render_text='36 in')]
-        observation = _observed(task)
-        observation["measurement_coverage"] = "complete"
-        measurement = {"measurement_id": "width", "object": "cabinet overall width", "source_text": "36 in", "candidate_text": "3 ft",
-                       "relationship": "same", "confidence": .99, "source_region": dict(left=0, top=0, right=1, bottom=1), "candidate_region": dict(left=0, top=0, right=1, bottom=1)}
-        observation["measurements"] = [measurement]
-        self.assertEqual("pass", image_qa._semantic_gates(task, observation)[1]["status"])
-        measurement["relationship"] = "different"
-        self.assertEqual("fail", image_qa._semantic_gates(task, observation)[1]["status"])
-        measurement["confidence"] = .6
-        self.assertEqual("inconclusive", image_qa._semantic_gates(task, observation)[1]["status"])
-        mixed = _task("func_04", "source_image")
-        mixed['measurement_authority']['measurement_groups'] = [dict(id='width', render_text='12 in')]
-        mixed["renderable_text_contract"]["strings"] = ["Ample Space under Bed"]
-        observed = _observed(mixed)
-        observed["texts"].append({"text": '12"', "kind": "measurement", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)})
-        observed["measurements"] = [{**measurement, "object": "underbed clearance", "source_text": '12"', "candidate_text": "12 in", "relationship": "same", "confidence": .99}]
-        observed["measurement_coverage"] = "complete"
-        self.assertEqual(["pass", "pass", "pass"], [row["status"] for row in image_qa._semantic_gates(mixed, observed)])
-        observed["measurements"][0]["candidate_text"] = '16"'
-        self.assertEqual("fail", image_qa._semantic_gates(mixed, observed)[1]["status"])
-
-        from copy import deepcopy
-        from core.visual_semantics import _validate_candidate_bindings
-        bound_task = _task('size', 'source_image')
-        group = dict(id='source_00:width', source_id='source_00', attachment_index=2,
-                     evidence_type='dimension_line', render_text='36 in')
-        bound_task['measurement_authority']['measurement_groups'] = [group]
-        attachments = [dict(source_id='source_00', attachment_index=2)]
-        points = [dict(x=.1, y=.2), dict(x=.8, y=.2)]
-        for kind, source_points, candidate_points, relationship, expected in (
-            ('dimension_line', None, None, 'same', 'inconclusive'),
-            ('dimension_line', points, None, 'same', 'inconclusive'),
-            ('dimension_line', None, points, 'same', 'inconclusive'),
-            ('dimension_line', points, points, 'same', 'pass'),
-            ('dimension_line', points, points, 'different', 'fail'),
-            ('dimension_line', points, [dict(x=-1, y=0), dict(x=1, y=1)], 'same', 'inconclusive'),
-            ('text_spec', None, None, 'same', 'pass'),
-        ):
-            with self.subTest(kind=kind, endpoints=(source_points, candidate_points), relationship=relationship):
-                bound_task['measurement_authority']['measurement_groups'][0]['evidence_type'] = kind
-                obs = _observed(bound_task)
-                obs.update(measurement_coverage='complete', measurements=[{
-                    **measurement, 'measurement_id': group['id'], 'source_id': 'source_00', 'attachment_index': 2,
-                    'relationship': relationship, 'confidence': .99, 'source_endpoints': deepcopy(source_points),
-                    'candidate_endpoints': deepcopy(candidate_points),
-                }])
-                _validate_candidate_bindings(obs, attachments, candidate_product_targets(bound_task), [group], {})
-                self.assertEqual(expected, image_qa._semantic_gates(bound_task, obs)[1]['status'])
-        obs['measurements'][0]['attachment_index'] = 3
-        with self.assertRaisesRegex(ValueError, 'different source attachment'):
-            _validate_candidate_bindings(obs, attachments, candidate_product_targets(bound_task), [group], {})
-
-    def test_obvious_nonwhite_main_is_a_hard_fact_failure(self) -> None:
-        with patch.object(image_qa, "inspect_image_pixel_evidence", return_value={"white_background": False}):
-            gate = image_qa._main_background_gate(_task("main"), Path("candidate.png"))
-            lifestyle = _task('main')
-            lifestyle['category_image_policy']['main_image_policy'] = 'product_first_lifestyle'
-            self.assertEqual('pass', image_qa._main_background_gate(lifestyle, Path('candidate.png'))['status'])
-            lifestyle['category_image_policy'] = {}
-            with self.assertRaises(KeyError):
-                image_qa._main_background_gate(lifestyle, Path('candidate.png'))
-        self.assertEqual("fail", gate["status"])
-        observation = _observed(_task("main"))
-        observation["texts"] = [{"text": "Beautiful Storage", "kind": "marketing", "confidence": .99, "region": dict(left=0, top=0, right=1, bottom=1)}]
-        self.assertEqual("fail", image_qa._semantic_gates(_task("main"), observation)[0]["status"])
-        observation["texts"][0]["kind"] = "prop"
-        self.assertEqual("pass", image_qa._semantic_gates(_task("scene"), observation)[0]["status"])
-        observation["product_comparisons"][0]["status"] = "contradiction"
-        self.assertEqual("fail", image_qa._semantic_gates(_task("scene"), observation)[2]["status"])
-        from copy import deepcopy
-        from core.visual_semantics import _validate_candidate_observation
-        task = _task('func')
-        complete = _observed(task)
-        _validate_candidate_observation(complete)
-        self.assertEqual('pass', image_qa._semantic_gates(task, complete)[2]['status'])
-        partial = deepcopy(complete)
-        partial['product_coverage'] = 'partial'
-        self.assertEqual('inconclusive', image_qa._semantic_gates(task, partial)[2]['status'])
-        extra = deepcopy(complete)
-        extra['product_comparisons'].append({**extra['product_comparisons'][0], 'target_id': 'extra:caster',
-            'status': 'contradiction', 'part': 'drawer stop', 'evidence': 'Wooden stop replaced by a caster brake'})
-        _validate_candidate_observation(extra)
-        self.assertEqual('fail', image_qa._semantic_gates(task, extra)[2]['status'])
-        wrong = deepcopy(complete)
-        wrong['product_comparisons'][0].update(status='contradiction', part='corner', evidence='Product corner joint replaced by a different construction')
-        self.assertEqual('fail', image_qa._semantic_gates(task, wrong)[2]['status'])
-        wrong['product_comparisons'][0]['confidence'] = .4
-        self.assertEqual('inconclusive', image_qa._semantic_gates(task, wrong)[2]['status'])
-        complete['product_comparisons'].pop()
-        self.assertEqual('inconclusive', image_qa._semantic_gates(task, complete)[2]['status'])
-        complete = _observed(task)
-        complete['product_comparisons'].append(deepcopy(complete['product_comparisons'][0]))
-        with self.assertRaisesRegex(ValueError, 'repeats a target'):
-            _validate_candidate_observation(complete)
-        del complete['product_comparisons']
-        with self.assertRaisesRegex(ValueError, 'output product comparisons'):
-            _validate_candidate_observation(complete)
+    def test_background_edge_signal_does_not_prove_product_or_canvas(self):
+        from tests.image_boundary_fixture import verify_background
+        verify_background(self)
+        from tests.audit_planning_fixture import verify_main_quantity
+        verify_main_quantity(self)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

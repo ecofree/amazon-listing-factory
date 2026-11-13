@@ -10,7 +10,7 @@ from .io import file_sha256, write_json
 from .text_evidence import normalize_text
 
 
-ROLE_OCR_EVIDENCE_CACHE_VERSION = "role-ocr-evidence-cache-v9-normalized-text"
+ROLE_OCR_EVIDENCE_CACHE_VERSION = "role-ocr-evidence-cache-v10-completeness"
 OCR_CONCLUSIVE_CONFIDENCE = 0.8
 
 
@@ -36,18 +36,26 @@ def ocr_evidence_for_image(
     try:
         from .ocr_scanner import scan_image
 
-        ocr = scan_image(image_path, deadline_monotonic=deadline_monotonic)
+        ocr = scan_image(image_path, deadline_monotonic=deadline_monotonic,
+                         receipt_root=cache_root / 'requests' if cache_root is not None else None)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        evidence = {"available": False, "error": error, "raw_text": "", "retryable": _ocr_error_retryable(error)}
+        evidence = {"available": False, "error": error, "raw_text": "", "retryable": _ocr_error_retryable(error),
+                    'completeness': 'unavailable', 'completeness_reasons': ['scan_failed']}
     else:
         error = str(getattr(ocr, "error", "") or "")
+        truncation = list(getattr(ocr, 'summary_truncation', []) or [])
         evidence = {
-            "available": not bool(error),
+            "available": bool(getattr(ocr, 'text_blocks', []) or getattr(ocr, 'raw_text', '')) or
+                         (getattr(ocr, 'completeness', 'unknown') == 'complete' and not error),
             "error": error,
             "raw_text": clean_source_text_evidence(brief_value(getattr(ocr, "raw_text", ""))),
-            "lines": _ocr_lines(getattr(ocr, "text_blocks", [])),
+            "lines": _ocr_lines(getattr(ocr, "text_blocks", []), diagnostics=truncation),
             "retryable": _ocr_error_retryable(error),
+            'completeness': getattr(ocr, 'completeness', 'unknown'),
+            'completeness_source': getattr(ocr, 'completeness_source', ''),
+            'completeness_reasons': list(getattr(ocr, 'completeness_reasons', []) or []),
+            'summary_truncation': truncation,
         }
     evidence["attempts"] = attempts
     evidence["retryable"] = bool(evidence.get("retryable"))
@@ -120,11 +128,23 @@ def _write_ocr_evidence_cache(
 def _canonical_ocr_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     error = str(evidence.get("error") or "").strip()
     attempts = max(0, int(evidence.get("attempts") or 0))
+    truncation = list(evidence.get('summary_truncation') or [])
+    raw_text = clean_source_text_evidence(str(evidence.get('raw_text') or ''))
+    if len(raw_text) > 1200:
+        truncation.append('raw_text_1200')
+    lines = _canonical_ocr_lines(evidence.get('lines'), diagnostics=truncation)
+    completeness = str(evidence.get('completeness') or 'unknown')
+    if completeness not in {'complete', 'partial', 'unknown', 'unavailable'}:
+        completeness = 'unknown'
     return {
-        "available": bool(evidence.get("available")) and not error,
+        "available": bool(evidence.get("available")) and (bool(raw_text or lines) or completeness != 'unavailable'),
         "error": error,
-        "raw_text": clean_source_text_evidence(brief_value(evidence.get("raw_text"))),
-        "lines": _canonical_ocr_lines(evidence.get("lines")),
+        "raw_text": raw_text[:1200],
+        "lines": lines,
+        'completeness': completeness,
+        'completeness_source': str(evidence.get('completeness_source') or ''),
+        'completeness_reasons': list(dict.fromkeys(str(reason) for reason in evidence.get('completeness_reasons') or [])),
+        'summary_truncation': list(dict.fromkeys(truncation)),
         "retryable": bool(error) and (bool(evidence.get("retryable")) or _ocr_error_retryable(error)),
         "attempts": attempts,
     }
@@ -135,7 +155,7 @@ def _ocr_error_retryable(error: str) -> bool:
     return any(token in text for token in ("timeout", "timed out", "connection", "temporar", "429", " 500", " 502", " 503", " 504"))
 
 
-def _ocr_lines(value: Any) -> list[dict[str, Any]]:
+def _ocr_lines(value: Any, *, diagnostics: list[str] | None = None) -> list[dict[str, Any]]:
     return _canonical_ocr_lines(
         [
             {
@@ -144,11 +164,11 @@ def _ocr_lines(value: Any) -> list[dict[str, Any]]:
                 "box": getattr(item, "bbox", []),
             }
             for item in value if getattr(item, "text", "")
-        ]
+        ], diagnostics=diagnostics,
     )
 
 
-def _canonical_ocr_lines(value: Any) -> list[dict[str, Any]]:
+def _canonical_ocr_lines(value: Any, *, diagnostics: list[str] | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for raw in value if isinstance(value, list) else []:
         if not isinstance(raw, dict):
@@ -162,6 +182,8 @@ def _canonical_ocr_lines(value: Any) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             confidence = 0.0
         rows.append({"text": text, "confidence": confidence, "box": box})
+    if len(rows) > 32 and diagnostics is not None:
+        diagnostics.append('lines_32')
     return rows[:32]
 
 

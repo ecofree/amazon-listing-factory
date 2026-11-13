@@ -33,3 +33,30 @@ def process_file_lock(path: str | Path) -> Iterator[None]:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def stop_process(pid, created):
+    """Kill only the exact owned process identity and its descendants after a deadline."""
+    import psutil
+    try:
+        parent = psutil.Process(pid)
+        if parent.create_time() != created:
+            return
+        children = parent.children(recursive=True)
+        for process in reversed(children):
+            try:
+                process.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        parent.terminate()
+        _, alive = psutil.wait_procs([parent, *children], timeout=1)
+        for process in alive:
+            try:
+                process.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(alive, timeout=1)
+    except psutil.NoSuchProcess:
+        pass
+
+

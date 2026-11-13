@@ -1,0 +1,6 @@
+{
+  "schema": "business-input-v2",
+  "scope": {"seller_id":"safeplus", "brand":"safeplus", "marketplace":"US", "category_id":"*"},
+  "source": "2026-11-09 商家确认以后销售的所有商品均无需电池。",
+  "values": {"batteries_required":false}
+}

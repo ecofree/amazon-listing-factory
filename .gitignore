@@ -25,6 +25,7 @@ __pycache__/
 *.pyc
 
 # Local tooling/cache state
+.venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

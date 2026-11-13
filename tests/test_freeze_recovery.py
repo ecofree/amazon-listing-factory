@@ -23,9 +23,13 @@ from tests.test_status_revision_contract import _job
 
 
 class FreezeRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        paid=patch('core.batch_ledger.admit_paid_request',return_value='mock-network-admission')
+        paid.start();self.addCleanup(paid.stop)
+
     def _check_receipt_resolution_and_submission_boundary(self):
         from core.image_response import (begin_response, recover_response, resolve_response,
-            response_binding, response_directory, save_response, submit_response, finish_response)
+            response_binding, response_directory, response_submission_metrics, save_response, submit_response, finish_response)
         from core.image_provider_routing import _provider_worker
         from queue import Queue
         with tempfile.TemporaryDirectory() as tmp:
@@ -39,10 +43,12 @@ class FreezeRecoveryTests(unittest.TestCase):
             image.write_bytes(b'fixture')
             def prep_failure(**kwargs):
                 self.assertEqual('prepared', read_json(receipt)['status'])
-                raise MemoryError('local encoding')
+                raise ProviderConfigurationError('cxk_fixed', 'local configuration')
             with patch('core.image_provider_routing.generate_with_registry_image_provider', side_effect=prep_failure):
                 _provider_worker('cxk_fixed', [str(image)], 'p', None, 'r', str(receipt), Queue())
             self.assertEqual('known_failure', read_json(receipt)['status'])
+            self.assertIsNone(read_json(receipt)['submitted_at'])
+            self.assertEqual(0, response_submission_metrics(job)['image_provider_submission_count'])
             receipt = begin_response(directory, provider='cxk_fixed', audit=audit)
             def submitted_failure(**kwargs):
                 kwargs['request_observer'](audit)
@@ -52,6 +58,9 @@ class FreezeRecoveryTests(unittest.TestCase):
                 _provider_worker('cxk_fixed', [str(image)], 'p', None, 'r', str(receipt), Queue())
             with self.assertRaises(ProviderTransportError):
                 recover_response(task)
+            submitted_at = read_json(receipt)['submitted_at']
+            self.assertTrue(submitted_at)
+            self.assertEqual(1, response_submission_metrics(job)['image_provider_submission_count'])
             changed = {**task, 'task_fingerprint': 'changed', 'prompt': 'new prompt'}
             with self.assertRaises(ProviderTransportError):
                 recover_response(changed)
@@ -62,12 +71,31 @@ class FreezeRecoveryTests(unittest.TestCase):
             outcome = resolve_response(job, str(receipt), action='approve_one_resend', reason='Explicit test authorization')
             self.assertEqual(0, outcome['requests_sent'])
             self.assertEqual('resend_authorized', read_json(receipt)['status'])
-            with self.assertRaises(ProviderTransportError):
-                recover_response(changed)
+            self.assertEqual(submitted_at, read_json(receipt)['submitted_at'])
+            self.assertEqual({}, recover_response(changed))
+            with patch('core.image_response.load_provider_policy', return_value={'image_generation': {}}):
+                with self.assertRaises(ProviderTransportError):
+                    recover_response(changed)
             self.assertEqual({}, recover_response(task))
             replacement = begin_response(directory, provider='cxk_fixed', audit=audit)
-            self.assertEqual(replacement.name, read_json(receipt)['replacement_receipt'])
-            write_json(replacement, {**read_json(replacement), 'status': 'submitted'})
+            self.assertEqual('resend_authorized', read_json(receipt)['status'])
+            original = read_json(receipt)
+            write_json(receipt, {**original, 'status': 'superseded', 'replacement_receipt': replacement.name})
+            self.assertEqual({}, recover_response(changed))
+            write_json(receipt, original)
+            self.assertEqual({}, recover_response(changed))
+            with patch('core.image_response.write_json', side_effect=OSError('before commit')):
+                with self.assertRaises(OSError):
+                    submit_response(replacement, audit)
+            self.assertEqual({}, recover_response(changed))
+            def commit_then_interrupt(path, row):
+                write_json(path, row)
+                raise OSError('after atomic commit')
+            with patch('core.image_response.write_json', side_effect=commit_then_interrupt):
+                with self.assertRaises(OSError):
+                    submit_response(replacement, audit)
+            self.assertEqual([receipt.name], read_json(replacement)['replaces'])
+            self.assertEqual(2, response_submission_metrics(job)['image_provider_submission_count'])
             for _ in range(2):
                 resolve_response(job, str(replacement), action='approve_one_resend', reason='User authorized three resends')
                 replacement = begin_response(directory, provider='cxk_fixed', audit=audit)
@@ -79,6 +107,10 @@ class FreezeRecoveryTests(unittest.TestCase):
             resolve_response(job, str(replacement), action='confirmed_not_generated', reason='Provider confirmed no image created')
             self.assertEqual({}, recover_response(task))
             paid = begin_response(directory, provider='cxk_fixed', audit=audit)
+            submit_response(paid, audit)
+            paid_at = read_json(paid)['submitted_at']
+            with self.assertRaises(ProviderTransportError):submit_response(paid, audit)
+            self.assertEqual(paid_at, read_json(paid)['submitted_at'])
             save_response(paid, b'saved remote image', audit)
             with self.assertRaisesRegex(ValueError, 'saved responses'):
                 resolve_response(job, str(paid), action='approve_one_resend', reason='Must reuse')
@@ -89,6 +121,22 @@ class FreezeRecoveryTests(unittest.TestCase):
             with self.assertRaises(CandidateCommitError):
                 recover_response(changed)
             finish_response(paid, 'finalized')
+            self.assertEqual(paid_at, read_json(paid)['submitted_at'])
+            self.assertEqual(b'saved remote image', paid.with_suffix('.bin').read_bytes())
+            from core.io import file_sha256
+            self.assertEqual(read_json(paid)['raw_sha256'], file_sha256(paid.with_suffix('.bin')))
+            rejected = begin_response(directory, provider='cxk_fixed', audit=audit)
+            submit_response(rejected, audit)
+            rejected_at = read_json(rejected)['submitted_at']
+            save_response(rejected, b'rejected remote image', audit)
+            for suffix in ('.http', '.partial'):
+                rejected.with_suffix(suffix).write_bytes(b'transport temporary')
+            finish_response(rejected, 'rejected_content')
+            self.assertEqual(rejected_at, read_json(rejected)['submitted_at'])
+            self.assertEqual(b'rejected remote image', rejected.with_suffix('.bin').read_bytes())
+            self.assertEqual(read_json(rejected)['raw_sha256'], file_sha256(rejected.with_suffix('.bin')))
+            self.assertFalse(any(rejected.with_suffix(suffix).exists() for suffix in ('.http', '.partial')))
+            self.assertEqual({}, recover_response(task))
             # Two workers may prepare locally; only one may cross the paid submission boundary.
             first = begin_response(directory, provider='cxk_fixed', audit=audit)
             changed_audit = {**audit, 'response_binding': response_binding(changed)}
@@ -104,39 +152,56 @@ class FreezeRecoveryTests(unittest.TestCase):
         reset_provider_run_circuits()
 
     def test_production_registry_enforces_role_models_and_disabled_routes(self):
+        configured = json.loads((Path(__file__).resolve().parents[1] / 'configs/api_registry.json').read_text(encoding='utf-8'))
+        for row in configured['providers']:
+            if str(row.get('name', '')).startswith(('bilinkai-fixed', 'bilinkai_fixed')):
+                row['enabled'] = True  # Exercise configured routes with synthetic credentials.
         with (
-            patch.dict("os.environ", {"CXK_FIXED_API_KEY": "fixture", "QC_YC_FIXED_API_KEY": "fixture", "AICOST_API_KEY": "fixture"}, clear=True),
-            patch.object(routing, "_persistently_unhealthy_providers", return_value=set()),
+            patch.dict("os.environ", {"CXK_FIXED_API_KEY": "fixture", "MODEL_SHARE_FIXED_API_KEY": "fixture",
+                                     "BILINKAI_FIXED_API_KEY": "fixture",
+                                     "AMAZON_FACTORY_API_REGISTRY": json.dumps(configured),
+                                     "QC_YC_FIXED_API_KEY": "fixture", "AICOST_API_KEY": "fixture"}, clear=True),
             patch.object(routing, "_global_provider_cooldown_active", return_value=False),
             patch.object(routing, "_order_by_health", side_effect=lambda _task, providers: providers),
             patch.object(routing, "_provider_scores", side_effect=lambda _task, providers: dict.fromkeys(providers, 0)),
         ):
             plugin = load_plugin("bed_frame")
             registry = {entry.name: entry for entry in api_registry.image_provider_entries()}
-            self.assertIn("qc_yc_fixed", registry)
+            bilinkai = {name for name in registry if name.startswith('bilinkai_fixed')}
+            self.assertEqual({'bilinkai_fixed', 'bilinkai_fixed_gpt_image_25',
+                              'bilinkai_fixed_gpt_image_25_flare', 'bilinkai_fixed_gpt_image_25_sunburst'}, bilinkai)
+            self.assertTrue(all(api_registry.image_provider_supports_multiple_references(name) for name in bilinkai))
+            self.assertTrue(api_registry.image_provider_fallback_only('bilinkai_fixed'))
+            self.assertTrue(registry['qc_yc_fixed'].raw['fallback_only'])
+            self.assertEqual({'gpt-image-2','gpt-image-2.5-flare','gpt-image-2.5-sunburst','gpt-image-2.6-flare','gpt-image-2.6-sunburst'},
+                {p.model for name,p in registry.items() if name.startswith('qc_yc')})
             self.assertNotIn("lz_token_gpt_image_2", registry)
             self.assertFalse(any(name.startswith('aicost_') for name in registry))
             roles = ("func_04", "size", "main", "scene_03", "scene_04")
             tasks = [routing.apply_role_provider_policy({"child": "B1", "role": role}, plugin) for role in roles]
             for role, task in zip(roles, tasks):
                 models = {registry[name].model for name in task["providers"]}
+                expected = {'bilinkai_fixed', 'bilinkai_fixed_gpt_image_25_sunburst'} if role.startswith(('func', 'size')) else bilinkai
+                self.assertEqual(expected, bilinkai & set(task['providers']))
                 self.assertEqual(
-                    {"gpt-image-2", "gpt-image-2.5-sunburst"} if role.startswith(('func', 'size'))
-                    else {"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}, models,
+                    {"gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.6-sunburst"} if role.startswith(('func', 'size'))
+                    else {"gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}, models,
                 )
             assigned = routing.assign_provider_pool(tasks)
             for source, result in zip(tasks, assigned):
                 self.assertEqual(set(source["providers"]), set(result["providers"] + result["child_provider_reserve"]))
-            self.assertEqual(5, len({row['child_provider_primary'] for row in assigned}))
-            self.assertTrue(all(registry[row['child_provider_primary']].model.startswith('gpt-image-2.5') for row in assigned))
-            self.assertTrue(all(registry[row['child_provider_primary']].model == 'gpt-image-2.5-sunburst' for row in assigned[:2]))
+            self.assertEqual(len(roles), len({row['child_provider_primary'] for row in assigned}))
+            self.assertTrue(all(registry[row['child_provider_primary']].model.startswith(('gpt-image-2.5','gpt-image-2.6')) for row in assigned))
+            self.assertTrue(all(registry[row['child_provider_primary']].model in {'gpt-image-2.5-sunburst','gpt-image-2.6-sunburst'} for row in assigned[:2]))
             self.assertTrue(all(registry[row['child_provider_backup']].model == 'gpt-image-2' for row in assigned))
             from core.image_generation import _dispatch_generation_batch
             with patch('core.image_generation._effective_generation_workers', return_value=8):
                 first, waiting = _dispatch_generation_batch(assigned, 8)
-                self.assertEqual(5, len(first))
+                self.assertEqual(len(roles), len(first))
                 self.assertEqual([], waiting)
-                blocked, waiting = _dispatch_generation_batch([{**assigned[0], 'role': 'scene_05'}], 8, active=first)
+                busy_routes = [row['child_provider_primary'] for row in first] + [assigned[0]['child_provider_backup']]
+                blocked, waiting = _dispatch_generation_batch([{**assigned[0], 'role': 'scene_05',
+                    'providers': busy_routes, 'child_provider_reserve': []}], 8, active=first)
                 self.assertEqual([], blocked)  # An idle GPT-image-2 must not steal normal work.
                 self.assertEqual(1, len(waiting))
 
@@ -148,7 +213,8 @@ class FreezeRecoveryTests(unittest.TestCase):
             output = Path(tmp) / "candidate.png"
             from PIL import Image
             receipt = Path(tmp) / 'response.json'
-            Image.new('RGB', (32, 32), 'white').save(receipt.with_suffix('.bin'), format='PNG')
+            from tests.image_boundary_fixture import native_bytes
+            receipt.with_suffix('.bin').write_bytes(native_bytes())
             for count in (1, 2, 3, 7, 10):
                 for remaining in (1000, 45):
                     with self.subTest(count=count, remaining=remaining), contextlib.ExitStack() as stack:
@@ -174,6 +240,21 @@ class FreezeRecoveryTests(unittest.TestCase):
                         transport = stack.enter_context(patch.object(executor, "generate_with_provider_retries", side_effect=responses))
                         generate_one(task, plugin=load_plugin("bed_frame"))
                         self.assertTrue(all(call.kwargs["total_timeout_seconds"] == min(420, remaining) for call in transport.call_args_list))
+                        if count==1 and remaining==1000:
+                            from core.image_provider_common import ProviderQueueUnavailable
+                            task.pop('deadline_monotonic');task.pop('role_deadline_monotonic',None)
+                            transport.side_effect=ProviderQueueUnavailable(providers[0],'busy before submission')
+                            with self.assertRaises(ProviderQueueUnavailable):generate_one(task,plugin=load_plugin('bed_frame'))
+                            self.assertNotIn('role_deadline_monotonic',task)
+                            executor.time.monotonic.return_value=2800
+                            def sent(**kwargs):
+                                kwargs['attempt_observer'](providers[0],1,status='started')
+                                return receipt
+                            transport.side_effect=sent
+                            stack.enter_context(patch.object(executor,'record_provider_transport_attempt_event'))
+                            generate_one(task,plugin=load_plugin('bed_frame'))
+                            self.assertEqual(420,transport.call_args.kwargs['total_timeout_seconds'])
+                            self.assertGreater(task['role_deadline_monotonic'],2800)
 
     def test_unknown_state_roundtrip_and_controller_exception_cleanup(self):
         self._check_receipt_resolution_and_submission_boundary()
@@ -218,7 +299,7 @@ class FreezeRecoveryTests(unittest.TestCase):
             events, record = _attempt_trace(path)
             with patch("core.vision_gemini_client.gemini_clients", return_value=clients), \
                  patch("core.vision_gemini_client._record_vision_model_event"), \
-                 patch("core.vision_gemini_client._post_vision_request", side_effect=[URLError("[SYS] unknown error (_ssl.c:2406)"), good]) as post:
+                 patch("core.vision_gemini_client._post_json_preserve_redirects", side_effect=[URLError("[SYS] unknown error (_ssl.c:2406)"), good]) as post:
                 self.assertEqual("good", gemini_stream_generate("fixture", [], client_scope="visual_planning",
                     max_physical_requests=2, total_timeout_seconds=20, attempt_observer=record))
             self.assertEqual(2, post.call_count)
@@ -227,7 +308,7 @@ class FreezeRecoveryTests(unittest.TestCase):
             self.assertIn("_ssl.c", read_json(path)[0]["error"])
             with patch("core.vision_gemini_client.gemini_clients", return_value=[clients[1]]), \
                  patch("core.vision_gemini_client._record_vision_model_event"), \
-                 patch("core.vision_gemini_client._post_vision_request", return_value=good):
+                 patch("core.vision_gemini_client._post_json_preserve_redirects", return_value=good):
                 with self.assertRaises(VisionRequestError) as raised:
                     gemini_stream_generate("fixture", [], client_scope="visual_planning", max_physical_requests=1,
                         total_timeout_seconds=20, attempt_observer=record, response_validator=lambda text: False)
@@ -269,7 +350,7 @@ class FreezeRecoveryTests(unittest.TestCase):
         self.assertTrue(run.call_args.args[0].write_excel)
         self.assertEqual("draft", run.call_args.args[0].template_mode)
         self.assertEqual(('B2', 'B1'), run.call_args.args[0].child_ids)
-        from core.run_scope import ensure_run_scope, RunScopeError
+        from core.run_scope import ensure_run_scope, read_run_scope, row_in_scope, _scope_identity, RUN_SCOPE_ARTIFACT, RunScopeError
         family = {'family': {'children': [{'asin': key, 'reference_images': ['first', 'second']} for key in ('B1', 'B2', 'B3')]}}
         with tempfile.TemporaryDirectory() as tmp, patch('core.run_scope.read_product_family', return_value=family):
             scope = ensure_run_scope(job_dir=tmp, child_ids=('B2', 'B1'))
@@ -281,7 +362,37 @@ class FreezeRecoveryTests(unittest.TestCase):
             family['family']['children'].append({'asin': 'B4', 'reference_images': ['first']})
             self.assertEqual(['B2', 'B1'], ensure_run_scope(job_dir=tmp)['selected_children'])
         with tempfile.TemporaryDirectory() as tmp, patch('core.run_scope.read_product_family', return_value=family):
-            ensure_run_scope(job_dir=tmp, production=True)
+            scope=ensure_run_scope(job_dir=tmp, production=True)
+            self.assertEqual(scope,read_run_scope(tmp))
+            self.assertTrue(row_in_scope(tmp,{'child':'B1','index':0}))
+            for invalid in ('0',True,.0,None):
+                self.assertFalse(row_in_scope(tmp,{'child':'B1','index':invalid}))
+            path=Path(tmp)/'reports'/RUN_SCOPE_ARTIFACT
+            from copy import deepcopy
+            corruptions=[('selected_children',scope['selected_children']+[scope['selected_children'][0]]),
+                ('mode','unknown'),('family_complete_required',False),('family_child_count',True),
+                ('selected_sources',{**scope['selected_sources'],'B1':[0,0]}),
+                ('selected_sources',{**scope['selected_sources'],'B1':[True]}),
+                ('selected_sources',{**scope['selected_sources'],'B1':['0']}),
+                ('selected_sources',{**scope['selected_sources'],'B1':[.0]}),
+                ('selected_sources',{**scope['selected_sources'],'B1':[]}),
+                ('selected_sources',{**scope['selected_sources'],'B1':[0]})]
+            for field,value in corruptions:
+                damaged=deepcopy(scope);damaged[field]=value
+                damaged['scope_fingerprint']=_scope_identity(damaged)
+                write_json(path,damaged)
+                with self.subTest(field=field,value=value),self.assertRaises(RunScopeError):read_run_scope(tmp)
+            damaged=deepcopy(scope);damaged['scope_fingerprint']='0'*64;write_json(path,damaged)
+            with self.assertRaisesRegex(RunScopeError,'scope_fingerprint'):read_run_scope(tmp)
+            damaged=deepcopy(scope);damaged['unexpected']=True;write_json(path,damaged)
+            with self.assertRaisesRegex(RunScopeError,'fields differ'):read_run_scope(tmp)
+            write_json(path,scope)
+            family['family']['children'][0]['reference_images'][0]='changed-url'
+            with self.assertRaisesRegex(RunScopeError,'inventory'):read_run_scope(tmp)
+            family['family']['children'][0]['reference_images'][0]='first'
+            family['source']={'child_fetch_errors':['B1 failed']}
+            with self.assertRaisesRegex(RunScopeError,'child_fetch_errors'):read_run_scope(tmp)
+            family.pop('source')
             family['family']['children'].append({'asin': 'B5', 'reference_images': ['first']})
             with self.assertRaisesRegex(RunScopeError, 'full family'):
                 ensure_run_scope(job_dir=tmp, production=True)

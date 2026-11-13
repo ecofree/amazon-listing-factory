@@ -32,9 +32,12 @@ class CategoryRouteResult:
     confidence: str = "low"
 
 
-def assert_family_matches_plugin(job_dir: str | Path, plugin: ProductPlugin) -> CategoryMatchResult:
+def assert_family_matches_plugin(job_dir: str | Path, plugin: ProductPlugin, *, work_children=()) -> CategoryMatchResult:
     family = read_product_family(job_dir)
     _assert_family_identity(family, plugin)
+    from .run_scope import scoped_family_children,execution_children
+    selected=execution_children(job_dir,work_children)
+    family = {**family, 'family': {**family['family'], 'children': [row for row in scoped_family_children(family, job_dir) if row['asin'] in selected]}}
     result = check_family_matches_plugin(family, plugin)
     if result.negative_hits or (_requires_positive(plugin) and not result.positive_hits):
         suggestion = ""
@@ -64,10 +67,11 @@ def _assert_family_identity(family: dict[str, Any], plugin: ProductPlugin) -> No
 def check_family_matches_plugin(family: dict[str, Any], plugin: ProductPlugin) -> CategoryMatchResult:
     text = _family_text(family)
     cfg = _match_config(plugin)
+    incompatible=len(_identity_archetypes(text))>1
     priority_hits = _hits(text, cfg.get("priority_keywords"))
     positive_hits = list(dict.fromkeys([*priority_hits, *_hits(text, cfg.get("positive_keywords"))]))
     raw_negative_hits = _hits(text, _match_config(plugin).get("negative_keywords"))
-    if priority_hits:
+    if priority_hits and not incompatible:
         raw_negative_hits = []
     target_score = _score_hits(positive_hits, raw_negative_hits)
     suggested_category = ""
@@ -85,8 +89,9 @@ def check_family_matches_plugin(family: dict[str, Any], plugin: ProductPlugin) -
             suggested_hits = candidate_hits
             suggested_score = candidate_score
     negative_hits = raw_negative_hits
-    if raw_negative_hits and positive_hits and target_score > 0 and target_score > suggested_score:
+    if raw_negative_hits and positive_hits and target_score > 0 and target_score > suggested_score and not incompatible:
         negative_hits = []
+    if incompatible:negative_hits=[*negative_hits,'conflicting_primary_product_types']
     return CategoryMatchResult(
         category_id=plugin.category_id,
         positive_hits=positive_hits,
@@ -98,8 +103,7 @@ def check_family_matches_plugin(family: dict[str, Any], plugin: ProductPlugin) -
 
 def guess_category_from_raw(raw: dict[str, Any]) -> CategoryRouteResult:
     title = str(raw.get("title") or raw.get("productTitle") or "").strip()
-    text = " ".join(_flatten_text(raw)).lower()
-    return guess_category_from_text(text, title=title)
+    return guess_category_from_text(_primary_identity_text(raw), title=title)
 
 
 def guess_category_from_text(text: str, *, title: str = "") -> CategoryRouteResult:
@@ -133,6 +137,7 @@ def guess_category_from_text(text: str, *, title: str = "") -> CategoryRouteResu
     # An ambiguous low-signal match is not a safe category decision.  Return
     # no route so the caller can request review instead of creating a job with
     # the wrong product manifest.
+    if len(_identity_archetypes(normalized))>1:confidence='low'
     if confidence == "low":
         best_category = ""
         best_hits = []
@@ -144,6 +149,16 @@ def guess_category_from_text(text: str, *, title: str = "") -> CategoryRouteResu
         all_scores=scores,
         confidence=confidence,
     )
+
+
+def _identity_archetypes(text: str) -> set[str]:
+    groups=set()
+    for plugin in discover_plugins().values():
+        cfg=_match_config(plugin)
+        if _hits(text,cfg.get('positive_keywords')) or _hits(text,cfg.get('priority_keywords')):
+            group=plugin.merged_config().get('archetype')
+            if group:groups.add(group)
+    return groups
 
 
 def _score_hits(positive_hits: list[str], negative_hits: list[str]) -> int:
@@ -179,56 +194,22 @@ def _keyword_in_text(needle: str, text: str) -> bool:
     return bool(re.search(pattern, text.lower()))
 
 
+def _primary_identity_text(raw: dict[str, Any]) -> str:
+    """Only direct product identity; recommendations/prose cannot vote on category."""
+    from products.generic_extractors import detail_rows,norm_key
+    parts=[]
+    for key in ('title','productTitle','productType','product_type','itemType','category','categoryName','categories','breadcrumbs'):
+        value=raw.get(key)
+        for item in value if isinstance(value,list) else [value]:
+            if isinstance(item,str):parts.append(item)
+            elif isinstance(item,dict):
+                parts.extend(item[k] for k in ('name','title') if isinstance(item.get(k),str))
+    parts.extend(value for _,label,value in detail_rows(raw)
+                 if norm_key(label) in {'producttype','itemtype','furnituretype','plantoranimalproducttype'})
+    return ' '.join(parts).lower()
+
+
 def _family_text(family: dict[str, Any]) -> str:
-    parts: list[str] = []
-    source = family.get("source")
-    if isinstance(source, dict):
-        parts.extend(_flatten_text(source.get("seed_asin")))
-    family_block = family.get("family")
-    if isinstance(family_block, dict):
-        parts.extend(_flatten_text(family_block.get("brand")))
-        parts.extend(_flatten_text(family_block.get("variation_theme")))
-        for child in family_block.get("children") or []:
-            if isinstance(child, dict):
-                for key in ("title", "bullets", "description"):
-                    parts.extend(_flatten_text(child.get(key)))
-                for key in ("specs", "variation_values", "product_specific"):
-                    parts.extend(_flatten_values(child.get(key)))
-    return " ".join(part.lower() for part in parts if part)
-
-
-def _flatten_text(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (int, float, bool)):
-        return [str(value)]
-    if isinstance(value, list):
-        out: list[str] = []
-        for item in value:
-            out.extend(_flatten_text(item))
-        return out
-    if isinstance(value, dict):
-        out: list[str] = []
-        for key, item in value.items():
-            out.extend(_flatten_text(key))
-            out.extend(_flatten_text(item))
-        return out
-    return [str(value)]
-
-
-def _flatten_values(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, dict):
-        out: list[str] = []
-        for item in value.values():
-            out.extend(_flatten_values(item))
-        return out
-    if isinstance(value, list):
-        out: list[str] = []
-        for item in value:
-            out.extend(_flatten_values(item))
-        return out
-    return _flatten_text(value)
+    # Assigned category/product_type is not independent evidence for itself.
+    return ' '.join(_primary_identity_text({'title':child.get('title'),'attributes':child.get('specs') or {}})
+                    for child in family.get('family',{}).get('children',[]) if isinstance(child,dict))

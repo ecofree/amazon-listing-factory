@@ -21,9 +21,10 @@ from .text_evidence import extract_measurements, us_measurement_text, measuremen
 
 
 class CopyWriterError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(self, message: str, *, retryable: bool = False, fields: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.fields = fields
 
 
 @dataclass(frozen=True)
@@ -40,12 +41,15 @@ class CopyWriterConfig:
     temperature: float = 0.15
     deadline_monotonic: float | None = None
     trace_dir: Path | None = None
+    receipt_root: Path | None = None
+    request_owners: tuple[str, ...] = ()
+    retry_received: bool = False
 
 
 COPY_CACHE_MAX_ENTRIES = 256
 _LOGGER = logging.getLogger(__name__)
 COPY_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
-COPY_WRITER_PROMPT_VERSION = "copy-writer-v27-authorized-facts"
+COPY_WRITER_PROMPT_VERSION = "copy-writer-v30-child-derived-parent"
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TITLE_PREFERRED_CHARS = 68
 TITLE_MAX_CHARS = 75
@@ -56,7 +60,6 @@ ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS = 120
 ITEM_HIGHLIGHT_SEPARATOR = ", "
 BULLET_PREFERRED_CHARS = BULLET_MODEL_MAX_CHARS = 120
 BULLET_AUDIT_MAX_CHARS = 150
-_BULLET_LENGTH_ISSUE_RE = re.compile(r"bullet\s+(\d+)\s+has\s+\d+", re.I)
 DESCRIPTION_MAX_CHARS = 2000
 _TITLE_DIMENSION_RE = re.compile(
     r"(?:\b(?:california\s+king|twin(?:\s+xl)?|full(?!-)|queen|king)\b|"
@@ -114,7 +117,7 @@ EXTERNAL_REFERENCE_PATTERNS = (
     re.compile(r"\bemail\s+us\b", re.I),
 )
 
-SPECIAL_TITLE_CHARS = re.compile(r"[~!*$?{}#<>@]")
+SPECIAL_TITLE_CHARS = re.compile(r"[~!*$?{}#<>@_^¬¦]")
 ALLOWED_TITLE_ACRONYMS = {"LED", "USB", "USB-C", "MDF", "PVC", "PE", "PEVA", "ABS", "R2"}
 
 COPY_SENSITIVE_PARAM_FRAGMENTS = (
@@ -216,12 +219,14 @@ def rewrite_listing_copy(
     product_specific: dict[str, Any],
     deadline_monotonic: float | None = None,
     trace_dir: Path | None = None,
+    receipt_root: Path | None = None, request_owners: tuple[str, ...] = (), retry_received: bool = False,
 ) -> dict[str, Any]:
-    config = replace(load_copy_writer_config(env), deadline_monotonic=deadline_monotonic, trace_dir=trace_dir)
+    config = replace(load_copy_writer_config(env), deadline_monotonic=deadline_monotonic, trace_dir=trace_dir,
+                     receipt_root=receipt_root, request_owners=request_owners, retry_received=retry_received)
     if not config.enabled:
-        raise CopyWriterError("Copy AI is disabled")
+        raise CopyWriterError('Copy AI is disabled',retryable=True)
     if not config.api_key:
-        raise CopyWriterError("Copy AI API key is not configured")
+        raise CopyWriterError('Copy AI API key is not configured',retryable=True)
     product_specific = _copy_safe_product_specific(product_specific, brand=brand, source_title=source_title)
     market_context = _copy_market_context(
         env=env,
@@ -354,10 +359,7 @@ def _loose_text_brand_candidate(value: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", "", text.lower())
     if not normalized:
         return False
-    if any(fragment in normalized for fragment in ("brand", "maker", "seller", "store", "shop", "merchant")):
-        return True
-    letters = re.sub(r"[^A-Za-z]+", "", text)
-    return bool(letters) and letters == letters.upper() and len(letters) >= 3
+    return any(fragment in normalized for fragment in ("brand", "maker", "seller", "store", "shop", "merchant"))
 
 
 def _collect_brand_candidates(value: Any, candidates: list[str]) -> None:
@@ -440,7 +442,11 @@ def _rewrite_listing_copy_with_openai(
     forbidden_reference_brands: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     row_scope = (
-        "Parent row: use only family-common known_product_facts; omit child color, size, style, and other variation values."
+        "Parent row: source.description contains validated child listings. Summarize their shared identity and benefits; "
+        "omit child-specific size, color, style, light/tip counts and other differences. Different included light counts "
+        "do not mean unlit. A mixed lit/unlit family must omit a family-wide lighting assertion. Original child facts "
+        "in _child_facts remain constraints, not extra claims. Do not invent negatives from missing common fields. "
+        "Parent may return empty highlights and zero to five shared bullets; never repeat benefits to fill space."
         if str(row_type).strip().lower() == "parent"
         else "Child row: use only this child's supplied facts and variation values."
     )
@@ -467,6 +473,7 @@ def _rewrite_listing_copy_with_openai(
                     f"- Title hard max: {TITLE_MAX_CHARS} characters.\n"
                     "- Use operator-style title thinking: broad high-traffic terms are category anchors, not enough by themselves. Add source-supported qualifiers that narrow competition and match buyer intent, such as tall, narrow, slim, floor, freestanding, height, size, door/shelf count, pack count, no box spring needed, or maintenance-free.\n"
                     "- Title priority is: confirmed size when used, exact product entity, competition-narrowing qualifier, purchase-decision parameter, then precise use scenario. Cut generic scene words before hard facts.\n"
+                    "- Keep the supplied product subtype (for example cactus, olive, bunk or mirrored) in the title; do not generalize it away. Each bullet should cover a different evidenced purchase benefit, not paraphrase the same benefit.\n"
                     "- If the title includes a confirmed size or product dimension, put that size at the very beginning. Never move a size to the end. Example: '67 Inch Tall Bathroom Cabinet for Narrow Spaces'.\n"
                     "- Write one natural title phrase. Do not use vertical bars or other marketing separators.\n"
                     "- Move low-title-signal accessory or compliance details to bullets/description unless market references clearly support them in titles. This includes anti-tipping devices, wall anchors, rubber feet, included hardware, planter color, pot color, decorative trunk material, and assembly instructions.\n"
@@ -481,6 +488,7 @@ def _rewrite_listing_copy_with_openai(
                     "Positive retail writing guidance:\n"
                     "- Write like a senior Amazon US listing specialist: concrete, buyer-aware, and specific without hype.\n"
                     "- Bullet hierarchy: 1 primary buyer benefit, 2 key differentiator, 3 practical dimensions/capacity/fit, 4 durability or trust signal, 5 included parts/setup/maintenance.\n"
+                    "- Express measurements using digits and explicit units. Keep the actual product/part, axis and bound/range qualifier. Label each axis in a dimension chain (L/W/H/D); do not invent a convention or copy a component size as an overall size.\n"
                     "- Start bullets with varied benefit-led labels; do not reuse the same opener pattern.\n"
                     "- Prefer measurable facts and buyer situations over generic phrases. '66 lb per shelf' beats 'sturdy construction'.\n"
                     "- Avoid AI filler phrases such as suitable for, straightforward, designed to, premium, best, perfect, and versatile placement unless the phrase is unavoidable in a supplied fact.\n"
@@ -568,7 +576,7 @@ def _rewrite_listing_copy_with_openai(
                              "title": f"brandless natural phrase preferably <={TITLE_PREFERRED_CHARS} chars, hard max <={TITLE_MAX_CHARS} chars; if a confirmed size is used it must be the first phrase",
                              "item_highlights": f"array of {ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} distinct source-supported phrases, each 2-{ITEM_HIGHLIGHT_MAX_WORDS} words; their comma-and-space joined text must be under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters",
                              "bullets": [
-                                f"exactly five strings, target <={BULLET_MODEL_MAX_CHARS} chars, audit hard max <={BULLET_AUDIT_MAX_CHARS} chars",
+                                ("zero to five shared strings" if row_type.casefold() == 'parent' else "exactly five strings") + f", target <={BULLET_MODEL_MAX_CHARS} chars, audit hard max <={BULLET_AUDIT_MAX_CHARS} chars",
                                 "each bullet starts with CAPITALIZED FEATURE LABEL: followed by description",
                                 "each bullet focuses on a different selling point",
                             ],
@@ -590,8 +598,17 @@ def _rewrite_listing_copy_with_openai(
     product_specific = {**product_specific, 'source_description': source_for_model['description']}
     result: dict[str, Any] | None = None
     parse_attempts = 3
+    repair_fields: tuple[str, ...] = ()
+    invalid_copy = None
     for attempt in range(1, parse_attempts + 1):
         body = _post_chat_completion(config, payload)
+        if repair_fields:
+            try:
+                body = _merge_copy_repair(invalid_copy, body, repair_fields)
+            except CopyWriterError as exc:
+                if attempt >= parse_attempts:raise CopyWriterError(str(exc), retryable=True) from exc
+                payload = _copy_validation_repair_payload(payload, str(exc), invalid_body=_copy_body(invalid_copy), failed_fields=repair_fields)
+                continue
         try:
             result = _parse_copy_response(
                 body,
@@ -611,48 +628,11 @@ def _rewrite_listing_copy_with_openai(
                     raise CopyWriterError(str(exc), retryable=True) from exc
                 payload = _copy_json_repair_payload(payload, error_text, invalid_body=body)
                 continue
-            if _only_title_validation_errors(error_text):
-                result = _repair_title_only_with_ai(
-                    config=config,
-                    row_type=row_type,
-                    invalid_body=body,
-                    validation_error=error_text,
-                    category=category,
-                    product_specific=product_specific,
-                    brand=brand,
-                    market_context=market_context,
-                    forbidden_reference_brands=forbidden_reference_brands,
-                )
-                break
-            if _only_item_highlight_validation_errors(error_text):
-                result = _repair_item_highlights_only_with_ai(
-                    config=config,
-                    row_type=row_type,
-                    invalid_body=body,
-                    source_item_highlights=list(_copy_payload_user(payload).get("source", {}).get("item_highlights") or []),
-                    category=category,
-                    product_specific=product_specific,
-                    brand=brand,
-                    market_context=market_context,
-                    forbidden_reference_brands=forbidden_reference_brands,
-                )
-                break
-            if _only_bullet_length_errors(error_text):
-                result = _repair_long_bullets_with_ai(
-                    config=config,
-                    row_type=row_type,
-                    invalid_body=body,
-                    validation_error=error_text,
-                    category=category,
-                    product_specific=product_specific,
-                    brand=brand,
-                    market_context=market_context,
-                    forbidden_reference_brands=forbidden_reference_brands,
-                )
-                break
             if attempt >= parse_attempts:
                 raise CopyWriterError(str(exc), retryable=True) from exc
-            payload = _copy_validation_repair_payload(payload, error_text, invalid_body=body)
+            if not exc.fields:raise
+            repair_fields=exc.fields;invalid_copy=_copy_response_content_object(body)
+            payload = _copy_validation_repair_payload(payload, error_text, invalid_body=body, failed_fields=repair_fields)
     if result is None:
         raise CopyWriterError("Copy AI response could not be parsed", retryable=True)
     result["_provider"] = config.base_url
@@ -690,7 +670,7 @@ def _copy_json_repair_payload(
         "required_keys": ["title", "item_highlights", "bullets", "description"],
         "title": "string only",
         "item_highlights": ("empty array allowed for Parent; otherwise " if str(user_payload.get("row_type", "")).lower() == "parent" else "") + f"array of {ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} strings whose comma-separated total is under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters",
-        "bullets": "array of exactly five strings",
+        "bullets": "array of zero to five shared strings" if str(user_payload.get('row_type', '')).casefold() == 'parent' else "array of exactly five strings",
         "description": "string only",
         "forbidden_output": [
             "reasoning",
@@ -726,11 +706,19 @@ def _copy_json_repair_payload(
 
 
 def _copy_validation_repair_payload(
-    payload: dict[str, Any], error_text: str, *, invalid_body: str,
+    payload: dict[str, Any], error_text: str, *, invalid_body: str, failed_fields: tuple[str, ...],
 ) -> dict[str, Any]:
     repaired = _copy_payload_clone(payload)
     user_payload = _copy_payload_user(repaired)
-    user_payload["task"] = "Regenerate the final listing copy and correct the validation error."
+    invalid = _copy_response_content_object(invalid_body)
+    indexes = [int(field[8:-1]) for field in failed_fields if field.startswith('bullets[')]
+    output_keys = [field for field in failed_fields if not field.startswith('bullets[')]
+    if indexes:output_keys.append('replacement_bullets')
+    user_payload['failed_fields'] = list(failed_fields)
+    user_payload['output_keys'] = output_keys
+    user_payload['invalid_bullets'] = [{'index':i+1,'text':invalid['bullets'][i]} for i in indexes]
+    user_payload['source_item_highlights'] = list(user_payload.get('source',{}).get('item_highlights') or [])
+    user_payload["task"] = "Repair every listed failed field together. Other fields and bullet indexes are immutable."
     user_payload["validation_error"] = _response_snippet(error_text, limit=1000)
     user_payload["invalid_copy_to_repair"] = _copy_invalid_response_text(invalid_body)
     if "title exceeds" in error_text.lower():
@@ -769,7 +757,7 @@ def _copy_validation_repair_payload(
             "forbidden": "Do not return sentences, duplicate phrases, copied source statements, unsupported claims, or an empty Child array.",
         }
     user_payload["repair_rules"] = [
-        "Return exactly title, item_highlights, bullets, and description as JSON.",
+        "Return only output_keys as JSON. replacement_bullets is an array of {index: one-based original index, text: replacement} for exactly the requested indexes.",
         "Count every character including spaces and punctuation before returning.",
         f"Keep the title at or below {TITLE_MAX_CHARS} characters.",
         f"Keep every bullet at or below {BULLET_AUDIT_MAX_CHARS} characters and target {BULLET_MODEL_MAX_CHARS}.",
@@ -783,7 +771,7 @@ def _copy_validation_repair_payload(
             "role": "system",
             "content": (
                 "Repair Amazon listing copy after deterministic validation. Return one strict JSON object only. "
-                "Obey the shorter repair limits in repair_rules. Do not explain the correction or add facts."
+                "Preserve exact product structure nouns. Obey repair_rules and output_keys. Do not explain the correction or add facts."
             ),
         },
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -792,272 +780,34 @@ def _copy_validation_repair_payload(
     return repaired
 
 
-def _only_title_validation_errors(error_text: str) -> bool:
-    issues = [part.strip().lower() for part in str(error_text or "").split(";") if part.strip()]
-    return bool(issues) and all("title" in issue and "item_highlights" not in issue for issue in issues)
+def _copy_body(value: dict[str, Any]) -> str:
+    return json.dumps({'choices':[{'message':{'content':json.dumps(value,ensure_ascii=False)}}]})
 
 
-def _only_bullet_length_errors(error_text: str) -> bool:
-    issues = [part.strip() for part in str(error_text or "").split(";") if part.strip()]
-    return bool(issues) and all(_BULLET_LENGTH_ISSUE_RE.search(issue) for issue in issues)
-
-
-def _only_item_highlight_validation_errors(error_text: str) -> bool:
-    issues = [part.strip().lower() for part in str(error_text or "").split(";") if part.strip()]
-    return bool(issues) and all("item highlight" in issue for issue in issues)
-
-
-def _repair_long_bullets_with_ai(
-    *,
-    config: CopyWriterConfig,
-    row_type: str,
-    invalid_body: str,
-    validation_error: str,
-    category: str,
-    product_specific: dict[str, Any],
-    brand: str,
-    market_context: dict[str, Any] | None,
-    forbidden_reference_brands: tuple[str, ...],
-) -> dict[str, Any]:
-    invalid = _copy_response_content_object(invalid_body)
-    if set(invalid) != {"title", "item_highlights", "bullets", "description"}:
-        raise CopyWriterError("Bullet repair requires a complete validated copy object")
-    bullets = invalid.get("bullets")
-    indexes = sorted({int(match.group(1)) - 1 for match in _BULLET_LENGTH_ISSUE_RE.finditer(validation_error)})
-    if not isinstance(bullets, list) or not indexes or any(index < 0 or index >= len(bullets) for index in indexes):
-        raise CopyWriterError("Bullet repair could not identify the invalid bullet")
-    repair_payload: dict[str, Any] = {
-        "model": config.model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Shorten only the supplied Amazon bullet points. Return strict JSON with exactly one key "
-                    "named replacement_bullets. Preserve each index and its source-supported meaning. "
-                    "Do not add facts or explain."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "invalid_bullets": [
-                            {"index": index + 1, "text": str(bullets[index])}
-                            for index in indexes
-                        ],
-                        "contract": {
-                            "target": "105 characters or fewer per bullet",
-                            "hard_limit": f"{BULLET_MODEL_MAX_CHARS} characters per bullet including spaces and punctuation",
-                            "shape": "Short Title Case Label: one concrete buyer benefit",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 700,
-    }
-    if config.json_mode:
-        repair_payload["response_format"] = {"type": "json_object"}
-    expected = {index + 1 for index in indexes}
-    last_error: CopyWriterError | None = None
-    for _ in range(2):
-        repaired_body = _post_chat_completion(config, repair_payload)
-        repaired = _copy_response_content_object(repaired_body)
-        rows = repaired.get("replacement_bullets") if set(repaired) == {"replacement_bullets"} else None
-        replacements = {
-            int(row.get("index")): _model_text(row.get("text"))
-            for row in rows or []
-            if isinstance(row, dict) and str(row.get("index") or "").isdigit()
-        }
-        if set(replacements) != expected or any(
-            not text or len(text) > BULLET_MODEL_MAX_CHARS for text in replacements.values()
-        ):
-            last_error = CopyWriterError("Copy bullet repair did not return every requested bullet within the hard limit")
-            continue
-        merged_bullets = list(bullets)
-        for one_based, text in replacements.items():
-            merged_bullets[one_based - 1] = text
-        merged = {**invalid, "bullets": merged_bullets}
-        merged_body = json.dumps({"choices": [{"message": {"content": json.dumps(merged, ensure_ascii=False)}}]})
-        return _parse_copy_response(
-            merged_body,
-            category=category,
-            row_type=row_type,
-            product_specific=product_specific,
-            brand=brand,
-            market_context=market_context,
-            forbidden_reference_brands=forbidden_reference_brands,
-        )
-    raise CopyWriterError(
-        str(last_error or "Copy bullet repair failed"), retryable=True,
-    ) from last_error
-
-
-def _repair_title_only_with_ai(
-    *,
-    config: CopyWriterConfig,
-    row_type: str,
-    invalid_body: str,
-    validation_error: str,
-    category: str,
-    product_specific: dict[str, Any],
-    brand: str,
-    market_context: dict[str, Any] | None,
-    forbidden_reference_brands: tuple[str, ...],
-) -> dict[str, Any]:
-    invalid = _copy_response_content_object(invalid_body)
-    if set(invalid) != {"title", "item_highlights", "bullets", "description"}:
-        raise CopyWriterError("Title repair requires a complete validated copy object")
-    repair_payload: dict[str, Any] = {
-        "model": config.model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Compress one Amazon US title. Return JSON with exactly one key named title. "
-                    "Use only words and facts already present in the supplied title. Preserve exact product structure nouns; do not replace them with near synonyms. Remove every brand name and vertical bar. "
-                    "If the title contains a size or dimension, keep it at the beginning. "
-                    "Count every character including spaces and punctuation. Do not explain."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "invalid_title": str(invalid.get("title") or ""),
-                        "validation_error": str(validation_error or "")[:500],
-                        "title_only_contract": {
-                            "target": "55 characters or fewer",
-                            "hard_limit": f"{TITLE_MAX_CHARS} characters",
-                            "shape": "confirmed size first when present + compact product noun + one strongest existing qualifier",
-                            "ending": "end with the product noun or a descriptive word; never end with a standalone measurement, weight, model code, separator, or punctuation",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 300,
-    }
-    if config.json_mode:
-        repair_payload["response_format"] = {"type": "json_object"}
-    last_error: CopyWriterError | None = None
-    for _ in range(2):
-        repaired_body = _post_chat_completion(config, repair_payload)
-        repaired = _copy_response_content_object(repaired_body)
-        title = _model_text(repaired.get("title")) if set(repaired) == {"title"} and isinstance(repaired.get("title"), str) else ""
-        if not title:
-            last_error = CopyWriterError("Copy title repair did not return exactly one title string")
-            continue
-        merged = {**invalid, "title": title}
-        merged_body = json.dumps({"choices": [{"message": {"content": json.dumps(merged, ensure_ascii=False)}}]})
-        try:
-            return _parse_copy_response(
-                merged_body,
-                category=category,
-                row_type=row_type,
-                product_specific=product_specific,
-                brand=brand,
-                market_context=market_context,
-                forbidden_reference_brands=forbidden_reference_brands,
-            )
-        except CopyWriterError as exc:
-            last_error = exc
-            repair_payload["messages"][1]["content"] = json.dumps(
-                {
-                    "invalid_title": title,
-                    "validation_error": str(exc),
-                    "title_only_contract": {
-                        "target": "50 characters or fewer",
-                        "hard_limit": f"{TITLE_MAX_CHARS} characters",
-                        "shape": "confirmed size first when present + compact product noun + one existing qualifier",
-                    },
-                },
-                ensure_ascii=False,
-            )
-    raise CopyWriterError(
-        str(last_error or "Copy title repair failed"), retryable=True,
-    ) from last_error
-
-
-def _repair_item_highlights_only_with_ai(
-    *,
-    config: CopyWriterConfig,
-    row_type: str,
-    invalid_body: str,
-    source_item_highlights: list[str],
-    category: str,
-    product_specific: dict[str, Any],
-    brand: str,
-    market_context: dict[str, Any] | None,
-    forbidden_reference_brands: tuple[str, ...],
-) -> dict[str, Any]:
-    invalid = _copy_response_content_object(invalid_body)
-    if set(invalid) != {"title", "item_highlights", "bullets", "description"}:
-        raise CopyWriterError("Item Highlight repair requires a complete validated copy object")
-    repair_payload: dict[str, Any] = {
-        "model": config.model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Repair only the supplied Amazon Item Highlights. Return strict JSON with exactly one key "
-                    "named item_highlights. Use short distinct phrases supported by the supplied candidates. "
-                    "Do not add facts or explain."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "invalid_item_highlights": invalid.get("item_highlights"),
-                        "source_item_highlights": source_item_highlights,
-                        "contract": {
-                            "count": ("0 or " if row_type.lower() == "parent" else "") + f"{ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT}",
-                            "words_per_phrase": f"2-{ITEM_HIGHLIGHT_MAX_WORDS}",
-                            "joined_limit": f"under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters including comma-and-space separators",
-                            "separator": ITEM_HIGHLIGHT_SEPARATOR,
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 500,
-    }
-    if config.json_mode:
-        repair_payload["response_format"] = {"type": "json_object"}
-    repaired_body = _post_chat_completion(config, repair_payload)
-    repaired = _copy_response_content_object(repaired_body)
-    # The repair contract asks for one key, but some compatible endpoints
-    # return the complete copy object. The highlights field is still read
-    # under the same source/fact validation below; accepting that harmless
-    # envelope avoids turning a formatting variation into a child blocker.
-    highlights = repaired.get("item_highlights") if isinstance(repaired, dict) else None
-    if not isinstance(highlights, list) or not all(isinstance(item, str) for item in highlights):
-        raise CopyWriterError(
-            "Copy Item Highlight repair did not return an item_highlights string array",
-            retryable=True,
-        )
-    selected = _select_item_highlights_within_budget(highlights)
-    merged = {**invalid, "item_highlights": selected}
-    merged_body = json.dumps({"choices": [{"message": {"content": json.dumps(merged, ensure_ascii=False)}}]})
-    try:
-        return _parse_copy_response(
-            merged_body,
-            category=category,
-            row_type=row_type,
-            product_specific=product_specific,
-            brand=brand,
-            market_context=market_context,
-            forbidden_reference_brands=forbidden_reference_brands,
-        )
-    except CopyWriterError as exc:
-        raise CopyWriterError(str(exc), retryable=True) from exc
+def _merge_copy_repair(invalid: dict[str, Any], body: str, fields: tuple[str, ...]) -> str:
+    repaired = _copy_response_content_object(body)
+    merged = {**invalid}
+    if isinstance(invalid.get('bullets'),list):merged['bullets']=list(invalid['bullets'])
+    for field in fields:
+        if field.startswith('bullets['):continue
+        if field not in repaired:raise CopyWriterError('Copy repair omitted failed field: '+field)
+        merged[field] = repaired[field]
+    indexes = {int(field[8:-1]) for field in fields if field.startswith('bullets[')}
+    if indexes:
+        if isinstance(repaired.get('bullets'),list) and len(repaired['bullets'])==5:
+            replacements = {i:repaired['bullets'][i] for i in indexes}
+        else:
+            rows=repaired.get('replacement_bullets')
+            if (not isinstance(rows,list) or any(not isinstance(r,dict) or set(r)!={'index','text'}
+                    or type(r['index']) is not int for r in rows)):
+                raise CopyWriterError('Copy repair requires indexed replacement_bullets')
+            replacements={r['index']-1:r['text'] for r in rows}
+            if len(rows)!=len(replacements):raise CopyWriterError('Copy repair repeated a bullet index')
+        if set(replacements)!=indexes:raise CopyWriterError('Copy repair changed or omitted requested bullet indexes')
+        for i,text in replacements.items():merged['bullets'][i]=text
+    if 'item_highlights' in fields and isinstance(merged['item_highlights'],list) and all(isinstance(t,str) for t in merged['item_highlights']):
+        merged['item_highlights']=_select_item_highlights_within_budget(merged['item_highlights'])
+    return _copy_body(merged)
 
 
 def _select_item_highlights_within_budget(values: list[str]) -> list[str]:
@@ -1251,6 +1001,9 @@ def _concrete_prompt_facts(product_specific: dict[str, Any]) -> dict[str, str]:
         "size",
         "material",
         "frame_material",
+        "top_material",
+        "leaf_material",
+        "trunk_material",
         "finish_type",
         "color",
         "mounting_type",
@@ -1329,6 +1082,16 @@ def rewrite_title(**kwargs: Any) -> str:
 
 
 def _post_chat_completion(config: CopyWriterConfig, payload: dict[str, Any]) -> str:
+    from .service_response import perform_request, known_unsent, ServiceOutcomeUnknown
+    if config.deadline_monotonic is not None and config.deadline_monotonic <= time.monotonic():
+        raise CopyWriterError('Copy execution deadline exhausted before request', retryable=True)
+    root = config.receipt_root or (config.trace_dir / 'requests' if config.trace_dir else None)
+    if root is None:
+        raise CopyWriterError('Copy POST requires durable request context; no request sent')
+    if not config.request_owners and config.trace_dir is None:
+        raise CopyWriterError('Copy POST requires stable logical request owners; no request sent')
+    owners = list(config.request_owners) or ['copy:' + str(config.trace_dir.resolve())]
+    identity = {'operation': 'copy_completion', 'provider': copy_request_identity(config), 'payload': payload}
     attempts = _copy_retry_attempts(config)
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -1349,10 +1112,21 @@ def _post_chat_completion(config: CopyWriterConfig, payload: dict[str, Any]) -> 
             if timeout <= 0:
                 raise CopyWriterError("Copy execution deadline exhausted before request", retryable=True)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = response.read().decode("utf-8", errors="replace")
-                _copy_trace(config, trace_id, 'response.txt', body)
-                return body
+            def send():
+                from .batch_ledger import admit_paid_request
+                from .service_response import prepare_request,start_submission
+                with prepare_request():admit_paid_request('copy')
+                start_submission()
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.read(16 * 1024 * 1024 + 1)
+            def rejected(exc):
+                return known_unsent(exc) or (isinstance(exc, urllib.error.HTTPError) and exc.code in {400, 401, 403, 404, 422, 429})
+            raw = perform_request(root, owners, identity, send, known_not_executed=rejected, retry_received=config.retry_received)
+            body = raw.decode('utf-8', errors='replace')
+            _copy_trace(config, trace_id, 'response.txt', body)
+            return body
+        except ServiceOutcomeUnknown as exc:
+            raise CopyWriterError(str(exc), retryable=False) from exc
         except urllib.error.HTTPError as exc:
             last_exc = exc
             if exc.code not in COPY_RETRY_STATUS_CODES or attempt >= attempts:
@@ -1366,7 +1140,8 @@ def _post_chat_completion(config: CopyWriterConfig, payload: dict[str, Any]) -> 
             if attempt >= attempts:
                 raise CopyWriterError(f"Copy AI request failed: {exc}", retryable=True) from exc
         except Exception as exc:
-            raise CopyWriterError(f"Copy AI request failed: {exc}") from exc
+            from .service_response import RequestNotSent
+            raise CopyWriterError(f'Copy AI request failed: {exc}',retryable=isinstance(exc,RequestNotSent)) from exc
         _sleep_before_copy_retry(attempt, config)
     raise CopyWriterError(
         f"Copy AI request failed after {attempts} attempts: {last_exc}", retryable=True
@@ -1431,44 +1206,59 @@ def _parse_copy_response(
     if set(parsed) != {"title", "item_highlights", "bullets", "description"}:
         raise CopyWriterError("Copy AI response must contain title, item_highlights, bullets, and description keys only")
     if not all(isinstance(parsed.get(key), str) for key in ("title", "description")):
-        raise CopyWriterError("Copy AI title and description must be strings")
+        raise CopyWriterError("Copy AI title and description must be strings",fields=tuple(k for k in ('title','description') if not isinstance(parsed[k],str)))
     item_highlights_raw = parsed.get("item_highlights")
     if not isinstance(item_highlights_raw, list) or not all(isinstance(item, str) for item in item_highlights_raw):
-        raise CopyWriterError("Copy AI item_highlights must be an array of strings")
+        raise CopyWriterError("Copy AI item_highlights must be an array of strings",fields=('item_highlights',))
     bullets_raw = parsed.get("bullets")
-    if not isinstance(bullets_raw, list) or len(bullets_raw) != 5 or not all(isinstance(item, str) for item in bullets_raw):
-        raise CopyWriterError("Copy AI response must contain exactly five string bullets")
+    if (not isinstance(bullets_raw, list) or (len(bullets_raw) > 5 if str(row_type).casefold() == 'parent' else len(bullets_raw) != 5)
+            or not all(isinstance(item, str) for item in bullets_raw)):
+        raise CopyWriterError("Copy AI response bullet count is invalid for its row type",fields=('bullets',))
     title = _model_text(us_measurement_text(parsed["title"]))
     item_highlights = _normalize_item_highlights([us_measurement_text(item) for item in item_highlights_raw])
     optional_parent_highlights = str(row_type or "").strip().casefold() == "parent" and not item_highlights
     bullets = [_model_text(us_measurement_text(item)) for item in bullets_raw]
     description = _model_text(us_measurement_text(parsed["description"]))
     if not title or not description or any(not item for item in item_highlights) or any(not item for item in bullets):
-        raise CopyWriterError("Copy AI response missed title, bullets, or description")
+        empty=[k for k,v in (('title',title),('description',description)) if not v]
+        if any(not v for v in item_highlights):empty.append('item_highlights')
+        empty.extend(f'bullets[{i}]' for i,v in enumerate(bullets) if not v)
+        raise CopyWriterError("Copy AI response missed title, bullets, or description",fields=tuple(empty))
     validation_result = {"title": title, "item_highlights": item_highlights, "bullets": bullets, "description": description}
     issues: list[str] = []
+    failed: set[str] = set()
     if brand and _contains_reference_brand_text(title, (brand,)):
         issues.append("Copy AI title must not contain the requested brand")
+        failed.add('title')
     try:
         _validate_no_reference_brands(validation_result, forbidden_reference_brands)
     except CopyWriterError as exc:
         issues.append(str(exc))
+        for field,value in _copy_field_values(validation_result):
+            if _contains_reference_brand_text(' '.join(value) if isinstance(value,list) else value,forbidden_reference_brands):failed.add(field)
     if len(title) > TITLE_MAX_CHARS:
         issues.append(f"Copy title exceeds {TITLE_MAX_CHARS} characters")
+        failed.add('title')
     if "|" in title:
         issues.append("Copy title must not contain vertical bars")
+        failed.add('title')
     title_dimension = _TITLE_DIMENSION_RE.search(title)
     if title_dimension and not _TITLE_DIMENSION_RE.match(title):
         issues.append("Copy title size or dimension must appear at the beginning")
+        failed.add('title')
     normalized_highlights = [re.sub(r"\W+", " ", item.casefold()).strip() for item in item_highlights]
     if not optional_parent_highlights and not ITEM_HIGHLIGHT_MIN_COUNT <= len(item_highlights) <= ITEM_HIGHLIGHT_MAX_COUNT:
         issues.append(f"Copy Item Highlights must contain {ITEM_HIGHLIGHT_MIN_COUNT}-{ITEM_HIGHLIGHT_MAX_COUNT} phrases")
+        failed.add('item_highlights')
     if not optional_parent_highlights and any(not 2 <= len(item.split()) <= ITEM_HIGHLIGHT_MAX_WORDS for item in item_highlights):
         issues.append(f"Copy Item Highlight phrases must contain 2-{ITEM_HIGHLIGHT_MAX_WORDS} words each")
+        failed.add('item_highlights')
     if not optional_parent_highlights and len(set(normalized_highlights)) != len(normalized_highlights):
         issues.append("Copy Item Highlights must be distinct")
+        failed.add('item_highlights')
     if not optional_parent_highlights and len(ITEM_HIGHLIGHT_SEPARATOR.join(item_highlights)) >= ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS:
         issues.append(f"Copy Item Highlights joined text must be under {ITEM_HIGHLIGHT_TOTAL_LIMIT_CHARS} characters")
+        failed.add('item_highlights')
     oversized = [
         (index + 1, len(item))
         for index, item in enumerate(bullets)
@@ -1477,13 +1267,17 @@ def _parse_copy_response(
     if oversized:
         details = ", ".join(f"bullet {index} has {length}" for index, length in oversized)
         issues.append(f"Copy bullet exceeds {BULLET_AUDIT_MAX_CHARS} characters: {details}")
+        failed.update(f'bullets[{index-1}]' for index,_ in oversized)
     if len(description) > DESCRIPTION_MAX_CHARS:
         issues.append(f"Copy description exceeds {DESCRIPTION_MAX_CHARS} characters")
+        failed.add('description')
     if re.search(r"(?:&|\band|\bwith|\bfor|\bof|\||[,;:])\s*$", title, flags=re.I):
         issues.append("Copy title ends with an incomplete phrase")
+        failed.add('title')
     normalized_bullets = [re.sub(r"\W+", " ", item.lower()).strip() for item in bullets]
     if len(set(normalized_bullets)) < len(normalized_bullets):
         issues.append("Copy AI response contains duplicate bullets")
+        failed.update(f'bullets[{i}]' for i,text in enumerate(normalized_bullets) if normalized_bullets.count(text)>1)
     # Claim support comes from structured product facts only; raw source
     # (reference listing) text must never authorize a claim in our copy.
     try:
@@ -1494,9 +1288,20 @@ def _parse_copy_response(
         )
     except CopyWriterError as exc:
         issues.append(str(exc))
+        for field,value in _copy_field_values(validation_result):
+            one={key:[] if key in {'bullets','item_highlights'} else '' for key in validation_result}
+            if field.startswith('bullets['):one['bullets']=[value]
+            else:one[field]=value
+            try:_validate_copy_compliance(one,category=category,product_specific=product_specific or {})
+            except CopyWriterError:failed.add(field)
     if issues:
-        raise CopyWriterError("; ".join(dict.fromkeys(issues)))
+        raise CopyWriterError("; ".join(dict.fromkeys(issues)),fields=tuple(sorted(failed)))
     return {"title": title, "item_highlights": item_highlights, "bullets": bullets, "description": description}
+
+
+def _copy_field_values(result):
+    return [('title',result['title']),('item_highlights',result['item_highlights']),
+            *[(f'bullets[{i}]',text) for i,text in enumerate(result['bullets'])],('description',result['description'])]
 
 
 def _model_text(value: str) -> str:
@@ -1623,7 +1428,29 @@ def _validate_copy_compliance(
               str(result.get("description") or "")]
     text = "\n".join(str(value) for value in fields if value)
     fact_text = json.dumps(product_specific or {}, ensure_ascii=False, sort_keys=True, default=str).lower()
-    violations: list[str] = ["resolved fact contradiction: " + key for key in fact_statement_issues(text, product_specific.get("_fact_resolutions") or {})]
+    violations: list[str] = ["resolved fact contradiction: " + key for key in fact_statement_issues(text, product_specific.get("_fact_resolutions") or {}, product_title=category.replace('_', ' '))]
+    if category.replace('_', ' ').casefold() == 'artificial tree':
+        subtype = str(product_specific.get('tree_type') or '').strip()
+        if (re.fullmatch(r'[A-Za-z]+', subtype) and subtype.casefold() not in {'tree', 'artificial', 'plant', 'christmas', 'other'}
+                and title and not re.search(r'\b' + re.escape(subtype) + r'\b', title, re.I)):
+            violations.append('title omits confirmed tree subtype: ' + subtype)
+        members = product_specific.get('_child_facts') or [product_specific]
+        negative = bool(re.search(r'\bunlit\b|\b(?:without|no) (?:built[- ]in |included |pre[- ]installed )?lights\b|\blights (?:are )?not included\b', text, re.I))
+        positive = bool(re.search(r'\bpre[- ]?lit\b|\b(?:includes?|included|built[- ]in|pre[- ]installed) (?:\d+ )?(?:LED )?lights\b', text, re.I))
+        states = []
+        for member in members:
+            count = str(member.get('light_count', '')).replace(',', '').strip()
+            state = (float(count) > 0) if re.fullmatch(r'\d+(?:\.\d+)?', count) else None
+            if state is None:
+                state = {'true':True,'false':False}.get(str(member.get('light_included', '')).casefold())
+            if state is None and str(member.get('light_type', '')).casefold() in {'unlit', 'no lights', 'none'}:
+                state = False
+            states.append(state)
+        if (negative and not all(state is False for state in states)) or (positive and any(state is False for state in states)):
+            violations.append('lighting inclusion contradicts supplied child facts')
+    from .copy_measurements import copy_measurement_issues, bind_copy_quantity_claims
+    violations.extend(copy_measurement_issues([str(value) for value in fields], product_specific))
+    violations.extend(bind_copy_quantity_claims({str(i):str(value) for i,value in enumerate(fields)}, product_specific, category=category)['issues'])
     for pattern in HARD_SUBJECTIVE_FORBIDDEN_PATTERNS:
         match = pattern.search(text)
         if match:
@@ -1678,14 +1505,7 @@ def _validate_copy_compliance(
                 if not supports_fact(product_specific, exact, claim_context=sentence):
                     violations.append("unsupported " + label)
     capacity_claim = re.search(r"\b(?:weight capacity|load capacity|supports up to|holds up to|up to \d+ ?(?:lb|lbs|pounds|kg))\b", text, re.I)
-    capacity_fact = re.search(
-        r"\b(?:weight_capacity|load_capacity|maximum_weight|max_weight|weight capacity|load capacity|capacity of|supports up to|holds up to)\b",
-        fact_text,
-        re.I,
-    )
-    if capacity_claim and not capacity_fact:
-        violations.append("unsupported weight capacity")
-    if capacity_claim and capacity_fact:
+    if capacity_claim:
         capacity_terms = r"(?:weight[_ ]capacity|load[_ ]capacity|maximum[_ ]weight|max[_ ]weight|capacity of|supports up to|holds up to|up to)"
         def capacity_values(value: Any, context: str = "") -> list[tuple[str, str]]:
             if isinstance(value, dict):
@@ -1701,13 +1521,16 @@ def _validate_copy_compliance(
             if isinstance(value, list):
                 return [number for item in value for number in capacity_values(item, context)]
             content = str(value)
-            matches = list(re.finditer(r'\d+(?:\.\d+)?\s*-?\s*(?:pounds?|lbs?|kg|kilograms?)(?=$|[^A-Za-z]|Weight|Load|Total)', content, re.I))
+            matches = list(re.finditer(r'(?<![\w.])[+-]?\d+(?:\.\d+)?\s*-?\s*(?:pounds?|lbs?|kg|kilograms?)(?=$|[^A-Za-z]|Weight|Load|Total)', content, re.I))
             numbers = []
             for index, match in enumerate(matches):
                 before = content[matches[index-1].end() if index else 0:match.start()]
                 after = content[match.end():matches[index+1].start() if index+1 < len(matches) else len(content)]
                 before = re.split(r'[,;\n.!?]|\bwith\b', before, flags=re.I)[-1]
                 after = re.split(r'[,;\n.!?]|\bwith\b', after, flags=re.I)[0]
+                if float(re.match(r'[+-]?\d+(?:\.\d+)?', match[0])[0]) <= 0 or re.search(
+                        r'\b(?:not|no|unknown|unverified|unspecified|estimated|if)\b', before + ' ' + context, re.I):
+                    continue
                 post_object = re.search(r'\b(?:for (?:the |each )?|per )(shel(?:f|ves)|drawers?|top|tabletop)\b', after, re.I)
                 anchor = re.search(capacity_terms, before, re.I)
                 scope_text = before[anchor.start():] if anchor else before.rsplit(':', 1)[-1]
@@ -1727,7 +1550,9 @@ def _validate_copy_compliance(
 
         known_capacities = capacity_values(product_specific)
         claimed_capacities = capacity_values([title, *result.get('bullets', []), *result.get('item_highlights', []), result.get('description', '')])
-        if known_capacities and any(not any(owner == scope and measurement_values_match('Capacity: ' + known, value)
+        if not known_capacities or not claimed_capacities:
+            violations.append("unsupported weight capacity")
+        elif any(not any(owner == scope and measurement_values_match('Capacity: ' + known, value)
                        for owner, known in known_capacities) for scope, value in claimed_capacities):
             violations.append("weight capacity value contradicts product facts")
     if violations:

@@ -6,7 +6,7 @@ from typing import Any
 from . import api_registry
 
 
-MODEL_SCOPES = {"vision_qa", "visual_planning"}
+MODEL_SCOPES = {"visual_planning", "vision_qa"}
 
 
 class ModelRouterError(RuntimeError):
@@ -47,14 +47,27 @@ def provider_names_for_scope(scope: str) -> list[str]:
     ]
 
 
-def validate_routes(*, require_smoke: bool = False) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    errors, warnings = api_registry.validate_registry()
-    if not provider_names_for_scope("image_generation"):
-        errors.append({"error": "model_router: no enabled provider for image_generation"})
+def validate_routes(*, require_smoke: bool = False,
+                    required_scopes: tuple[str, ...] = ('visual_planning', 'image_generation')) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    invalid, warnings = api_registry.validate_registry()
+    warnings.extend({'warning': row['error']} for row in invalid)
+    errors, selected = [], []
+    for scope in set(required_scopes):
+        if scope not in api_registry.VALID_SCOPES:
+            errors.append({'error': f'model_router: unsupported required scope {scope}'})
+            continue
+        try:
+            usable = [entry for entry in api_registry.load_registry_entries()
+                      if scope in entry.scopes and entry.api_key and _entry_has_required_capabilities(entry)]
+        except (ValueError, OSError):
+            usable = []
+        selected.extend(usable)
+        if not usable:
+            errors.append({'error': f'model_router: no enabled, credentialed and capable provider for {scope}'})
     if require_smoke:
         from .provider_smoke_store import smoke_errors_for_entries
 
-        errors.extend(smoke_errors_for_entries(api_registry.load_registry_entries()))
+        errors.extend(smoke_errors_for_entries(list({entry.name: entry for entry in selected}.values())))
     return errors, warnings
 
 

@@ -5,6 +5,10 @@ import time
 import urllib.error
 import os
 import calendar
+from contextlib import contextmanager
+from urllib.parse import urlsplit
+from uuid import uuid4
+from hashlib import sha256
 from pathlib import Path
 from .io import read_json, write_json
 from .process_lock import process_file_lock
@@ -92,6 +96,8 @@ def record_model_call_event(
     status: str,
     protocol: str = "",
     error: str = "",
+    configuration_revision: str = "",
+    attempt_id: str = "",
 ) -> None:
     """Record model endpoint health in one project-level 30-day ledger."""
 
@@ -120,6 +126,13 @@ def record_model_call_event(
                 "failures": 0,
             },
         )
+        if configuration_revision and entry.get('configuration_revision')!=configuration_revision:
+            entry.clear();entry.update(scope=scope,provider=provider,model=model,protocol=protocol,
+                configuration_revision=configuration_revision,attempts=0,successes=0,failures=0)
+        active=entry.setdefault('active_attempts',{})
+        if attempt_id:
+            if status=='started':active[attempt_id]=now_ts
+            else:active.pop(attempt_id,None)
         if status in _attempt_statuses():
             entry["attempts"] = int(entry.get("attempts") or 0) + 1
         if status == "success":
@@ -132,15 +145,17 @@ def record_model_call_event(
         events = entry.get("recent_events")
         if not isinstance(events, list):
             events = []
-        events.append({"ts": now_ts, "status": status})
+        if status in _attempt_statuses():events.append({"ts":now_ts,"status":status,"attempt_id":attempt_id})
         cutoff = now_ts - 30 * 24 * 60 * 60
         recent = [item for item in events if isinstance(item, dict) and float(item.get("ts") or 0.0) >= cutoff][-300:]
         entry["recent_events"] = recent
         entry["recent_attempts"] = sum(1 for item in recent if str(item.get("status") or "") in _attempt_statuses())
         entry["recent_successes"] = sum(1 for item in recent if str(item.get("status") or "") == "success")
         entry["recent_failures"] = sum(1 for item in recent if str(item.get("status") or "") in _failure_statuses())
-        entry["last_status"] = status
-        entry["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts))
+        if status in _attempt_statuses():
+            entry["last_status"] = status
+            entry["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts))
+        entry.setdefault('last_updated',time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(now_ts)))
         ledger["schema_version"] = MODEL_CALL_HEALTH_SCHEMA_VERSION
         ledger["decay_window_days"] = 30
         ledger["updated_at"] = entry["last_updated"]
@@ -153,7 +168,7 @@ def model_call_health_ledger_path() -> Path:
     return root / "runtime" / "model_call_health_ledger.json"
 
 
-def model_provider_cooldown_active(*, scope: str, provider: str, model: str, now: float | None = None) -> bool:
+def model_provider_cooldown_active(*, scope: str, provider: str, model: str, now: float | None = None, configuration_revision: str = '') -> bool:
     """Temporarily demote a recently failing endpoint without disabling future recovery."""
     path = model_call_health_ledger_path()
     try:
@@ -161,7 +176,7 @@ def model_provider_cooldown_active(*, scope: str, provider: str, model: str, now
     except Exception:
         return False
     entry = (ledger.get("entries") or {}).get(f"{scope}|{provider}|{model}")
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or configuration_revision and entry.get('configuration_revision')!=configuration_revision:
         return False
     status = str(entry.get("last_status") or "")
     if status == "success":
@@ -189,9 +204,75 @@ def model_provider_cooldown_active(*, scope: str, provider: str, model: str, now
     return float(now if now is not None else time.time()) - updated < cooldown
 
 
+def model_health_scores(*,scope,providers):
+    """Transport-only read projection from the single health authority, not quality scoring."""
+    path=model_call_health_ledger_path()
+    data=read_json(path) if path.is_file() else {};result={}
+    for provider,(model,revision) in providers.items():
+        row=data.get('entries',{}).get(f'{scope}|{provider}|{model}',{})
+        if row.get('configuration_revision')!=revision:result[provider]=0.0;continue
+        status=row.get('last_status')
+        try:age=time.time()-calendar.timegm(time.strptime(row['last_updated'],'%Y-%m-%dT%H:%M:%SZ'))
+        except (KeyError,ValueError):age=float('inf')
+        if age>(3600 if status in {'configuration_failure','auth_failure','model_not_found'} else 180):
+            result[provider]=0.0;continue
+        result[provider]=-5.0 if status in {'configuration_failure','auth_failure','model_not_found'} else -1.0 if status in {'timeout_failure','transport_failure','rate_limit_failure'} else 0.0
+    return result
+
+
+@contextmanager
+def image_gateway_attempt(endpoint: str):
+    """One persisted transport-domain circuit, independent of aliases and receipt authority."""
+    from .image_provider_common import ProviderQueueUnavailable, ProviderTransportError
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {'https','http'} or not parsed.hostname:
+        yield  # Unresolved routes are rejected by provider configuration, not a fictitious domain.
+        return
+    origin = f'{parsed.scheme}://{parsed.hostname.lower()}:{parsed.port or (443 if parsed.scheme=="https" else 80)}'
+    proxy = os.environ.get(parsed.scheme.upper()+'_PROXY') or os.environ.get(parsed.scheme+'_proxy', '')
+    bypass = os.environ.get('NO_PROXY') or os.environ.get('no_proxy', '')
+    egress = sha256((proxy+'|'+bypass).encode('utf-8')).hexdigest()[:20]
+    key = 'image_gateway|' + origin + '|images_edit|' + egress
+    path = model_call_health_ledger_path()
+    token = uuid4().hex
+    def ledger():
+        return read_json(path) if path.is_file() else {'schema_version':MODEL_CALL_HEALTH_SCHEMA_VERSION,'entries':{}}
+    with _LOCK, process_file_lock(path.with_suffix('.lock')):
+        data=ledger(); row=data.setdefault('entries',{}).setdefault(key,{})
+        now=time.time()
+        if row.get('retry_at',0)>now or row.get('probe_until',0)>now:
+            exc = ProviderQueueUnavailable('image_gateway', 'Shared image gateway is cooling down or has an active half-open probe')
+            exc.retry_at = max(row.get('retry_at', 0), row.get('probe_until', 0))
+            raise exc
+        if row.get('failures_in_sequence',0)>=2:
+            row.update(probe_token=token,probe_until=now+600)
+            write_json(path,data)
+    outcome=None
+    try:
+        yield key
+        outcome='success'
+    except ProviderTransportError:
+        outcome='transport_failure'
+        raise
+    finally:
+        with _LOCK, process_file_lock(path.with_suffix('.lock')):
+            data=ledger(); row=data.setdefault('entries',{}).setdefault(key,{})
+            if outcome=='success':
+                row.update(failures_in_sequence=0,retry_at=0)
+            elif outcome=='transport_failure':
+                row['failures_in_sequence']=row.get('failures_in_sequence',0)+1
+                if row['failures_in_sequence']>=2:row['retry_at']=time.time()+180
+            if row.get('probe_token')==token:
+                row.pop('probe_token',None);row.pop('probe_until',None)
+            row.update(scope='image_gateway',origin=origin,last_result=outcome or 'local_or_content_failure',updated_at=time.time())
+            write_json(path,data)
+
+
 def model_status_from_exception(exc: Exception, detail: str = "") -> str:
     text = f"{type(exc).__name__}: {exc} {detail}".lower()
     code = exc.code if isinstance(exc, urllib.error.HTTPError) else 0
+    if code == 402:
+        return "configuration_failure"
     if code == 404 or "model_not_found" in text or "model not found" in text:
         return "model_not_found"
     if "401" in text or "403" in text or "unauthorized" in text or "forbidden" in text:

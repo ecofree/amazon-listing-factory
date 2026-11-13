@@ -1,6 +1,9 @@
 $ErrorActionPreference = "Stop"
 
-$Python = "D:\anaconda\python.exe"
+$Python = $env:AMAZON_FACTORY_PYTHON
+if ([string]::IsNullOrWhiteSpace($Python)) {
+    $Python = Join-Path $PSScriptRoot "..\.venv\Scripts\python.exe"
+}
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Project Python was not found: $Python"
 }

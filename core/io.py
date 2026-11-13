@@ -7,6 +7,8 @@ import os
 import re
 import tempfile
 import time
+import threading
+from types import MappingProxyType
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -146,20 +148,20 @@ def replace_file_with_retries(src: Path, dst: Path) -> None:
         raise last_exc
 
 
-def load_env(
-    path: str | Path | None,
-    *,
-    override: bool = False,
-    only_keys: set[str] | None = None,
-) -> dict[str, str]:
+_FROZEN_ENV = None
+_ENV_LOCK = threading.RLock()
+
+
+def read_env_values(path: str | Path | None, *, only_keys: set[str] | None = None) -> dict[str,str]:
     if not path:
         return {}
     env_path = Path(path)
     values: dict[str, str] = {}
-    duplicate_keys: dict[str, str] = {}
+    locations: dict[str, int] = {}
+    duplicate_keys: dict[str, tuple[int, int]] = {}
     if not env_path.exists():
         return values
-    for line in env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+    for line_number, line in enumerate(env_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
@@ -169,16 +171,65 @@ def load_env(
             continue
         value = value.strip().strip('"').strip("'")
         if key in values and values[key] != value:
-            duplicate_keys[key] = f"{values[key]!r} != {value!r}"
+            duplicate_keys[key] = (locations[key], line_number)
+        locations.setdefault(key, line_number)
         values[key] = value
-        if override:
-            os.environ[key] = value
-        else:
-            os.environ.setdefault(key, value)
     if duplicate_keys:
-        details = ", ".join(f"{key}: {value}" for key, value in sorted(duplicate_keys.items()))
+        details = ", ".join(f"{key} (lines {first}, {last})" for key, (first, last) in sorted(duplicate_keys.items()))
         raise ValueError(f"Conflicting duplicate environment keys in {env_path}: {details}")
     return values
+
+
+def environment_values(*paths):
+    """One config precedence for local preflight and the frozen production context."""
+    if _FROZEN_ENV is not None:return dict(_FROZEN_ENV)
+    # Business defaults may come from explicit files, not arbitrary inherited shell values.
+    prefixes=('AMAZON_FACTORY_','COPY_AI_','DEEPSEEK_','APIFY_','GEMINI_','OCR_','R2_','OCI_','IMAGE_PUBLISH_')
+    business=('DEFAULT_','AMAZON_FACTORY_BRAND','AMAZON_FACTORY_MANUFACTURER','AMAZON_FACTORY_COUNTRY_OF_ORIGIN','AMAZON_FACTORY_TEMPLATE_')
+    values={key:value for key,value in os.environ.items() if (key.startswith(prefixes) or key.upper() in {'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY'}
+        or key.endswith(('_API_KEY','_API_TOKEN','_BEARER_TOKEN'))) and not key.startswith(business)}
+    for path in paths:
+        if path:values.update(read_env_values(path))
+    return values
+
+
+def load_env(path, *, override=False,only_keys=None):
+    if _FROZEN_ENV is not None:
+        return {k:v for k,v in _FROZEN_ENV.items() if only_keys is None or k in only_keys}
+    values=read_env_values(path,only_keys=only_keys)
+    for key,value in values.items():
+        if override:os.environ[key]=value
+        else:os.environ.setdefault(key,value)
+    return values
+
+
+@contextmanager
+def frozen_execution_environment(*paths):
+    """One job per interpreter configuration; child threads see the same immutable values."""
+    global _FROZEN_ENV
+    with _ENV_LOCK:
+        if _FROZEN_ENV is not None:raise RuntimeError('Nested production configuration is not allowed')
+        previous=dict(os.environ);values=environment_values(*paths)
+        try:
+            for key in list(os.environ):
+                if key.startswith(('DEFAULT_','AMAZON_FACTORY_','COPY_AI_','DEEPSEEK_')) and key not in values:os.environ.pop(key)
+            os.environ.update(values)
+            os.environ['FACTORY_ENV_REVISION']=hashlib.sha256(json.dumps(values,sort_keys=True).encode()).hexdigest()
+            os.environ['FACTORY_ENV_KEYS']=json.dumps(sorted(values))
+            _FROZEN_ENV=MappingProxyType(values)
+            yield _FROZEN_ENV
+        finally:
+            _FROZEN_ENV=None;os.environ.clear();os.environ.update(previous)
+
+
+def assert_execution_environment():
+    """Child interpreters inherit the same seal; reject late configuration mutation."""
+    expected=os.environ.get('FACTORY_ENV_REVISION')
+    if not expected:return  # Pure local diagnostics may run without a production environment.
+    keys=json.loads(os.environ['FACTORY_ENV_KEYS'])
+    current={key:os.environ.get(key) for key in keys}
+    if hashlib.sha256(json.dumps(current,sort_keys=True).encode()).hexdigest()!=expected:
+        raise ValueError('Frozen execution environment changed before transport admission')
 
 
 @contextmanager

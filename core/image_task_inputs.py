@@ -8,67 +8,58 @@ from .product_family import effective_product_facts, fact_resolutions
 from .text_evidence import clean_evidence_text, extract_measurements, has_bad_encoding, us_measurement_text, measurement_values_match
 
 
-def shared_design_values(value: Any, prefix: str = '') -> dict[str, Any]:
-    """Address existing shared design leaves without granting container replacements."""
-    if isinstance(value, (dict, list)):
-        entries = value.items() if isinstance(value, dict) else enumerate(value)
-        return {path: leaf for key, item in entries
-                for path, leaf in shared_design_values(item, f'{prefix}.{key}' if prefix else str(key)).items()}
-    return {prefix: value}
-
-
-def role_art_direction(art: dict[str, Any], direction: dict[str, Any], role: str, *, main_policy: str = '') -> dict[str, Any]:
-    """The shared design values actually consumed by this role, without overrides."""
+def role_art_direction(art: dict[str, Any], direction: dict[str, Any], role: str, *, main_policy: str = '', image_policy=None) -> dict[str, Any]:
+    """Project shared design within the role's existing environment contract."""
     result = {key: art[key] for key in ('audience_and_market', 'photography_direction')}
-    environment = direction['environment_mode'] == 'designed_environment' and not (role == 'main' and main_policy == 'white_background')
+    white_main = role.split('_', 1)[0] == 'main' and main_policy == 'white_background'
+    if white_main or direction['environment_mode'] == 'graphic_canvas':
+        result['photography_direction'] = {'lighting': 'source', 'exposure': 'source'}
+    environment = direction['environment_mode'] == 'designed_environment' and not white_main
     selected = set(direction['presentation']['components'])
+    if image_policy is not None:
+        from .required_role_policy import authorized_staging_targets
+        allowed=authorized_staging_targets(image_policy, role=role, environment_mode=direction['environment_mode'])
+        if selected - allowed.keys():
+            raise ValueError('Palette contains targets outside this role/environment policy: ' + ', '.join(sorted(selected-allowed.keys())))
+        if any(f'{group}.{part}' not in authorized_staging_targets(image_policy)
+               or not isinstance(color,str) or not re.fullmatch(r'#[0-9A-Fa-f]{6}',color)
+               for group,parts in art['palette_direction'].items() for part,color in parts.items()):
+            raise ValueError('Palette must contain only authorized non-sold target IDs and strict #RRGGBB colors')
     result['palette_direction'] = {
         group: chosen for group, parts in art['palette_direction'].items()
         if (chosen := {part: value for part, value in parts.items()
-                       if (environment or group != 'room') and f'{group}.{part}' in selected})}
+                       if environment and f'{group}.{part}' in selected})}
     if role.split('_', 1)[0] in {'func', 'size'}:
         result.update({key: art[key] for key in ('typography_direction', 'graphic_direction')})
     return result
 
-def measurement_authority(role: str, direction: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
-    """Resolve only planned quantities, independently of the selected edit photograph."""
-    from .text_evidence import us_measurement_text
-    ids = direction.get('measurement_ids')
-    if not isinstance(ids, list) or any(not isinstance(key, str) for key in ids) or len(ids) != len(set(ids)):
-        raise ValueError('measurement_ids must be unique child measurement identities')
-    if role not in {'func', 'size'} and ids:
-        raise ValueError('Main and scene do not render measurement labels')
-    available = {source['source_id'] + ':' + row['source_occurrence']: (source, row)
-                 for source in sources for row in source.get('measurements', [])}
-    missing = set(ids) - available.keys()
-    if missing:
-        raise ValueError('Selected measurements are not observed in this child: ' + ', '.join(sorted(missing)))
-    if role == 'size' and not ids:
-        raise ValueError('Size needs actual measured quantities; choose measurement_ids from the child catalog')
-    groups = []
-    for key in ids:
-        source, row = available[key]
-        groups.append({
-            'id': key, 'source_id': source['source_id'], 'source_text': row['text'],
-            'measured_part': row['source_label'], 'axis': row['axis_hint'],
-            'evidence_type': row['evidence_type'], 'kind': 'measurement',
-            'canonical_value': row['canonical_pair'],
-            'render_text': us_measurement_text(row['text'], upper_bound='capacity' in row['source_label'].lower()),
-            'confidence': row.get('confidence') or 'source_visible',
-            'measurement_role': 'load_capacity' if row['measurement_kind'] == 'capacity' else row['measurement_kind'],
-        })
-    return {'mode': 'source_image' if groups else 'none',
-            'render_text': list(dict.fromkeys(row['render_text'] for row in groups)), 'measurement_groups': groups}
+def display_quantity_issues(direction: dict[str, Any], selected_count: int, product_type: str, *, product_title: str = '') -> dict[str, str]:
+    """Check explicit primary-count claims, not actions, aesthetics or free-text meaning."""
+    presentation = direction.get('presentation') or {}
+    if presentation.get('scope') != 'whole_product' or not selected_count or not product_type:
+        return {}
+    from products.generic_extractors import product_pack_counts
+    issues = {}
+    for path, value in (('visual_goal', direction.get('visual_goal')), ('presentation/state', presentation.get('state'))):
+        counts = product_pack_counts(value, title=product_title or product_type.replace('_', ' '), display=True)
+        if counts - {selected_count}:
+            issues[path] = f'Explicit primary product count {sorted(counts)} contradicts {selected_count} selected instances; correct this field in the same plan'
+    return issues
 
 
 def build_renderable_text_contract(family: str, measurement: dict[str, Any], *, display_copy: dict[str, Any]) -> dict[str, Any]:
     """Return the only strings an image provider may render as pixels."""
     if family in {"main", "scene"}:
         return {"mode": "none", "strings": []}
-    if family == "size" and measurement.get("mode") != "source_image":
-        raise ValueError("size renderable text requires a source measurement image")
-    if family in {"func", "size"}:
-        return authored_text_contract(display_copy)
+    from .measurement_sources import MEASUREMENT_MODES
+    if family == 'size' and measurement.get('mode') not in MEASUREMENT_MODES:
+        raise ValueError('size renderable text requires an explicit measurement source')
+    if family in {'func','size'}:
+        contract=authored_text_contract(display_copy)
+        if measurement.get('mode')=='product_statement':
+            contract['strings']=[*contract['strings'],*measurement['render_text']]
+            if len({s.casefold() for s in contract['strings']})!=len(contract['strings']):raise ValueError('Duplicate declared measurement text')
+        return contract
     raise ValueError("Unknown image role")
 
 
@@ -105,7 +96,7 @@ def build_display_copy_contract(
     return {
         "mode": "source_claims", "title": title, "labels": labels,
         "bindings": [
-            {"evidence_ids": [str(value) for value in row["evidence_ids"]], "text": str(row["text"])}
+            _copy_binding(row, claims)
             for row in bindings
         ],
     }
@@ -149,8 +140,9 @@ def visual_variation_values(child: dict[str, Any]) -> dict[str, Any]:
     raw = normalized.get("variation") if isinstance(normalized.get("variation"), dict) else child.get("variation_values")
     values = dict(raw) if isinstance(raw, dict) else {}
     resolutions = fact_resolutions(child)
+    from .product_family import fact_key
     for key in list(values):
-        decision = resolutions.get(str(key).casefold())
+        decision = resolutions.get(fact_key(key))
         if decision:
             values.pop(key)
             if decision['status'] == 'confirmed':
@@ -172,6 +164,15 @@ def authored_text_contract(story: dict[str, Any]) -> dict[str, Any]:
     strings = ([title] if title else []) + labels
     if len(strings) != len(set(value.casefold() for value in strings)):
         raise ValueError("DisplayCopyContract contains duplicate renderable strings")
+    bindings = story.get('bindings')
+    if (not isinstance(bindings, list) or len(bindings) != len(strings)
+            or any(not isinstance(row, dict) or set(row) != {'text', 'evidence_ids', 'target'}
+                   or row['text'] != text or not isinstance(row['evidence_ids'], list) or not row['evidence_ids']
+                   or (row['target'] is not None and (not isinstance(row['target'], dict)
+                       or set(row['target']) != {'source_id', 'feature_id'}
+                       or any(not isinstance(v, str) or not v for v in row['target'].values())))
+                   for text, row in zip(strings, bindings))):
+        raise ValueError('DisplayCopyContract must retain its exact copy-to-feature bindings')
     return {
         "mode": "exact",
         "strings": strings,
@@ -262,40 +263,35 @@ def _role_sources(sources: list[dict[str, Any]], family: str) -> list[dict[str, 
     return matches or (_appearance_sources(sources)[:1] if family == 'scene' else [])
 
 
-def initial_output_inventory(sources: list[dict[str, Any]], *, previous: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    """Keep allocated identities, adding only newly available scoped sources."""
+def initial_output_inventory(sources: list[dict[str, Any]], *, previous: dict[str, Any] | None = None, statement_sources=None) -> list[dict[str, str]]:
+    """Keep allocated identities, restoring outputs for current source purposes."""
     ordered = sorted(({**row, 'source_id': row.get('source_id') or f"source_{int(row['source_index']):02d}"} for row in sources),
                      key=lambda row: int(row.get('source_index') or 0))
-    if previous is not None:
-        inventory = [dict(row) for row in previous['output_inventory']]
-        known = {row['source_id'] for row in previous['source_references']}
+    def bind_statements(inventory):
+        from .image_reference_context import has_visible_product_evidence
+        catalog={s['source_id']:s for s in ordered}
         for slot in inventory:
-            family = slot['role'].split('_', 1)[0]
-            eligible = _role_sources(ordered, family)
-            if any(row.get('source_id') == slot['source_id'] for row in eligible):
-                continue
-            used = {row['source_id'] for row in inventory if row is not slot and row['role'].split('_', 1)[0] == family}
-            candidate = next((row for row in eligible if row.get('source_id') not in used), None)
-            slot['source_id'] = ''
-            if candidate is not None:
-                slot['source_id'] = candidate['source_id']
-        for source in ordered:
-            source_id = source['source_id']
-            family = source['role']
-            if source_id in known or family not in {'scene', 'func', 'size'}:
-                continue
-            if source not in _role_sources(ordered, family):
-                continue
-            peers = [row for row in inventory if row['role'].split('_', 1)[0] == family]
-            if any(row['source_id'] == source_id for row in peers):
-                continue
-            empty = next((row for row in peers if not row['source_id']), None)
-            if empty is not None:
-                empty['source_id'] = source_id
-            elif family != 'size':
-                ordinal = max(int(row['role'].split('_')[1]) if '_' in row['role'] else 1 for row in peers) + 1
-                inventory.append({'role': f'{family}_{ordinal:02d}', 'source_id': source_id})
+            selected=(statement_sources or {}).get(slot['role'])
+            if not slot['source_id'] and selected:
+                source=catalog.get(selected)
+                if not source or not has_visible_product_evidence(source.get('observation',source.get('visual_evidence')) or {}):
+                    raise ValueError('Statement coverage lacks a usable child source')
+                slot['source_id']=selected
         return inventory
+    if previous is not None:
+        # Preserve allocated identities; empty anchors can acquire verified evidence.
+        from .image_reference_context import has_visible_product_evidence
+        inventory = [dict(row) for row in previous['output_inventory']]
+        for slot in inventory:
+            if slot['source_id']:
+                continue
+            family = slot['role'].split('_', 1)[0]
+            used = {s['source_id'] for s in inventory if s['role'].split('_', 1)[0] == family}
+            source = next((s for s in _role_sources(ordered, family)
+                if s['source_id'] not in used and has_visible_product_evidence(s.get('observation', s.get('visual_evidence')) or {})), None)
+            if source:
+                slot['source_id'] = source['source_id']
+        return bind_statements(inventory)
     appearances = _appearance_sources(ordered)
     main = appearances[0] if appearances else None
     specs = [{'role': 'main', 'source': main, 'reason': '' if main else 'No selected whole-product appearance evidence'}]
@@ -308,8 +304,7 @@ def initial_output_inventory(sources: list[dict[str, Any]], *, previous: dict[st
                          for i, row in enumerate(matches, 1))
         else:
             specs.append({'role': family, 'source': None, 'reason': f'No final source intent is classified as {family}'})
-    return [{'role': spec['role'], 'source_id': spec['source']['source_id'] if spec['source'] else ''}
-        for spec in specs]
+    return bind_statements([{'role':spec['role'],'source_id':spec['source']['source_id'] if spec['source'] else ''} for spec in specs])
 
 
 def task_specs(child: dict[str, Any], sources: list[dict[str, Any]], *, inventory: list[dict[str, str]],
@@ -330,12 +325,6 @@ def task_specs(child: dict[str, Any], sources: list[dict[str, Any]], *, inventor
         if not include_optional and role not in {'main', 'scene', 'func', 'size'}:
             continue
         source = catalog.get(slot['source_id'])
-        eligible = _role_sources(list(catalog.values()), role.split('_', 1)[0])
-        if source not in eligible:
-            family = role.split('_', 1)[0]
-            used = {row['source_id'] for row in inventory if row is not slot and row['role'].split('_', 1)[0] == family}
-            used.update(key for key, row in catalog.items() if any(spec['source'] is row and spec['role'].split('_', 1)[0] == family for spec in specs))
-            source = next((row for row in eligible if (row.get('source_id') or f"source_{int(row['source_index']):02d}") not in used), None)
         specs.append({'role': role, 'source': source, 'reason': '' if source else 'Output evidence anchor is unresolved'})
     for spec in specs:
         family = spec['role'].split('_', 1)[0]
@@ -345,11 +334,14 @@ def task_specs(child: dict[str, Any], sources: list[dict[str, Any]], *, inventor
 
 
 def task_facts(child: dict[str, Any], *, product_type: str) -> dict[str, Any]:
+    facts = effective_product_facts(child)
     return {
         "asin": str(child.get("asin") or ""),
         "product_type": str(product_type or ""),
         "color": visual_product_color(child),
-        "size": str(effective_product_facts(child).get("size") or "")[:120],
+        "size": str(facts.get("size") or "")[:120],
+        "physical_dimensions": {key: facts[key] for key in ('length', 'width', 'height', 'item_depth',
+            'length_unit', 'width_unit', 'height_unit', 'item_depth_unit') if key in facts},
         "variation": visual_variation_values(child),
         "sold_unit_count": fact_resolutions(child).get("sold_unit_count", {}).get("value"),
     }
@@ -358,15 +350,16 @@ def task_facts(child: dict[str, Any], *, product_type: str) -> dict[str, Any]:
 EXECUTION_PROFILES = frozenset({
     "reference_edit_soft_lock",
     "source_size_visual_restyle",
+    "statement_size_visual_restyle",
     "reference_infographic_design",
 })
 
 
 def execution_profile(family: str, measurement: dict[str, Any]) -> str:
     if family == "size":
-        if measurement.get("mode") != "source_image":
-            raise ValueError("size execution requires a classified source measurement image")
-        return "source_size_visual_restyle"
+        if measurement.get('mode')=='product_statement':return 'statement_size_visual_restyle'
+        if measurement.get('mode')!='source_image':raise ValueError('size execution requires an explicit measurement source')
+        return 'source_size_visual_restyle'
     return "reference_infographic_design" if family == "func" else "reference_edit_soft_lock"
 
 

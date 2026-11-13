@@ -11,13 +11,8 @@ from .provider_profiles import profile_to_client_value
 
 
 FACTORY_ROOT = Path(__file__).resolve().parents[1]
-VALID_SCOPES = {"vision_qa", "visual_planning", "image_generation"}
-IMAGE_API_TYPES = {
-    "openai_images_edit",
-    "openai_chat_completions_image",
-    "async_image_generation",
-    "highwayapi",
-}
+VALID_SCOPES = {"visual_planning", "image_generation", "vision_qa"}
+IMAGE_API_TYPES = {"openai_images_edit"}
 
 
 @dataclass(frozen=True)
@@ -47,6 +42,8 @@ class ApiRegistryEntry:
 def load_registry_entries() -> list[ApiRegistryEntry]:
     entries: list[ApiRegistryEntry] = []
     for item in _raw_registry_items():
+        if validate_registry(items=[item])[0]:
+            continue  # An invalid backup is isolated, never selected as a fallback.
         entry = _normalize_entry(item)
         if entry is not None:
             entries.append(entry)
@@ -54,7 +51,7 @@ def load_registry_entries() -> list[ApiRegistryEntry]:
 
 
 def model_clients_for_scope(scope: str) -> list[dict[str, str]]:
-    wanted = _normalize_scope(scope) or "vision_qa"
+    wanted = _normalize_scope(scope)
     clients: list[dict[str, str]] = []
     for entry in _entries_for_scope(wanted, family="gemini"):
         if entry.family != "gemini" or wanted not in entry.scopes:
@@ -91,6 +88,7 @@ def model_clients_for_scope(scope: str) -> list[dict[str, str]]:
             ("max_output_tokens", "max_output_tokens"),
             ("max_tokens", "max_output_tokens"),
             ("temperature", "temperature"),
+            ("thinking_level", "thinking_level"),
         ):
             if raw_key in entry.raw and entry.raw.get(raw_key) not in (None, ""):
                 client[client_key] = str(entry.raw.get(raw_key))
@@ -115,22 +113,11 @@ def image_provider_names() -> list[str]:
     return [entry.name for entry in image_provider_entries()]
 
 
-def image_provider_supports_mask(name: str) -> bool:
-    """Only native image-edit transports can enforce an immutable pixel mask."""
-    logical_name = str(name or "").strip()
-    return any(
-        entry.name == logical_name
-        and entry.api_type in {"openai_images_edit", "highwayapi"}
-        and "protected_mask" in entry.capabilities
-        for entry in image_provider_entries()
-    )
-
-
 def image_provider_supports_multiple_references(name: str, reference_count: int = 2) -> bool:
     logical_name = str(name or "").strip()
     return any(
         entry.name == logical_name and "multiple_reference_images" in entry.capabilities
-        and reference_count <= int(entry.protocol_profile.get("max_reference_images") or (1 if entry.api_type == "highwayapi" else 16))
+        and reference_count <= int(entry.protocol_profile.get("max_reference_images") or 16)
         for entry in image_provider_entries()
     )
 
@@ -179,6 +166,7 @@ def model_client_physical_identity(client: dict[str, Any]) -> dict[str, Any]:
             "max_output_tokens",
             "reasoning_effort",
             "temperature",
+            "thinking_level",
         )
         if client.get(key) not in (None, "")
     }
@@ -202,18 +190,32 @@ def image_provider_physical_identity(name: str) -> dict[str, Any]:
     return {"unresolved_provider": logical_name}
 
 
-def validate_registry() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def validate_registry(*, items=None) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     errors: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
-    for item in _raw_registry_items(include_disabled=True):
+    try:
+        items = _raw_registry_items(include_disabled=True) if items is None else items
+    except (ValueError, OSError) as exc:
+        return [{'error': f'api_registry could not be read: {exc}'}], []
+    for item in items:
         if not isinstance(item, dict):
             errors.append({"error": "api_registry entry must be an object"})
             continue
         if _disabled(item):
             continue
-        entry = _normalize_entry(item)
+        try:
+            entry = _normalize_entry(item)
+        except (ValueError, TypeError, KeyError):
+            errors.append({'error': 'api_registry entry has invalid typed configuration'})
+            continue
         if entry is None:
             continue
+        if entry.family == 'gemini':
+            from .provider_profiles import profile_from_value
+            try:profile_from_value(entry.protocol_profile,protocol=entry.protocol)
+            except ValueError:
+                errors.append({'error':'api_registry '+entry.name+': invalid protocol profile'})
+                continue
         label = entry.name or "(unnamed)"
         if not entry.name:
             errors.append({"error": "api_registry entry missing name"})
@@ -223,6 +225,8 @@ def validate_registry() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         if invalid_scopes:
             errors.append({"error": f"api_registry {label}: unsupported scope(s): {', '.join(invalid_scopes)}"})
         if entry.family == "gemini":
+            if entry.protocol not in {'gemini','google_gemini','openai','openai_chat','chat_completions','responses','openai_responses','responses_api'}:
+                errors.append({'error': f'api_registry {label}: unsupported vision protocol'})
             if not entry.base_url:
                 errors.append({"error": f"api_registry {label}: gemini entry requires base_url"})
             if not entry.model:
@@ -241,8 +245,7 @@ def validate_registry() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
                     {
                         "error": (
                             f"api_registry {label}: image_generation api_type must be "
-                            "openai_images_edit, openai_chat_completions_image, "
-                            "async_image_generation, or highwayapi"
+                            "openai_images_edit"
                         )
                     }
                 )
@@ -289,8 +292,8 @@ def _raw_registry_items(*, include_disabled: bool = False) -> list[Any]:
         return items if include_disabled else [item for item in items if not (isinstance(item, dict) and _disabled(item))]
     items: list[Any] = []
     for path in _registry_file_paths():
-        if not path.exists():
-            continue
+        if not path.is_file():
+            raise ValueError(f'Configured API registry file is missing: {path}')
         items.extend(_items_from_payload(_loads_json(path.read_text(encoding="utf-8-sig"))))
     if include_disabled:
         return items
@@ -315,21 +318,24 @@ def _registry_file_paths() -> list[Path]:
 def _loads_json(raw: str) -> Any:
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'Invalid API registry JSON at line {exc.lineno}, column {exc.colno}') from exc
 
 
 def _items_from_payload(payload: Any) -> list[Any]:
     if isinstance(payload, list):
         return payload
     if not isinstance(payload, dict):
-        return []
+        raise ValueError('API registry must be a list or a registry object')
     items: list[Any] = []
-    for key in ("endpoints", "providers", "apis", "registry"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            items.extend(value)
-    if not items and any(key in payload for key in ("base_url", "url", "model", "key_env")):
+    containers = [key for key in ('endpoints', 'providers', 'apis', 'registry') if key in payload]
+    for key in containers:
+        if not isinstance(payload[key], list):
+            raise ValueError(f'API registry {key} must be a list')
+        items.extend(payload[key])
+    if not containers:
+        if not any(key in payload for key in ('base_url', 'url', 'model', 'key_env')):
+            raise ValueError('API registry object has no provider entries')
         items.append(payload)
     return items
 
@@ -353,10 +359,6 @@ def _normalize_entry(item: Any) -> ApiRegistryEntry | None:
             api_type = "openai_images_edit"
     if family == "image_generation" and api_type == "openai_images_edit":
         url = _openai_images_edit_url(base_url=base_url, url=url)
-    elif family == "image_generation" and api_type == "openai_chat_completions_image":
-        url = _openai_chat_completions_url(base_url=base_url, url=url)
-    elif family == "image_generation" and api_type == "async_image_generation":
-        url = _async_image_generation_url(base_url=base_url, url=url)
     elif family == "image_generation" and not url:
         url = base_url
     key_env = str(item.get("key_env") or item.get("api_key_env") or "").strip()
@@ -425,7 +427,6 @@ def _normalize_family(raw: str, *, model: str, api_type: str) -> str:
     if value in {
         "gemini",
         "vision",
-        "vision_qa",
         "openai",
         "openai_vision",
         "openai_responses",
@@ -463,26 +464,6 @@ def _normalize_api_type(raw: str) -> str:
     value = raw.strip().lower().replace("-", "_")
     if value in {"openai_images_edit", "openai_image_edit", "images_edit", "image_edit", "openai_edit"}:
         return "openai_images_edit"
-    if value in {
-        "openai_chat_completions_image",
-        "openai_chat_completion_image",
-        "chat_completions_image",
-        "chat_completion_image",
-        "openai_chat_image",
-    }:
-        return "openai_chat_completions_image"
-    if value in {
-        "async_image_generation",
-        "apimart",
-        "apimart_async",
-        "apimart_image_generation",
-        "dragoncode",
-        "dragoncode_async",
-        "dragoncode_image_generation",
-    }:
-        return "async_image_generation"
-    if value in {"highwayapi", "highway", "highwayapi_image_generation"}:
-        return "highwayapi"
     return value
 
 
@@ -494,24 +475,6 @@ def _openai_images_edit_url(*, base_url: str, url: str) -> str:
     if normalized.endswith("/images/edits") or normalized.endswith("/images/edit"):
         return target
     return f"{target}/images/edits"
-
-
-def _openai_chat_completions_url(*, base_url: str, url: str) -> str:
-    target = (url or base_url).strip().rstrip("/")
-    if not target:
-        return ""
-    if target.lower().endswith("/chat/completions"):
-        return target
-    return f"{target}/chat/completions"
-
-
-def _async_image_generation_url(*, base_url: str, url: str) -> str:
-    target = (url or base_url).strip().rstrip("/")
-    if not target:
-        return ""
-    if target.lower().endswith("/images/generations"):
-        return target
-    return f"{target}/images/generations"
 
 
 def _response_modalities(item: dict[str, Any]) -> list[str]:
@@ -530,8 +493,8 @@ def _response_modalities(item: dict[str, Any]) -> list[str]:
 
 
 REQUIRED_SCOPE_CAPABILITIES: dict[str, set[str]] = {
-    "vision_qa": {"vision_input", "json_output"},
     "visual_planning": {"vision_input", "json_output", "visual_planning"},
+    "vision_qa": {"vision_input", "json_output", "factual_image_qa"},
     "image_generation": {"image_edit", "reference_image", "square_output"},
 }
 
@@ -565,14 +528,13 @@ def _priority(value: Any) -> int:
 
 
 def _protocol_profile(item: dict[str, Any]) -> dict[str, Any]:
-    value = item.get("protocol_profile") or item.get("profile") or {}
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            parsed = {}
-        value = parsed
-    return dict(value) if isinstance(value, dict) else {}
+    value = item.get('protocol_profile', item.get('profile', {}))
+    if value is None:return {}
+    if isinstance(value,str):
+        if not value.strip():return {}
+        value=json.loads(value)
+    if not isinstance(value,dict):raise ValueError('Protocol profile must be an object')
+    return dict(value)
 
 
 def _missing_required_capabilities(entry: ApiRegistryEntry) -> list[str]:

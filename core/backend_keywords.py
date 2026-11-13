@@ -10,38 +10,6 @@ from .product_family import supports_fact
 # template/API paths; keep one byte of headroom for the serialized field.
 MAX_BACKEND_KEYWORD_BYTES = 249
 
-CATEGORY_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "artificial_tree": (
-        "faux plant",
-        "fake tree",
-        "imitation plant",
-        "decorative tree",
-        "indoor plant decor",
-        "office plant",
-        "low maintenance greenery",
-        "entryway decor",
-        "corner accent",
-    ),
-    "bed_frame": (
-        "bed base",
-        "bed foundation",
-        "platform bed",
-        "mattress frame",
-        "bedroom furniture",
-        "bed support",
-    ),
-    "bathroom_cabinet": (
-        "bathroom storage",
-        "bathroom organizer",
-        "vanity storage",
-    ),
-    "medicine_cabinet": (
-        "bathroom mirror",
-        "mirror cabinet",
-        "bathroom storage mirror",
-    ),
-}
-
 STOP_WORDS = {
     "the",
     "and",
@@ -64,7 +32,6 @@ def generate_backend_keywords(
     bullets: list[str],
     description: str,
     product_specific: dict[str, Any],
-    competitor_keywords: list[str] | tuple[str, ...],
     extra_terms: list[str] | tuple[str, ...] | None = None,
     brand: str = "",
 ) -> str:
@@ -74,16 +41,21 @@ def generate_backend_keywords(
     blocked_words = _frontend_words(frontend_text)
     brand_words = _frontend_words(str(brand or "").lower())
     candidates: list[str] = []
-    candidates.extend(CATEGORY_SYNONYMS.get(_normalize_category(category_id), ()))
+    from .search_terms import category_search_policy
+    candidates.extend(category_search_policy(category_id).get('backend_synonyms',[]))
     mounting_terms = {
         'wall cabinet': r'\bwall[- ]?(?:mount(?:ed)?|hung)\b',
         'recessed cabinet': r'\brecess(?:ed)?\b',
         'over toilet storage': r'\bover[- ](?:the[- ])?toilet\b',
     }
     candidates.extend(term for term, pattern in mounting_terms.items() if supports_fact(product_specific, pattern))
-    candidates.extend(str(item) for item in competitor_keywords if item)
-    candidates.extend(str(item) for item in (extra_terms or ()) if item)
-    candidates.extend(_short_fact_terms(product_specific))
+    fact_terms=_short_fact_terms(product_specific)
+    # Configured search phrases are not product evidence. Only admit their
+    # substantive words when already supported by generic category/fact terms.
+    supported=_frontend_words(' '.join([*candidates,*fact_terms]))
+    candidates.extend(str(item) for item in (extra_terms or ()) if item
+        and (_frontend_words(str(item))-STOP_WORDS)<=supported)
+    candidates.extend(fact_terms)
 
     unique: list[str] = []
     seen: set[str] = set()
@@ -116,17 +88,12 @@ def generate_backend_keywords(
 
     result: list[str] = []
     used = 0
-    for term in unique:
-        add = len(term.encode("utf-8")) + (1 if result else 0)
-        if used + add > MAX_BACKEND_KEYWORD_BYTES:
-            continue
-        result.append(term)
-        used += add
+    for word in dict.fromkeys(word for term in unique for word in re.findall(r'[a-z0-9]+', term)):
+        add = len(word.encode("utf-8")) + (1 if result else 0)
+        if used + add <= MAX_BACKEND_KEYWORD_BYTES:
+            result.append(word)
+            used += add
     return " ".join(result)
-
-
-def _normalize_category(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
 
 
 def _frontend_words(text: str) -> set[str]:

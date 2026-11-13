@@ -17,6 +17,18 @@ def _body(payload: dict) -> str:
 
 class CopyV1ContractTests(unittest.TestCase):
     def test_parent_artifact_uses_optional_parent_highlight_contract(self) -> None:
+        from core.copy_writer import _reference_brand_candidates
+        brands = _reference_brand_candidates(target_brand='Shop', source_title='Example Brand Artificial Tree',
+            source_bullets=['DECORATE YOUR WAY: trim the tree'], source_description='',
+            product_specific={'manufacturer':'Example Brand'}, market_context={})
+        self.assertIn('Example Brand', brands)
+        self.assertNotIn('DECORATE', brands)
+        from tests.continuity_contract_fixture import verify_copy_retry_owner
+        verify_copy_retry_owner(self)
+        from tests.unit_work_fixture import verify_copy_units
+        verify_copy_units(self)
+        from tests.feedback_fix_fixture import verify_parent_count
+        verify_parent_count(self)
         row = {
             "title": "Wall Mounted Medicine Cabinet",
             "item_highlights": [
@@ -41,6 +53,8 @@ class CopyV1ContractTests(unittest.TestCase):
             "groups": [],
             "parent_model_request_fingerprint": "parent-fingerprint",
         }
+        from core.copy_polish import _fingerprint, _child_copy_payload
+        artifact['parent_child_copy_fingerprint'] = _fingerprint(_child_copy_payload(artifact['rows']))
         with self.assertRaises(CopyPolishError):
             _validate_artifact_provenance(artifact)
         from core.template_engine import _copy_v1_for_row, TemplateEngineError
@@ -79,7 +93,6 @@ class CopyV1ContractTests(unittest.TestCase):
             with patch.multiple(copy_polish,
                 load_job=lambda _: {}, load_template_env=lambda *a: {},
                 read_product_family=lambda _: {'family': {'children': children}},
-                copy_provider_configured=lambda _: True,
                 copy_request_fingerprint=lambda *a, **k: 'request',
                 _model_request_fingerprint=lambda **k: k['row_type'],
                 _group_request_fingerprint=lambda **k: k['row_type'],
@@ -87,10 +100,26 @@ class CopyV1ContractTests(unittest.TestCase):
             ), patch.object(copy_polish, '_rewrite_group', side_effect=[child_copy, row]) as rewrite:
                 copy_polish.run_copy_polish(job_dir=root, plugin=load_plugin('medicine_cabinet'), limit=2)
                 data = read_json(root / 'reports' / 'copy_v1.json')
+                parent_input = rewrite.call_args_list[-1].kwargs['source']['description']
+                self.assertIn(child_copy['description'], parent_input)
+                self.assertEqual(_fingerprint(_child_copy_payload(data['rows'])), data['parent_child_copy_fingerprint'])
                 self.assertEqual('B1', data['groups'][0]['source_asin'])
                 self.assertTrue(all(value['copy_group_source_asin'] == 'B1' for key, value in data['rows'].items() if key != '__parent__'))
                 copy_polish.run_copy_polish(job_dir=root, plugin=load_plugin('medicine_cabinet'), limit=2)
                 self.assertEqual(2, rewrite.call_count)  # Both child and empty-highlight parent fragments reused.
+                data['rows'][data['child_map']['B1']]['description'] += ' Revised child text.'
+                with self.assertRaisesRegex(CopyPolishError, 'current child copy'):
+                    _validate_artifact_provenance(data)
+        from core.copy_writer import _validate_copy_compliance
+        for negative in ('Unlit design for your own lights.', 'Lights are not included.', 'No lights or ornaments are included.'):
+            with self.assertRaisesRegex(CopyWriterError, 'lighting inclusion'):
+                _validate_copy_compliance({'title':'Cactus Christmas Tree','description':negative},category='Artificial Tree',
+                    product_specific={'tree_type':'Cactus','_child_facts':[{'light_count':90},{'light_count':120}]})
+        with self.assertRaisesRegex(CopyWriterError, 'subtype'):
+            _validate_copy_compliance({'title':'Artificial Christmas Tree'},category='Artificial Tree',product_specific={'tree_type':'Cactus'})
+        with self.assertRaisesRegex(CopyWriterError, 'lighting inclusion'):
+            _validate_copy_compliance({'title':'Pre-lit Christmas Tree'},category='Artificial Tree',
+                product_specific={'_child_facts':[{'light_count':90},{'light_count':0}]})
 
     def test_multiple_item_highlights_and_brandless_size_first_title(self) -> None:
         payload = {
@@ -105,7 +134,7 @@ class CopyV1ContractTests(unittest.TestCase):
             ],
             "description": "A wall-mounted medicine cabinet for organized bathroom and first-aid storage.",
         }
-        result = _parse_copy_response(_body(payload), brand="safeplus")
+        result = _parse_copy_response(_body(payload), brand="safeplus", product_specific={'width':'24 inches'})
         self.assertEqual(payload["item_highlights"], result["item_highlights"])
         self.assertNotIn("safeplus", result["title"].lower())
         separated = {
@@ -120,7 +149,7 @@ class CopyV1ContractTests(unittest.TestCase):
             ],
             "description": "A wall-mounted medicine cabinet for organized bathroom and first-aid storage.",
         }
-        result = _parse_copy_response(_body(separated), brand="safeplus")
+        result = _parse_copy_response(_body(separated), brand="safeplus", product_specific={'width':'24 inches'})
         self.assertEqual(
             ["Adjustable Shelf", "Mirrored Door", "Wall-Mounted Storage"],
             result["item_highlights"],
@@ -128,12 +157,18 @@ class CopyV1ContractTests(unittest.TestCase):
         parent_payload = dict(separated)
         parent_payload["item_highlights"] = ["Green"]
         with self.assertRaises(CopyWriterError):
-            _parse_copy_response(_body(parent_payload), brand="safeplus", row_type="parent")
+            _parse_copy_response(_body(parent_payload), brand="safeplus", row_type="parent", product_specific={'width':'24 inches'})
         parent_payload["item_highlights"] = []
-        parent_result = _parse_copy_response(_body(parent_payload), brand="safeplus", row_type="parent")
+        parent_payload['bullets'] = []
+        parent_result = _parse_copy_response(_body(parent_payload), brand="safeplus", row_type="parent", product_specific={'width':'24 inches'})
         self.assertEqual([], parent_result["item_highlights"])
+        self.assertEqual([], parent_result['bullets'])
 
     def test_forbidden_claim_is_not_laundered(self) -> None:
+        from tests.audit_copy_fixture import verify_copy_measurements
+        from tests.feedback_fix_fixture import verify_function_compound
+        verify_function_compound(self)
+        verify_copy_measurements(self)
         payload = {
             "title": "Wall Mount Medicine Cabinet with Mirror",
             "item_highlights": ["Adjustable Shelf", "Mirrored Door", "Wall-Mounted Storage"],
@@ -165,6 +200,22 @@ class CopyV1ContractTests(unittest.TestCase):
                 _parse_copy_response(_body({**payload, 'description': wrong}), product_specific=facts)
 
         from core.copy_writer import _validate_copy_compliance
+        with self.assertRaisesRegex(CopyWriterError,'quantity scope'):
+            _validate_copy_compliance({'description':'Three rattan-wrapped trunks each hold three square pruned boxwood sections.'},
+                category='Artificial Tree',product_specific={'sold_unit_count':2,'material':'Polyethylene'})
+        _validate_copy_compliance({'description':'Three trunks topped with three square boxwood forms.'},
+            category='Artificial Tree',product_specific={'structure':'Three trunks topped with three square boxwood forms.'})
+        _validate_copy_compliance({'description':'Each tree measures 13.5 inch depth by 13.5 inch width by 36 inch height.'},
+            category='Artificial Tree',product_specific={'item_depth':'13.5 inches','width':'13.5 inches','height':'36 inches'})
+        _validate_copy_compliance({'description':'Three trunks, each wrapped in rattan, topped with three square forms.'},
+            category='Artificial Tree',product_specific={'structure':'Three trunks, each wrapped in rattan, topped with three square forms.'})
+        for value in ('Not specified', False, 0, -1000, '-1000 lbs', '1000', 'not rated for 1000 lbs', float('inf')):
+            with self.subTest(capacity=value), self.assertRaises(CopyWriterError):
+                _validate_copy_compliance({'title': 'Storage Cabinet', 'description': 'Supports up to 1000 lbs'},
+                    category='bathroom_cabinet', product_specific={'weight_capacity': value})
+        _validate_copy_compliance({'title': 'Storage Cabinet', 'description': 'Weight capacity: 22.04 lbs'},
+                    category='bathroom_cabinet', product_specific={'weight_capacity': '10 kg'})
+
         for claim, facts, accepted in (
             ('waterproof', {'waterproof': False, 'source_description': 'Waterproof cabinet'}, False),
             ('waterproof', {'waterproof': True}, True),
@@ -237,7 +288,8 @@ class CopyV1ContractTests(unittest.TestCase):
         from pathlib import Path
         from dataclasses import replace
         from core.copy_writer import _post_chat_completion
-        with tempfile.TemporaryDirectory() as tmp, patch('core.copy_writer.urllib.request.urlopen') as transport:
+        with tempfile.TemporaryDirectory() as tmp, patch('core.copy_writer.urllib.request.urlopen') as transport, \
+             patch('core.batch_ledger.admit_paid_request',return_value='mock-network-admission'):
             transport.return_value.__enter__.return_value.read.return_value = _body(invalid).encode()
             traced = replace(config, trace_dir=Path(tmp), api_key='secret-not-in-diagnostics')
             request = post.call_args_list[0].args[1]
@@ -245,7 +297,7 @@ class CopyV1ContractTests(unittest.TestCase):
             recorded = list(Path(tmp).glob('*.response.txt'))
             self.assertEqual(1, len(recorded))
             self.assertEqual(_body(invalid), recorded[0].read_text(encoding='utf-8'))
-            self.assertNotIn(traced.api_key, ''.join(p.read_text(encoding='utf-8') for p in Path(tmp).iterdir()))
+            self.assertNotIn(traced.api_key, ''.join(p.read_text(encoding='utf-8') for p in Path(tmp).rglob('*') if p.is_file()))
             with patch.object(Path, 'write_text', side_effect=OSError('disk error')), self.assertLogs('core.copy_writer', level='WARNING'):
                 self.assertEqual(_body(invalid), _post_chat_completion(traced, request))
         repair = json.loads(post.call_args_list[1].args[1]["messages"][1]["content"])
@@ -283,10 +335,9 @@ class CopyV1ContractTests(unittest.TestCase):
             )
         self.assertEqual(valid["title"], focused["title"])
         title_repair = json.loads(title_post.call_args_list[1].args[1]["messages"][1]["content"])
-        self.assertEqual(title_only_invalid["title"], title_repair["invalid_title"])
+        self.assertIn(title_only_invalid["title"], title_repair["invalid_copy_to_repair"])
         self.assertIn("title exceeds", title_repair["validation_error"])
-        self.assertEqual("55 characters or fewer", title_repair["title_only_contract"]["target"])
-        self.assertIn("standalone measurement", title_repair["title_only_contract"]["ending"])
+        self.assertEqual(['title'],title_repair['failed_fields'])
         self.assertIn("Preserve exact product structure nouns", title_post.call_args_list[1].args[1]["messages"][0]["content"])
         for invalid_parent, repair in (
             ({**title_only_invalid, "item_highlights": []}, {"title": valid["title"]}),
@@ -396,11 +447,25 @@ class CopyV1ContractTests(unittest.TestCase):
         self.assertEqual(valid["bullets"], focused_bullet["bullets"])
         bullet_repair = json.loads(bullet_post.call_args_list[1].args[1]["messages"][1]["content"])
         self.assertEqual(4, bullet_repair["invalid_bullets"][0]["index"])
-        self.assertEqual("105 characters or fewer per bullet", bullet_repair["contract"]["target"])
+        self.assertEqual(['bullets[3]'],bullet_repair['failed_fields'])
+        # A mixed length + fact failure repairs both failed fields in one call,
+        # while an endpoint's unsolicited edits to good copy are ignored.
+        mixed={**valid,'item_highlights':over_budget,'bullets':list(valid['bullets'])}
+        mixed['bullets'][2]='Pot Size: The planter stands 31.5 inches tall. '+('Daily storage ' * 10)
+        unrequested={**valid,'title':'Unsolicited Changed Title','description':'Unsolicited description'}
+        with patch('core.copy_writer._post_chat_completion',side_effect=[_body(mixed),_body(unrequested)]) as repair_post:
+            repaired=_rewrite_listing_copy_with_openai(config=config,category='medicine_cabinet',brand='safeplus',row_type='child',
+                source_title='Wall Mount Medicine Cabinet',source_bullets=['Adjustable shelf storage'],source_description='',
+                product_specific={'mounting_type':'wall mount','shelf':'adjustable'})
+        self.assertEqual(valid['title'],repaired['title']);self.assertEqual(valid['description'],repaired['description'])
+        self.assertEqual(valid['bullets'],repaired['bullets']);self.assertEqual(2,repair_post.call_count)
+        repair_request=json.loads(repair_post.call_args_list[1].args[1]['messages'][1]['content'])
+        self.assertEqual(['bullets[2]','item_highlights'],repair_request['failed_fields'])
         with patch(
             "core.copy_writer._post_chat_completion",
             side_effect=[
                 _body(highlight_only_invalid),
+                _body({"item_highlights": ["Adjustable Shelf"]}),
                 _body({"item_highlights": ["Adjustable Shelf"]}),
             ],
         ):

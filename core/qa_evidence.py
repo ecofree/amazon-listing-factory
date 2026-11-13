@@ -11,7 +11,7 @@ from .status import input_revision_id
 
 QA_EVIDENCE_SCHEMA_VERSION = "qa-evidence-v5"
 QA_EVIDENCE_ARTIFACT = "qa_evidence_v5.jsonl"
-QA_POLICY_VERSION = "observed-facts-three-state-v51-task-background-policy"
+QA_POLICY_VERSION = "source-bound-hard-facts-v3-candidate-text-evidence"
 
 
 class QaEvidenceError(RuntimeError):
@@ -20,18 +20,13 @@ class QaEvidenceError(RuntimeError):
 
 def qa_policy_id(task: dict[str, Any]) -> str:
     from .image_pixel_evidence import PIXEL_EVIDENCE_VERSION
-    from .image_role_ocr import ROLE_OCR_EVIDENCE_CACHE_VERSION
-    from .vision_gemini_client import gemini_scope_execution_revision
-
     return input_revision_id({
         "policy": QA_POLICY_VERSION,
-        "observer_execution": gemini_scope_execution_revision("vision_qa"),
         "role": str(task.get("role_family") or task.get("role") or ""),
         "task_policy": task.get("policy_version") or "",
         "task_fingerprint": task.get("task_fingerprint") or "",
         "category_image_policy": task.get("category_image_policy") or {},
         "measurement_authority": task.get("measurement_authority") or {},
-        "ocr_policy": ROLE_OCR_EVIDENCE_CACHE_VERSION,
         "pixel_policy": PIXEL_EVIDENCE_VERSION,
     })
 
@@ -79,6 +74,8 @@ def evidence_is_current(
         if evidence["evidence_fingerprint"] != evidence_fingerprint(evidence):
             return False
         if job_dir is not None:
+            if evidence.get("model_receipt_revision") != qa_receipt_revision(job_dir, task, candidate):
+                return False
             output = resolve_job_owned_path(job_dir, str(candidate["candidate_path"]))
             evidence_output = resolve_job_owned_path(job_dir, str(evidence["candidate_path"]))
             if evidence_output != output:
@@ -114,3 +111,13 @@ def _validate_row(row: Any) -> None:
     expected = "fail" if "fail" in statuses else "inconclusive" if "inconclusive" in statuses else "pass"
     if row["automatic_decision"] != expected:
         raise QaEvidenceError("QA decision contradicts its factual gates")
+
+
+def qa_receipt_root(job, task, candidate):
+    return Path(job) / 'reports' / 'qa_requests' / input_revision_id({
+        'child': task['child'], 'role': task['role'], 'candidate': candidate['candidate_sha256']})
+
+
+def qa_receipt_revision(job, task, candidate):
+    root = qa_receipt_root(job, task, candidate)
+    return input_revision_id({p.name: file_sha256(p) for p in sorted(root.glob('*')) if p.suffix in {'.json', '.response'}})

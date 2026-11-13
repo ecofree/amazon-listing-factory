@@ -6,10 +6,21 @@ lifecycle: production_ready
 amazon_category: Home & Kitchen > Bath > Bathroom Furniture > Bathroom Cabinets
 browse_node_id: ""
 
+search_terms:
+  categories: [cabinet]
+  backend_synonyms: [bathroom storage, bathroom organizer]
+  excluded_tokens: [hinge, knob, paint]
+  unsupported_tokens: [medicine, mirror, mirrored, recessed, lighting, light]
+  identity_tokens: []
+  preserve_tokens: []
+  excluded_all_tokens: []
+
 template:
+  allowed_item_type_hints: ["Storage Cabinets (cabinets)"]
   engine: template_field_plan
   path_env: AMAZON_BATHROOM_CABINET_TEMPLATE
   default_path: templates/CABINET.xlsm
+  product_type: CABINET
 
 variation_themes:
   - COLOR
@@ -27,9 +38,14 @@ extractors:
     material:
       - Material
       - Material Type
+    top_material:
       - Top Material Type
+      - Top Material
+      - Tabletop Material
+    frame_material:
       - Frame Material Type
       - Frame Material
+    wood_type:
       - Wood Type
     color:
       - Color
@@ -42,6 +58,9 @@ extractors:
     mounting_type:
       - Mounting Type
       - Installation Type
+    item_depth:
+      - Item Depth
+      - Product Depth
     dimensions:
       - Product Dimensions
       - Item Dimensions
@@ -66,12 +85,6 @@ extractors:
     room_type:
       - Room Type
       - Recommended Uses For Product
-competitor_keywords:
-  - bathroom cabinet
-  - over toilet storage
-  - floor cabinet
-  - wall cabinet
-  - bathroom storage cabinet
 
 category_match:
   require_positive_match: true
@@ -119,6 +132,17 @@ required_role_policy:
     func: 1
 
 image_generation:
+  statement_measurements:
+    item_depth:
+      subject: product
+      axis: depth
+      label: Declared cabinet depth
+      source_fields: [Item Depth, Product Depth]
+      tuple_fields: [Item Dimensions D x W x H, Product Dimensions, Item Dimensions]
+  planning_guidance:
+    - "Distinguish the sold cabinet count from source instances and repeated detail views. A sliding door covers only its observed compartment, not every open storage area."
+    - "Count physical boards separately from spaces and marketing totals. Adjustable-position ghosts are graphics, not simultaneous shelves; preserve source-visible short feet and pads without rebuilding longer legs."
+    - "Keep current mounting contact/separation, panel material and compartment load scope. Match floor, wall or over-toilet use to this child's evidence; towels or baskets named in sales evidence remain owned instances."
   main_image_policy: white_background
   template_image_role_order: [main, scene, func, size]
   structure_invariants:
@@ -131,7 +155,31 @@ image_generation:
     - neatly arranged toiletries inside open shelves or compartments
     - folded towels inside visible storage
   replaceable_staging:
-    - loose toiletries, towels, flowers, baskets, wall decor, floor decor, and room surfaces not attached to the cabinet
+    - target_id: room.wall
+      physical_scope: Non-sold room wall surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: room.floor
+      physical_scope: Non-sold room floor or rug surfaces
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: bath.towels
+      physical_scope: Loose towels not sold with the cabinet
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: bath.toiletries
+      physical_scope: Loose toiletries not sold with the cabinet
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
+    - target_id: decor.loose_props
+      physical_scope: Independent non-sold flowers, baskets and wall or floor decor
+      roles: [main, scene, func, size]
+      environment_modes: [designed_environment]
+      non_sold_required: true
   forbidden_additions: []
   visual_context:
     primary_setting: modern US bathroom or powder room

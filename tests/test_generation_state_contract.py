@@ -3,16 +3,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 import hashlib
+from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
 from core.api_registry import image_provider_identity_key, image_provider_physical_identity
-from core.candidate_state import CandidateStateError, CANDIDATE_MANIFEST_SCHEMA_VERSION, current_candidate, candidate_by_sha, write_candidate_manifest
+from core.candidate_state import CandidateStateError, current_candidate, candidate_by_sha, write_candidate_manifest
 from core.image_generation import run_image_generation
 from core.imagegen_artifacts import IMAGEGEN_OUTPUT_CACHE_VERSION, imagegen_output_marker, staged_imagegen_output
 from core.io import file_sha256, read_json, write_json
 from tests.current_image_contract_fixture import current_image_task, current_prompt_artifact
+from tests.publication_resize_fixture import fixture_processing
 
 
 class _Plugin:
@@ -21,16 +23,21 @@ class _Plugin:
 
 
 class GenerationStateContractTests(unittest.TestCase):
+    def setUp(self):
+        paid=patch('core.batch_ledger.admit_paid_request',return_value='mock-network-admission')
+        paid.start();self.addCleanup(paid.stop)
+
     def test_formation_block_is_owned_by_brief_not_duplicated_by_generate(self) -> None:
-        from tests.failure_boundary_regression_fixture import verify_failure_boundaries
-        verify_failure_boundaries(self)
         from core.image_tasks import _blocked, _task_failure
-        for owner in ('review', 'brief', 'shared_design'):
-            failure = _task_failure(_blocked(dict(child='B1', role='func'), 'review clock', failure_owner=owner))
-            self.assertEqual(owner, failure['failure_owner'])
-            self.assertEqual('retryable' if owner == 'review' else 'blocked', failure['task_status'])
+        with tempfile.TemporaryDirectory() as directory:
+            for owner in ('tool', 'brief', 'observation'):
+                failure = _task_failure(_blocked(dict(child='B1', role='func'), 'review clock', failure_owner=owner), Path(directory))
+                self.assertEqual(owner, failure['failure_owner'])
+                self.assertEqual('blocked', failure['task_status'])
         task = current_image_task("func_01", blocked_reason="missing role plan")
         with tempfile.TemporaryDirectory() as tmp:
+            from tests.test_status_revision_contract import _job
+            _job(Path(tmp))
             prompt_artifact = current_prompt_artifact(tmp, task)
             with (
                 patch("core.image_generation.load_job", return_value={}),
@@ -53,31 +60,20 @@ class GenerationStateContractTests(unittest.TestCase):
         )
 
     def test_manifest_recovery_owns_currentness_and_repairs_receipt(self) -> None:
+        from tests.christmas_recovery_fixture import verify_saved_lane_and_accounting
+        verify_saved_lane_and_accounting(self)
+        from tests.audit_recovery_fixture import verify_unavailable_image_result
+        verify_unavailable_image_result(self)
+        from tests.image_boundary_fixture import verify_native_and_transport
+        verify_native_and_transport(self)
+        from tests.image_boundary_fixture import verify_rejection_disposition
+        verify_rejection_disposition(self)
+        self._check_provider_recovery_routes()
         from tests.current_image_recovery_fixture import verify_paid_response_recovery, verify_scheduler_overlap
         verify_paid_response_recovery(self)
         verify_scheduler_overlap(self)
-        from io import BytesIO
-        from PIL import Image
-        from core import image_upscale
-        import subprocess
-        original = BytesIO()
-        Image.new("RGB", (16, 16), "white").save(original, format="PNG")
-        def enhance(command, **kwargs):
-            self.assertNotIn("-g", command)
-            self.assertEqual(30, kwargs["timeout"])
-            Image.new("RGB", (32, 32), "white").save(command[command.index("-o") + 1])
-        with (
-            patch.object(image_upscale, "_configured_backend", return_value="auto"),
-            patch.object(image_upscale, "_realesrgan_executable", return_value=Path(__file__).resolve()),
-            patch.object(image_upscale.subprocess, "run", side_effect=enhance) as process,
-        ):
-            output, backend = image_upscale.upscale_for_publication_with_backend(original.getvalue())
-            self.assertEqual("realesrgan-x4plus", backend)
-            self.assertEqual((1600, 1600), image_upscale.publication_dimensions(output))
-            process.side_effect = subprocess.TimeoutExpired("realesrgan", 30)
-            output, backend = image_upscale.upscale_for_publication_with_backend(original.getvalue())
-            self.assertIn("fallback_from_realesrgan:Real-ESRGAN TimeoutExpired after 30s", backend)
-            self.assertEqual((1600, 1600), image_upscale.publication_dimensions(output))
+        from tests.publication_resize_fixture import verify_publication_sizing,verify_local_publication_revision
+        verify_publication_sizing(self);verify_local_publication_revision(self)
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
             task = {
@@ -116,7 +112,9 @@ class GenerationStateContractTests(unittest.TestCase):
             })
             manifest_path = job / "reports/candidate_manifests/B1/main/task/candidate0.json"
             manifest = {
-                "schema_version": CANDIDATE_MANIFEST_SCHEMA_VERSION,
+                'schema_version':'candidate-manifest-v9-processing-provenance',
+                'postprocess':fixture_processing(output.read_bytes()),
+                'native_image': dict(policy=__import__('core.imagegen_artifacts',fromlist=['NATIVE_IMAGE_POLICY']).NATIVE_IMAGE_POLICY, sha256='a'*64, size=[1600,1600]),
                 "child": "B1", "role": "main", "logical_task_id": "generate:B1:main",
                 "candidate_sha256": candidate_sha,
                 "candidate_path": str(output.relative_to(job)), "candidate_revision": 0,
@@ -142,8 +140,39 @@ class GenerationStateContractTests(unittest.TestCase):
                 patch("core.candidate_state.assert_image_output"),
                 patch("core.candidate_state._image_dimensions", return_value=(1600, 1600)),
             ):
+                from core.candidate_state import candidate_current
+                before_marker=imagegen_output_marker(output).read_bytes()
+                self.assertTrue(candidate_current(job,task))
+                self.assertEqual(before_marker,imagegen_output_marker(output).read_bytes())
                 self.assertEqual("manifest_recovered", current_candidate(job, task)["state"])
+                self.assertEqual(manifest['postprocess'],current_candidate(job,task)['postprocess'])
                 self.assertEqual("copy", read_json(imagegen_output_marker(output))["provider"])
+                from tests.current_image_contract_fixture import current_image_task
+                from core.image_prompt_compiler import compile_task_prompt
+                equivalent={**current_image_task(role='main'),**deepcopy(task),'formation_status':'ready'}
+                equivalent['generation_references']=equivalent['generation_references'][:1]
+                equivalent['edit_contract']['create'] += ' Keep these selected instances from attachment 1 (source coordinates): [{"object_id":"frame","crop":{"top":0,"left":0,"bottom":1,"right":1}}]'
+                original_prompt=prompt_path.read_bytes()
+                canonical=compile_task_prompt(task=equivalent)
+                saved=canonical.replace('"bottom":1,"left":0,"right":1,"top":0','"top":0,"left":0,"bottom":1,"right":1')
+                prompt_path.write_text(saved,encoding='utf-8')
+                saved_manifest={**manifest,'request_prompt_fingerprint':file_sha256(prompt_path),
+                    'generation_references':deepcopy(equivalent['generation_references'])}
+                write_json(manifest_path,saved_manifest)
+                before=manifest_path.read_bytes()
+                equivalent.update(task_fingerprint='current-rechecked',input_revision_id='new-observation')
+                equivalent['generation_references'][0]['visible_evidence'][0]['feature_id']='renamed-local-feature'
+                result=current_candidate(job,equivalent)
+                self.assertEqual(candidate_sha,result['candidate_sha256'])
+                self.assertEqual('task',result['reuse_evidence']['original_task_fingerprint'])
+                self.assertEqual(candidate_sha,candidate_by_sha(job,equivalent,candidate_sha)['candidate_sha256'])
+                self.assertEqual(before,manifest_path.read_bytes())
+                self.assertEqual(saved,prompt_path.read_text(encoding='utf-8'))
+                changed=deepcopy(equivalent);changed['edit_contract']['create']+=' Different authorized scene.'
+                with self.assertRaisesRegex(CandidateStateError,'Stored candidate'):current_candidate(job,changed)
+                changed=deepcopy(equivalent);changed['generation_references'][0]['protected_mask']['sha256']='f'*64
+                with self.assertRaisesRegex(CandidateStateError,'Stored candidate'):current_candidate(job,changed)
+                prompt_path.write_bytes(original_prompt);write_json(manifest_path,manifest)
                 from tests.current_image_recovery_fixture import verify_exact_candidate_finalization
                 verify_exact_candidate_finalization(self, job, task, manifest)
                 moved = deepcopy(task)
@@ -198,9 +227,10 @@ class GenerationStateContractTests(unittest.TestCase):
                 with self.assertRaises(CandidateStateError):
                     current_candidate(job, task)
                 with self.assertRaises(CandidateStateError):
-                    write_candidate_manifest(job, {**task, "candidate_path": "../escaped.png"})
+                    write_candidate_manifest(job, {**task, "candidate_path": "../escaped.png"}, native_image=manifest['native_image'], postprocess=fixture_processing(output.read_bytes()))
                 self.assertFalse((job.parent / "escaped.png").exists())
-                self.assertEqual({}, current_candidate(job, {**task, "task_fingerprint": "task-v2", "input_revision_id": "input-v2"}))
+                with self.assertRaisesRegex(CandidateStateError,'Stored candidate'):
+                    current_candidate(job,{**task,'task_fingerprint':'task-v2','input_revision_id':'input-v2'})
                 write_json(manifest_path, manifest)
                 write_json(manifest_path.with_name("candidate1.json"), {"candidate_revision": 1, "candidate_sha256": "broken"})
                 with self.assertRaises(CandidateStateError):
@@ -221,7 +251,15 @@ class GenerationStateContractTests(unittest.TestCase):
                            "task_prompt_fingerprint": "task-prompt", "request_prompt_fingerprint": request_sha,
                            "prompt_path": str(prompt_path)}
                 with patch("core.image_tasks.read_image_tasks", return_value={"tasks": [task]}):
-                    saved = write_candidate_manifest(job, runtime)
+                    paid = {**runtime, 'provider': 'renamed-provider', 'request_audit': {
+                        'provider': 'renamed-provider', 'model': 'original-model', 'endpoint': 'https://original.invalid/images/edits',
+                        'request_id': 'original-request', 'inputs': [{'original_sha256': r['sha256'], 'sent_sha256': 'a'*64}
+                            for r in runtime['generation_references']]}}
+                    with patch('core.candidate_state.image_provider_physical_identity', side_effect=AssertionError('No current registry lookup')):
+                        historical = write_candidate_manifest(job, paid, native_image=manifest['native_image'], postprocess=fixture_processing(edited_output.read_bytes()))
+                    self.assertEqual('original-model', historical['provider_model'])
+                    self.assertEqual('https://original.invalid/images/edits', historical['provider_identity']['url'])
+                    saved = write_candidate_manifest(job, runtime, native_image=manifest['native_image'], postprocess=fixture_processing(edited_output.read_bytes()))
                     self.assertEqual(candidate_sha, saved["edit_parent_candidate_sha256"])
                     self.assertEqual(file_sha256(edited_output), current_candidate(job, runtime)["candidate_sha256"])
                     self.assertEqual('targeted_edit', current_candidate(job, runtime)['revision_mode'])
@@ -238,6 +276,199 @@ class GenerationStateContractTests(unittest.TestCase):
                 write_json(manifest_path.with_name("candidate-latest.json"), manifest)
                 with self.assertRaisesRegex(CandidateStateError, "filename is invalid"):
                     current_candidate(job, task)
+
+    def _check_provider_recovery_routes(self) -> None:
+        from PIL import Image
+        from core import image_generation_executor as executor, image_provider_transport as transport
+        from core.image_response import (begin_response, submit_response, finish_response, save_response,
+            response_directory, authorize_unknown_resend, response_binding, recover_response, response_submission_metrics,
+            settle_candidate_response, resolve_response)
+        from core.image_provider_common import ProviderConfigurationError, ProviderTransportError, PromptCompileError, CandidateCommitError
+        policy = {'image_generation': {'unknown_result_policy': {'max_replacements':3}}}
+        scenarios = (
+            ('configuration', ['normal', 'backup_a', 'backup_b']),
+            ('unknown', ['normal']),
+            ('contract', ['normal']), ('candidate_commit', ['normal']),
+        )
+        for scenario, expected in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+                source = Path(tmp) / 'source.png'
+                from tests.image_boundary_fixture import native_bytes
+                source.write_bytes(native_bytes())
+                refs = [dict(kind='edit_base', path=str(source), source_id='source_00', sha256=file_sha256(source),
+                             purpose='Product evidence', evidence_ids=[])]
+                task = dict(job_dir=tmp, output_path=str(Path(tmp) / 'candidate.png'), prompt='fixture', child='B1',
+                    role='main', logical_task_id='generate:B1:main', task_fingerprint='fixed', generation_references=refs,
+                    providers=['normal', 'backup_a', 'backup_b'], execution_profile='reference_edit_soft_lock')
+                closed = {'backup_a'} if scenario.startswith('unknown') else set()
+                calls = []
+                def remote(**kwargs):
+                    provider = kwargs['provider_name']
+                    calls.append(provider)
+                    if scenario in {'contract', 'candidate_commit'}:
+                        raise (PromptCompileError if scenario == 'contract' else CandidateCommitError)('local failure')
+                    kwargs['attempt_observer'](provider, 1, status='started')
+                    audit = kwargs['request_audit']
+                    audit['endpoint'] = 'https://fixture.invalid/images/edits'
+                    receipt = begin_response(kwargs['response_directory'], provider=provider, audit=audit)
+                    submit_response(receipt, audit)
+                    if scenario == 'configuration' and provider != 'backup_b':
+                        finish_response(receipt, 'known_failure')
+                        raise ProviderConfigurationError(provider, 'model_not_found')
+                    if scenario == 'unknown':
+                        raise ProviderTransportError(provider, 'HTTP 524', ambiguous=True)
+                    save_response(receipt, source.read_bytes(), audit)
+                    return receipt
+                stack.enter_context(patch.dict('os.environ', {'AMAZON_FACTORY_IMAGEGEN_MODE': ''}))
+                stack.enter_context(patch('core.image_response.load_provider_policy', return_value=policy))
+                stack.enter_context(patch.object(executor, 'generation_reference_primary_path', return_value=source))
+                stack.enter_context(patch.object(executor, 'generation_reference_sources', return_value=refs))
+                stack.enter_context(patch.object(executor, 'image_provider_fallback_only', side_effect=lambda name: name.startswith('backup')))
+                stack.enter_context(patch.object(executor, 'provider_runtime_circuit_key', side_effect=lambda name: name))
+                stack.enter_context(patch.object(executor, 'provider_run_circuit_open', side_effect=lambda name: name in closed))
+                stack.enter_context(patch.object(executor, 'open_provider_run_circuit', side_effect=lambda name, **kw: closed.add(name)))
+                for name in ('reserve_image', 'release_image', 'assert_imagegen_prompt_preflight', 'assert_provider_allowed',
+                             '_record_generation_progress', '_record_provider_event_audit_only', 'record_provider_transport_attempt_event'):
+                    stack.enter_context(patch.object(executor, name))
+                generated = stack.enter_context(patch.object(executor, 'generate_with_provider_retries', side_effect=remote))
+                if scenario in {'unknown', 'contract', 'candidate_commit'}:
+                    with self.assertRaises((ProviderTransportError, PromptCompileError, CandidateCommitError)):
+                        executor.generate_one(task, plugin=_Plugin())
+                else:
+                    result = executor.generate_one(task, plugin=_Plugin())
+                    self.assertEqual('backup_b', result['provider'])
+                    self.assertEqual(response_binding(task), read_json(Path(result['raw_response_path']))['binding'])
+                    executor.generate_one(task, plugin=_Plugin())  # Recover saved bytes without another submission.
+                self.assertEqual(expected, calls)
+                if scenario == 'unknown':
+                    self.assertFalse(authorize_unknown_resend(task))
+                    with self.assertRaises(ProviderTransportError):executor.generate_one(task, plugin=_Plugin())
+                    self.assertEqual(1, generated.call_count)
+        with tempfile.TemporaryDirectory() as tmp, patch('core.image_response.load_provider_policy', return_value=policy):
+            task = dict(job_dir=tmp, logical_task_id='generate:B1:scene', task_fingerprint='original',
+                        candidate_revision=0, prompt='original', generation_references=[])
+            audit = {'response_binding': response_binding(task), 'logical_task_id': task['logical_task_id']}
+            previous = begin_response(response_directory(task), provider='fixture', audit=audit)
+            submit_response(previous, audit)
+            original, authorized_bytes = previous, None
+            for index in range(3):
+                changed = {**task, 'task_fingerprint': f'current-{index}', 'prompt': f'current-{index}'}
+                self.assertFalse(authorize_unknown_resend(changed))
+                resolve_response(Path(tmp),str(previous),action='approve_one_resend',reason=f'Explicit replacement {index+1}')
+                self.assertTrue(authorize_unknown_resend(changed))
+                if index == 0:
+                    authorized_bytes = original.read_bytes()
+                self.assertEqual({}, recover_response(changed))
+                changed_audit = {**audit, 'response_binding': response_binding(changed)}
+                replacement = begin_response(response_directory(changed), provider='fixture', audit=changed_audit)
+                parallel_task = {**changed, 'prompt': f'parallel-{index}'}
+                parallel_audit = {**audit, 'response_binding': response_binding(parallel_task)}
+                parallel = begin_response(response_directory(parallel_task), provider='fixture', audit=parallel_audit)
+                if index == 0:
+                    with patch('core.image_response.write_json', side_effect=OSError('before replacement POST')):
+                        with self.assertRaises(OSError):
+                            submit_response(replacement, changed_audit)
+                    self.assertEqual('prepared', read_json(replacement)['status'])
+                    self.assertEqual('resend_authorized', read_json(previous)['status'])
+                submit_response(replacement, changed_audit)
+                with self.assertRaises(ProviderTransportError):
+                    submit_response(parallel, parallel_audit)
+                record = read_json(replacement)
+                self.assertEqual([previous.name], record['replaces'])
+                self.assertEqual(previous.parent.name, record['replaces_binding'])
+                with self.assertRaises(ProviderTransportError):submit_response(replacement, changed_audit)
+                self.assertEqual(record['replaces'], read_json(replacement)['replaces'])
+                self.assertEqual(record['replaces_binding'], read_json(replacement)['replaces_binding'])
+                self.assertEqual(authorized_bytes, original.read_bytes())
+                previous, audit = replacement, changed_audit
+            fourth = {**task, 'prompt': 'fourth replacement'}
+            self.assertFalse(authorize_unknown_resend(fourth))
+            with self.assertRaises(ProviderTransportError):
+                recover_response(fourth)
+            self.assertEqual(4, response_submission_metrics(Path(tmp))['image_provider_submission_count'])
+            finish_response(previous, 'known_failure')
+            fresh = {**task, 'prompt': 'independent later chain'}
+            fresh_audit = {**audit, 'response_binding': response_binding(fresh)}
+            fresh_receipt = begin_response(response_directory(fresh), provider='fixture', audit=fresh_audit)
+            submit_response(fresh_receipt, fresh_audit)
+            resolve_response(Path(tmp),str(fresh_receipt),action='approve_one_resend',reason='Explicit independent replacement')
+            self.assertTrue(authorize_unknown_resend({**fresh, 'prompt': 'fresh replacement'}))
+            old_unknown = fresh_receipt.read_bytes()
+            current = {**fresh, 'prompt': 'fresh replacement'}
+            current_audit = {**fresh_audit, 'response_binding': response_binding(current), 'provider': 'fixture',
+                             'request_id': 'replacement', 'model': 'fixture-model', 'endpoint': 'https://fixture.invalid/images/edits'}
+            current_receipt = begin_response(response_directory(current), provider='fixture', audit=current_audit)
+            submit_response(current_receipt, current_audit)
+            output, prompt = Path(tmp) / 'candidate.png', Path(tmp) / 'prompt.txt'
+            Image.new('RGB', (2, 2), 'white').save(output)
+            prompt.write_text(current['prompt'], encoding='utf-8')
+            save_response(current_receipt, output.read_bytes(), current_audit)
+            candidate = {**current, 'request_audit': current_audit, 'prompt_path': prompt.name,
+                         'candidate_path': output.name, 'candidate_sha256': file_sha256(output)}
+            settle_candidate_response(Path(tmp), candidate)
+            settle_candidate_response(Path(tmp), candidate)
+            self.assertEqual('finalized', read_json(current_receipt)['status'])
+            self.assertEqual(old_unknown, fresh_receipt.read_bytes())
+            self.assertEqual(authorized_bytes, original.read_bytes())
+        for suffix in ('.http', '.bin'):
+            with tempfile.TemporaryDirectory() as tmp, patch('core.image_response.load_provider_policy', return_value=policy):
+                task = dict(job_dir=tmp, logical_task_id='generate:B1:scene', task_fingerprint='original',
+                            candidate_revision=0, prompt='original', generation_references=[])
+                audit = {'response_binding': response_binding(task), 'logical_task_id': task['logical_task_id']}
+                paid = begin_response(response_directory(task), provider='fixture', audit=audit)
+                submit_response(paid, audit)
+                if suffix == '.bin':
+                    Image.new('RGB', (2, 2), 'white').save(paid.with_suffix(suffix), format='PNG')
+                else:
+                    paid.with_suffix(suffix).write_text('{"data":[{"url":"https://fixture.invalid/image"}]}', encoding='utf-8')
+                changed = {**task, 'prompt': 'changed contract'}
+                self.assertFalse(authorize_unknown_resend(changed))
+                with self.assertRaises(CandidateCommitError):
+                    recover_response(changed)
+                self.assertEqual(str(paid), recover_response(task)['receipt_path'])
+                self.assertEqual(1, response_submission_metrics(Path(tmp))['image_provider_submission_count'])
+        audit = {'remote_request_id': 'header-id'}
+        error = '{"error":{"code":"model_not_found","message":"route rejected Bearer example-secret token=hidden","request_id":"gateway-id"}}'
+        with self.assertRaises(ProviderConfigurationError):
+            transport._raise_image_rejection('fixture', error, 503, request_audit=audit, api_key='example-secret')
+        self.assertEqual({'http_status': 503, 'code': 'model_not_found',
+            'message': 'route rejected Bearer [redacted] token=[redacted]', 'request_id': 'gateway-id'}, audit['provider_error'])
+        from io import BytesIO
+        from types import SimpleNamespace
+        from urllib.error import HTTPError
+        from unittest.mock import MagicMock
+        spec = SimpleNamespace(api_type='openai_images_edit', model='fixture', url='https://fixture.invalid/images/edits')
+        for status, body, kind, message_prefix in (
+            (200, error, ProviderConfigurationError, 'route rejected'),
+            (503, error, ProviderConfigurationError, 'route rejected'),
+            (524, '{"error":"busy example-secret"}', ProviderTransportError, 'busy [redacted]'),
+            (524, '{"message":"timeout example-secret"}', ProviderTransportError, 'timeout [redacted]'),
+            (524, 'Gateway timeout api_key=example-secret ' + 'x ' * 400, ProviderTransportError, 'Gateway timeout api_key=[redacted]'),
+        ):
+            audit, snapshots = {}, []
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.headers, response.read.side_effect = {'x-request-id': 'header-id'}, BytesIO(body.encode()).read
+            with ExitStack() as stack:
+                from tests.current_image_recovery_fixture import transport_attempt
+                audit, observer = stack.enter_context(transport_attempt())
+                stack.enter_context(patch.object(transport, '_image_provider_spec', return_value=spec))
+                stack.enter_context(patch.object(transport, '_provider_api_key', return_value='example-secret'))
+                stack.enter_context(patch.object(transport, '_canonical_image_edit_request', return_value=SimpleNamespace(
+                    prompt='fixture', quality='', background='', moderation='', size='')))
+                stack.enter_context(patch.object(transport, '_openai_images_edit_multipart_body', return_value=(b'post', 'fixture')))
+                stack.enter_context(patch.object(transport.urllib.request, 'urlopen', return_value=response,
+                    side_effect=HTTPError(spec.url, status, 'error', response.headers, BytesIO(body.encode())) if status >= 400 else None))
+                with self.assertRaises(kind):
+                    transport._generate_with_openai_images_edit(provider_name='fixture', image_inputs=[b'fixture'], prompt='fixture',
+                        request_audit=audit, request_observer=observer,
+                        transport_observer=lambda phase, data, snapshot: snapshots.append(deepcopy(snapshot)))
+                self.assertEqual(audit['provider_error'], snapshots[-1]['provider_error'])
+                self.assertNotIn('example-secret', str(snapshots))
+                self.assertEqual(status, snapshots[-1]['provider_error']['http_status'])
+                self.assertTrue(audit['provider_error']['message'].startswith(message_prefix))
+                self.assertLessEqual(len(audit['provider_error']['message']), 500)
+                self.assertEqual('gateway-id' if body == error else 'header-id', audit['provider_error']['request_id'])
 
 
 if __name__ == "__main__":

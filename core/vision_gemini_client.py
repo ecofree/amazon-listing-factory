@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 from functools import partial
@@ -11,13 +12,14 @@ import os
 import random
 import re
 import time
+import uuid
 import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image
+import httpx
 
 from .api_registry import model_client_physical_identity
 from .image_provider_common import ProviderQueueUnavailable, ProviderTransportError, provider_concurrency_slot, provider_concurrency_limit
@@ -36,13 +38,14 @@ from .vision_errors import VisionQAError, VisionRequestError
 
 
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_VISION_REQUEST_BYTES = 5 * 1024 * 1024  # Local safety policy, not a provider limit.
 
 
 def gemini_stream_generate(
     prompt: str,
     image_paths: list[Path],
     *,
-    timeout_seconds: int = 120,
+    timeout_seconds: int | None = None,
     attempts: int = 3,
     total_timeout_seconds: int = 0,
     client_scope: str = "",
@@ -55,6 +58,8 @@ def gemini_stream_generate(
     max_output_tokens: int | None = None,
     prior_output_limits: list[dict[str, Any]] | None = None,
 ) -> str:
+    if attempt_observer is not None:
+        attempt_observer({'event':'request_budget','request_id':request_id,'physical_request_count':0})
     effective_scope = gemini_client_effective_scope(client_scope)
     max_models = 0
     if effective_scope == "visual_planning":
@@ -62,8 +67,10 @@ def gemini_stream_generate(
         # visual-planning provider gets one response plus one schema-only
         # repair opportunity; transport failures switch provider immediately.
         attempts = max(2, _env_int("AMAZON_FACTORY_VISUAL_PLANNER_ATTEMPTS", attempts, 1, 4))
-        timeout_seconds = _env_int("AMAZON_FACTORY_VISUAL_PLANNER_TIMEOUT_SECONDS", timeout_seconds, 15, 300)
         max_models = _env_int("AMAZON_FACTORY_VISUAL_PLANNER_MAX_MODELS", 0, 0, 12)
+    if timeout_seconds is None:
+        key = 'AMAZON_FACTORY_VISUAL_PLANNER_TIMEOUT_SECONDS' if effective_scope == 'visual_planning' else 'AMAZON_FACTORY_QA_TIMEOUT_SECONDS'
+        timeout_seconds = _env_int(key, 120, 15, 300)
     attempts = max(1, min(4, int(attempts)))
     deadline = time.monotonic() + max(1, int(total_timeout_seconds)) if total_timeout_seconds > 0 else None
     if deadline_monotonic is not None:
@@ -118,12 +125,18 @@ def gemini_stream_generate(
     validation_exhausted: set[tuple[str, str]] = set()
     transient_failures: dict[str, int] = {}
     transient_failure_domains: set[str] = set()
+    busy_resources: set[str] = set()
     recorded_transport_results: set[tuple[str, str]] = set()
     physical_request_count = 0
 
     def report_request_budget() -> None:
         attempt_observer({'event': 'request_budget', 'request_id': request_id,
                           'physical_request_count': physical_request_count})
+
+    def submitted() -> None:
+        nonlocal physical_request_count
+        physical_request_count += 1
+        report_request_budget()
 
     def client_key(client: dict[str, Any]) -> str:
         return json.dumps(
@@ -134,12 +147,14 @@ def gemini_stream_generate(
         )
 
     def transport_request_allowed(client: dict[str, Any]) -> bool:
-        nonlocal physical_request_count, last_status, last_exc
+        nonlocal last_status, last_exc
         key = client_key(client)
         domain = _visual_transport_failure_domain(client)
         available = (
-            domain not in transient_failure_domains
+            _vision_resource(client)[1] not in busy_resources
+            and domain not in transient_failure_domains
             and not provider_run_circuit_open(key, task_id=request_id)
+            and not provider_run_circuit_open(_vision_resource(client)[1])
             and transient_failures.get(key, 0) < 2
         )
         if not available:
@@ -151,25 +166,24 @@ def gemini_stream_generate(
             return False
         if not admit_provider_probe(key):
             return False
-        physical_request_count += 1
-        report_request_budget()
         return True
 
     def record_transport_failure(client: dict[str, Any], exc: Exception) -> tuple[str, str, bool]:
-        nonlocal physical_request_count
         key = client_key(client)
         detail = _transport_error_summary(exc)
         if isinstance(exc, ProviderQueueUnavailable):
             # No network request was sent.  A busy local concurrency slot must
             # not consume the visual-planning request budget.
-            physical_request_count = max(0, physical_request_count - 1)
             report_request_budget()
             release_unused_provider_probe(key)
+            busy_resources.add(_vision_resource(client)[1])
             return "queue_unavailable", detail, False
         status = "transport_failure" if isinstance(exc, HTTPException) else model_status_from_exception(exc, detail)
         terminal = status in {"auth_failure", "configuration_failure", "model_not_found", "request_failure"}
         if terminal:
             open_provider_run_circuit(key, task_id=request_id)
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 402:
+                open_provider_run_circuit(_vision_resource(client)[1], task_id=request_id)
             return status, detail, True
         transient_failures[key] = transient_failures.get(key, 0) + 1
         if status in {"timeout_failure", "transport_failure", "server_failure"}:
@@ -224,10 +238,14 @@ def gemini_stream_generate(
             ordered_clients, max_models,
         ) if effective_scope == "visual_planning" else ordered_clients[:max_models]
     for client in ordered_clients:
+        if last_status == 'output_limit':
+            required_tokens = 2 * max(int(row.get('max_output_tokens') or 0)
+                                     for row in attempt_history if row.get('status') == 'output_limit')
+            client['max_output_tokens'] = min(client['_output_token_cap'], max(_client_token_limit(client), required_tokens))
         client['_request_prompt'] = prompt
         last_provider = client_key(client)
         last_model = str(client.get("model") or "").strip()
-        if provider_run_circuit_open(last_provider, task_id=request_id):
+        if provider_run_circuit_open(last_provider, task_id=request_id) or provider_run_circuit_open(_vision_resource(client)[1]):
             if not last_status:
                 last_status = "provider_circuit_open"
                 last_exc = VisionQAError(f"Provider {last_provider} circuit is open for this run")
@@ -256,7 +274,8 @@ def gemini_stream_generate(
                         try:
                             body = _post_vision_request(
                                 client, endpoint_url, openai_payload, headers=headers,
-                                timeout_seconds=effective_timeout, deadline=deadline,
+                                timeout_seconds=effective_timeout, deadline=deadline, on_submit=submitted,
+                                service="qa" if effective_scope == "vision_qa" else "planning", request_id=request_id,
                             )
                             response_candidates = _parse_openai_responses_candidates(body)
                             text, selected_index, candidate_records, validation_error = _select_response_candidate(
@@ -320,7 +339,8 @@ def gemini_stream_generate(
                         try:
                             body = _post_vision_request(
                                 client, endpoint_url, openai_payload, headers=headers,
-                                timeout_seconds=effective_timeout, deadline=deadline,
+                                timeout_seconds=effective_timeout, deadline=deadline, on_submit=submitted,
+                                service="qa" if effective_scope == "vision_qa" else "planning", request_id=request_id,
                             )
                             response_candidates = _parse_openai_chat_candidates(body)
                             text, selected_index, candidate_records, validation_error = _select_response_candidate(
@@ -388,7 +408,8 @@ def gemini_stream_generate(
                         try:
                             body = _post_vision_request(
                                 client, url, payload, headers=headers,
-                                timeout_seconds=effective_timeout, deadline=deadline,
+                                timeout_seconds=effective_timeout, deadline=deadline, on_submit=submitted,
+                                service="qa" if effective_scope == "vision_qa" else "planning", request_id=request_id,
                             )
                             response_candidates = parser(body)
                             text, selected_index, candidate_records, validation_error = _select_response_candidate(
@@ -641,6 +662,9 @@ def _emit_attempt(
     selected_candidate_index: int | None = None,
     error: str = "",
 ) -> dict[str, Any]:
+    transport = dict(client.get('_transport', {}))
+    saved_body = transport.pop('_response_body', '')
+    response_body = response_body or saved_body
     event = {
         "request_id": request_id,
         "request_text": client.get('_request_prompt', ''),
@@ -653,12 +677,14 @@ def _emit_attempt(
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         "response_text": response_text or None,
         "response_char_count": len(response_text or ""),
-        "response_body_sha256": hashlib.sha256(response_body.encode('utf-8')).hexdigest() if response_body else None,
+        "response_body_sha256": hashlib.sha256(response_body.encode('utf-8')).hexdigest()
+            if response_body or transport.get('response_complete') else None,
         "response_body": response_body or None,
         "finish_reasons": _response_finish_reasons(response_body),
         "usage": _response_usage(response_body),
         "max_output_tokens": _client_token_limit(client),
         "output_token_cap": client.get('_output_token_cap'),
+        "transport": transport,
         "response_candidates": list(response_candidates or []),
         "selected_candidate_index": selected_candidate_index,
         "error": error or None,
@@ -730,6 +756,7 @@ def _attempt_event_summary(event: dict[str, Any]) -> dict[str, Any]:
         "usage": event.get('usage', {}),
         "max_output_tokens": event.get('max_output_tokens'),
         "output_token_cap": event.get('output_token_cap'),
+        "transport": event.get('transport', {}),
     }
 
 
@@ -852,6 +879,11 @@ def _gemini_native_payload(parts: list[dict[str, Any]], client: dict[str, str]) 
         generation_config["responseModalities"] = response_modalities
     if response_modalities == ["TEXT"] and profile_from_client(client).response_format == "json":
         generation_config["responseMimeType"] = "application/json"
+    if client.get('thinking_level'):
+        level = str(client['thinking_level']).upper()
+        if level not in {'MINIMAL', 'LOW', 'MEDIUM', 'HIGH'}:
+            raise VisionQAError('Configured thinking_level is not a native Gemini enum')
+        generation_config['thinkingConfig'] = {'thinkingLevel': level}
     return {"contents": [{"role": "user", "parts": parts}], "generationConfig": generation_config}
 
 
@@ -1054,15 +1086,6 @@ def _vision_resource(client: dict[str, Any]) -> tuple[str, str]:
     return name, "vision_" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
 
 
-def vision_scope_capacity(scope: str) -> int:
-    capacities = {}
-    for client in gemini_clients(client_scope=scope):
-        name, resource = _vision_resource(client)
-        limit = provider_concurrency_limit(name) or 32
-        capacities[resource] = min(capacities.get(resource, limit), limit)
-    return max(1, sum(capacities.values()))
-
-
 def _native_image_payload(prompt: str, paths: list[Path], client: dict[str, Any]) -> dict[str, Any]:
     return _gemini_native_payload([{"text": prompt}, *[_image_part(path) for path in paths]], client)
 
@@ -1075,6 +1098,9 @@ def _post_vision_request(
     headers: dict[str, str],
     timeout_seconds: int,
     deadline: float | None,
+    on_submit: Callable[[], None],
+    service: str = "planning",
+    request_id: str = "",
 ) -> str:
     """Share a physical planning endpoint safely across parallel jobs.
 
@@ -1083,64 +1109,125 @@ def _post_vision_request(
     jobs from immediately exhausting a provider-level concurrency quota.
     """
     provider, resource = _vision_resource(client)
-    # Queue time and request time are different budgets.  A congested primary
-    # may wait briefly, but must not consume the complete role deadline and
-    # leave every fallback with a near-zero timeout.
-    queue_deadline = None
-    if deadline is not None:
-        queue_deadline = min(deadline, time.monotonic() + 8.0)
-    with provider_concurrency_slot(provider, deadline=queue_deadline, resource_key=resource):
-        return _post_json_preserve_redirects(
-            url,
-            payload(),
-            headers=headers,
-            timeout_seconds=_bounded_deadline_timeout(timeout_seconds, deadline),
-            deadline=deadline,
-        )
-
-
-def _post_json_preserve_redirects(url: str, payload: dict[str, Any], headers: dict[str, str], *, timeout_seconds: int = 120, deadline: float | None = None) -> str:
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    opener = urllib.request.build_opener(_NoRedirectHandler)
-    current = url
-    end = min(time.monotonic() + timeout_seconds, deadline if deadline is not None else float('inf'))
-
-    def remaining() -> float:
-        seconds = end - time.monotonic()
-        if seconds <= 0:
-            raise TimeoutError('Vision response total deadline exhausted')
-        return seconds
-
-    for _ in range(4):
-        request = urllib.request.Request(current, data=data, headers=headers, method="POST")
+    client['_transport'] = {}
+    # Wait for the actual endpoint within this invocation's existing budget.
+    # Admission alone is not submission and must not charge the journal.
+    with provider_concurrency_slot(provider, deadline=deadline, resource_key=resource):
+        if provider_run_circuit_open(resource):
+            raise ProviderQueueUnavailable(provider, 'Account unavailable while waiting for its concurrency slot')
         try:
-            with opener.open(request, timeout=remaining()) as response:
-                chunks = []
-                while not response.isclosed():
-                    # Socket inactivity alone does not bound a trickling SSE response.
-                    response.fp.raw._sock.settimeout(remaining())
-                    chunk = response.read1(65536)
-                    remaining()
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                if response.length not in (None, 0):
-                    raise IncompleteRead(b''.join(chunks), response.length)
-                return b''.join(chunks).decode('utf-8', errors='replace')
-        except urllib.error.HTTPError as exc:
-            if exc.code in REDIRECT_STATUSES:
-                location = exc.headers.get("Location")
-                if location:
-                    current = urllib.parse.urljoin(current, location)
-                    exc.close()
-                    continue
-            raise
-    raise VisionQAError(f"Too many redirects for Gemini endpoint: {url}")
+            body = json.dumps(payload(), ensure_ascii=False).encode('utf-8')
+            if len(body) > MAX_VISION_REQUEST_BYTES:
+                raise ValueError(f'Complete vision request exceeds local {MAX_VISION_REQUEST_BYTES}-byte budget; no evidence was dropped')
+        except (ValueError, OSError, VisionQAError) as exc:
+            raise VisionRequestError('vision_qa' if service == 'qa' else 'visual_planning', 'request_failure',
+                f'Vision input preflight failed before POST: {exc}', metadata={'physical_request_count':0}) from exc
+        timeout = _bounded_deadline_timeout(timeout_seconds, deadline)
+        from .batch_ledger import admit_paid_request
+        from .service_response import prepare_request
+        admission = admit_paid_request(service, request_id or None)
+        try:
+            with prepare_request():
+                on_submit()
+                return _post_json_preserve_redirects(url,body,headers=headers,timeout_seconds=timeout,
+                    deadline=deadline,audit=client['_transport'])
+        finally:
+            client['_transport']['admission_id'] = admission
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        return None
+def _post_json_preserve_redirects(url: str, payload: dict[str, Any] | bytes, headers: dict[str, str], *, timeout_seconds: int = 120, deadline: float | None = None, audit: dict | None = None) -> str:
+    """One absolute deadline covers connection, upload, redirects and response bodies."""
+    started = time.monotonic()
+    end = min(started + timeout_seconds, deadline if deadline is not None else float('inf'))
+    data = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    if len(data) > MAX_VISION_REQUEST_BYTES:
+        raise VisionRequestError('vision', 'request_failure', 'Vision request exceeds local byte budget before POST',
+                                 metadata={'physical_request_count':0})
+    audit = audit if audit is not None else {}
+    audit.clear()
+    audit.update(request_bytes=len(data), request_body_sha256=hashlib.sha256(data).hexdigest(),
+                 request_outcome='unknown', response_complete=False)
+
+    from .service_response import prepare_request,start_submission,connection_not_sent,RequestNotSent
+    trace_state={'headers_started':False,'connect_failed':False};submission=None
+    async def trace(event, info):
+        if event.endswith('send_request_headers.started'):trace_state['headers_started']=True
+        if event in {'connection.connect_tcp.failed','connection.start_tls.failed'}:trace_state['connect_failed']=True
+    async def send():
+        nonlocal submission
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Vision response total deadline exhausted')
+        # The absolute deadline also cancels upload/header waits; retain the
+        # configured environment proxy and certificate verification.
+        async with asyncio.timeout(remaining), httpx.AsyncClient(timeout=None, trust_env=True,
+                follow_redirects=False, limits=httpx.Limits(max_keepalive_connections=0)) as session:
+            current = url
+            for _ in range(4):
+                submission=start_submission()
+                async with session.stream('POST', current, content=data, headers=headers,extensions={'trace':trace}) as response:
+                    audit.update(http_status=response.status_code, response_headers={
+                        key: response.headers[key] for key in ('x-request-id', 'request-id', 'x-correlation-id',
+                            'cf-ray', 'server', 'date', 'content-type') if key in response.headers})
+                    audit['response_headers_ms'] = round((time.monotonic() - started) * 1000)
+                    if response.status_code in REDIRECT_STATUSES and response.headers.get('Location'):
+                        target = urllib.parse.urljoin(current, response.headers['Location'])
+                        original, redirected = urllib.parse.urlsplit(url), urllib.parse.urlsplit(target)
+                        origin = lambda value: (value.scheme.casefold(), (value.hostname or '').casefold(), value.port or 443)
+                        if (response.status_code not in {307, 308} or original.scheme != 'https' or redirected.scheme != 'https'
+                                or redirected.username is not None or redirected.password is not None
+                                or not redirected.hostname or origin(original) != origin(redirected)):
+                            raise VisionQAError('Unsafe vision redirect; credentials and request body were not forwarded')
+                        from .url_safety import assert_public_http_url
+                        assert_public_http_url(target)
+                        current = target
+                        continue
+                    if response.status_code >= 400:
+                        # Buffer only a bounded error body inside the same deadline. Later error
+                        # reporting must not perform another blocking read on the live socket.
+                        raw = b''; complete = True
+                        async for chunk in response.aiter_bytes():
+                            remaining = 4096 - len(raw)
+                            raw += chunk[:remaining]
+                            if len(chunk) > remaining:
+                                complete = False; break
+                        audit.update(response_complete=complete, response_bytes=len(raw),
+                                     _response_body=raw.decode('utf-8', errors='replace'))
+                        try:
+                            parsed = json.loads(raw)
+                            error = parsed.get('error', parsed) if isinstance(parsed, dict) else {}
+                            code = str(error.get('type') or error.get('code') or '') if isinstance(error, dict) else ''
+                        except (ValueError, UnicodeError):code = ''
+                        audit['error_code'] = code
+                        # Only this explicit complete account refusal proves a rejected model request.
+                        # A 5xx, truncated body, or unrecognized 402 remains ambiguous.
+                        if complete and response.status_code == 402 and code == 'insufficient_balance':
+                            audit['request_outcome'] = 'rejected'
+                        raise urllib.error.HTTPError(current, response.status_code, response.reason_phrase,
+                                                     response.headers, io.BytesIO(raw))
+                    try:
+                        body = await response.aread()
+                    except httpx.RemoteProtocolError as exc:
+                        raise IncompleteRead(b'') from exc
+                    audit.update(response_bytes=len(body), response_complete=True, request_outcome='response_received')
+                    return body.decode('utf-8', errors='replace')
+            raise VisionQAError('Too many redirects for Gemini endpoint')
+    try:
+        with prepare_request():return asyncio.run(send())
+    except (httpx.TransportError,TimeoutError) as exc:
+        if trace_state['connect_failed'] and not trace_state['headers_started']:
+            proof=connection_not_sent(submission,exc)
+            if isinstance(proof,RequestNotSent):
+                audit.update(request_outcome='not_sent',submission_proof=proof.stage)
+                raise proof from exc
+        if isinstance(exc,TimeoutError):raise
+        chain=[];cause=exc
+        while cause is not None and len(chain)<4:
+            chain.append(f'{type(cause).__name__}: {cause}')
+            cause=cause.__cause__
+        raise urllib.error.URLError(' <- '.join(chain)) from exc
+    finally:
+        audit['elapsed_ms'] = round((time.monotonic() - started) * 1000)
 
 
 def _parse_sse_text_candidates(body: str) -> list[str]:
@@ -1327,8 +1414,6 @@ def _vision_image_payload(path: Path) -> tuple[str, bytes]:
     original = path.read_bytes()
     max_side = 1600
     max_bytes = 1_200_000
-    if max_side <= 0 and (max_bytes <= 0 or len(original) <= max_bytes):
-        return mime, original
     try:
         with Image.open(path) as image:
             width, height = image.size
@@ -1347,11 +1432,11 @@ def _vision_image_payload(path: Path) -> tuple[str, bytes]:
             out = io.BytesIO()
             working.save(out, format="JPEG", quality=88, optimize=True)
             compressed = out.getvalue()
-            if compressed:
-                return "image/jpeg", compressed
-    except Exception:
-        pass
-    return mime, original
+            if not compressed or len(compressed) > max_bytes:
+                raise VisionQAError('Encoded reference exceeds local per-image byte budget; no automatic evidence reduction')
+            return "image/jpeg", compressed
+    except (OSError, ValueError) as exc:
+        raise VisionQAError(f'Invalid vision reference image: {type(exc).__name__}') from exc
 
 
 def _client_token_limit(client: dict[str, Any]) -> int:

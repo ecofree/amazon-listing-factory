@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import os
 import time
 from pathlib import Path
@@ -9,8 +8,7 @@ from typing import Any
 from .candidate_state import CandidateStateError, commit_candidate_output
 from .image_provider_common import (
     ImageGenerationError,
-    CandidateCommitError,
-    ProviderContentError,
+    CandidateCommitError, ImageOutputRejected,
     PromptCompileError,
     ProviderConfigurationError,
     ProviderTransportError,
@@ -24,18 +22,18 @@ from .image_provider_common import (
 from .image_provider_routing import (
     generate_with_provider_retries,
     provider_runtime_circuit_key,
-    record_provider_generation_event,
     record_provider_transport_attempt_event,
 )
 from .model_call_health import open_provider_run_circuit, provider_run_circuit_open
 from .image_provider_transport import assert_imagegen_prompt_preflight
 from .image_task_inputs import EXECUTION_PROFILES
 from .image_reference_context import (
-    generation_reference_mask_bytes,
+    generation_attachment_count,
+    generation_reference_region_map_bytes,
     generation_reference_primary_path,
     generation_reference_sources,
 )
-from .api_registry import image_provider_supports_mask, image_provider_supports_multiple_references, image_provider_fallback_only
+from .api_registry import image_provider_supports_multiple_references, image_provider_fallback_only
 from .plugin import ProductPlugin
 from .paths import resolve_job_owned_path
 from .provider_policy import assert_provider_allowed, load_provider_policy
@@ -55,13 +53,13 @@ def generate_one(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, An
     deadlines = [float(task[key]) for key in ("deadline_monotonic", "role_deadline_monotonic") if task.get(key) is not None]
     if deadlines and time.monotonic() >= min(deadlines):
         raise ImageGenerationError("Image execution deadline exhausted before memory admission")
-    reserve_image(task)
+    lease = reserve_image(task)
     try:
         result = _generate_admitted(task, plugin=plugin)
     except Exception:
-        release_image(task)
+        release_image(task, lease)
         raise
-    release_image(task, buffered=True)
+    release_image(task, lease, buffered=True)
     return result
 
 
@@ -88,25 +86,14 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
         raise CandidateStateError(f"Immutable candidate output already exists without a current manifest: {output_path}")
     reference_sources = generation_reference_sources(task, plugin=plugin)
     image_input_paths = [str(row["path"]) for row in reference_sources]
-    if len(image_input_paths) > 1:
-        compatible = [name for name in providers if image_provider_supports_multiple_references(name, len(image_input_paths))]
+    attachment_count = generation_attachment_count(reference_sources)
+    if attachment_count > 1:
+        compatible = [name for name in providers if image_provider_supports_multiple_references(name, attachment_count)]
         if not compatible:
             raise ProviderConfigurationError(providers[0], "No assigned provider supports the required reference set; no request sent")
         providers = compatible
-    has_protected_mask = any(
-        isinstance(row, dict) and isinstance(row.get("protected_mask"), dict)
-        for row in reference_sources
-    )
-    protected_mask_bytes = (
-        generation_reference_mask_bytes(task, plugin=plugin)
-        if has_protected_mask
-        else None
-    )
-    if protected_mask_bytes is not None:
-        mask_providers = [provider for provider in providers if image_provider_supports_mask(provider)]
-        if not mask_providers:
-            raise ProviderConfigurationError(providers[0], "No assigned provider supports the supplied protected mask")
-        providers = mask_providers
+    region_map_bytes = (generation_reference_region_map_bytes(task, plugin=plugin)
+                        if attachment_count > len(reference_sources) else None)
     execution_profile = str(task.get("execution_profile") or "")
     if execution_profile not in EXECUTION_PROFILES:
         raise ImageGenerationError(f"Unsupported generated-image execution profile: {execution_profile}")
@@ -134,7 +121,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
         role_budget_seconds = max(60.0, float(os.environ.get("AMAZON_FACTORY_IMAGEGEN_ROLE_DEADLINE_SECONDS") or default_role_budget))
     except ValueError:
         role_budget_seconds = default_role_budget
-    role_deadline = task.setdefault("role_deadline_monotonic", time.monotonic() + role_budget_seconds)
+    role_deadline = task.get("role_deadline_monotonic", time.monotonic() + role_budget_seconds)
     if task.get("deadline_monotonic") is not None:
         role_deadline = min(role_deadline, float(task["deadline_monotonic"]))
     if time.monotonic() >= role_deadline:
@@ -168,6 +155,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 failure_class: str = "",
             ) -> None:
                 if status == "started":
+                    task.setdefault("role_deadline_monotonic", time.monotonic() + role_budget_seconds)
                     counts = dict(task.get("provider_attempts") or {})
                     counts[current_provider] = int(counts.get(current_provider) or 0) + 1
                     task["provider_attempts"] = counts
@@ -207,7 +195,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 'response_binding': response_binding(task),
                 'logical_task_id': task['logical_task_id'],
                 "revision_mode": task.get("revision_mode") or "initial",
-                "reference_count": len(reference_sources),
+                "reference_count": attachment_count,
                 "coordinate_frame": "candidate_in_place" if task.get("revision_mode") == "targeted_edit" else "original_source",
                 "design_transfer": (task.get("image_direction") or {}).get("design_transfer", []),
                 "reference_effect": "not_visually_evaluated",
@@ -215,11 +203,20 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                     ("kind", "source_id", "sha256", "purpose", "evidence_ids")}}
                     for index, row in enumerate(reference_sources, 1)],
             }
+            if region_map_bytes is not None:
+                import hashlib
+                request_audit['references'].append({
+                    'attachment_number': attachment_count, 'kind': 'region_map',
+                    'source_id': reference_sources[0]['source_id'],
+                    'sha256': hashlib.sha256(region_map_bytes).hexdigest(),
+                    'source_mask_sha256': reference_sources[0]['protected_mask']['sha256'],
+                    'purpose': 'White preserves product; black permits only contracted edits.', 'evidence_ids': [],
+                })
             receipt = generate_with_provider_retries(
                 provider_name=provider,
                 image_input_paths=image_input_paths,
                 prompt=prompt,
-                mask_bytes=protected_mask_bytes,
+                region_map_bytes=region_map_bytes,
                 attempt_observer=observe_transport_attempt,
                 total_timeout_seconds=provider_budget,
                 request_id=request_id,
@@ -227,17 +224,17 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 response_directory=response_directory(task),
             )
             task['request_audit'] = request_audit
-            from PIL import Image, UnidentifiedImageError
+            from .imagegen_artifacts import assert_native_image, IMAGE_OUTPUT_MAX_BYTES
             try:
-                with Image.open(receipt.with_suffix('.bin')) as image:
-                    if image.width != image.height or min(image.size) <= 0:
-                        raise ProviderContentError(provider, 'Generated image has an invalid canvas')
-                    image.verify()
-            except (UnidentifiedImageError, ProviderContentError) as exc:
-                finish_response(receipt, 'rejected_content')
-                raise ProviderContentError(provider, str(exc)) from exc
+                if receipt.with_suffix('.bin').stat().st_size > IMAGE_OUTPUT_MAX_BYTES:
+                    raise ImageOutputRejected('Native response exceeds output byte limit')
+                assert_native_image(receipt.with_suffix('.bin').read_bytes())
+            except ImageOutputRejected as exc:
+                from .image_response import reject_response_output
+                reject_response_output(receipt, str(exc))
+                raise
             except Exception as exc:
-                raise CandidateCommitError(f'Paid response saved; local validation failed: {exc}') from exc
+                raise CandidateCommitError(f'Paid response saved; local native validation failed: {exc}') from exc
             provider_duration = time.monotonic() - provider_started
             task.pop('request_outcome', None)
             commit_task = {
@@ -267,7 +264,7 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                 task["request_audit"] = request_audit
                 task["request_outcome"] = "unknown"
             failure_class = provider_failure_class(exc)
-            if failure_class == 'candidate_commit':
+            if failure_class in {'candidate_commit','budget'}:
                 raise
             if failure_class == "queue":
                 if attempted_providers and attempted_providers[-1] == provider:
@@ -309,12 +306,13 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
             if failure_class == "configuration":
                 open_provider_run_circuit(provider_runtime_circuit_key(provider), task_id=str(task.get("logical_task_id") or ""))
             if getattr(exc, "ambiguous", False):
-                if backups and role_deadline - time.monotonic() > 1 and authorize_unknown_resend(task):
-                    replacement = min(backups, key=lambda name: (attempted_providers.count(name), name == provider))
+                available_backups = [name for name in backups if not provider_run_circuit_open(provider_runtime_circuit_key(name))]
+                if available_backups and role_deadline - time.monotonic() > 1 and authorize_unknown_resend(task):
+                    replacement = min(available_backups, key=lambda name: (attempted_providers.count(name), name == provider))
                     providers.append(replacement)
                     continue
                 break
-            if provider in backups or failure_class in {"contract", "candidate_commit"}:
+            if failure_class == "contract" or (provider in backups and failure_class != "configuration"):
                 # Neither an immutable task-contract failure nor a local
                 # artifact-commit failure can be repaired by spending a backup
                 # provider call.
@@ -335,9 +333,55 @@ def _generate_admitted(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
 
 
 def finalize_candidate(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
+    """A stalled decoder, stream or native subprocess cannot outlive local finalization."""
+    import multiprocessing
+    import queue
+    import psutil
+    from .process_lock import stop_process
+    deadline = min(time.monotonic() + 120, float(task.get('deadline_monotonic') or float('inf')))
+    if time.monotonic() >= deadline:
+        raise CandidateCommitError('Local finalization deadline exhausted; receipt retained')
+    context = multiprocessing.get_context('spawn')
+    output = context.Queue(maxsize=1)
+    process = context.Process(target=_finalize_worker, args=({**task, 'deadline_monotonic': deadline}, output))
+    created = None
+    try:
+        process.start()
+        created = psutil.Process(process.pid).create_time()
+        while time.monotonic() < deadline:
+            try:
+                result = output.get(timeout=min(0.1, max(0.001, deadline - time.monotonic())))
+                if result['ok']:
+                    return result['task']
+                if result.get('waiting'):
+                    raise ProviderQueueUnavailable('host_image_finalize', result['error'])
+                raise CandidateCommitError(result['error'])
+            except queue.Empty:
+                if not process.is_alive():
+                    break
+        raise CandidateCommitError('Local finalization stopped or exceeded deadline; reconcile saved receipt, no resend')
+    finally:
+        if created is not None:
+            stop_process(process.pid, created)
+        if process.pid:
+            process.join(timeout=1)
+        output.cancel_join_thread()
+        output.close()
+
+
+def _finalize_worker(task, output):
+    try:
+        output.put({'ok': True, 'task': _finalize_local(task, plugin=None)})
+    except Exception as exc:
+        output.put({'ok': False, 'waiting': isinstance(exc, ProviderQueueUnavailable),
+                    'error': f'{type(exc).__name__}: {exc}'})
+
+
+def _finalize_local(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[str, Any]:
     del plugin
     started = time.monotonic()
     waiting = False
+    lease = ''
     try:
         from .candidate_state import current_candidate
         if not current_candidate(task['job_dir'], task, revision=int(task.get('candidate_revision') or 0)):
@@ -348,36 +392,37 @@ def finalize_candidate(task: dict[str, Any], *, plugin: ProductPlugin) -> dict[s
                     raise CandidateCommitError('Raw response no longer matches the current request')
             deadline = min(time.monotonic() + 120, float(task.get('deadline_monotonic') or float('inf')))
             with provider_concurrency_slot('host_image_finalize', deadline=deadline):
-                reserve_image(task, local=True)
-                path = materialize_response(receipt) if receipt else Path(task['local_source_path'])
-                commit_candidate_output(task['job_dir'], task, _finalize_candidate_bytes(path.read_bytes()))
+                lease = reserve_image(task, local=True)
+                path = materialize_response(receipt, deadline=deadline) if receipt else Path(task['local_source_path'])
+                from .imagegen_artifacts import IMAGE_OUTPUT_MAX_BYTES
+                if path.stat().st_size > IMAGE_OUTPUT_MAX_BYTES:
+                    raise ImageOutputRejected('Saved native response exceeds byte limit; no automatic resend')
+                commit_candidate_output(task['job_dir'], {**task, 'deadline_monotonic': deadline}, path.read_bytes())
         if task.get('raw_response_path'):
             finish_response(Path(task['raw_response_path']), 'finalized')
         _record_generation_progress(task, 'image_candidate_committed', str(task.get('provider') or ''),
             local_finalize_seconds=round(time.monotonic() - started, 3))
         return {**task, 'bytes': Path(task['output_path']).stat().st_size}
     except Exception as exc:
+        if isinstance(exc, ImageOutputRejected) and task.get('raw_response_path'):
+            from .image_response import reject_response_output
+            reject_response_output(Path(task['raw_response_path']), str(exc))
         waiting = isinstance(exc, ProviderQueueUnavailable)
         if isinstance(exc, (CandidateCommitError, ProviderQueueUnavailable)):
             raise
         raise CandidateCommitError(f'Local finalization failed; saved response retained: {type(exc).__name__}: {exc}') from exc
     finally:
-        release_image(task, buffered=waiting)
+        if lease:
+            release_image(task, lease, buffered=waiting)
 
 
 def _record_provider_event_audit_only(**event: Any) -> None:
-    """Provider quality telemetry must never change candidate authority."""
-    try:
-        record_provider_generation_event(**event)
-    except Exception as exc:
-        task = event.get("task") if isinstance(event.get("task"), dict) else {}
-        _record_generation_progress(
-            task,
-            "image_provider_quality_ledger_write_failed",
-            str(event.get("provider") or ""),
-            status="audit_failure",
-            error=f"{type(exc).__name__}: {exc}",
-        )
+    """Generation selection/finalization are progress, not a second health ledger."""
+    task=event.get('task') if isinstance(event.get('task'),dict) else {}
+    _record_generation_progress(task,'image_provider_execution',str(event.get('provider') or ''),
+        status=str(event.get('status') or ''),error=str(event.get('error') or ''),
+        selected=bool(event.get('selected')),duration_seconds=event.get('duration_seconds'),
+        failure_class=str(event.get('failure_class') or ''))
 
 
 def _record_generation_progress(
@@ -411,35 +456,3 @@ def _production_imagegen_task(task: dict[str, Any]) -> bool:
         return True
     raw = os.environ.get("AMAZON_FACTORY_PRODUCTION_IMAGEGEN", "")
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _finalize_candidate_bytes(data: bytes) -> bytes:
-    """Normalize provider bytes without inventing resolution through interpolation."""
-    from PIL import Image
-
-    try:
-        with Image.open(io.BytesIO(data)) as opened:
-            # Candidate commit owns the single publication-size conversion.
-            # Keep an already normalized PNG compressed bytestring intact so a
-            # large provider response is not decoded and re-encoded twice.
-            if opened.format == "PNG" and opened.mode == "RGB":
-                width, height = opened.size
-                if min(width, height) <= 0 or width != height:
-                    raise ImageGenerationError("Generated image has an invalid canvas")
-                return bytes(data)
-            if opened.mode in {"RGBA", "LA"} or (opened.mode == "P" and "transparency" in opened.info):
-                rgba = opened.convert("RGBA")
-                background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-                background.alpha_composite(rgba)
-                image = background.convert("RGB")
-            else:
-                image = opened.convert("RGB")
-            if min(image.size) <= 0:
-                raise ImageGenerationError("Generated image has an invalid canvas")
-            output = io.BytesIO()
-            image.save(output, format="PNG", optimize=True)
-            return output.getvalue()
-    except ImageGenerationError:
-        raise
-    except Exception as exc:
-        raise ImageGenerationError(f"Final candidate conversion failed: {type(exc).__name__}: {exc}") from exc

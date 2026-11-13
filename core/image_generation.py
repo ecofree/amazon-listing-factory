@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -12,10 +13,12 @@ from .api_registry import (
     image_provider_entries,
     image_provider_physical_identity,
 )
-from .candidate_state import CandidateStateError, current_candidate
+from .candidate_state import (CandidateStateError,current_candidate,candidate_prompt_current,reprocess_candidate_publication,
+    next_candidate_revision as _next_candidate_revision)
 from .image_generation_executor import generate_one, finalize_candidate
 from .image_response import recover_response, authorize_unknown_resend, unknown_result_resend_limit
 from .image_provider_common import (
+    CandidateCommitError,
     ProviderQueueUnavailable,
     provider_attempts,
     provider_concurrency_limit,
@@ -54,6 +57,105 @@ from .status import (
 from .url_safety import URL_SAFETY_POLICY_VERSION
 
 
+def generation_scope(selection) -> dict[str, Any]:
+    """None means normal scope; an explicit empty/malformed permission never means all."""
+    if selection is None:
+        value = {'mode':'all', 'tasks':None}
+    else:
+        if not isinstance(selection, (list, tuple)) or not selection:
+            raise ValueError('Generation task selection must be a nonempty explicit list')
+        identities, seen = [], set()
+        for item in selection:
+            if (not isinstance(item, dict) or set(item) != {'child','role','task_fingerprint'}
+                    or any(not isinstance(v,str) or not v for v in item.values())
+                    or not re.fullmatch('[0-9a-f]{64}', item['task_fingerprint'])):
+                raise ValueError('Generation selection only accepts child, role and current task_fingerprint')
+            key = (item['child'], item['role'])
+            if key in seen:
+                raise ValueError('Duplicate generation task selection')
+            seen.add(key); identities.append(dict(item))
+        value = {'mode':'selected', 'tasks':identities}
+    return {**value, 'selection_sha256':input_revision_id(value)}
+
+
+def check_generation_scope(job: Path, selection, *, all_generation_tasks: bool = False) -> dict[str, Any]:
+    """Read-only permission check; never reconcile receipts or restore candidates here."""
+    from .status import load_status
+    from .io import read_jsonl
+    scope = generation_scope(selection)
+    if type(all_generation_tasks) is not bool:
+        raise ValueError('Full generation acknowledgement must be an explicit boolean')
+    if all_generation_tasks and selection is not None:
+        raise ValueError('--all-generation-tasks and a task selection are mutually exclusive')
+    if selection is not None or all_generation_tasks:
+        return scope
+    previous = load_status(job).get('generation_execution_scope')
+    if previous is None:
+        # Current-job invocation evidence predates the optional state marker. It can
+        # restrict expansion, never import an approval or authorize a new task.
+        path = job / 'reports/progress_v1.jsonl'
+        try:
+            events = read_jsonl(path) if path.is_file() else []
+            for event in reversed(events):
+                if event.get('event') == 'run_environment_recorded' and 'generate' in event.get('environment',{}).get('stages',[]):
+                    tasks = event['environment'].get('scope',{}).get('generation_tasks')
+                    previous = generation_scope(None if tasks is None or tasks == [] else tasks)
+                    break
+        except (ValueError, OSError, TypeError, AttributeError) as exc:
+            raise ValueError('Previous generation scope is unavailable; provide a task selection or --all-generation-tasks') from exc
+    if previous is not None and previous != generation_scope(previous.get('tasks')):
+        raise ValueError('Generation scope record is invalid; provide a task selection or --all-generation-tasks')
+    if previous and previous['mode'] == 'selected':
+        raise ValueError('Previous generation was limited; provide --generation-tasks again or explicitly use --all-generation-tasks')
+    return scope
+
+
+def select_generation_tasks(tasks: list[dict], allowed_children: set[str], selection=None) -> list[dict]:
+    scope = generation_scope(selection)
+    scoped = [row for row in tasks if row['child'] in allowed_children]
+    if scope['mode'] == 'all':
+        return scoped
+    selected = []
+    for item in scope['tasks']:
+        matches = [row for row in scoped if all(row[k] == item[k] for k in item) and row['formation_status'] == 'ready']
+        if len(matches) != 1:
+            raise ValueError('Selected generation task is stale, unready or outside current RunScope')
+        selected.append(matches[0])
+    return selected
+
+
+def preflight_generation_tasks(job: Path, plugin: ProductPlugin, selection=None, *, work_children=(), required_only=False,work_roles=()):
+    """Read the same contracts at invocation admission and immediately before execution."""
+    generation_scope(selection)
+    allowed = scoped_child_set(job)
+    tasks = [row for row in read_image_tasks(job, category_id=plugin.category_id)['tasks'] if row['child'] in allowed]
+    from .run_scope import execution_children
+    active=execution_children(job,work_children) if work_children else allowed
+    selected = select_generation_tasks(tasks, active, selection)
+    if work_roles:selected=[row for row in selected if row['role'] in work_roles]
+    if required_only:
+        from .release_manifest import build_release_manifest,required_task_keys
+        required=required_task_keys(build_release_manifest(job_dir=job,plugin=plugin,work_children=work_children),work_children)
+        selected=[row for row in selected if (row['child'],row['role']) in required]
+    from .image_prompt_compiler import ImagePromptError
+    try:
+        require_current_image_branch(job, plugin, task_keys={(row['child'],row['role']) for row in selected})
+    except ImagePromptError:
+        if selection is not None:raise
+        issues={}
+        for row in selected:
+            key=(row['child'],row['role'])
+            try:require_current_image_branch(job,plugin,task_keys={key})
+            except ImagePromptError as exc:issues[key]=str(exc)
+        selected=[{**row,'formation_status':'blocked','formation_reason':issues[(row['child'],row['role'])],
+                   'formation_reason_code':'current_input_changed'} if (row['child'],row['role']) in issues else row for row in selected]
+    prompts = read_image_prompts(job, category_id=plugin.category_id,task_keys={(r['child'],r['role']) for r in selected if r['formation_status']=='ready'})
+    if selection is not None:
+        for task in selected:
+            prompt_for_task(prompts, task)
+    return tasks, selected, prompts
+
+
 def run_image_generation(
     *,
     job_dir: str | Path,
@@ -64,14 +166,23 @@ def run_image_generation(
     production: bool = False,
     attempt_id: str = "",
     deadline_monotonic: float | None = None,
+    task_selection: tuple[dict, ...] | None = None,
+    all_generation_tasks: bool = False,
+    work_children: tuple[str, ...] = (), required_only: bool = False, work_roles: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    if production and task_selection is not None:
+        raise ValueError('Production cannot use a debug task selection')
     job_path = Path(job_dir).resolve()
     _load_generation_env(config_path, str(load_job(job_path).get("config_path") or ""))
-    require_current_image_branch(job_path, plugin)
+    scope = check_generation_scope(job_path, task_selection, all_generation_tasks=all_generation_tasks)
+    task_selection = None if scope['tasks'] is None else tuple(scope['tasks'])
     del limit
-    allowed_children = scoped_child_set(job_path)
-    prompt_artifact = read_image_prompts(job_path, category_id=plugin.category_id)
-    tasks = read_image_tasks(job_path, category_id=plugin.category_id)["tasks"]
+    tasks, selected_tasks, prompt_artifact = preflight_generation_tasks(job_path, plugin, task_selection,work_children=work_children,required_only=required_only,work_roles=work_roles)
+    selected_ids = {(row['child'],row['role']) for row in selected_tasks}
+    not_run = [{'child':row['child'],'role':row['role'],'task_fingerprint':row['task_fingerprint'],
+                'status':'not_run'} for row in tasks if (row['child'],row['role']) not in selected_ids]
+    from .status import record_generation_scope
+    record_generation_scope(job_path, scope, allow_expansion=all_generation_tasks)
     providers = provider_order(plugin)
     execution_revision = _generation_execution_revision(providers)
 
@@ -79,10 +190,10 @@ def run_image_generation(
     outcomes: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     blocked_by: list[dict[str, str]] = []
-    for task in tasks:
-        if task["child"] not in allowed_children:
-            continue
+    for task in selected_tasks:
         if task["formation_status"] == "blocked":
+            if task.get('formation_reason_code')=='current_input_changed':
+                failures.append(_failure(task,owner='generation_preflight',status='blocked',error=task['formation_reason']))
             upstream = (
                 f"brief:{task['child']}:design_kit"
                 if task.get("formation_reason_code") == "upstream_design_kit_missing"
@@ -120,7 +231,7 @@ def run_image_generation(
             continue
         try:
             candidate = current_candidate(job_path, task)
-        except CandidateStateError as exc:
+        except (CandidateStateError, CandidateCommitError) as exc:
             failures.append(_failure(
                 {**task, "execution_revision": execution_revision},
                 owner="candidate_state", error=str(exc), status="blocked",
@@ -134,7 +245,11 @@ def run_image_generation(
                 status="retryable",
             ))
             continue
-        if candidate and candidate.get("task_prompt_fingerprint") == task_prompt_fingerprint:
+        if candidate and not candidate_prompt_current(task=task, candidate=candidate, prompt=prompt_row):
+            failures.append(_failure({**task, "execution_revision": execution_revision}, owner="candidate_state",
+                error="Candidate has no verified binding to the current task prompt; no automatic regeneration", status="blocked"))
+            continue
+        if candidate:
             recovered = _candidate_task_result(task, candidate, execution_revision=execution_revision)
             outcomes.append(recovered)
             record_progress(
@@ -176,11 +291,14 @@ def run_image_generation(
                 "provider_attempts": dict(state.get("provider_attempts") or {}),
                 "execution_revision": execution_revision,
             }
-            if authorize_unknown_resend(runtime_task):
-                runtime_task['request_outcome'] = 'unknown'
-            if recover_response(runtime_task):
+            saved = recover_response(runtime_task, check_pending=False)
+            if saved:
+                runtime_task.update(provider=saved['provider'], request_audit=saved['request_audit'], raw_response_path=saved['receipt_path'])
                 runtime.append(runtime_task)
                 continue
+            if authorize_unknown_resend(runtime_task):
+                runtime_task['request_outcome'] = 'unknown'
+            recover_response(runtime_task)  # unresolved receipts still prohibit remote dispatch
             if state.get('status') == 'blocked' and state.get('execution_revision') == execution_revision:
                 failures.append(_failure({**task, **state}, owner='generation',
                     error=str(state.get('error') or 'Generation contract is blocked'), status='blocked'))
@@ -225,7 +343,7 @@ def run_image_generation(
                 {**task, "execution_revision": execution_revision},
                 owner="generation_preflight",
                 error=f"{type(exc).__name__}: {exc}",
-                status="review" if getattr(exc, 'ambiguous', False) else "retryable" if provider_failure_class(exc) == 'candidate_commit' else "blocked",
+                status=_generation_failure_status(exc), cause=exc,
             ))
 
     persisted_results: dict[str, dict[str, Any]] = {}
@@ -286,6 +404,12 @@ def run_image_generation(
         "outcomes": outcomes,
         "failures": failures,
         "blocked_by": blocked_by,
+        'not_run': not_run,
+        'execution': {**scope, 'attempt_id':attempt_id,
+            'requested_count':len(selected_tasks), 'completed_count':len(outcomes),
+            'failed_count':len(failures), 'blocked_count':len(blocked_by), 'not_run_count':len(not_run),
+            'status':'success' if len(outcomes)==len(selected_tasks) and not failures and not blocked_by
+                     else 'partial_success' if outcomes else 'failed'},
         "child_provider_usage": {
             child: {"providers": names, "mixed_provider_warning": len(names) > 1}
             for child, names in provider_usage.items()
@@ -306,16 +430,24 @@ def run_image_revision(
     reason: str,
     config_path: str = "",
     production: bool = False,
-    revision_mode: str = "targeted_edit", candidate_sha256: str = "",
+    revision_mode: str = "targeted_edit", candidate_sha256: str = "", upscale_artifact_confirmed: bool = False,
 ) -> dict[str, Any]:
-    if revision_mode not in {"targeted_edit", "full_redraw"}:
-        raise ValueError("Revision mode must be targeted_edit or full_redraw")
+    if type(upscale_artifact_confirmed) is not bool:
+        raise ValueError('Upscale artifact confirmation must be a boolean')
+    if revision_mode == 'publication_reprocess' and not upscale_artifact_confirmed:
+        raise ValueError('Publication reprocess requires --upscale-artifact-confirmed for the selected candidate')
+    if upscale_artifact_confirmed and revision_mode != 'publication_reprocess':
+        raise ValueError('Upscale artifact confirmation is only valid for publication_reprocess')
+    if revision_mode not in {"targeted_edit", "full_redraw", "publication_reprocess"}:
+        raise ValueError("Unknown image revision mode")
+    if revision_mode=='publication_reprocess' and not re.fullmatch('[0-9a-f]{64}',str(candidate_sha256)):
+        raise ValueError('Publication reprocess requires an explicit candidate SHA')
     if not str(reason or "").strip():
         raise RuntimeError("Revision requires a human-readable reason")
     job_path = Path(job_dir).resolve()
     _load_generation_env(config_path, str(load_job(job_path).get("config_path") or ""))
-    require_current_image_branch(job_path, plugin)
-    prompt_artifact = read_image_prompts(job_path, category_id=plugin.category_id)
+    require_current_image_branch(job_path, plugin, task_keys={(child,role)})
+    prompt_artifact = read_image_prompts(job_path, category_id=plugin.category_id, task_keys={(child,role)})
     task = next(
         (
             row for row in read_image_tasks(job_path, category_id=plugin.category_id)["tasks"]
@@ -325,6 +457,15 @@ def run_image_revision(
     )
     if not task or task.get("formation_status") != "ready":
         raise RuntimeError(f"Ready image task not found for {child}/{role}")
+    if revision_mode=='publication_reprocess':
+        candidate=reprocess_candidate_publication(job_path,task,candidate_sha256=candidate_sha256,reason=reason,
+            task_prompt_fingerprint=prompt_for_task(prompt_artifact,task)['prompt_sha256'],
+            upscale_artifact_confirmed=upscale_artifact_confirmed)
+        from .image_upscale import UPSCALE_BACKEND,PUBLIC_IMAGE_SIZE
+        revision=input_revision_id({'operation':'publication_reprocess','backend':UPSCALE_BACKEND,'size':PUBLIC_IMAGE_SIZE})
+        return {'schema_version':'imagegen-revision-v1','tasks':[_candidate_task_result(task,candidate,execution_revision=revision)],
+            'failures':[],'revision_mode':revision_mode,'revision_reason':str(reason).strip(),'requests_sent':0,
+            'qa_required_for_candidate_sha256':candidate['candidate_sha256']}
     candidate_state_corrupt = False
     try:
         from .candidate_state import candidate_by_sha
@@ -358,11 +499,11 @@ def run_image_revision(
                       source_evidence, *references[1:]]
         from .image_prompt_compiler import compile_task_prompt
         base_prompt = compile_task_prompt(task={**task, "generation_references": references}, targeted_edit=True)
-    request_heading = {"targeted_edit": "TARGETED CANDIDATE EDIT", "full_redraw": "EXPLICIT FULL-REDRAW REQUEST",
+    request_heading = {"targeted_edit": "TARGETED CANDIDATE EDIT", "full_redraw": "SOURCE EDIT REPLACEMENT REQUEST",
                        "initial": "EXPLICIT MISSING CANDIDATE REQUEST"}[mode]
     request_intro = {
         "targeted_edit": "Edit attachment 1 only for the listed issue. Preserve other correct product pixels, approved copy, composition and staging.",
-        "full_redraw": "Redraw a complete candidate within the current child design. Change design direction through the existing brand brief and brief stage, never by overriding that design here.",
+        "full_redraw": "Re-execute the current edit contract from attachment 1 to produce a new candidate; keep the selected source product instances unchanged. Change design direction through the existing brand brief and brief stage, never by overriding that design here.",
         "initial": "Generate the first candidate for this ready role because no current candidate exists.",
     }[mode]
     prompt = _compose_revision_prompt(
@@ -400,33 +541,39 @@ def run_image_revision(
         "provider_attempts": {},
         "execution_revision": execution_revision,
     }
-    apply_role_provider_policy(runtime_task, plugin)
-    if not runtime_task.get("providers"):
-        return {
-            "schema_version": "imagegen-revision-v1",
-            "tasks": [],
-            "failures": [_failure(
-                runtime_task,
-                owner="generation_provider_availability",
-                error=f"No configured physical provider is available for {task['child']}/{task['role']}; retry after provider health/configuration changes",
-                status="retryable",
-            )],
-        }
-    runtime_task["providers"] = eligible_imagegen_providers(prompt, list(runtime_task["providers"]))
-    if not runtime_task["providers"]:
-        return {
-            "schema_version": "imagegen-revision-v1",
-            "tasks": [],
-            "failures": [_failure(
-                runtime_task,
-                owner="generation_provider_availability",
-                error=f"No currently eligible provider accepts the compiled prompt for {task['child']}/{task['role']}; retry after provider capability/configuration changes",
-                status="retryable",
-            )],
-        }
-    if authorize_unknown_resend(runtime_task):
-        runtime_task['request_outcome'] = 'unknown'
-    assigned = assign_provider_pool([runtime_task])
+    saved = recover_response(runtime_task, check_pending=False)
+    if saved:
+        runtime_task.update(provider=saved['provider'], request_audit=saved['request_audit'], raw_response_path=saved['receipt_path'])
+        assigned = [runtime_task]
+    else:
+        if authorize_unknown_resend(runtime_task):
+            runtime_task['request_outcome'] = 'unknown'
+        recover_response(runtime_task)
+        apply_role_provider_policy(runtime_task, plugin)
+        if not runtime_task.get("providers"):
+            return {
+                "schema_version": "imagegen-revision-v1",
+                "tasks": [],
+                "failures": [_failure(
+                    runtime_task,
+                    owner="generation_provider_availability",
+                    error=f"No configured physical provider is available for {task['child']}/{task['role']}; retry after provider health/configuration changes",
+                    status="retryable",
+                )],
+            }
+        runtime_task["providers"] = eligible_imagegen_providers(prompt, list(runtime_task["providers"]))
+        if not runtime_task["providers"]:
+            return {
+                "schema_version": "imagegen-revision-v1",
+                "tasks": [],
+                "failures": [_failure(
+                    runtime_task,
+                    owner="generation_provider_availability",
+                    error=f"No currently eligible provider accepts the compiled prompt for {task['child']}/{task['role']}; retry after provider capability/configuration changes",
+                    status="retryable",
+                )],
+            }
+        assigned = assign_provider_pool([runtime_task])
     previous_provider = str(current.get("provider_name") or "")
     if previous_provider and assigned:
         assigned_task = assigned[0]
@@ -471,7 +618,7 @@ def generation_artifacts_current(job_dir: str | Path, plugin: ProductPlugin) -> 
             if not candidate:
                 return False
             prompt_row = prompt_for_task(prompt_artifact, task)
-            if candidate.get("task_prompt_fingerprint") != prompt_row["prompt_sha256"]:
+            if not candidate_prompt_current(task=task, candidate=candidate, prompt=prompt_row):
                 return False
         return True
     except Exception:
@@ -508,33 +655,6 @@ def _compose_revision_prompt(
     return base_prompt + prefix + cleaned_reason
 
 
-def _next_candidate_revision(
-    job_path: Path,
-    task: dict[str, Any],
-    start: int,
-    *,
-    skip_existing: bool = False,
-) -> int:
-    revision = max(0, int(start))
-    while True:
-        output = resolve_job_owned_path(job_path, _candidate_output_path(task, revision))
-        manifest = resolve_job_owned_path(
-            job_path,
-            str(
-                Path("reports") / "candidate_manifests" / str(task.get("child") or "")
-                / str(task.get("role") or "") / str(task.get("task_fingerprint") or "")
-                / f"candidate{revision}.json"
-            ),
-        )
-        if not output.exists() and not manifest.exists():
-            return revision
-        if not skip_existing:
-            raise CandidateStateError(
-                f"Unowned candidate output blocks immutable revision {revision}: {task.get('child')}/{task.get('role')}"
-            )
-        revision += 1
-
-
 def _execute(
     tasks: list[dict[str, Any]], *, plugin: ProductPlugin, workers: int,
     on_success: Any | None = None,
@@ -553,7 +673,7 @@ def _execute(
     with ThreadPoolExecutor(max_workers=max(1, remote_cap)) as pool, ThreadPoolExecutor(max_workers=1) as local_pool:
         futures: dict[Any, dict[str, Any]] = {}
         local_futures: set[Any] = set()
-        local_ready: set[int] = set()
+        local_ready: set[int] = {id(task) for task in pending if task.get('raw_response_path')}
         while pending or futures:
             # A saved response waiting for local capacity must never re-enter remote dispatch.
             waiting_local = [task for task in pending if id(task) in local_ready]
@@ -564,6 +684,9 @@ def _execute(
                 futures[local_future] = task
                 local_futures.add(local_future)
                 local_ready.discard(id(task))
+            deferred = [task for task in pending if getattr(capacity_errors.get(
+                str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}")), 'retry_at', 0) > time.time()]
+            pending = [task for task in pending if not any(task is item for item in deferred)]
             current, pending = _dispatch_generation_batch(pending, workers,
                 active=[task for future, task in futures.items() if future not in local_futures],
                 occupied={(task.get('logical_task_id') or (task.get('child'), task.get('role')), task.get('candidate_revision', 0))
@@ -572,6 +695,7 @@ def _execute(
             pending = current[room:] + pending
             current = current[:room]
             pending.extend(waiting_local)
+            pending.extend(deferred)
             futures.update({pool.submit(generate_one, task, plugin=plugin): task for task in current})
             done, _ = wait(futures, timeout=.25, return_when=FIRST_COMPLETED)
             round_made_progress = False
@@ -611,7 +735,7 @@ def _execute(
                                 logical_task_id=task_id, child=task.get("child"), role=task.get("role"),
                                 capacity_round=capacity_requeues[task_id],
                                 phase='local_finalize' if is_local else 'remote_admission',
-                                reason=f'{type(exc).__name__}: {exc}'[:500],
+                                reason=f'{type(exc).__name__}[{exc.provider_name}]: {exc}'[:500],
                             )
                         continue
                     status = _generation_failure_status(exc)
@@ -622,7 +746,7 @@ def _execute(
                             task, selected="", attempted=getattr(exc, "attempted_providers", []),
                         ),
                     }
-                    failure = _failure(failed_task, owner="generation_finalize" if is_local else "generation", error=f"{type(exc).__name__}: {exc}", status=status)
+                    failure = _failure(failed_task, owner="generation_finalize" if is_local else "generation", error=f"{type(exc).__name__}: {exc}", status=status, cause=exc)
                     if status == "blocked":
                         failure["task_status"] = failure_task_status(failure)
                     failures.append(failure)
@@ -641,11 +765,21 @@ def _execute(
             if round_made_progress:
                 last_batch_progress_at = time.monotonic()
                 capacity_errors.clear()
-            if pending and not futures and not round_made_progress and (not current or all(
+            retry_wait = max((getattr(exc, 'retry_at', 0) - time.time() for exc in capacity_errors.values()), default=0)
+            # Known gateway cooldown is not unexplained lack of progress. Bound
+            # the wait by the existing 600s ceiling and each task's real deadline.
+            deadlines = [float(task[k]) for task in pending for k in ('deadline_monotonic', 'role_deadline_monotonic') if task.get(k) is not None]
+            deadline_expired = bool(deadlines and time.monotonic() >= min(deadlines))
+            can_wait = (retry_wait > 0 and time.monotonic() - last_batch_progress_at < 600
+                        and not deadline_expired)
+            if pending and not futures and not round_made_progress and not can_wait and (not current or all(
                 str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}") in capacity_errors
                 for task in pending
-            )) and time.monotonic() - last_batch_progress_at >= _capacity_stall_budget_seconds():
-                stalled, pending = pending, []
+            )) and (deadline_expired or time.monotonic() - last_batch_progress_at >= _capacity_stall_budget_seconds()):
+                stalled = [task for task in pending if not deadline_expired or any(
+                    task.get(k) is not None and time.monotonic() >= float(task[k])
+                    for k in ('deadline_monotonic', 'role_deadline_monotonic'))]
+                pending = [task for task in pending if not any(task is item for item in stalled)]
                 for task in stalled:
                     task_id = str(task.get("logical_task_id") or f"{task.get('child')}/{task.get('role')}")
                     exc = capacity_errors.get(task_id)
@@ -659,8 +793,8 @@ def _execute(
                         failed_task,
                         owner="generation_local_capacity" if id(task) in local_ready else "generation_provider_capacity",
                         error=(
-                            f"ProviderQueueUnavailable: capacity unavailable for {_capacity_stall_budget_seconds():g} seconds; "
-                            f"{exc or 'no dispatch capacity'}"
+                            f"ProviderQueueUnavailable: capacity unavailable after {time.monotonic() - last_batch_progress_at:g} seconds or execution deadline reached; "
+                            f"{(exc.provider_name + ': ' + str(exc)) if exc else 'no dispatch capacity'}"
                         ),
                         status="retryable",
                     )
@@ -687,7 +821,8 @@ def _dispatch_generation_batch(
     selected: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     used: dict[str, int] = {}
-    from .api_registry import image_provider_resource_group, image_provider_supports_multiple_references, image_provider_supports_mask
+    from .api_registry import image_provider_resource_group, image_provider_supports_multiple_references
+    from .image_reference_context import generation_attachment_count
     identities = {(task.get('logical_task_id') or (task.get('child'), task.get('role')), task.get('candidate_revision', 0)) for task in active}
     identities.update(occupied or set())
     for task in active:
@@ -701,9 +836,9 @@ def _dispatch_generation_batch(
             continue
         routes = list(dict.fromkeys([_task_primary_provider(task), *task.get('providers', []), *task.get('child_provider_reserve', [])]))
         references = task.get('generation_references', [])
+        count = generation_attachment_count(references)
         routes = [name for name in routes if name and
-                  (len(references) <= 1 or image_provider_supports_multiple_references(name, len(references))) and
-                  (not any(row.get('protected_mask') for row in references) or image_provider_supports_mask(name))]
+                  (count <= 1 or image_provider_supports_multiple_references(name, count))]
         normal = [name for name in routes if not image_provider_fallback_only(name)]
         routes = ([name for name in routes if image_provider_fallback_only(name)]
                   if task.get('request_outcome') == 'unknown' else normal or routes)
@@ -795,12 +930,15 @@ def _capacity_stall_budget_seconds() -> float:
 
 
 def _generation_failure_status(exc: Exception) -> str:
-    if getattr(exc, "ambiguous", False):
+    from .batch_ledger import AdmissionDenied
+    if isinstance(exc,AdmissionDenied):return 'retryable'  # Capacity/authorization may recover; the ledger still decides every send.
+    from .image_provider_common import ReceiptDispositionRequired
+    if isinstance(exc, ReceiptDispositionRequired) or getattr(exc, "ambiguous", False):
         return "review"
     # Only a locally compiled immutable prompt/contract may deterministically
     # block the task.  Provider transport, configuration, response decoding,
     # and invalid returned pixels are provider-owned and must remain recoverable.
-    return "blocked" if provider_failure_class(exc) == "contract" else "retryable"
+    return 'blocked' if provider_failure_class(exc) == 'contract' else 'retryable'
 
 
 def _completed_task_result(task: dict[str, Any], *, execution_revision: str) -> dict[str, Any]:
@@ -808,13 +946,23 @@ def _completed_task_result(task: dict[str, Any], *, execution_revision: str) -> 
     return _candidate_task_result(task, candidate, execution_revision=execution_revision)
 
 
-def _failure(task: dict[str, Any], *, owner: str, error: str, status: str) -> dict[str, Any]:
+def _failure(task: dict[str, Any], *, owner: str, error: str, status: str, cause: Exception | None = None) -> dict[str, Any]:
     runtime = {
         key: task[key]
         for key in (
             "transport_attempt", "provider_attempts", "execution_revision", "request_outcome", "request_audit",
         ) if key in task
     }
+    from .image_provider_common import CandidateCommitError
+    if status == 'review':
+        runtime.update(reason_code='remote_result_unknown' if getattr(cause,'ambiguous',False) or task.get('request_outcome')=='unknown' else 'receipt_disposition_required',next_action='resolve_receipt',
+                       resume_condition='explicit_receipt_disposition',remote_request_allowed=False)
+    elif isinstance(cause, CandidateCommitError) or owner in {'generation_finalize','generation_local_capacity'}:
+        runtime.update(reason_code='local_commit_pending',next_action='finalize_saved_response',
+                       resume_condition='local_resource_or_io_recovered',remote_request_allowed=False)
+    else:
+        runtime.update(reason_code=getattr(cause,'reason_code',owner), next_action='repair_input' if status=='blocked' else 'retry_when_available',
+                       resume_condition='validated_input_change' if status=='blocked' else 'capacity_health_and_budget_available')
     return {
         "task": {
             "child": str(task.get("child") or ""),
@@ -837,7 +985,7 @@ def _candidate_task_result(task: dict[str, Any], candidate: dict[str, Any], *, e
         "role": task["role"],
         **{key: candidate[key] for key in (
             "candidate_sha256", "candidate_path", "candidate_revision", "provider_physical",
-            "provider_name", "task_prompt_fingerprint", "request_prompt_fingerprint", "transport_attempt", "provider_attempts",
+            "provider_name", "task_prompt_fingerprint", "request_prompt_fingerprint", "transport_attempt", "provider_attempts", "reuse_evidence",
         ) if key in candidate},
         "execution_revision": execution_revision,
     }
@@ -864,7 +1012,8 @@ def _generation_execution_revision(providers: list[str]) -> str:
         # be eligible for recovery after the current func dual-reference fix.
         "generation_reference_contract": "typed-reference-edit-base-v2",
         "routing_contract": "role-model-pool-v3-primary-fallback",
-        "unknown_result_resends": unknown_result_resend_limit(),
+        'admission_contract':'work-unit-closing-capacity-v1',
+        "unknown_result_policy": load_provider_policy().get('image_generation', {}).get('unknown_result_policy', {}),
         "execution_profiles": sorted(EXECUTION_PROFILES),
         "url_safety_policy": URL_SAFETY_POLICY_VERSION,
         "providers": [],

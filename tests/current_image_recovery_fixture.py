@@ -1,5 +1,6 @@
 """Paid-response failure scenarios shared by the current generation contract case."""
 from pathlib import Path
+from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 from unittest.mock import patch, MagicMock
 from queue import Queue
@@ -10,8 +11,19 @@ from PIL import Image
 from core.io import write_json, read_json
 from core.image_response import RESPONSE_SCHEMA, begin_response, response_directory, response_binding, recover_response
 from core.image_provider_routing import _provider_worker
-from core.image_generation_executor import generate_one, finalize_candidate
+from core.image_generation_executor import generate_one, _finalize_local as finalize_candidate
 from core.image_provider_common import CandidateCommitError, ProviderTransportError, ProviderQueueUnavailable
+
+
+@contextmanager
+def transport_attempt(provider='fixture'):
+    from core.image_response import submit_response
+    with TemporaryDirectory() as tmp:
+        task={'job_dir':tmp,'logical_task_id':'wire:fixture','task_fingerprint':'fixture','prompt':'fixture'}
+        audit={'response_binding':response_binding(task),'logical_task_id':task['logical_task_id']}
+        receipt=begin_response(response_directory(task),provider=provider,audit=audit)
+        audit.update(attempt_id=receipt.stem,receipt_path=str(receipt))
+        yield audit, lambda snapshot:submit_response(receipt,snapshot)
 
 
 def verify_exact_candidate_finalization(test, job, task, manifest):
@@ -27,10 +39,13 @@ def verify_exact_candidate_finalization(test, job, task, manifest):
                'prompt': 'immutable request prompt', 'prompt_path': str(job / manifest['prompt_path']),
                'task_prompt_fingerprint': manifest['task_prompt_fingerprint'],
                'request_prompt_fingerprint': manifest['request_prompt_fingerprint']}
-    receipt = begin_response(response_directory(runtime), provider='copy', audit={'response_binding': response_binding(runtime)})
-    save_response(receipt, b'new candidate bytes', {})
-    with patch('core.image_generation_executor._finalize_candidate_bytes', side_effect=lambda value: value), patch(
-            'core.candidate_state.upscale_for_publication_with_backend', side_effect=lambda value: (value, 'pillow-lanczos-v1')), patch(
+    audit = dict(response_binding=response_binding(runtime), request_id='paid-once', provider='copy', logical_task_id=task['logical_task_id'])
+    receipt = begin_response(response_directory(runtime), provider='copy', audit=audit)
+    from tests.image_boundary_fixture import native_bytes
+    new_bytes = native_bytes((1600,1600))
+    save_response(receipt, new_bytes, audit)
+    from tests.publication_resize_fixture import fixture_processing
+    with patch('core.candidate_state.upscale_for_publication', side_effect=lambda value, **_: (value, fixture_processing(value))), patch(
             'core.image_generation_executor.reserve_image'), patch('core.image_generation_executor.release_image'), patch(
             'core.image_generation_executor.generate_with_provider_retries') as remote:
         ready = generate_one(runtime, plugin=None)
@@ -39,11 +54,17 @@ def verify_exact_candidate_finalization(test, job, task, manifest):
                 finalize_candidate(ready, plugin=None)
         test.assertTrue(output.is_file())
         test.assertEqual('received', read_json(receipt)['status'])
+        current_candidate(job, original)
+        test.assertEqual('finalized', read_json(receipt)['status'])
         finalized = finalize_candidate(ready, plugin=None)
-        test.assertEqual(len(b'new candidate bytes'), finalized['bytes'])
+        test.assertEqual(len(new_bytes), finalized['bytes'])
         test.assertEqual(1, current_candidate(job, original)['candidate_revision'])
         test.assertEqual('finalized', read_json(receipt)['status'])
-        test.assertFalse(receipt.with_suffix('.bin').exists())
+        test.assertEqual(new_bytes, receipt.with_suffix('.bin').read_bytes())
+        from core.image_response import settle_candidate_response
+        with patch('core.image_response.finish_response') as cleanup:
+            settle_candidate_response(job, current_candidate(job, original))
+        cleanup.assert_not_called()
         finalize_candidate(ready, plugin=None)
         with test.assertRaisesRegex(CandidateCommitError, 'request'):
             finalize_candidate({**ready, 'request_prompt_fingerprint': 'different-request'}, plugin=None)
@@ -82,6 +103,13 @@ def verify_paid_response_recovery(test):
         test.assertTrue(queue.get_nowait()['ok'])
         saved = recover_response(task)
         test.assertEqual('received', saved['status'])
+        # Crash after atomic image write and before receipt metadata commit.
+        metadata = read_json(receipt)
+        write_json(receipt, {k: v for k, v in {**metadata, 'status': 'submitted'}.items() if k not in {'raw_sha256', 'raw_bytes'}})
+        saved = recover_response(task)
+        test.assertEqual('received', saved['status'])
+        test.assertEqual(metadata['raw_sha256'], saved['raw_sha256'])
+
         with patch('core.image_generation_executor.generate_with_provider_retries') as remote, patch(
                 'core.candidate_state.current_candidate', return_value={}), patch(
                 'core.image_generation_executor.commit_candidate_output', side_effect=MemoryError('local OOM')):
@@ -104,33 +132,43 @@ def verify_paid_response_recovery(test):
             test.assertGreater(result['bytes'], 0)
             test.assertEqual({'fixture': 1}, result['provider_attempts'])
             remote.assert_not_called()
-        test.assertFalse(Path(saved['raw_path']).exists())
+        test.assertEqual(source.read_bytes(), Path(saved['raw_path']).read_bytes())
         test.assertEqual('finalized', read_json(receipt)['status'])
         unknown = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
         write_json(unknown, {**read_json(receipt), 'status': 'submitted'})
         with patch('core.image_response.unknown_result_resend_limit', return_value=0), test.assertRaises(ProviderTransportError):
             generate_one(task, plugin=None)
         other = {**task, 'logical_task_id': 'generate:B2:main'}
-        resources.reserve_image(other)
+        lease = resources.reserve_image(other)
+        sibling = {**other, 'job_dir': str(root / 'another-job')}
+        sibling_lease = resources.reserve_image(sibling)
+        resources.release_image(sibling, lease)
+        test.assertEqual(2, len(read_json(resources._LEDGER)))
+        resources.release_image(sibling, sibling_lease)
+        resources.release_image(other, lease)
+        renewed = resources.reserve_image(other)
+        resources.release_image(other, lease)
+        test.assertEqual(renewed, read_json(resources._LEDGER)[str(response_directory(other)).casefold()]['lease'])
+        lease = renewed
         with test.assertRaises(ProviderQueueUnavailable):
-            resources.reserve_image(other)
-        resources.release_image(other)
-        with patch.object(resources, '_system_memory_bytes', return_value=(32 * 1024**3, 8 * 1024**3)):
-            test.assertEqual(0, resources.image_memory_capacity([other]))
+            lease = resources.reserve_image(other)
+        resources.release_image(other, lease)
+        with patch.object(resources, '_system_memory_bytes', return_value=(32 * 1024**3, 15 * 1024**3 // 2)):
+            test.assertEqual(2, resources.image_memory_capacity([other]))
+            lease = resources.reserve_image(other)
+            resources.release_image(other, lease)
             with test.assertRaises(ProviderQueueUnavailable):
-                resources.reserve_image(other)
-            resources.reserve_image(other, local=True)
-            resources.release_image(other)
-        with patch.object(resources, '_system_memory_bytes', return_value=(int(31.79 * 1024**3), int(10.81 * 1024**3))):
+                resources.reserve_image(other, local=True)
+        with patch.object(resources, '_system_memory_bytes', return_value=(int(31.79 * 1024**3), int(6.9 * 1024**3))):
             test.assertEqual(1, resources.image_memory_capacity([other]))
-            resources.reserve_image(other)
+            lease = resources.reserve_image(other)
             second = {**other, 'logical_task_id': 'generate:B3:main'}
             with test.assertRaises(ProviderQueueUnavailable):
                 resources.reserve_image(second)
             body = response_directory(other) / 'saved.http'
             body.write_bytes(b'paid response')
-            resources.release_image(other)
-            test.assertEqual(body.stat().st_size, read_json(resources._LEDGER)[response_binding(other)]['disk'])
+            resources.release_image(other, lease)
+            test.assertEqual(body.stat().st_size, read_json(resources._LEDGER)[str(response_directory(other)).casefold()]['disk'])
 
 
 def verify_cross_process_admission(test):
@@ -138,27 +176,32 @@ def verify_cross_process_admission(test):
     import sys
     from core import image_resources as resources
     with TemporaryDirectory() as tmp, patch.object(resources, '_LEDGER', Path(tmp) / 'leases.json'), patch.object(
-            resources, '_system_memory_bytes', return_value=(32*1024**3, int(10.81*1024**3))):
+            resources, '_system_memory_bytes', return_value=(32*1024**3, int(6.9*1024**3))):
         code = "\n".join([
             'import sys', 'from pathlib import Path', 'from core import image_resources as r',
             "r._LEDGER=Path(sys.argv[1])/'leases.json'",
-            'r._system_memory_bytes=lambda:(32*1024**3,int(10.81*1024**3))',
+            'r._system_memory_bytes=lambda:(32*1024**3,int(6.9*1024**3))',
             "task={'job_dir':sys.argv[1], 'logical_task_id':'generate:child:main', 'generation_references':[]}",
-            'r.reserve_image(task)', "print('reserved', flush=True)", 'input()', 'r.release_image(task)',
+            'lease = r.reserve_image(task)', "print('reserved', flush=True)", 'input()', 'r.release_image(task, lease)',
         ])
         process = subprocess.Popen([sys.executable, '-B', '-c', code, tmp], cwd=Path(__file__).resolve().parents[1],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             test.assertEqual('reserved', process.stdout.readline().strip())
-            own = {'job_dir': tmp, 'logical_task_id': 'generate:other:main', 'generation_references': []}
+            foreign = {'job_dir': tmp, 'logical_task_id': 'generate:child:main', 'generation_references': []}
+            before = read_json(resources._LEDGER)
+            foreign_lease = next(iter(before.values()))['lease']
+            resources.release_image(foreign, foreign_lease)
+            test.assertEqual(before, read_json(resources._LEDGER))
+            own = {**foreign, 'job_dir': str(Path(tmp) / 'second-job')}
             test.assertEqual(0, resources.image_memory_capacity([own]))
             with test.assertRaises(ProviderQueueUnavailable):
-                resources.reserve_image(own)
+                lease = resources.reserve_image(own)
             _, error = process.communicate('\n', timeout=5)
             test.assertEqual(0, process.returncode, error[-500:])
             test.assertEqual(1, resources.image_memory_capacity([own]))
-            resources.reserve_image(own)
-            resources.release_image(own)
+            lease = resources.reserve_image(own)
+            resources.release_image(own, lease)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -178,20 +221,20 @@ def verify_interrupted_response_recovery(test):
         for partial in (True, False):
             task = {'job_dir': tmp, 'logical_task_id': f'generate:B1:{partial}', 'task_fingerprint': str(partial)}
             receipt = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
-            write_json(receipt, {'schema': RESPONSE_SCHEMA, 'binding': response_binding(task), 'status': 'prepared',
-                                 'provider': 'fixture', 'request_audit': {}})
             response = MagicMock()
             response.__enter__.return_value = response
             response.headers = {'x-request-id': 'remote-known-id'}
-            response.read.side_effect = IncompleteRead(b'partial-image', 100) if partial else None
-            response.read.return_value = b'{"data":[{"url":"https://fixture.invalid/paid-image.png"}]}'
+            from io import BytesIO
+            response.read.side_effect = IncompleteRead(b'partial-image', 100) if partial else BytesIO(b'{"data":[{"url":"https://fixture.invalid/paid-image.png"}]}').read
             def request(**kwargs):
                 return transport._generate_with_openai_images_edit(provider_name='fixture', image_inputs=kwargs['image_inputs'],
-                    prompt='fixture', mask_bytes=None, request_audit=kwargs['request_audit'], transport_observer=kwargs['transport_observer'],
+                    prompt='fixture', request_audit=kwargs['request_audit'], transport_observer=kwargs['transport_observer'],
                     request_observer=kwargs['request_observer'])
             queue = Queue()
             with patch.object(transport, '_image_provider_spec', return_value=spec), patch.object(transport, '_provider_api_key', return_value='fixture'), \
-                 patch.object(transport, '_canonical_image_edit_request'), patch.object(transport, '_openai_images_edit_multipart_body', return_value=(b'post', 'fixture')), \
+                 patch.object(transport, '_canonical_image_edit_request', return_value=SimpleNamespace(
+                     prompt='fixture', quality='', background='', moderation='', size='')), \
+                 patch.object(transport, '_openai_images_edit_multipart_body', return_value=(b'post', 'fixture')), \
                  patch.object(transport, 'provider_timeout_seconds', return_value=1), patch.object(transport.urllib.request, 'urlopen', return_value=response) as post, \
                  patch.object(transport, '_decode_image_response', side_effect=OSError('download interrupted')), \
                  patch('core.image_provider_routing.generate_with_registry_image_provider', side_effect=request):
@@ -211,6 +254,10 @@ def verify_interrupted_response_recovery(test):
             else:
                 test.assertTrue(outcome['local_failure'])
                 with patch.object(transport, '_decode_image_response', return_value=source.read_bytes()) as download:
+                    record = read_json(receipt)
+                    write_json(receipt, {k: v for k, v in record.items() if k not in {'body_sha256', 'body_bytes'}})
+                    from core.image_response import authorize_unknown_resend
+                    test.assertFalse(authorize_unknown_resend(task))
                     test.assertEqual(str(receipt), recover_response(task)['receipt_path'])
                     download.assert_not_called()
                     test.assertEqual(source.read_bytes(), materialize_response(receipt).read_bytes())
@@ -270,6 +317,30 @@ def verify_scheduler_overlap(test):
 
 def verify_local_retry_in_same_run(test):
     from core import image_generation as generation
+    from tests.current_image_contract_fixture import current_image_task, current_prompt_artifact
+    from contextlib import ExitStack
+    with TemporaryDirectory() as tmp, ExitStack() as stack:
+        task = current_image_task('func_01')
+        artifact = current_prompt_artifact(tmp, task)
+        plugin = type('Plugin', (), {'category_id': 'bathroom_cabinet'})()
+        for name, value in [('load_job', {}), ('_load_generation_env', None), ('require_current_image_branch', None),
+                ('read_image_prompts', artifact), ('read_image_tasks', {'tasks': [task]}), ('current_candidate', {}),
+                ('_runtime_generation_references', task['generation_references']), ('provider_order', []), ('authorize_unknown_resend', False), ('recover_response', {'receipt_path': 'saved','provider':'fixture','request_audit':{}}),
+                ('_execute', ([task], [])), ('_completed_task_result', {'recovered': True})]:
+            stack.enter_context(patch.object(generation, name, return_value=value))
+        route = stack.enter_context(patch.object(generation, 'apply_role_provider_policy', side_effect=AssertionError('Saved response needs no route')))
+        result = generation.run_image_revision(job_dir=tmp, plugin=plugin, child=task['child'], role=task['role'], reason='Recover original attempt')
+        test.assertEqual([{'recovered': True}], result['tasks'])
+        route.assert_not_called()
+        with patch.object(generation, 'current_candidate', return_value={'candidate_revision': 0}):
+            generation.run_image_revision(job_dir=tmp, plugin=plugin, child=task['child'], role=task['role'],
+                                          reason='Repeat the source edit', revision_mode='full_redraw')
+        request = generation._execute.call_args.args[0][0]
+        test.assertEqual('full_redraw', request['revision_mode'])
+        test.assertIn('SOURCE EDIT REPLACEMENT REQUEST', request['prompt'])
+        test.assertIn('keep the selected source product instances unchanged', request['prompt'])
+        test.assertNotIn('FULL-REDRAW', request['prompt'])
+        test.assertNotIn('Redraw a complete candidate', request['prompt'])
     with TemporaryDirectory() as tmp:
         task = {'job_dir': tmp, 'logical_task_id': 'generate:B1:main', 'child': 'B1', 'role': 'main', 'providers': ['fixture']}
         saved = {'provider': 'fixture', 'request_audit': {}, 'receipt_path': str(Path(tmp) / 'paid.json')}
@@ -307,34 +378,36 @@ def verify_safe_transport_retry(test):
     errors.extend([(urllib.error.URLError(socket.gaierror('DNS failed')), ProviderTransportError, False),
                    (urllib.error.URLError(ssl.SSLEOFError('EOF')), ProviderTransportError, True)])
     for error, kind, ambiguous in errors:
-        with patch.object(transport, '_image_provider_spec', return_value=spec), patch.object(
+        with transport_attempt() as (audit, observer), patch.object(transport, '_image_provider_spec', return_value=spec), patch.object(
                 transport, '_provider_api_key', return_value='fixture'), patch.object(
-                transport, '_canonical_image_edit_request'), patch.object(
+                transport, '_canonical_image_edit_request', return_value=SimpleNamespace(
+                    prompt='fixture', quality='', background='', moderation='', size='')), patch.object(
                 transport, '_openai_images_edit_multipart_body', return_value=(b'post', 'fixture')), patch.object(
                 transport.urllib.request, 'urlopen', side_effect=error):
             with test.assertRaises(kind) as caught:
-                transport._generate_with_openai_images_edit(provider_name='fixture', image_inputs=[b'input'], prompt='fixture', mask_bytes=None)
+                transport._generate_with_openai_images_edit(provider_name='fixture', image_inputs=[b'input'], prompt='fixture',
+                    request_audit=audit,request_observer=observer)
             test.assertEqual(ambiguous, bool(getattr(caught.exception, 'ambiguous', False)))
     for code, kind in (('model_not_found', ProviderConfigurationError), ('no_available_channel', ProviderTransportError),
                        ('unknown_gateway_error', CandidateCommitError)):
         with TemporaryDirectory() as tmp:
             task = {'job_dir': tmp, 'logical_task_id': 'generate:B1:func', 'prompt': 'fixture'}
             receipt = begin_response(response_directory(task), provider='fixture', audit={'response_binding': response_binding(task)})
-            write_json(receipt, {'schema': RESPONSE_SCHEMA, 'binding': response_binding(task), 'status': 'prepared',
-                                 'provider': 'fixture', 'request_audit': {}})
             response = MagicMock()
             response.__enter__.return_value = response
             response.headers = {'x-request-id': 'fixture-response'}
-            response.read.return_value = ('{"error":{"code":"' + code + '"}}').encode()
+            from io import BytesIO
+            response.read.side_effect = BytesIO(('{"error":{"code":"' + code + '"}}').encode()).read
             output = MagicMock()
             def call_transport(**kwargs):
                 return transport._generate_with_openai_images_edit(**{key: kwargs[key] for key in (
-                    'provider_name', 'image_inputs', 'prompt', 'mask_bytes', 'request_audit', 'transport_observer', 'request_observer')})
+                    'provider_name', 'image_inputs', 'prompt', 'request_audit', 'transport_observer', 'request_observer')})
             source = Path(tmp) / 'source.png'
             source.write_bytes(b'fixture image handled by mocked encoder')
             with patch.object(transport, '_image_provider_spec', return_value=spec), patch.object(
                     transport, '_provider_api_key', return_value='fixture'), patch.object(
-                    transport, '_canonical_image_edit_request'), patch.object(
+                    transport, '_canonical_image_edit_request', return_value=SimpleNamespace(
+                        prompt='fixture', quality='', background='', moderation='', size='')), patch.object(
                     transport, '_openai_images_edit_multipart_body', return_value=(b'post', 'fixture')), patch.object(
                     transport.urllib.request, 'urlopen', return_value=response), patch.object(
                     routing, 'generate_with_registry_image_provider', side_effect=call_transport):
