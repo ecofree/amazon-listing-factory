@@ -312,6 +312,8 @@ Added targeted process-kill coverage for the request submission boundary and a s
 
 The offline CI workflow is being extended to run process-recovery and synthetic ledger tests on `windows-latest`, matching the production operator environment. Both Ubuntu and Windows jobs must pass before the offline engineering gate is green.
 
+The Windows job now also exercises descendant process-tree termination using the same helper as the curated test runner. Its result must be verified by GitHub Actions before cross-platform process recovery is considered accepted.
+
 ### Phase 7 — Codex handoff
 
 The final local/live acceptance instructions are in [CODEX_FINAL_ACCEPTANCE.md](docs/production_readiness_1/CODEX_FINAL_ACCEPTANCE.md). They distinguish offline engineering checks from authorized real-provider, four-category and 72-hour acceptance.

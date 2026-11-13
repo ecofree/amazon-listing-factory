@@ -97,4 +97,8 @@ The same run passed all offline gates: 100/100 curated cases in 37.601s, 5/5 tar
 
 ## Windows CI coverage status
 
-The production operator environment is Windows, but the existing workflow only ran Ubuntu. A Windows job is being added to run the real local process-crash/provider tests and synthetic ledger drill under `windows-latest`. It must pass before Windows process recovery is considered verified. This still does not test the production worker body or kill a real worker during a provider request.
+The workflow now includes a `windows-latest` job running the local process-crash/provider tests and synthetic ledger drill. A new targeted test launches a parent process and descendant, then exercises the same `_terminate_process_tree` function used by the curated runner. The Windows job has not yet been verified by CI. This still does not test the production worker body or kill a real worker during a provider request.
+
+## Descendant process termination contract
+
+The targeted suite now launches a real local parent Python process which itself launches a child process, then calls the production test-runner process-tree termination helper. The test asserts both parent and descendant exit. It runs on POSIX and Windows; on Windows it exercises the `taskkill /T /F` path. No provider request is made.

@@ -2,7 +2,7 @@
 
 **Repository:** `ecofree/amazon-listing-factory`  
 **Branch:** `codex/model-native-image-refactor`  
-**Engineering baseline:** `3c639fc2c024797fefa8e4c11bdcb09cb00c4b99`  
+**Code acceptance baseline:** `c36f7bf750225e22713b0da4513d9cbbff1a474b` (documentation updates may follow without changing runtime code).  
 **Purpose:** validate the implementation locally and perform separately authorized live acceptance. Do not assume this document means the tests have passed.
 
 ## 1. Safety rules
@@ -21,7 +21,7 @@
 - Fetch latest origin.
 - Confirm branch is `codex/model-native-image-refactor`.
 - Confirm HEAD is this baseline or a descendant that contains it. The baseline includes the real eight-child-process dispatcher drill.
-- Inspect the `Production Readiness (offline)` GitHub Actions run for this exact HEAD and download its JSON artifact. The last verified offline pass is run `43373829371` on `7ced838b`; this run includes the 100-case curated suite, targeted process/provider tests, synthetic 100-order ledger drill, and eight real local child processes launched by the dispatcher. The current baseline `3c639fc` adds documentation only. The workflow is being extended to Windows; require a new run after that workflow change.
+- Inspect the `Production Readiness (offline)` GitHub Actions run for the current HEAD and download its JSON artifact. Last verified Linux pass: run `43373829371` on `7ced838b` (100 curated cases, 6 targeted tests at that time, 100 synthetic ledger orders, and eight real local child processes launched by the dispatcher). The code baseline `c36f7bf` adds a descendant-process termination test and the workflow adds a Windows process/ledger job; neither change has a verified CI result yet. Require both Ubuntu and Windows jobs to pass for the current revision.
 - Record `git status --short`, commit SHA and remote SHA.
 - Inspect `git log --oneline --decorate -15`.
 - Do not overwrite uncommitted user work.
@@ -119,6 +119,6 @@ Include:
 
 A successful offline report is not permission to begin live production. A 72-hour soak is not proof of visual quality. Production readiness requires all applicable gates and explicit operator approval.
 
-## 8. CI availability at baseline
+## 8. CI status and platform coverage
 
-The branch has no `.github/workflows/` files, and the baseline commit has no GitHub Actions run or combined status check. Do not report CI as green or red; it is not configured for this branch. The local offline gate remains the required engineering check.
+The branch has a `.github/workflows/production-readiness.yml` workflow. The last verified run, `43373829371` on `7ced838b`, passed the Ubuntu offline gates. A Windows job was added to test process-tree termination and the synthetic ledger drill on `windows-latest`; it has not yet produced a verified result for code baseline `c36f7bf`. Do not report the current revision as cross-platform green until both jobs pass. CI is offline-only and does not authorize paid provider calls or uploads.

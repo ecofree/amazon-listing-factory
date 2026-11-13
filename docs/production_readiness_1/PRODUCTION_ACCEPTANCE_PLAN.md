@@ -111,4 +111,4 @@ Run [43373829371](https://github.com/ecofree/amazon-listing-factory/actions/runs
 
 ## 9. Windows process validation
 
-The workflow is being extended with a `windows-latest` job for targeted process-crash/provider tests and the synthetic ledger drill. Require this job to pass as well as the Ubuntu curated suite. It does not replace full local Windows testing of SAM, Blender, Excel, provider integrations, or the production workspace.
+The workflow now includes a `windows-latest` job for targeted process-crash/provider tests and the synthetic ledger drill, including descendant process-tree termination. Require this job to pass as well as the Ubuntu curated suite. It does not replace full local Windows testing of SAM, Blender, Excel, provider integrations, or the production workspace.
