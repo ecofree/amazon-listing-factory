@@ -59,6 +59,59 @@ class UnattendedProductionContractTests(unittest.TestCase):
                 ),stage)
 
 
+    def test_process_tree_termination_kills_descendants(self) -> None:
+        import subprocess
+        import psutil
+        from scripts.run_production_tests import _terminate_process_tree
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "child.pid"
+            child_code = "import time; time.sleep(60)"
+            parent_code = (
+                "import pathlib,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable,'-B','-c',sys.argv[2]]); "
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='utf-8'); "
+                "time.sleep(60)"
+            )
+            kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if os.name != "nt":
+                kwargs["start_new_session"] = True
+            parent = subprocess.Popen(
+                [sys.executable, "-B", "-c", parent_code, str(marker), child_code],
+                **kwargs,
+            )
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not marker.is_file() and parent.poll() is None:
+                    time.sleep(0.05)
+                self.assertTrue(marker.is_file(), "parent did not start its child process")
+                child_pid = int(marker.read_text(encoding="utf-8"))
+                _terminate_process_tree(parent)
+                self.assertIsNotNone(parent.poll(), "parent process survived tree termination")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        child = psutil.Process(child_pid)
+                        if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                            break
+                    except psutil.NoSuchProcess:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail(f"descendant process {child_pid} survived process-tree termination")
+            finally:
+                if parent.poll() is None:
+                    _terminate_process_tree(parent)
+                if child_pid is not None and psutil.pid_exists(child_pid):
+                    try:
+                        child = psutil.Process(child_pid)
+                        if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                            child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+
+
     def test_publish_rejects_unprocessed_1024_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "candidate.png"
