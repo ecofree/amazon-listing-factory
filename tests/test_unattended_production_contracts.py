@@ -237,6 +237,146 @@ class UnattendedProductionContractTests(unittest.TestCase):
                     ledger.reserve(key=row['id'], lease=row['lease'], service='copy', request_id='late-request')
                 self.assertEqual(0, ledger.cost()['admitted_requests'])
 
+    def test_dispatcher_restart_observes_live_worker_without_duplicate_launch(self) -> None:
+        from core import production_batch as batch
+        from core.batch_ledger import BatchLedger
+        from core.process_lock import stop_process
+
+        class DispatcherCrash(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = BatchLedger(root / 'ledger.sqlite')
+            ledger.create(policy={'workers': 1, 'max_paid_calls': 0, 'max_attempts': 2,
+                'job_timeout_seconds': 30, 'total_job_seconds': 60}, source_revision='restart-fixture')
+            job = root / 'job'
+            (job / 'reports').mkdir(parents=True)
+            row = ledger.enqueue({'seed_asin': 'B000000001', 'seller_id': 'restart-fixture',
+                'stages': ['copy']}, job)
+            ledger.initialized(row['id'])
+            worker_code = (
+                "import json,sys,time; from pathlib import Path; from datetime import datetime,timezone; "
+                "job=Path(sys.argv[1]); "
+                "(job/'reports'/'worker-starts.txt').open('a',encoding='utf-8').write('started\\n'); "
+                "time.sleep(0.35); "
+                "(job/'job_state.json').write_text(json.dumps({'tasks':{},'stages':{'copy':{'status':'success'}}}),encoding='utf-8'); "
+                "(job/'reports'/'production_summary_v3.json').write_text(json.dumps({"
+                "'snapshot_at':datetime.now(timezone.utc).isoformat(),'workflow_status':'success',"
+                "'stage_times':{'copy':0.1},'run_environment':{'stages':['copy']}}),encoding='utf-8')"
+            )
+            launched = []
+            def command(_ledger, current):
+                launched.append(current['id'])
+                return [sys.executable, '-B', '-c', worker_code, current['path']]
+
+            common = (
+                patch.object(BatchLedger, 'require_workspace'),
+                patch.object(batch, 'production_revision', return_value='restart-fixture'),
+                patch.object(batch, 'refresh_operational_alerts'),
+                patch.object(batch, '_worker_command', side_effect=command),
+            )
+            try:
+                with common[0], common[1], common[2], common[3]:
+                    with patch.object(batch.time, 'sleep', side_effect=DispatcherCrash('dispatcher process stopped')):
+                        with self.assertRaises(DispatcherCrash):
+                            batch.run_batch(ledger.path, poll_seconds=0.05)
+                    running = ledger.rows()[0]
+                    self.assertEqual('running', running['state'])
+                    self.assertTrue(batch._alive(running), 'the worker must survive loss of its dispatcher handle')
+                    with patch('core.delivery_package.current_delivery', side_effect=ValueError('not delivered')):
+                        result = batch.run_batch(ledger.path, drain=True, poll_seconds=0.05)
+                settled = result['jobs'][0]
+                self.assertEqual('completed', settled['state'])
+                self.assertEqual(1, settled['attempt'], 'restart must observe, not reclaim, the live lease')
+                self.assertEqual([row['id']], launched, 'the same order must not be launched twice')
+                self.assertEqual('started', (job / 'reports' / 'worker-starts.txt').read_text(encoding='utf-8').strip())
+                self.assertIsNone(settled['lease'])
+                self.assertEqual(0, result['cost']['admitted_requests'])
+            finally:
+                for current in ledger.rows():
+                    if current.get('state') == 'running' and current.get('pid'):
+                        stop_process(current['pid'], current['process_start'])
+
+    def test_human_qa_review_wakes_original_order_and_resumes_dispatch(self) -> None:
+        from core import batch_console as console, production_batch as batch
+        from core.batch_ledger import BatchLedger
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = BatchLedger(root / 'ledger.sqlite')
+            ledger.create(policy={'workers': 1, 'max_paid_calls': 0, 'max_attempts': 2,
+                'job_timeout_seconds': 30, 'total_job_seconds': 60}, source_revision='review-fixture')
+            job = root / 'order-job'
+            (job / 'reports').mkdir(parents=True)
+            child = 'B000000001'
+            write_json(job / 'job.json', {'seed_asin': child, 'config_path': ''})
+            write_json(job / 'job_state.json', {'tasks': {
+                f'qa:{child}:main': {'logical_task_id': f'qa:{child}:main', 'owner_stage': 'qa',
+                    'status': 'awaiting_review', 'input_revision_id': 'q' * 64},
+            }, 'stages': {'qa': {'status': 'success'}}})
+            write_json(job / 'reports' / 'production_summary_v3.json', {
+                'workflow_status': 'awaiting_review', 'stage_times': {},
+                'run_environment': {'stages': ['fetch', 'copy', 'download', 'classify', 'brief', 'generate', 'qa', 'publish', 'template']},
+            })
+            spec = {'seed_asin': child, 'seller_id': 'review-fixture', 'category': 'bed_frame',
+                'brand': 'Fixture', 'sku_prefix': 'FIX'}
+            row = ledger.enqueue(spec, job)
+            ledger.initialized(row['id'])
+            worker = ledger.claim(ttl=30)
+            with patch('core.delivery_package.current_delivery', side_effect=ValueError('delivery is waiting for QA')):
+                batch._settle(ledger, worker, expired=False)
+            self.assertEqual('exception', ledger.rows()[0]['state'])
+            original_revision = ledger.rows()[0]['review_revision']
+
+            candidate = {
+                'child': child, 'role': 'main', 'candidate_sha256': 'a' * 64,
+                'automatic_decision': 'pass', 'failed_checks': [], 'unresolved_checks': [],
+                'qa_warning_gates': [], 'release_candidate_fingerprint': 'b' * 64,
+                'qa_policy_id': 'fixture-qa-policy', 'qa_evidence_fingerprint': 'c' * 64,
+                'source_sha256': 'd' * 64, 'final_decision': 'awaiting_review',
+            }
+            write_json(job / 'reports' / 'release_manifest_v6.json', {'rows': [candidate]})
+            body = None
+            with patch('core.release_manifest.build_release_manifest', return_value={'rows': [candidate]}):
+                view = console.evidence(ledger, row['id'])
+                body = {'id': row['id'], 'action': 'review', 'decision_id': 'qa-human-review-1',
+                    'reason': 'Operator confirmed the candidate against the source evidence',
+                    'expected_snapshot': view['snapshot'], 'child': child, 'role': 'main',
+                    'decision': 'approve', 'candidate_sha256': candidate['candidate_sha256'], 'resolutions': []}
+                applied = console.apply_action(ledger, body)
+                self.assertEqual('applied', applied['status'])
+                self.assertEqual('queued', ledger.rows()[0]['state'])
+                review_path = job / 'reports' / 'human_review_v5.json'
+                self.assertTrue(review_path.is_file())
+                saved_review = review_path.read_bytes()
+                replay = console.apply_action(ledger, body)
+                self.assertEqual(applied, replay, 'the same human decision must be idempotent')
+                self.assertEqual(saved_review, review_path.read_bytes())
+            self.assertNotEqual(original_revision, ledger.rows()[0]['review_revision'])
+
+            worker_code = (
+                "import sys; from pathlib import Path; "
+                "(Path(sys.argv[1])/'reports'/'downstream-resumed.txt').write_text('full-production-resumed',encoding='utf-8')"
+            )
+            launched = []
+            def command(_ledger, current):
+                launched.append(current['id'])
+                return [sys.executable, '-B', '-c', worker_code, current['path']]
+            package = {'context': {'delivery': {'completion': 'order_complete'}}, 'revision': 'synthetic-delivery'}
+            with (patch.object(BatchLedger, 'require_workspace'),
+                  patch.object(batch, 'production_revision', return_value='review-fixture'),
+                  patch.object(batch, 'refresh_operational_alerts'),
+                  patch.object(batch, '_worker_command', side_effect=command),
+                  patch('core.delivery_package.current_delivery', return_value=package)):
+                result = batch.run_batch(ledger.path, drain=True, poll_seconds=0.05)
+            self.assertEqual([row['id']], launched, 'the original order, not a replacement, must resume')
+            self.assertEqual('full-production-resumed',
+                (job / 'reports' / 'downstream-resumed.txt').read_text(encoding='utf-8'))
+            self.assertEqual('delivered', result['jobs'][0]['state'])
+            self.assertEqual(2, result['jobs'][0]['attempt'])
+            self.assertEqual(0, result['cost']['admitted_requests'])
+
     def test_publish_recovers_verified_remote_bytes_without_duplicate_put(self) -> None:
         import requests
         from core import publish, service_response as service
