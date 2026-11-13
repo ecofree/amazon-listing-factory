@@ -65,3 +65,13 @@ A release may be called **live-production accepted** only when A0–A8 pass. If 
 ## 5. Required report
 
 Include exact commit, files changed, tests and duration, synthetic/live distinction, categories and order count, candidate/QA/release counts, retry/unknown counts, budget admissions and reconciled actual cost, URL checks, workbook/package hashes, queue fairness, resource peaks, restarts and outstanding human decisions.
+
+## 5. Current repository test entry points
+
+After code changes, Codex should run these separately and preserve each exit code/output:
+
+1. Curated offline production contracts (100-case / 60-second gate): `python -B scripts/run_production_tests.py`.
+2. Targeted unattended process/provider contracts: `python -B -m unittest tests.test_unattended_production_contracts`.
+3. Synthetic 100-order ledger/lease/budget drill: `python -B scripts/check_unattended_acceptance.py`.
+
+The targeted process-crash test uses a real local child process but no external request. These three commands are still engineering/synthetic gates, not live production acceptance. Do not run a paid provider smoke test or live upload without separate operator authorization.

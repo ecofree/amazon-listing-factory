@@ -68,6 +68,8 @@ Evidence:
 
 | G24 | P1/C | Provider cooldowns were persisted across processes, but `review_revision()` did not include cooldown state. An order that exhausted automatic retries during a provider outage could remain in `exception` after the cooldown expired if credentials/configuration had not changed and no new provider event occurred. Phase 4 adds the scoped cooldown-active bit to the wake revision for failed service stages. | production_batch.py, model_call_health.py, vision_gemini_client.py, image_provider_routing.py | At cooldown active, review revision is stable; when the same configured provider cooldown expires, revision changes and the original order is requeued once without creating a new order or budget |
 
+| G25 | P0/U | Hard-fact QA false-pass/false-block rate, real visual design quality and complete four-category delivery remain unverified. Existing code has source-bound hard-fact gates and human escalation; do not add aesthetic scoring or weaken factual gates to claim acceptance. | image_qa.py, qa_evidence.py, release_manifest.py, template_engine.py, delivery_package.py | Blind adjudicated real candidate set + four-category complete family package, URL byte verification and workbook opening |
+
 ## 4. Scope boundaries and non-goals
 
 - Do not redesign or replace the production controller.
