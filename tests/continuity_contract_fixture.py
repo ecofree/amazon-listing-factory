@@ -210,7 +210,7 @@ def verify_dispatcher_multi_order_isolation(test):
             patch.object(production_batch,'production_revision',return_value='synthetic-dispatcher-fixture'),
             patch.object(production_batch,'refresh_operational_alerts'),
             patch.object(production_batch.subprocess,'Popen',side_effect=spawn),
-            patch.object(production_batch.psutil,'Process',side_effect=lambda _pid: type('P',(),{'create_time':lambda self:float(_pid)})()),
+            patch.object(production_batch.psutil,'Process',side_effect=lambda _pid=None: type('P',(),{'create_time':lambda self:float(_pid or 1)})()),
             patch.object(production_batch,'stop_process'),
             patch.object(production_batch,'_settle',side_effect=settle),
             patch.object(production_batch,'review_revision',return_value='review:synthetic'),
