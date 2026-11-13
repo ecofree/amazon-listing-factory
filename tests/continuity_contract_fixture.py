@@ -143,7 +143,7 @@ def verify_provider_cooldown_wakeup(test):
         }}})
         health_path=job/'model_health.json'
         write_json(health_path,{'entries':{
-            'image_generation|fixture-image|gpt-image-2':{
+            'image_generation|fixture_image|gpt-image-2':{
                 'configuration_revision':'fixture-revision','last_status':'timeout_failure',
                 'last_updated':'2026-11-13T00:00:00Z',
             }

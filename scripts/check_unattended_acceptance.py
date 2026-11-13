@@ -20,7 +20,8 @@ def run():
             'price_evidence': {'image': 'Synthetic fixed per-call ceiling for offline ledger exercise'}},
             source_revision='synthetic-test-only')
         for number in range(100):
-            spec = {'family': number, 'synthetic': True}
+            spec = {'family': number, 'seed_asin': f'B{number + 1:09d}',
+                    'seller_id': 'synthetic-offline', 'synthetic': True}
             row = ledger.enqueue(spec, root / str(number))
             assert ledger.enqueue(spec, root / str(number))['id'] == row['id']
             ledger.initialized(row['id'])

@@ -691,7 +691,11 @@ def _execute(
                 active=[task for future, task in futures.items() if future not in local_futures],
                 occupied={(task.get('logical_task_id') or (task.get('child'), task.get('role')), task.get('candidate_revision', 0))
                           for task in futures.values()})
-            room = max(0, remote_cap + 1 - len(futures) - len(waiting_local))
+            remote_inflight = sum(1 for future in futures if future not in local_futures)
+            # The remote pool has exactly remote_cap threads. Local finalization
+            # runs in its own single-thread pool and must not create an extra
+            # remote admission lane or be counted as occupying one.
+            room = max(0, remote_cap - remote_inflight)
             pending = current[room:] + pending
             current = current[:room]
             pending.extend(waiting_local)
