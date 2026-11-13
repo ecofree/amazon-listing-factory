@@ -223,6 +223,7 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
 
         # Exercise the actual template CopyV1 loader: draft may inspect a partial
         # family artifact, while submit-ready must reject the identical artifact.
+        from unittest.mock import patch
         from core.plugin import ProductPlugin
         from core.io import write_json
         from core.copy_polish import CopyPolishError
