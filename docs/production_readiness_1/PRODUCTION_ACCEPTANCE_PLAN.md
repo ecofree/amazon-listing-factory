@@ -79,3 +79,7 @@ The targeted process-crash test uses a real local child process but no external 
 ## 6. Single-command offline engineering gate
 
 `python -B scripts/run_readiness_checks.py --report test_runs/production_readiness_offline_report.json` runs the curated production suite, targeted unattended process/provider tests, and the synthetic 100-order ledger drill. It returns non-zero if any gate fails and records stdout/stderr/elapsed time. It explicitly reports live provider calls/uploads as zero and marks real image quality, four-category delivery and long-running soak as untested. This command is not production acceptance.
+
+## 7. Codex handoff and reporting
+
+See [CODEX_FINAL_ACCEPTANCE.md](CODEX_FINAL_ACCEPTANCE.md) for the exact branch baseline, safe local commands, required four-category/live order sequence, multi-order failure drill, 72-hour soak and mandatory report fields. Codex must not reset/recreate the fixed production ledger or treat this offline report as live acceptance.

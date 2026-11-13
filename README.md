@@ -304,6 +304,14 @@ Run the curated suite, targeted unattended process/provider contracts and synthe
 
 This runner never performs live provider calls or uploads. Its report explicitly marks real image quality, four-category live delivery and long-running soak as untested.
 
+### Phase 6 implementation
+
+Added targeted process-kill coverage for the request submission boundary and a single-command offline gate that runs the curated suite, targeted unattended tests and the synthetic 100-order ledger drill. See [Phase 6 implementation record](docs/production_readiness_1/PHASE6_IMPLEMENTATION.md). No Python suite has been executed by the GitHub editing environment.
+
+### Phase 7 — Codex handoff
+
+The final local/live acceptance instructions are in [CODEX_FINAL_ACCEPTANCE.md](docs/production_readiness_1/CODEX_FINAL_ACCEPTANCE.md). They distinguish offline engineering checks from authorized real-provider, four-category and 72-hour acceptance.
+
 ### Phase 5 implementation
 
 QA/release/template/delivery gates were reviewed and retained: uncertainty remains human-review, submit-ready remains full-family, URLs remain candidate-SHA/retention bound, and package commit remains hash verified. No real-output quality claim is made. See [Phase 5 quality and delivery gate audit](docs/production_readiness_1/PHASE5_IMPLEMENTATION.md).
