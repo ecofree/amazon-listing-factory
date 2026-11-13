@@ -310,6 +310,8 @@ The branch subsequently advanced to `15a9d5c` with a test-fixture correction: th
 
 Added targeted process-kill coverage for the request submission boundary and a single-command offline gate that runs the curated suite, targeted unattended tests and the synthetic 100-order ledger drill. See [Phase 6 implementation record](docs/production_readiness_1/PHASE6_IMPLEMENTATION.md). No Python suite has been executed by the GitHub editing environment.
 
+The offline CI workflow is being extended to run process-recovery and synthetic ledger tests on `windows-latest`, matching the production operator environment. Both Ubuntu and Windows jobs must pass before the offline engineering gate is green.
+
 ### Phase 7 — Codex handoff
 
 The final local/live acceptance instructions are in [CODEX_FINAL_ACCEPTANCE.md](docs/production_readiness_1/CODEX_FINAL_ACCEPTANCE.md). They distinguish offline engineering checks from authorized real-provider, four-category and 72-hour acceptance.

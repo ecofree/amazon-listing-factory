@@ -94,3 +94,7 @@ The previous fake-process dispatcher fixture was upgraded. The actual `productio
 This exercises real OS process creation, PID/start-time attachment, process polling/waiting, and dispatcher drain. It still does not execute the production `_worker` body or inject a kill during a real paid request. Windows process-tree termination and stale-worker mutation after lease expiry remain Codex/local acceptance items.
 
 The same run passed all offline gates: 100/100 curated cases in 37.601s, 5/5 targeted process/provider cases, and 100/100 synthetic ledger families. No paid requests or live uploads were made.
+
+## Windows CI coverage status
+
+The production operator environment is Windows, but the existing workflow only ran Ubuntu. A Windows job is being added to run the real local process-crash/provider tests and synthetic ledger drill under `windows-latest`. It must pass before Windows process recovery is considered verified. This still does not test the production worker body or kill a real worker during a provider request.

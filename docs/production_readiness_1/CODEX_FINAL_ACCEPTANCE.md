@@ -2,7 +2,7 @@
 
 **Repository:** `ecofree/amazon-listing-factory`  
 **Branch:** `codex/model-native-image-refactor`  
-**Engineering baseline:** `7ced838bf54b6ed63dcaa8aa48a759ba0d4290f5`  
+**Engineering baseline:** `3c639fc2c024797fefa8e4c11bdcb09cb00c4b99`  
 **Purpose:** validate the implementation locally and perform separately authorized live acceptance. Do not assume this document means the tests have passed.
 
 ## 1. Safety rules
@@ -20,8 +20,8 @@
 
 - Fetch latest origin.
 - Confirm branch is `codex/model-native-image-refactor`.
-- Confirm HEAD is this baseline or a descendant that contains it.
-- Inspect the `Production Readiness (offline)` GitHub Actions run for this exact HEAD and download its JSON artifact. The last verified offline pass is run `43373829371` on `7ced838b`; any later commit must have its own passing run. The baseline includes offline CI, the remote generation lane fix, the executor worker-cap fixture alignment, and a real local subprocess drill of the batch dispatcher using synthetic worker commands.
+- Confirm HEAD is this baseline or a descendant that contains it. The baseline includes the real eight-child-process dispatcher drill.
+- Inspect the `Production Readiness (offline)` GitHub Actions run for this exact HEAD and download its JSON artifact. The last verified offline pass is run `43373829371` on `7ced838b`; this run includes the 100-case curated suite, targeted process/provider tests, synthetic 100-order ledger drill, and eight real local child processes launched by the dispatcher. The current baseline `3c639fc` adds documentation only. The workflow is being extended to Windows; require a new run after that workflow change.
 - Record `git status --short`, commit SHA and remote SHA.
 - Inspect `git log --oneline --decorate -15`.
 - Do not overwrite uncommitted user work.

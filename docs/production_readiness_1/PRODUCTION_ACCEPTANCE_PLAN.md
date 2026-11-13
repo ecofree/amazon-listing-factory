@@ -108,3 +108,7 @@ Run [43372803029](https://github.com/ecofree/amazon-listing-factory/actions/runs
 ## 12. Real child-process dispatcher drill
 
 Run [43373829371](https://github.com/ecofree/amazon-listing-factory/actions/runs/43373829371) on `7ced838bf54b6ed63dcaa8aa48a759ba0d4290f5` passed. The `run_batch` integration test launched eight real local Python child processes via a synthetic worker command, measured peak concurrency of three, verified FIFO retry eligibility, isolated one non-zero child exit, completed seven unrelated orders, and drained with zero active child processes. The worker command was synthetic; the actual production `_worker` body, provider calls, process-kill during an in-flight paid request and Windows process-tree termination were not exercised.
+
+## 9. Windows process validation
+
+The workflow is being extended with a `windows-latest` job for targeted process-crash/provider tests and the synthetic ledger drill. Require this job to pass as well as the Ubuntu curated suite. It does not replace full local Windows testing of SAM, Blender, Excel, provider integrations, or the production workspace.
