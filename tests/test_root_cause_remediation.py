@@ -164,6 +164,8 @@ class RootCauseRemediationTests(unittest.TestCase):
         verify_terminal_image_receipts_do_not_hold_resource_leases(self)
         from tests.continuity_contract_fixture import verify_provider_cooldown_wakeup
         verify_provider_cooldown_wakeup(self)
+        from tests.continuity_contract_fixture import verify_dispatcher_multi_order_isolation
+        verify_dispatcher_multi_order_isolation(self)
         from core.source_fetch.apify_client import ApifyClient
         from core.asset_manager import _download_once
         from core.vision_gemini_client import gemini_stream_generate
