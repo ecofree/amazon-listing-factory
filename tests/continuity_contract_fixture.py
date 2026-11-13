@@ -172,7 +172,7 @@ def verify_dispatcher_multi_order_isolation(test):
         ledger.create(policy={'workers':3,'max_paid_calls':0,'job_timeout_seconds':60,
             'total_job_seconds':120,'max_attempts':2},source_revision='synthetic-dispatcher-fixture')
         rows=[]
-        for number in range(8):
+        for number in range(12):
             job=root/'jobs'/f'job-{number}';(job/'reports').mkdir(parents=True)
             spec={'seed_asin':f'B{number+1:09d}','seller_id':'synthetic-dispatcher',
                 'category':'bed_frame','purpose':'production','production':True,
@@ -180,7 +180,8 @@ def verify_dispatcher_multi_order_isolation(test):
             row=ledger.enqueue(spec,job);ledger.initialized(row['id']);rows.append(row)
         first=ledger.claim(ttl=30);test.assertEqual(rows[0]['id'],first['id'])
         ledger.complete(first,state='retry',reason='synthetic prior attempt',due=time.time()-1)
-        failed_id=rows[2]['id']
+        failed_ids={rows[2]['id']:'synthetic copy-stage worker failure',
+                    rows[8]['id']:'synthetic image-stage worker failure'}
         stats=root/'worker-stats.sqlite'
         with sqlite3.connect(stats) as db:
             db.execute('CREATE TABLE stats(active INTEGER NOT NULL, peak INTEGER NOT NULL)')
@@ -198,12 +199,12 @@ def verify_dispatcher_multi_order_isolation(test):
         launched=[]
         def command(_ledger,row):
             marker=Path(row['path'])/'reports'/'worker-started.txt'
-            code=17 if row['id']==failed_id else 0
+            code=17 if row['id'] in failed_ids else 0
             launched.append(row['id'])
             return [sys.executable,'-B','-c',worker_code,str(stats),str(marker),str(code)]
         def settle(current_ledger,row,*,expired=False):
-            if row['id']==failed_id:
-                current_ledger.complete(row,state='exception',reason='synthetic isolated worker failure',
+            if row['id'] in failed_ids:
+                current_ledger.complete(row,state='exception',reason=failed_ids[row['id']],
                     review_revision='review:synthetic')
             else:
                 current_ledger.complete(row,state='completed')
@@ -219,14 +220,16 @@ def verify_dispatcher_multi_order_isolation(test):
         states={row['id']:row['state'] for row in result['jobs']}
         with sqlite3.connect(stats) as db:
             active,peak=db.execute('SELECT active,peak FROM stats').fetchone()
-        test.assertEqual(8,len(launched))
-        test.assertEqual(8,len(set(launched)))
+        test.assertEqual(12,len(launched))
+        test.assertEqual(12,len(set(launched)))
         test.assertEqual(rows[0]['id'],launched[0],'Oldest eligible retry must precede later admissions')
         test.assertEqual(3,peak,'Real child processes must use all three worker slots without exceeding the cap')
         test.assertEqual(0,active,'All real synthetic workers must exit before drain returns')
-        test.assertEqual(1,sum(state=='exception' for state in states.values()))
-        test.assertEqual(7,sum(state=='completed' for state in states.values()))
-        test.assertEqual('exception',states[failed_id],'One failed worker must not stop unrelated orders')
+        test.assertEqual(2,sum(state=='exception' for state in states.values()))
+        test.assertEqual(10,sum(state=='completed' for state in states.values()))
+        for failed_id in failed_ids:
+            test.assertEqual('exception',states[failed_id],'A failed worker must not stop unrelated orders')
+        test.assertFalse(any(state in {'queued','running','retry'} for state in states.values()))
         for row in rows:
             test.assertTrue((Path(row['path'])/'reports'/'worker-started.txt').is_file())
 
