@@ -224,7 +224,7 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
         # Exercise the actual template CopyV1 loader: draft may inspect a partial
         # family artifact, while submit-ready must reject the identical artifact.
         from unittest.mock import patch
-        from core.plugin import ProductPlugin
+        from core.plugin import load_plugin
         from core.io import write_json
         from core.copy_polish import CopyPolishError
         with TemporaryDirectory() as tmp:
@@ -236,7 +236,7 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
                 "rows": {}, "groups": [],
                 "failures": [{"task": {"child": "B000000001"}, "error": "copy group pending"}],
             })
-            plugin = ProductPlugin(category_id="bed_frame", root=Path("."), manifest={})
+            plugin = load_plugin("bed_frame")
             with (
                 patch("core.copy_polish.copy_request_fingerprint", return_value="current-fingerprint"),
                 patch("core.template_engine.child_sku", return_value="T-B000000001"),
