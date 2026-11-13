@@ -160,6 +160,8 @@ class RootCauseRemediationTests(unittest.TestCase):
         verify_service_receipts(self); verify_upstream_unknown_post(self)
         from tests.continuity_contract_fixture import verify_retry_grant, verify_initialization, verify_batch_queue_fairness
         verify_retry_grant(self); verify_initialization(self); verify_batch_queue_fairness(self)
+        from tests.continuity_contract_fixture import verify_terminal_image_receipts_do_not_hold_resource_leases
+        verify_terminal_image_receipts_do_not_hold_resource_leases(self)
         from core.source_fetch.apify_client import ApifyClient
         from core.asset_manager import _download_once
         from core.vision_gemini_client import gemini_stream_generate

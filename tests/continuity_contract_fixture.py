@@ -111,6 +111,22 @@ def verify_batch_queue_fairness(test):
         test.assertEqual(first['id'],claimed['id'],'An older retry must not starve behind later new orders')
 
 
+def verify_terminal_image_receipts_do_not_hold_resource_leases(test):
+    from core import image_resources
+    with TemporaryDirectory() as tmp:
+        directory=Path(tmp)/'binding';directory.mkdir()
+        receipt=directory/'attempt.json'
+        image_resources.write_json(receipt,{'schema':image_resources.RESPONSE_SCHEMA,'binding':directory.name,'status':'finalized'})
+        (directory/'attempt.bin').write_bytes(b'native-image')
+        (directory/'attempt.http').write_bytes(b'provider-envelope')
+        test.assertEqual(0,image_resources._pending_response_bytes(directory),
+                         'Finalized bytes are immutable audit archives, not in-flight reservations')
+        image_resources.write_json(receipt,{'schema':image_resources.RESPONSE_SCHEMA,'binding':directory.name,'status':'received'})
+        expected=len(b'native-image')+len(b'provider-envelope')
+        test.assertEqual(expected,image_resources._pending_response_bytes(directory),
+                         'Unfinalized response bytes must remain reserved')
+
+
 def verify_initialization(test):
     from core import job as jobs
     from core.plugin import load_plugin

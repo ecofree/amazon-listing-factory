@@ -1,34 +1,31 @@
-# Phase 3 — Batch scheduling and resource management implementation record
+# Phase 3 — Resource accounting implementation record
 
-**Scope:** queue fairness without a new scheduler, state store or schema migration.
+**Baseline:** commit `10cc3e93db8d0ac83c26b1faaa32a15e7d00a7ce`.  
+**Scope:** keep long-running host image-resource accounting bounded without deleting audit evidence.
 
 ## Confirmed issue
 
-The jobs table has no explicit `created_at`/queue-age column. `BatchLedger.claim()` previously selected eligible `queued/retry` rows using `ORDER BY due,id`. New jobs are initialized with `due=0`; retry jobs have a future due timestamp. Once retries became eligible, a continuous arrival of new due=0 orders could keep those older retries behind newer admissions.
+`core/image_resources.py:_pending_response_bytes` excluded terminal native `.bin` bytes for `finalized/rejected_content`, but still counted terminal `.http` and `.partial` envelopes. Once a worker exited, `_reservations()` could retain a zero-memory stale reservation indefinitely because its terminal envelope remained on disk. This did not delete data, but caused the shared reservation JSON to grow and repeatedly inspect already-finalized work.
 
-## Implemented change
+## Implemented behavior
 
-- `due <= now` remains the eligibility condition.
-- Eligible jobs are selected by SQLite admission row order (`ORDER BY rowid`).
-- A future retry is excluded and cannot block a new eligible order.
-- Once an older retry becomes due, it is considered before later admissions.
-- Existing worker limit, lease fencing, retry limits, order budgets and completion holds are unchanged.
-- No schema migration or additional scheduler was introduced.
-
-This is FIFO among currently eligible enrolled production orders, not priority by order size or category. Retry attempts remain bounded by the existing policy.
+- Read the matching response receipt for each `.bin`, `.http` and `.partial` file.
+- Exclude payload bytes from pending-resource reservations when the bound receipt is terminal: `finalized`, `rejected_content`, `known_failure`, `output_rejected` or `superseded`.
+- Preserve every terminal receipt and payload file as immutable audit evidence.
+- Continue counting `prepared/submitted/received/resend_authorized` response bytes as pending.
+- Continue using actual filesystem free space as the final disk admission check.
 
 ## Test coverage
 
-Assertions were added to the existing `test_dns_resolution_failure_is_retryable` path via `verify_batch_queue_fairness`:
-1. An older retry whose due time is in the future does not block a newer queued order.
-2. Once that retry is due, it is claimed before a later new order.
+Added assertions to the existing default-suite root-cause fixture:
+- finalized native and HTTP envelope bytes do not remain pending reservations;
+- received native/envelope bytes remain counted.
 
-No new default test method was added; the suite case count remains unchanged. The Python test suite has not been executed here.
+No new default test method was added. Tests were not run in this environment.
 
 ## Remaining Phase 3 work
 
-- Measure queue wait and per-order service time under 10+ mixed synthetic orders.
-- Prove a repeated retrying order cannot occupy every worker indefinitely (existing max attempts must be included).
-- Test dispatcher restart, expired lease, stale worker process tree termination and simultaneous dispatchers.
-- Measure memory/disk/SAM process pressure and safe cache cleanup.
-- Decide whether persisted enqueue timestamps are needed before any future schema migration; current implementation intentionally avoids schema version change.
+- 10+ mixed-order fairness and worker saturation test.
+- Dispatcher restart, simultaneous dispatcher and stale worker fencing.
+- 72-hour disk/memory/SAM resource measurement.
+- Verify cleanup never removes referenced source, receipt, candidate, QA or delivery evidence.

@@ -296,6 +296,10 @@ A full source gallery is still planned before selecting generated test outputs.
 
 ### Phase 3 implementation
 
+Batch dispatch uses due time as an eligibility filter and admission order among eligible jobs, preventing retry starvation. Image resource accounting now releases terminal response-envelope reservations while preserving immutable receipt files; real free disk remains the final capacity check. See the Phase 3 implementation record. Fairness/resource assertions were added inside existing default-suite test methods; they have not been executed here.
+
+
+
 Batch dispatch now uses due time only as an eligibility filter and preserves original SQLite admission order among eligible orders. This prevents a constant stream of new due=0 orders from starving older retries, while future-due retries do not block new work. See the Phase 3 implementation record. Fairness tests were added inside an existing default-suite test method; they have not been executed here.
 
 ### Phase 2 implementation

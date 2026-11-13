@@ -64,6 +64,8 @@ Evidence:
 
 | G22 | P1/C | `BatchLedger.claim` ordered eligible jobs by `due,id`. New queued jobs use due=0 while retries have a later due timestamp, so a continuous stream of new orders could keep eligible older retries behind newer work. Phase 3 changes due to eligibility-only and dispatches eligible work in original admission order. | batch_ledger.py | Future retry does not block a new eligible order; once due, the older retry is selected before later arrivals; retry limit still bounds repeated attempts |
 
+| G23 | P2/C | `image_resources._pending_response_bytes` excluded terminal native `.bin` bytes but continued counting terminal `.http`/`.partial` envelopes. After a worker exited, finalized candidates could therefore leave stale disk reservations in the shared image resource ledger indefinitely. Phase 3 now excludes all response payload files for terminal receipt states while preserving their bytes on disk. | image_resources.py | Finalized/rejected/known-failure receipts contribute zero pending reservation; received/submitted payloads remain counted; actual free disk still gates new work |
+
 ## 4. Scope boundaries and non-goals
 
 - Do not redesign or replace the production controller.

@@ -49,15 +49,17 @@ def _pending_response_bytes(directory: Path) -> int:
     for path in directory.iterdir() if directory.is_dir() else []:
         if path.suffix in {'.bin', '.http', '.partial'}:
             try:
-                if path.suffix == '.bin':
-                    try:
-                        receipt = read_json(path.with_suffix('.json'))
-                    except (OSError, ValueError):
-                        receipt = {}
-                    if (isinstance(receipt, dict) and receipt.get('schema') == RESPONSE_SCHEMA
-                            and receipt.get('binding') == directory.name
-                            and receipt.get('status') in {'finalized', 'rejected_content'}):
-                        continue
+                try:
+                    receipt = read_json(path.with_suffix('.json'))
+                except (OSError, ValueError):
+                    receipt = {}
+                if (isinstance(receipt, dict) and receipt.get('schema') == RESPONSE_SCHEMA
+                        and receipt.get('binding') == directory.name
+                        and receipt.get('status') in {'finalized', 'rejected_content', 'known_failure',
+                                                       'output_rejected', 'superseded'}):
+                    # Terminal response bytes remain immutable audit evidence;
+                    # they are not an in-flight resource reservation.
+                    continue
                 size += path.stat().st_size
             except FileNotFoundError:
                 pass  # Finalization may remove a drained response during this snapshot.

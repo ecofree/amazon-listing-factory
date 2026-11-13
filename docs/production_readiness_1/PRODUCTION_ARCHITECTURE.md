@@ -60,6 +60,8 @@ Copy and image production are independent branches until template assembly. With
 
 The current batch dispatcher owns admission, leases, and spending. Queue fairness is by admission order among currently due jobs; due timestamps decide eligibility, not priority. A future retry must not block new work, and an eligible older retry must not be starved by a stream of later admissions.
 
+The image resource ledger reserves host memory and response-volume headroom across processes. Terminal receipt bytes remain immutable audit files but must not remain counted as in-flight reservations; actual filesystem free space continues to gate new admissions.
+
 ## 4. Completion is a projection, not one boolean
 
 Expose separate states/counts for:
