@@ -39,7 +39,7 @@ PRODUCTION_TEST_MODULES = (
 MAX_CASES = 100
 MAX_SECONDS = 60.0
 # Separate interpreters AND roots: patched globals/runtime ledgers cannot leak.
-GROUP_COUNT = 1
+GROUP_COUNT = 4
 # Measured contract costs only balance execution; every discovered case still runs.
 CASE_WEIGHTS = {
     'test_pipeline_stops_only_when_a_stage_has_no_usable_output': 26,
@@ -178,33 +178,36 @@ def main():
     allowed = {'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATH', 'PATHEXT', 'SYSTEMDRIVE',
                'TEMP', 'TMP', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'PYTHONPATH',
                'ALF_TEST_ROOT', 'AUDIT_SANDBOX_ROOT'}
-    children = [];exit_code=1
+    exit_code = 0
     with tempfile.TemporaryDirectory(prefix='production-contracts-') as temporary:
         root = Path(temporary)
-        try:
-            for index in range(GROUP_COUNT):
-                work = root / str(index)
-                _copy_test_inputs(work)
-                env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
-                env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1', PYTHONPATH=str(work), TEMP=str(work/'tmp'), TMP=str(work/'tmp'),
-                           NO_PROXY='localhost,127.0.0.1,::1')
-                log = (root / f'{index}.log').open('wb')
+        for index, group in enumerate(groups):
+            work = root / str(index)
+            _copy_test_inputs(work)
+            env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
+            env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1', PYTHONPATH=str(work),
+                       TEMP=str(work/'tmp'), TMP=str(work/'tmp'), NO_PROXY='localhost,127.0.0.1,::1')
+            log_path = root / f'{index}.log'
+            with log_path.open('wb') as log:
                 process = subprocess.Popen([sys.executable, '-B', '-X', 'utf8', str(work/'scripts/run_production_tests.py'),
-                    '--group-worker', str(index), *groups[index]], cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
+                    '--group-worker', str(index), *group], cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0,
                     start_new_session=os.name != 'nt')
-                children.append((process, log, index))
-            while any(p.poll() is None for p, _, _ in children):
-                if time.monotonic() - started >= MAX_SECONDS:
-                    print(f'PRODUCTION_TEST_TIME_BUDGET_EXCEEDED hard_deadline={MAX_SECONDS:.1f}', flush=True)
-                    break
-                time.sleep(.05)
-            exit_code = 0 if all(p.poll() == 0 for p, _, _ in children) else 1
-        finally:
-            for process, log, index in children:
-                _terminate_process_tree(process)
-                log.close()
-                print((root/f'{index}.log').read_text(encoding='utf-8', errors='replace'), end='')
+                try:
+                    while process.poll() is None:
+                        if time.monotonic() - started >= MAX_SECONDS:
+                            print(f'PRODUCTION_TEST_TIME_BUDGET_EXCEEDED hard_deadline={MAX_SECONDS:.1f}', flush=True)
+                            _terminate_process_tree(process)
+                            exit_code = 1
+                            break
+                        time.sleep(.05)
+                    if process.poll() != 0:
+                        exit_code = 1
+                finally:
+                    _terminate_process_tree(process)
+            print(log_path.read_text(encoding='utf-8', errors='replace'), end='')
+            if time.monotonic() - started >= MAX_SECONDS:
+                break
     elapsed=time.monotonic()-started
     print(f'PRODUCTION_TEST_RESULT cases={count} seconds={elapsed:.3f} limit={MAX_SECONDS:.1f}', flush=True)
     if elapsed>MAX_SECONDS:

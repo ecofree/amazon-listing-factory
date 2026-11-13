@@ -44,3 +44,7 @@ The GitHub editing environment cannot execute the Python interpreter, subprocess
 - Run `43370344665` on `a64a3ccd`: curated 100-case suite passed in 29.401 seconds and targeted 5-case process/provider suite passed in 1.134 seconds. The 100-order drill reached its explicit human-requeue assertion but passed a non-prefixed revision without `explicit=True`; the drill fixture is being corrected to model the authorized human decision API accurately.
 
 These are real GitHub Actions executions using Python 3.11 on Ubuntu, with no paid provider calls or live uploads. The overall gate remains failed until the synthetic 100-order drill and subsequent complete run pass.
+
+## Curated test runner isolation adjustment
+
+The curated suite now keeps four isolated interpreter/root groups (to prevent patched globals and runtime ledgers leaking across test groups) but executes those groups sequentially rather than concurrently. The two-process CI attempt showed one group process exiting without a log while the other completed; running groups sequentially removes cross-group memory/CPU contention without sacrificing interpreter isolation. The existing 60-second global wall budget and 100-case inventory remain unchanged. This adjustment is pending CI verification.
