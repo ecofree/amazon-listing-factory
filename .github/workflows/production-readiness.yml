@@ -74,8 +74,14 @@ jobs:
       - name: Install offline test dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Verify Windows process crash and provider contracts
-        run: python -B -X utf8 -m unittest tests.test_unattended_production_contracts
+      - name: Run isolated Windows process and ledger gates
+        run: python -B -X utf8 scripts/run_readiness_checks.py --targeted-only --report test_runs/windows_readiness_report.json
 
-      - name: Verify synthetic ledger and order recovery
-        run: python -B -X utf8 scripts/check_unattended_acceptance.py
+      - name: Upload Windows offline test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-readiness-windows-${{ github.sha }}
+          path: test_runs/windows_readiness_report.json
+          if-no-files-found: warn
+          retention-days: 30

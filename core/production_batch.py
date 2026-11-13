@@ -8,10 +8,11 @@ import subprocess
 import sys
 import time
 from functools import lru_cache
+from typing import Any
 
 import psutil
 
-from .batch_ledger import BatchLedger, identity, order_identity, REVIEW_PREFIX, COMPLETION_SERVICES
+from .batch_ledger import BatchLedger, AdmissionDenied, identity, order_identity, REVIEW_PREFIX, COMPLETION_SERVICES
 from .io import file_sha256, read_json, write_json
 from .paths import FACTORY_ROOT
 from .process_lock import stop_process
@@ -260,31 +261,39 @@ def _worker(path, key, lease):
     ledger = BatchLedger(path)
     ledger.require_workspace()
     row = ledger.worker(key, lease)
-    spec = json.loads(row['spec'])
-    if production_revision() != ledger.settings()['source_revision']:
-        raise ValueError('Source changed; pause and explicitly reconcile execution revision on the original workspace/order')
-    metadata=read_json(Path(row['path'])/'job.json')
-    if configuration_revision(spec['config_path'],metadata_config=metadata.get('config_path','')) != spec.get('config_semantics_sha256'):
-        raise ValueError('Effective execution policy changed after admission; credential rotation alone does not require reapproval')
-    os.environ.update(FACTORY_BATCH_DB=str(ledger.path), FACTORY_BATCH_JOB=key, FACTORY_BATCH_LEASE=lease)
-    from .plugin import load_plugin
-    from .production import JobRunRequest, run_job
-    selected_stages=json.loads(row['resume_stages']) if row.get('resume_stages') else spec.get('stages')
-    request = JobRunRequest(job_dir=Path(row['path']), plugin=load_plugin(spec['category']),
-        config_path=spec['config_path'], workers=1, limit=int(spec.get('limit', 0)), child_ids=tuple(spec.get('child_ids', ())),
-        production=spec.get('production', True), upload=spec.get('upload', True), write_excel=True,
-        execution_policy=spec.get('execution_policy', 'progressive'),
-        resume=True, all_generation_tasks=not selected_stages or 'generate' in selected_stages,
-        deadline_monotonic=time.monotonic() + max(0, row['lease_until'] - time.time()))
     try:
+        spec = json.loads(row['spec'])
+        if production_revision() != ledger.settings()['source_revision']:
+            raise ValueError('Source changed; pause and explicitly reconcile execution revision on the original workspace/order')
+        metadata=read_json(Path(row['path'])/'job.json')
+        if configuration_revision(spec['config_path'],metadata_config=metadata.get('config_path','')) != spec.get('config_semantics_sha256'):
+            raise ValueError('Effective execution policy changed after admission; credential rotation alone does not require reapproval')
+        os.environ.update(FACTORY_BATCH_DB=str(ledger.path), FACTORY_BATCH_JOB=key, FACTORY_BATCH_LEASE=lease)
+        from .plugin import load_plugin
+        from .production import JobRunRequest, run_job
+        selected_stages=json.loads(row['resume_stages']) if row.get('resume_stages') else spec.get('stages')
+        request = JobRunRequest(job_dir=Path(row['path']), plugin=load_plugin(spec['category']),
+            config_path=spec['config_path'], workers=1, limit=int(spec.get('limit', 0)), child_ids=tuple(spec.get('child_ids', ())),
+            production=spec.get('production', True), upload=spec.get('upload', True), write_excel=True,
+            execution_policy=spec.get('execution_policy', 'progressive'),
+            resume=True, all_generation_tasks=not selected_stages or 'generate' in selected_stages,
+            deadline_monotonic=time.monotonic() + max(0, row['lease_until'] - time.time()))
         run_job(request, stages=selected_stages)
     except Exception as exc:
         cause=exc;seen=set()
         while not getattr(cause,'reason_code',None) and (cause.__cause__ or cause.__context__) and id(cause) not in seen:
             seen.add(id(cause));cause=cause.__cause__ or cause.__context__
-        write_json(Path(row['path']) / 'reports/batch_failure.json',
-                   {'lease': lease, 'attempt':row['attempt'], 'error': f'{type(exc).__name__}: {exc}'[:2000],
-                    'reason_code':getattr(cause,'reason_code',''), 'service':getattr(cause,'service','')})
+        # The old worker may fail after its lease expired or was replaced.
+        # Serialize this diagnostic write with lease changes; never clobber the
+        # replacement worker's failure report. Request receipts remain untouched.
+        try:
+            with ledger.transaction() as db:
+                ledger._leased_job(db, key, lease, time.time())
+                write_json(Path(row['path']) / 'reports/batch_failure.json',
+                           {'lease': lease, 'attempt':row['attempt'], 'error': f'{type(exc).__name__}: {exc}'[:2000],
+                            'reason_code':getattr(cause,'reason_code',''), 'service':getattr(cause,'service','')})
+        except AdmissionDenied:
+            pass
         raise
 
 
@@ -401,7 +410,7 @@ def refresh_operational_alerts(ledger):
                 with (job/'images/_r2_image_urls.csv').open(encoding='utf-8-sig',newline='') as handle:urls=list(csv.DictReader(handle))
                 if not urls or any(not url_record_current(r,metadata.get('publication_policy')) for r in urls):
                     ledger.record_alert(row['id'],'publication_expired','Refresh publication verification/retention; archived package remains separate')
-        except (OSError,ValueError,KeyError,RuntimeError) as exc:
+        except (OSError,ValueError,KeyError,TypeError,AttributeError,RuntimeError) as exc:
             ledger.record_alert(row['id'],'evidence_unavailable',str(exc))
 
 
@@ -440,16 +449,25 @@ def run_batch(path, *, drain=False, poll_seconds=2, stop_event=None):
                         if process:
                             process.wait(timeout=5)
                             active.pop(row['id'], None)
-                        from .batch_ledger import AdmissionDenied
                         try:
                             _settle(ledger, row, expired=expired or not process)
                         except AdmissionDenied:
                             pass  # Another dispatcher already settled this fenced lease.
+                        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                            # Invalid per-order evidence is not a dispatcher outage.
+                            # Database/admission failures are deliberately not swallowed.
+                            try:
+                                ledger.complete(row, state='exception',
+                                    reason=f'Invalid settlement evidence: {type(exc).__name__}: {exc}',
+                                    review_revision=REVIEW_PREFIX+'unreadable')
+                            except AdmissionDenied:
+                                pass
                 elif row['state'] == 'exception':
                     try:
                         changed = review_revision(row['path'],ledger=ledger)
                         ledger.requeue(row['id'], review_revision=changed)
-                    except (OSError,ValueError,KeyError):
+                    except (OSError,ValueError,KeyError,TypeError,AttributeError) as exc:
+                        ledger.record_alert(row['id'], 'evidence_unavailable', str(exc))
                         continue  # Unreadable authority stays an exception; other jobs still run.
             running = sum(row['state'] == 'running' for row in ledger.rows())
             while running < policy.get('workers',1):
@@ -460,16 +478,41 @@ def run_batch(path, *, drain=False, poll_seconds=2, stop_event=None):
                 env = {key: value for key, value in os.environ.items() if not key.startswith('FACTORY_BATCH_')}
                 env['PYTHONDONTWRITEBYTECODE'] = '1'
                 log_path = Path(row['path']) / 'reports' / f"batch-attempt-{row['attempt']}-{row['lease']}.log"
-                with log_path.open('wb') as log:
-                    process = subprocess.Popen(_worker_command(ledger, row), cwd=FACTORY_ROOT, env=env,
-                        stdout=log, stderr=subprocess.STDOUT,
-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
                 try:
-                    ledger.attach_process(row, process.pid, psutil.Process(process.pid).create_time())
-                except BaseException:
-                    process.kill()
-                    process.wait()
-                    raise
+                    with log_path.open('wb') as log:
+                        process = subprocess.Popen(_worker_command(ledger, row), cwd=FACTORY_ROOT, env=env,
+                            stdout=log, stderr=subprocess.STDOUT,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                except OSError as exc:
+                    # No worker started. Retain the order and its existing receipts;
+                    # the normal retry budget still bounds another launch attempt.
+                    try:
+                        revision = review_revision(row['path'], ledger=ledger)
+                    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                        revision = REVIEW_PREFIX+'unreadable'
+                    try:
+                        ledger.complete(row, state='retry',
+                            reason=f'Worker launch failed: {type(exc).__name__}: {exc}',
+                            due=time.time() + min(300, 10 * 2 ** row['attempt']), review_revision=revision)
+                    except AdmissionDenied:
+                        pass
+                    continue
+                try:
+                    created = psutil.Process(process.pid).create_time()
+                except psutil.NoSuchProcess:
+                    # A short-lived worker can exit before PID attachment. Reap it
+                    # and let the usual evidence-based settlement handle the result.
+                    process.wait(timeout=5)
+                else:
+                    try:
+                        ledger.attach_process(row, process.pid, created)
+                    except AdmissionDenied:
+                        stop_process(process.pid, created)
+                        process.wait(timeout=5)
+                    except BaseException:
+                        stop_process(process.pid, created)
+                        process.wait(timeout=5)
+                        raise
                 active[row['id']] = process
                 running += 1
             rows = ledger.rows()
@@ -482,7 +525,8 @@ def run_batch(path, *, drain=False, poll_seconds=2, stop_event=None):
         ledger.pause()
         for row in ledger.rows():
             if row['id'] in active:
-                stop_process(row['pid'], row['process_start'])
+                if row['pid']:
+                    stop_process(row['pid'], row['process_start'])
                 active[row['id']].wait(timeout=5)
                 _settle(ledger, row, expired=True)
         raise
