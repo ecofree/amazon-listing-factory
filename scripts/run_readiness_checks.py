@@ -21,6 +21,9 @@ CHECKS = (
     ('unattended_process_and_provider_contracts', [
         sys.executable, '-B', '-m', 'unittest', 'tests.test_unattended_production_contracts'
     ], 900),
+    ('os_level_dispatcher_and_review_recovery', [
+        sys.executable, '-B', '-m', 'unittest', 'tests.test_dispatcher_os_recovery'
+    ], 900),
     ('synthetic_100_order_ledger_drill', [
         sys.executable, '-B', 'scripts/check_unattended_acceptance.py'
     ], 900),
