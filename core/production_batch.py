@@ -405,6 +405,12 @@ def refresh_operational_alerts(ledger):
             ledger.record_alert(row['id'],'evidence_unavailable',str(exc))
 
 
+def _worker_command(ledger: BatchLedger, row: dict[str, Any]) -> list[str]:
+    """Build the canonical isolated worker command; injectable at this boundary in tests."""
+    return [sys.executable, '-B', '-m', 'core.production_batch',
+            '--worker', str(ledger.path), row['id'], row['lease']]
+
+
 def run_batch(path, *, drain=False, poll_seconds=2, stop_event=None):
     ledger = BatchLedger(path)
     ledger.require_workspace()
@@ -455,8 +461,7 @@ def run_batch(path, *, drain=False, poll_seconds=2, stop_event=None):
                 env['PYTHONDONTWRITEBYTECODE'] = '1'
                 log_path = Path(row['path']) / 'reports' / f"batch-attempt-{row['attempt']}-{row['lease']}.log"
                 with log_path.open('wb') as log:
-                    process = subprocess.Popen([sys.executable, '-B', '-m', 'core.production_batch',
-                        '--worker', str(ledger.path), row['id'], row['lease']], cwd=FACTORY_ROOT, env=env,
+                    process = subprocess.Popen(_worker_command(ledger, row), cwd=FACTORY_ROOT, env=env,
                         stdout=log, stderr=subprocess.STDOUT,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
                 try:

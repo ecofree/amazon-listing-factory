@@ -161,11 +161,12 @@ def verify_provider_cooldown_wakeup(test):
 
 
 def verify_dispatcher_multi_order_isolation(test):
-    """Exercise the real run_batch claim/lease/settle loop with synthetic worker processes."""
+    """Run the real dispatcher with real child processes and synthetic worker commands."""
+    import sqlite3
+    import sys
     import time
     from core.batch_ledger import BatchLedger
     from core import production_batch
-    from unittest.mock import patch
     with TemporaryDirectory() as tmp:
         root=Path(tmp);ledger=BatchLedger(root/'batch.sqlite')
         ledger.create(policy={'workers':3,'max_paid_calls':0,'job_timeout_seconds':60,
@@ -177,28 +178,29 @@ def verify_dispatcher_multi_order_isolation(test):
                 'category':'bed_frame','purpose':'production','production':True,
                 'execution_policy':'progressive','config_path':'','limit':0}
             row=ledger.enqueue(spec,job);ledger.initialized(row['id']);rows.append(row)
-        # Make the oldest admitted order an already-due retry. FIFO eligibility
-        # must put it ahead of the seven later new orders.
         first=ledger.claim(ttl=30);test.assertEqual(rows[0]['id'],first['id'])
         ledger.complete(first,state='retry',reason='synthetic prior attempt',due=time.time()-1)
         failed_id=rows[2]['id']
-        launched=[];active=0;peak=0;pid=700000
-        class FakeWorker:
-            def __init__(self,worker_pid):
-                self.pid=worker_pid;self.finished=False
-            def poll(self):
-                return 0
-            def wait(self,timeout=None):
-                nonlocal active
-                if not self.finished:
-                    self.finished=True;active-=1
-                return 0
-            def kill(self):
-                self.wait()
-        def spawn(command,**kwargs):
-            nonlocal active,peak,pid
-            pid+=1;active+=1;peak=max(peak,active);launched.append(command[-2])
-            return FakeWorker(pid)
+        stats=root/'worker-stats.sqlite'
+        with sqlite3.connect(stats) as db:
+            db.execute('CREATE TABLE stats(active INTEGER NOT NULL, peak INTEGER NOT NULL)')
+            db.execute('INSERT INTO stats VALUES(0,0)')
+        worker_code=(
+            "import sqlite3,sys,time; from pathlib import Path; "
+            "db,marker,exit_code=sys.argv[1:4]; "
+            "c=sqlite3.connect(db,timeout=10); c.execute('BEGIN IMMEDIATE'); "
+            "c.execute('UPDATE stats SET active=active+1, peak=MAX(peak,active+1)'); c.commit(); c.close(); "
+            "time.sleep(0.15); "
+            "c=sqlite3.connect(db,timeout=10); c.execute('BEGIN IMMEDIATE'); "
+            "c.execute('UPDATE stats SET active=active-1'); c.commit(); c.close(); "
+            "Path(marker).write_text('worker-ran',encoding='utf-8'); raise SystemExit(int(exit_code))"
+        )
+        launched=[]
+        def command(_ledger,row):
+            marker=Path(row['path'])/'reports'/'worker-started.txt'
+            code=17 if row['id']==failed_id else 0
+            launched.append(row['id'])
+            return [sys.executable,'-B','-c',worker_code,str(stats),str(marker),str(code)]
         def settle(current_ledger,row,*,expired=False):
             if row['id']==failed_id:
                 current_ledger.complete(row,state='exception',reason='synthetic isolated worker failure',
@@ -209,22 +211,26 @@ def verify_dispatcher_multi_order_isolation(test):
             patch.object(BatchLedger,'require_workspace'),
             patch.object(production_batch,'production_revision',return_value='synthetic-dispatcher-fixture'),
             patch.object(production_batch,'refresh_operational_alerts'),
-            patch.object(production_batch.subprocess,'Popen',side_effect=spawn),
-            patch.object(production_batch.psutil,'Process',side_effect=lambda _pid=None: type('P',(),{'create_time':lambda self:float(_pid or 1)})()),
-            patch.object(production_batch,'stop_process'),
+            patch.object(production_batch,'_worker_command',side_effect=command),
             patch.object(production_batch,'_settle',side_effect=settle),
             patch.object(production_batch,'review_revision',return_value='review:synthetic'),
         ):
             result=production_batch.run_batch(ledger.path,drain=True,poll_seconds=.05)
         states={row['id']:row['state'] for row in result['jobs']}
+        with sqlite3.connect(stats) as db:
+            active,peak=db.execute('SELECT active,peak FROM stats').fetchone()
         test.assertEqual(8,len(launched))
         test.assertEqual(8,len(set(launched)))
         test.assertEqual(rows[0]['id'],launched[0],'Oldest eligible retry must precede later admissions')
-        test.assertEqual(3,peak,'Dispatcher must fill but never exceed the configured worker pool')
+        test.assertEqual(3,peak,'Real child processes must use all three worker slots without exceeding the cap')
+        test.assertEqual(0,active,'All real synthetic workers must exit before drain returns')
         test.assertEqual(1,sum(state=='exception' for state in states.values()))
         test.assertEqual(7,sum(state=='completed' for state in states.values()))
-        test.assertEqual('exception',states[failed_id],'One failed order must not stop unrelated orders')
-        test.assertEqual(0,active,'All synthetic workers must be settled before drain returns')
+        test.assertEqual('exception',states[failed_id],'One failed worker must not stop unrelated orders')
+        for row in rows:
+            test.assertTrue((Path(row['path'])/'reports'/'worker-started.txt').is_file())
+
+
 
 
 def verify_initialization(test):
