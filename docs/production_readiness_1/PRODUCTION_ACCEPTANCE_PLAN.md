@@ -91,3 +91,12 @@ At baseline `15a9d5c2fe0b173845dfbadaca401da276213aff`, CI was unconfigured. Pha
 ## 9. CI workflow
 
 `.github/workflows/production-readiness.yml` runs the offline readiness runner on pushes, pull requests and manual dispatch for this branch. The workflow is intentionally read-only and credential-free; inspect its first run and uploaded JSON report. CI success is only offline engineering evidence.
+
+## 10. Verified offline CI result
+
+Run [43371675918](https://github.com/ecofree/amazon-listing-factory/actions/runs/43371675918) on commit `e555854bfe35e98ee7b3cad6371c4db12574ad3e` completed with conclusion `success`:
+- 100/100 curated production contracts passed (54.847s / 60s hard budget);
+- 5/5 targeted unattended process/provider contracts passed;
+- 100/100 synthetic ledger families passed across four terminal outcomes.
+
+This does not close A3 actual multi-order dispatcher fault drill, A5 real-output adjudication, A6 four-category real workbook/package delivery, A7 72-hour soak or A8 live production canary. No paid calls or live uploads occurred.

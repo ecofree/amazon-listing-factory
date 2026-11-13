@@ -48,3 +48,16 @@ These are real GitHub Actions executions using Python 3.11 on Ubuntu, with no pa
 ## Curated test runner isolation adjustment
 
 The curated suite now keeps four isolated interpreter/root groups (to prevent patched globals and runtime ledgers leaking across test groups) but executes those groups sequentially rather than concurrently. The two-process CI attempt showed one group process exiting without a log while the other completed; running groups sequentially removes cross-group memory/CPU contention without sacrificing interpreter isolation. The existing 60-second global wall budget and 100-case inventory remain unchanged. This adjustment is pending CI verification.
+
+## Successful offline CI evidence — 2026-11-13
+
+**GitHub Actions run:** [43371675918](https://github.com/ecofree/amazon-listing-factory/actions/runs/43371675918)  
+**Commit:** `e555854bfe35e98ee7b3cad6371c4db12574ad3e`  
+**Result:** `success` on Ubuntu 26.04 / Python 3.11.18.
+
+All three offline gates passed:
+- Curated production contracts: 100/100 cases, `scripts/run_production_tests.py` exit code 0, 54.847 seconds (60-second hard budget).
+- Unattended process/provider contracts: 5/5 cases, exit code 0. This includes real local child-process termination before and after the durable submission checkpoint; no external HTTP request is made.
+- Synthetic 100-order ledger drill: 100/100 synthetic families, 25 each in synthetic completion, unknown-result hold, cancellation and deadline-preserved outcomes; exit code 0. It exercises deduplication, lease fencing, unknown holds, restart/reopen, explicit human requeue and budget enforcement.
+
+The report explicitly records `live_provider_calls=0`, `live_uploads=0`, real image quality `not_tested`, four-category live delivery `not_tested`, and long-running soak `not_run`. This is an offline engineering pass only. The curated suite has about 5.15 seconds of headroom under its current 60-second wall budget, so monitor timing on future runner images rather than silently relaxing the budget.

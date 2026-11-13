@@ -355,4 +355,8 @@ The baseline is the `codex/model-native-image-refactor` branch at `a74dc61542360
 
 ### Offline CI
 
+Latest verified offline CI pass: [run 43371675918](https://github.com/ecofree/amazon-listing-factory/actions/runs/43371675918) on `e555854b` (100 curated tests, 5 targeted tests and 100 synthetic ledger families). This is not live-provider, real-image, four-category delivery or 72-hour acceptance.
+
+
+
 The `Production Readiness (offline)` GitHub Actions workflow runs on pushes and pull requests to `codex/model-native-image-refactor`. It installs only `requirements.txt`, runs `scripts/run_readiness_checks.py`, and uploads the JSON report. It has no provider credentials, performs no live requests/uploads, and is not live-production acceptance.

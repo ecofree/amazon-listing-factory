@@ -2,7 +2,7 @@
 
 **Repository:** `ecofree/amazon-listing-factory`  
 **Branch:** `codex/model-native-image-refactor`  
-**Engineering baseline:** `15a9d5c2fe0b173845dfbadaca401da276213aff`  
+**Engineering baseline:** `e555854bfe35e98ee7b3cad6371c4db12574ad3e`  
 **Purpose:** validate the implementation locally and perform separately authorized live acceptance. Do not assume this document means the tests have passed.
 
 ## 1. Safety rules
@@ -21,7 +21,7 @@
 - Fetch latest origin.
 - Confirm branch is `codex/model-native-image-refactor`.
 - Confirm HEAD is this baseline or a descendant that contains it.
-- Inspect the `Production Readiness (offline)` GitHub Actions run and download its JSON artifact; do not infer success from the workflow file existing. The baseline includes the follow-up fixture correction `15a9d5c` (load the real bed-frame plugin rather than constructing an incomplete plugin stub) and the offline CI workflow added after the original handoff.
+- Inspect the `Production Readiness (offline)` GitHub Actions run for this exact HEAD and download its JSON artifact. The last verified offline pass is run `43371675918` on `e555854b`; any later commit must have its own passing run. The baseline includes the follow-up fixture correction `15a9d5c`, offline CI, the remote generation lane fix, and the test fixture alignment with the executor's worker cap.
 - Record `git status --short`, commit SHA and remote SHA.
 - Inspect `git log --oneline --decorate -15`.
 - Do not overwrite uncommitted user work.
