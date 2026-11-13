@@ -355,6 +355,8 @@ The baseline is the `codex/model-native-image-refactor` branch at `a74dc61542360
 
 ### Offline CI
 
+Latest verified run: [43373829371](https://github.com/ecofree/amazon-listing-factory/actions/runs/43373829371) on `7ced838b`; it includes eight real local synthetic child processes launched by the actual batch dispatcher, a measured three-worker peak, one isolated child failure and seven completed orders.
+
 Latest verified run: [43372803029](https://github.com/ecofree/amazon-listing-factory/actions/runs/43372803029) on `f618b4d0`; it also exercised the actual batch dispatcher loop with eight synthetic orders and three worker slots, isolating one failed order while seven completed.
 
 Latest verified offline CI pass: [run 43371675918](https://github.com/ecofree/amazon-listing-factory/actions/runs/43371675918) on `e555854b` (100 curated tests, 5 targeted tests and 100 synthetic ledger families). This is not live-provider, real-image, four-category delivery or 72-hour acceptance.

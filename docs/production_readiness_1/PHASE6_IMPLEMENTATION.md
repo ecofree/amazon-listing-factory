@@ -76,3 +76,21 @@ The existing curated `test_dns_resolution_failure_is_retryable` path now also ex
 - all 8 launched once; no queued/running order remained when drain returned.
 
 This validates dispatcher claim/lease/settle scheduling and order-level failure isolation. It does **not** prove real child-process creation/termination, Windows process-tree cleanup, or provider request behavior; those remain separate acceptance items. The default curated test count remains 100 because these assertions are folded into an existing test method.
+
+## Real subprocess dispatcher drill — 2026-11-13
+
+**GitHub Actions run:** [43373829371](https://github.com/ecofree/amazon-listing-factory/actions/runs/43373829371)  
+**Commit:** `7ced838bf54b6ed63dcaa8aa48a759ba0d4290f5`  
+**Result:** `success`.
+
+The previous fake-process dispatcher fixture was upgraded. The actual `production_batch.run_batch` loop now launches eight real local Python child processes through its canonical worker-command seam. The child commands are synthetic and never invoke `_worker`, a provider, or production stages. The test proves:
+- 8 processes launched and wrote their per-job marker files;
+- 3-worker concurrency cap was actually reached (SQLite cross-process peak counter = 3) and not exceeded;
+- oldest due retry launched first;
+- one child exited with a non-zero code and its order was settled as an isolated exception by the synthetic settlement adapter;
+- seven other orders settled completed;
+- all child processes exited and the dispatcher drain returned with zero active synthetic workers.
+
+This exercises real OS process creation, PID/start-time attachment, process polling/waiting, and dispatcher drain. It still does not execute the production `_worker` body or inject a kill during a real paid request. Windows process-tree termination and stale-worker mutation after lease expiry remain Codex/local acceptance items.
+
+The same run passed all offline gates: 100/100 curated cases in 37.601s, 5/5 targeted process/provider cases, and 100/100 synthetic ledger families. No paid requests or live uploads were made.

@@ -104,3 +104,7 @@ This does not close A3 actual multi-order dispatcher fault drill, A5 real-output
 ## 11. Synthetic batch dispatcher integration result
 
 Run [43372803029](https://github.com/ecofree/amazon-listing-factory/actions/runs/43372803029) on `f618b4d0fa9b151a477b0d4184c3801b9dbc6915` passed. In addition to the 100-case curated suite, 5 targeted process/provider cases and 100 synthetic ledger orders, the curated root-cause test exercised the real `production_batch.run_batch` loop with a temporary ledger and fake worker process adapter: 8 orders, 3 concurrent worker slots, one isolated exception, seven completed orders, oldest due retry first. This does not replace actual subprocess crash/Windows process-tree tests.
+
+## 12. Real child-process dispatcher drill
+
+Run [43373829371](https://github.com/ecofree/amazon-listing-factory/actions/runs/43373829371) on `7ced838bf54b6ed63dcaa8aa48a759ba0d4290f5` passed. The `run_batch` integration test launched eight real local Python child processes via a synthetic worker command, measured peak concurrency of three, verified FIFO retry eligibility, isolated one non-zero child exit, completed seven unrelated orders, and drained with zero active child processes. The worker command was synthetic; the actual production `_worker` body, provider calls, process-kill during an in-flight paid request and Windows process-tree termination were not exercised.
