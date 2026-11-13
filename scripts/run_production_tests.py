@@ -206,6 +206,7 @@ def main():
                 finally:
                     _terminate_process_tree(process)
             print(log_path.read_text(encoding='utf-8', errors='replace'), end='')
+            print(f'PRODUCTION_TEST_GROUP_EXIT index={index} returncode={process.returncode} log_bytes={log_path.stat().st_size}', flush=True)
             if time.monotonic() - started >= MAX_SECONDS:
                 break
     elapsed=time.monotonic()-started
