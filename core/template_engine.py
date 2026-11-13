@@ -828,6 +828,7 @@ def _build_listing_row_data(
     else:
         title, item_highlights, bullets, description = _copy_v1_for_row(
             copy_v1, row_type=row_type, sku=sku, asin=asin,
+            allow_missing=template_mode != "submit_ready",
         )
     if copy_audit is not None:
         copy_audit.append({"severity": "info", "sku": sku, "field": "copy", "message":
@@ -1484,7 +1485,8 @@ def _load_copy_v1(
 ) -> dict[str, Any]:
     from .copy_polish import copy_request_fingerprint, read_copy_artifact
 
-    data = read_copy_artifact(job_path, require_complete=True)
+    require_complete = mode == "submit_ready"
+    data = read_copy_artifact(job_path, require_complete=require_complete)
     expected_fingerprint = copy_request_fingerprint(
         env, mode=mode, children=children, plugin=plugin, job=job
     )
@@ -1492,7 +1494,7 @@ def _load_copy_v1(
         raise TemplateEngineError("Template requires current CopyV1; rerun the copy stage")
     rows = data.get("rows") if isinstance(data.get("rows"), dict) else {}
     expected = {child_sku(job, child, index) for index, child in enumerate(children, start=1)} | {"__parent__"}
-    if set(rows) != expected:
+    if set(rows) - expected or require_complete and set(rows) != expected:
         raise TemplateEngineError("CopyV1 row inventory does not match ProductFamilyV3")
     invalid = [key for key, row in rows.items() if not isinstance(row, dict) or not _copy_row_has_ai_provenance(row)]
     if invalid:
@@ -1513,6 +1515,7 @@ def _copy_v1_for_row(
     row_type: str,
     sku: str,
     asin: str,
+    allow_missing: bool = False,
 ) -> tuple[str, list[str], list[str], str]:
     rows = data.get("rows")
     if not isinstance(rows, dict):
@@ -1520,6 +1523,10 @@ def _copy_v1_for_row(
     keys = ["__parent__", f"parent:{asin}", sku] if row_type == "Parent" else [asin, sku]
     row = next((rows.get(key) for key in keys if isinstance(rows.get(key), dict)), None)
     if row is None:
+        if allow_missing:
+            # Drafts are inspection artifacts; missing copy stays blank and is
+            # reported by field audit. It never becomes submit-ready.
+            return "", [], [], ""
         raise TemplateEngineError(f"Template requires CopyV1 row for {row_type} sku={sku} asin={asin}")
     if not _copy_row_has_ai_provenance(row):
         raise TemplateEngineError(f"Template requires AI CopyV1 provenance for {sku}")

@@ -194,6 +194,33 @@ class TemplateFieldPlanContractsTests(unittest.TestCase):
         )
         self.assertEqual(1, coverage["business_required_missing_count"])
 
+        from tempfile import TemporaryDirectory
+        from core.copy_polish import read_copy_artifact, CopyPolishError
+        from core.io import write_json
+
+        with TemporaryDirectory() as tmp:
+            job = Path(tmp)
+            reports = job / "reports"
+            reports.mkdir()
+            write_json(reports / "copy_v1.json", {
+                "schema_version": "copy-v1", "job_id": "fixture",
+                "rows": {}, "groups": [],
+                "failures": [{"task": {"child": "B000000001"}, "error": "synthetic group failure"}],
+            })
+            self.assertEqual({}, read_copy_artifact(job, require_complete=False)["rows"])
+            with self.assertRaises(CopyPolishError):
+                read_copy_artifact(job, require_complete=True)
+
+        self.assertEqual(("", [], [], ""), template_engine._copy_v1_for_row(
+            {"rows": {}}, row_type="Child", sku="T-B000000001",
+            asin="B000000001", allow_missing=True,
+        ))
+        with self.assertRaisesRegex(template_engine.TemplateEngineError, "requires CopyV1 row"):
+            template_engine._copy_v1_for_row(
+                {"rows": {}}, row_type="Child", sku="T-B000000001",
+                asin="B000000001",
+            )
+
     def test_field_plan_splits_weight_value_and_unit(self) -> None:
         from tests.audit_delivery_fixture import verify_zero_and_template_validation
         verify_zero_and_template_validation(self)

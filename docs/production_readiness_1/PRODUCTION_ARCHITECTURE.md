@@ -83,6 +83,12 @@ A completed selected stage range is not a delivered order. A candidate file is n
 - Never lower hard-fact, QA, release, template or delivery gates to increase throughput.
 - Never reduce frozen family/role goals to make a batch appear complete.
 
+
+
+### Draft template behavior
+
+Draft template generation may consume a current but incomplete CopyV1 artifact. Rows with valid copy are rendered; absent child/parent copy remains blank and is exposed by the existing field/listing-data audit. Existing malformed rows or provenance mismatches still fail closed. Draft output remains `draft_with_blockers` and is never eligible for publish or delivery. Submit-ready continues to require a complete CopyV1, exact family row inventory, valid parent copy and all existing business/image/release gates.
+
 ## 6. Operational boundaries
 
 The production workspace, order leases, budget policy and durable receipts remain mandatory. No code path may bypass the fixed ledger or create a new spending domain to escape an unknown outcome. Configuration changes that alter execution semantics require explicit reconciliation; credential rotation alone must not invalidate unrelated factual approvals.

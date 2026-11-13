@@ -20,7 +20,7 @@ class FlowRegressionTests(unittest.TestCase):
         from tests.audit_delivery_fixture import verify_remote_content_identity
         verify_remote_content_identity(self)
         from core.release_manifest import _production_task_completion, approved_release_rows
-        from core.production import _release_terminal_before_publish
+        from core.production import _release_terminal_before_publish, _completed_family_status
 
         rows = approved_release_rows({
             "children": {"B1": {"status": "incomplete"}, "B2": {"status": "approved"}},
@@ -43,6 +43,9 @@ class FlowRegressionTests(unittest.TestCase):
                 {"child": "B1", "role": "func", "final_decision": "awaiting_review"},
             ],
         }))
+        with patch("core.release_manifest.release_order_complete", return_value=True):
+            self.assertEqual("partial_success", _completed_family_status({}, run_had_failures=True))
+            self.assertEqual("success", _completed_family_status({}, run_had_failures=False))
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp)
             (job / "images").mkdir()

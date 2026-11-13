@@ -294,6 +294,12 @@ A full source gallery is still planned before selecting generated test outputs.
 
 ## Production Readiness 1.0 — engineering plan
 
+### Phase 1 implementation
+
+The first workflow change allows draft templates to expose current successful CopyV1 rows while keeping missing rows blank and audited; submit-ready still requires the complete family copy contract. A recorded stage failure also cannot be hidden by family release completion. See [Phase 1 implementation record](docs/production_readiness_1/PHASE1_IMPLEMENTATION.md). Runtime tests and workbook inspection remain required before acceptance.
+
+
+
 The target is safe unattended batch production: independent progress across copy and image work, bounded recovery, order isolation, verified listing delivery, and human escalation only when evidence or authority is missing. This is an engineering target, not a statement that live production has been accepted.
 
 Phase 0 baseline specifications are maintained in [docs/production_readiness_1/](docs/production_readiness_1/):

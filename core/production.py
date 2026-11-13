@@ -527,8 +527,7 @@ def _run_job_locked(request: JobRunRequest, stages: Iterable[str] | None = None)
             record_task_successes(request.job_dir,owner_stage='template',attempt_id=attempt_id,tasks=[{**package_task,'status':'success'}])
         # The summary projects this invocation separately from release readiness.
         if completed_family:
-            from .release_manifest import release_order_complete
-            final_status = 'success' if release_order_complete(release) else 'partial_success'
+            final_status = _completed_family_status(release, run_had_failures=run_had_failures)
         elif run_had_failures and not release:
             final_status = "partial_success"
         elif release.get("status") == "awaiting_review":
@@ -809,6 +808,11 @@ def _run_stage(stage: str, *, request: JobRunRequest, attempt_id: str = "") -> A
             template_mode="submit_ready" if request.production else request.template_mode,
         )
     raise AssertionError(stage)
+
+
+def _completed_family_status(release: dict[str, Any], *, run_had_failures: bool) -> str:
+    from .release_manifest import release_order_complete
+    return "success" if release_order_complete(release) and not run_had_failures else "partial_success"
 
 
 def _selected_stages(stages: Iterable[str] | None) -> list[str]:
