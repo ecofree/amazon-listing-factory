@@ -266,18 +266,25 @@ class UnattendedProductionContractTests(unittest.TestCase):
                 "'stage_times':{'copy':0.1},'run_environment':{'stages':['copy']}}),encoding='utf-8')"
             )
             launched = []
+            processes = []
+            real_popen = subprocess.Popen
             def command(_ledger, current):
                 launched.append(current['id'])
                 return [sys.executable, '-B', '-c', worker_code, current['path']]
+            def spawn(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                processes.append(process)
+                return process
 
             common = (
                 patch.object(BatchLedger, 'require_workspace'),
                 patch.object(batch, 'production_revision', return_value='restart-fixture'),
                 patch.object(batch, 'refresh_operational_alerts'),
                 patch.object(batch, '_worker_command', side_effect=command),
+                patch.object(batch.subprocess, 'Popen', side_effect=spawn),
             )
             try:
-                with common[0], common[1], common[2], common[3]:
+                with common[0], common[1], common[2], common[3], common[4]:
                     with patch.object(batch.time, 'sleep', side_effect=DispatcherCrash('dispatcher process stopped')):
                         with self.assertRaises(DispatcherCrash):
                             batch.run_batch(ledger.path, poll_seconds=0.05)
@@ -286,6 +293,8 @@ class UnattendedProductionContractTests(unittest.TestCase):
                     self.assertTrue(batch._alive(running), 'the worker must survive loss of its dispatcher handle')
                     with patch('core.delivery_package.current_delivery', side_effect=ValueError('not delivered')):
                         result = batch.run_batch(ledger.path, drain=True, poll_seconds=0.05)
+                self.assertEqual(1, len(processes))
+                processes[0].wait(timeout=5)  # Reap the test-owned child after the restarted dispatcher settles it.
                 settled = result['jobs'][0]
                 self.assertEqual('completed', settled['state'])
                 self.assertEqual(1, settled['attempt'], 'restart must observe, not reclaim, the live lease')
