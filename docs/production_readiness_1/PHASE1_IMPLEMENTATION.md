@@ -1,7 +1,7 @@
 # Phase 1 — Four-part workflow implementation record
 
 **Baseline:** Phase 0 commit `0b2e18cb8bd6283774bda028c883ca28b85fa544`  
-**Implementation commit:** recorded in the repository history after this document is committed.  
+**Implementation commit:** `8ea909baf2011b11278fda9e58f4a8d996936139`.  
 **Scope:** safe partial draft visibility and accurate partial-success reporting. No production controller or state authority added.
 
 ## Change 1 — Partial CopyV1 is visible to draft templates
@@ -28,7 +28,7 @@ Assertions were added inside existing default-suite test methods:
 - the same missing row remains an error by default;
 - family-release completion cannot mask a recorded run failure in the workflow status.
 
-The curated suite's declared case count is unchanged; this was checked from the existing test method structure, not by executing the suite.
+The curated suite's declared case count remains 100 (the runner limit is 100); the test assertions were folded into existing test methods. This was checked statically from the module AST/method inventory, not by executing the suite.
 
 ## Verification boundary
 
