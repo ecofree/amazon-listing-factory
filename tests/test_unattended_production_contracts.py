@@ -1,6 +1,8 @@
 import io
+import multiprocessing
 import os
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,7 +17,48 @@ from core.publish import PublishError, _publish_candidate_row
 from core.vision_gemini_client import gemini_stream_generate
 
 
+
+
+
+def _write_service_receipt_then_wait(root: str, stage: str, ready) -> None:
+    import psutil
+    from core.service_response import SCHEMA, write_json
+    path=Path(root)/'000001-crash.json'
+    write_json(path, {
+        'schema':SCHEMA,'id':'crash','sequence':1,'key':'crash-request',
+        'owners':['copy:crash'],'status':'submitted','pid':os.getpid(),
+        'process_start':psutil.Process(os.getpid()).create_time(),
+        'submitted_at':'2026-11-13T00:00:00+00:00','submission_stage':stage,
+    })
+    ready.set()
+    while True:
+        time.sleep(1)
+
+
 class UnattendedProductionContractTests(unittest.TestCase):
+    def test_service_receipt_crash_boundary_distinguishes_unsent_from_unknown(self) -> None:
+        import psutil
+        from core.service_response import retry_authorized
+        context=multiprocessing.get_context("spawn")
+        for stage, expected in (("preparation", True), ("submission_call_started", False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                ready=context.Event()
+                process=context.Process(target=_write_service_receipt_then_wait,args=(tmp,stage,ready))
+                process.start()
+                try:
+                    self.assertTrue(ready.wait(10), f"worker did not persist {stage} receipt")
+                finally:
+                    process.terminate()
+                    process.join(10)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(5)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(expected,retry_authorized(
+                    Path(tmp),["copy:crash"],include_known_unsent=True
+                ),stage)
+
+
     def test_publish_rejects_unprocessed_1024_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "candidate.png"
